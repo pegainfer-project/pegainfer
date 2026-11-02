@@ -10,6 +10,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
 fastrace = { workspace = true }
+http-body-util = { workspace = true }
 log = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
@@ -20,15 +21,17 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true, features = ["v4"] }
+vllm-chat = { workspace = true }
 vllm-engine-core-client = { workspace = true }
 vllm-server = { workspace = true }
+vllm-text = { workspace = true }
 zeromq = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
-vllm-chat = { workspace = true }
-vllm-text = { workspace = true }
 
 [lints]
 workspace = true

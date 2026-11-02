@@ -18,7 +18,7 @@ It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hi
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - records the per-model engine direction and says root should be reusable frontend/control-plane infrastructure, not a universal model abstraction.
   - `src/main.rs`, `src/lib.rs`, `src/server_engine.rs`, `src/scheduler.rs`, `src/model_executor.rs`, `src/model/qwen3/*`, `src/bin/bench_serving.rs`, and Qwen3 tests - mapped what root currently knows about Qwen3.
 - **Relevant history**:
-  - The earlier shared-runtime work (now consolidated into `docs/subsystems/runtime/runtime.md`) was a useful simplification, but the next boundary should not make `ModelForward` the long-term universal engine API.
+  - The earlier shared-runtime work around the `ModelForward` trait (since removed) was a useful simplification, but the next boundary should not make that trait the long-term universal engine API.
 - **Plan**:
   1. Define the model crate/root interface before moving code.
   2. Move the generic text-generation handle/request/event types into `pegainfer-core` so root and model crates can communicate without model crates depending on root.
@@ -157,7 +157,7 @@ pub fn start_engine(
 ### Step 7: Retire ModelForward and Fix Length Limit
 - Deleted `pegainfer_core::model::{ModelForward, GenerationState}` and removed the root `src/model.rs` re-export.
 - Deleted the Qwen3 `forward.rs` compatibility path. Qwen3 tests that used it now build their baselines from `batch_prefill(bs=1)` plus `batch_decode(bs=1)`, so they exercise the same phase APIs as production.
-- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. EOS behavior is unchanged: EOS finishes without emitting the stop token. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`.
+- Fixed Qwen3 decode length-limit handling by adding `DecodeEffect::EmitAndFinish`. Length limit now emits the sampled final token, then sends `Finished { finish_reason: Length }`. Under the typed stop contract the triggering token — model EOS or an explicit stop ID — is retained and emitted as the final token; the vLLM primary EOS carries no wire `stop_reason`, while explicit stops and secondary EOS IDs report the matching ID.
 - Regenerated `test_data/Qwen3-4B.json` because every length-limited golden output now includes the final requested token.
 - Re-ran `bench_serving snapshot` on the CUDA validation host and pulled back `bench_snapshots/rtx-5090/qwen3-4b.json`; `decode_heavy (1024,256)` now records `generated_tokens min=max=avg=256`.
 - Performance stayed within noise on RTX 5090:

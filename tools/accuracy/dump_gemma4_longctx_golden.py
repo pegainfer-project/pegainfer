@@ -58,11 +58,11 @@ def main() -> None:
     eager_skipped: list[str] = []
     for impl in ("sdpa", "eager"):
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir, dtype=torch.bfloat16, attn_implementation=impl
-        ).to(args.device)
+            args.model_dir, dtype=torch.bfloat16, attn_implementation=impl, device_map=args.device
+        )
         model.eval()
         for case, length in CASES.items():
-            seq = torch.tensor([ids[: length + TEACHER_STEPS]], device=args.device)
+            seq = torch.tensor([ids[: length + TEACHER_STEPS]], device=model.device if args.device == "auto" else args.device)
 
             def rows_of() -> torch.Tensor:
                 # Keep only the recorded positions' logits: the full

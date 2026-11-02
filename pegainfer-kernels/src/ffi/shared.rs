@@ -5,6 +5,20 @@ use super::Half;
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
+    pub fn dflash2_grouped_conv_cuda(
+        input: *const Half,
+        dynamic: *const Half,
+        base: *const Half,
+        output: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group_size: i32,
+        taps: i32,
+        side: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,
@@ -144,16 +158,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn fused_add_rms_norm_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
-
     pub fn layer_norm_cuda(
         x: *const Half,
         gamma: *const f32,
@@ -188,6 +192,9 @@ unsafe extern "C" {
         gate: *const Half,
         up: *const Half,
         out: *mut Half,
+        cols: i32,
+        gate_stride: i32,
+        up_stride: i32,
         n: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -317,6 +324,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// `y[rows] = W[rows, cols] * x[cols]`, bf16 in and out with fp32 accumulation.
+    pub fn gemv_bf16_cuda(
+        w: *const Half,
+        x: *const Half,
+        y: *mut Half,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> i32;
+
     /// cuBLAS `cublasGemmStridedBatchedEx` (bf16, workspace-free, graph-safe).
     pub fn gemm_strided_batched_bf16_cuda(
         op_a: i32,
@@ -418,15 +435,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
-    pub fn embedding_decode_cuda(
-        embed: *const Half,
-        token_id: *const u32,
-        out: *mut Half,
-        hidden_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn silu_mul_fused_cuda(
         gate_up: *const Half,
         out: *mut Half,
@@ -475,14 +483,35 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Per-head RMSNorm with F32 weight + SiLU gate
+    // Per-head RMSNorm with F32 weight + SiLU gate. `num_heads` counts every
+    // head of every slot; `heads_per_slot` splits that back into (slot, head)
+    // so `x` and `gate` can each carry their own tensor's slot stride.
     pub fn rms_norm_gated_cuda(
         x: *const Half,
         weight: *const f32,
         gate: *const Half,
         out: *mut Half,
         num_heads: i32,
+        heads_per_slot: i32,
         head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // The same kernel with a sigmoid gate, for the lines whose
+    // `output_gate_type` selects it.
+    pub fn rms_norm_gated_sigmoid_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        heads_per_slot: i32,
+        head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
         eps: f32,
         stream: CUstream,
     );
@@ -568,13 +597,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the number of Q tiles for batch prefill (needed to size plan arrays).
-    pub fn batch_prefill_paged_num_tiles(
-        seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
         seq_len: i32,
         num_qo_heads: i32,
@@ -584,13 +606,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the CTA tile size for batch prefill planning.
-    pub fn batch_prefill_cta_tile_q(
-        total_seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_cta_tile_q_with_override(
         total_seq_len: i32,
         num_qo_heads: i32,
@@ -600,33 +615,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
-    pub fn batch_prefill_paged_cuda(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn batch_prefill_paged_cuda_with_cta_tile_q(
         q: *const Half,
         output: *mut Half,
@@ -687,22 +675,6 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn single_prefill_nhd_noncausal_cuda_hd64(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Causal NHD single-sequence prefill (same layout, causal mask).
-    pub fn single_prefill_nhd_causal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,
@@ -781,139 +753,6 @@ unsafe extern "C" {
         padded_batch_size: i32,
         stride_page: i64,
         sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-}
-
-// HEAD_DIM=256 paged attention. Qwen3.5-4B calls the full-attention pair; the
-// windowed pair carries the sliding-window mask for Gemma 4's local layers.
-// `window_left` is an inclusive distance: an N-token window passes N - 1, and
-// -1 degrades to full attention.
-unsafe extern "C" {
-    pub fn paged_attention_decode_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn paged_attention_decode_window_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        window_left: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn paged_attention_decode_split_kv_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        request_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        o_indptr: *const i32,
-        block_valid_mask: *const u8,
-        tmp_v: *mut Half,
-        tmp_s: *mut f32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn batch_prefill_paged_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn batch_prefill_paged_window_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        window_left: i32,
         stream: CUstream,
     ) -> i32;
 }
@@ -1118,301 +957,41 @@ unsafe extern "C" {
 
 }
 
-// hd256 single prefill (qwen35 full-attention layers, Gemma 4 local layers):
-// csrc/shared/paged_attention.cu. K/V are a contiguous HND cache —
-// k[head, pos, dim] with max_seq_len rows per head — not token-major NHD.
-unsafe extern "C" {
-    pub fn single_prefill_cuda_hd256(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-}
-
-// hd512 (Gemma 4 global layers): csrc/shared/paged_attention_hd512.cu
-unsafe extern "C" {
-    pub fn single_prefill_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn batch_prefill_paged_cuda_hd512(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-}
-
-// hd256 plain-w QK-norm + RoPE prep (Gemma 4 local layers):
-// csrc/shared/prefill_attention_hd256_plain.cu. Contract and validation live
-// on the Rust wrapper in ops::attention; the entry returns 0 on success, -1
-// with a diagnostic on failure.
-unsafe extern "C" {
-    // Oracle form: Q and K both land in contiguous buffers shaped like
-    // their inputs; the paged serving form is the qkv_ entry below.
-    pub fn qk_norm_rope_prefill_hd256_plain_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        k_batch_out: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Paged serving form: Q → contiguous q_batch_out; K (normed + rotated)
-    // and V (weightless-normed, never rotated) → straight into the paged KV
-    // pool at k_offset_elems / v_offset_elems.
-    pub fn qkv_norm_rope_paged_prefill_hd256_plain_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        page_origin: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-
-    pub fn qkv_norm_rope_paged_decode_hd256_plain_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        page_indptr: *const i32,
-        page_origins: *const i32,
-        positions: *const i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        batch: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-
-    /// E4m3 KV twin.
-    pub fn qkv_norm_rope_paged_prefill_hd256_plain_fp8kv_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        page_origin: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-
-    /// E4m3 KV twin.
-    pub fn qkv_norm_rope_paged_decode_hd256_plain_fp8kv_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        v_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        page_indptr: *const i32,
-        page_origins: *const i32,
-        positions: *const i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        batch: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-}
-
-// hd512 QK-norm + partial RoPE prep (Gemma 4 global layers):
-// csrc/shared/prefill_attention_hd512.cu. Contract and validation live on
-// the Rust wrappers in ops::attention; both entries return 0 on success,
-// -1 with a diagnostic on failure.
-unsafe extern "C" {
-    // Prefill: Q → contiguous q_batch_out; K → straight into the paged KV
-    // pool at k_offset_elems (feeds batch_prefill_paged, not single_prefill).
-    // V is the K=V fork — the weightless norm of the same raw K, sharing
-    // its denominator — written to v_offset_elems in the same pass.
-    pub fn qk_norm_partial_rope_paged_prefill_hd512_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        seq_len: i32,
-        start_pos: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-
-    // Batched decode straight into the pool: per-token position and page
-    // window; V is the K=V fork written alongside K.
-    pub fn qk_norm_partial_rope_paged_decode_hd512_cuda(
-        q_batch: *const Half,
-        k_batch: *const Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        q_batch_out: *mut Half,
-        kv_data: *mut Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indices_len: i32,
-        page_indptr: *const i32,
-        page_origins: *const i32,
-        positions: *const i32,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        batch: i32,
-        cos_max_pos: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        page_size: i32,
-        num_pages: i32,
-        stride_page: i64,
-        stream: CUstream,
-    ) -> i32;
-
-    // Batched decode: Q → contiguous q_batch_out; K normalised + partially
-    // rotated in place (caller scatters it into the paged pool afterwards).
-    pub fn qk_norm_partial_rope_batched_decode_hd512_cuda(
-        q_batch: *const Half,
-        k_batch: *mut Half,
-        q_norm_weight: *const Half,
-        k_norm_weight: *const Half,
-        cos_cache: *const Half,
-        sin_cache: *const Half,
-        positions: *const i32,
-        cos_max_pos: i32,
-        q_batch_out: *mut Half,
-        num_q_heads: i32,
-        num_kv_heads: i32,
-        batch_size: i32,
-        rotary_dim: i32,
-        rms_eps: f32,
-        stream: CUstream,
-    ) -> i32;
-}
-
 unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
+}
+
+// Native DFlash2 candidate selection. All entries guard C++ exceptions;
+// nonfinite selected candidates and computed scores use the error flag.
+unsafe extern "C" {
+    pub fn dflash2_prepare_cuda(
+        logits: *const Half,
+        hidden: *const Half,
+        predecessor: *const Half,
+        successor: *const Half,
+        anchors: *const u32,
+        ids: *mut u32,
+        unary: *mut f32,
+        gated: *mut f32,
+        successors: *mut f32,
+        error: *mut u32,
+        topk_values: *mut Half,
+        row_states: *mut u8,
+        batch: i32,
+        block_size: i32,
+        vocab: i32,
+        rank: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_finish_cuda(
+        edges: *mut f32,
+        unary: *const f32,
+        ids: *const u32,
+        selected: *mut u32,
+        error: *mut u32,
+        batch: i32,
+        length: i32,
+        stream: CUstream,
+    ) -> i32;
 }

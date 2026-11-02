@@ -161,7 +161,7 @@
 - Treated `prefill_attention_paged_into` as a wrapper over three separately measurable kernel stages:
   - `prefill_qk_norm_rope`: `qk_norm_rope_batched_decode_cuda` (per-token positions; the scalar `prefill_qk_norm_rope_only_cuda` wrapper was removed with the prefix-cache RoPE fix)
   - `prefill_kv_scatter`: `paged_kv_scatter_cuda`
-  - `prefill_attention_core`: `batch_prefill_paged_cuda`
+  - `prefill_attention_core`: `batch_prefill_paged_cuda_with_cta_tile_q`
 - Added `PrefillStage` launch paths in `kernel_bench.rs`. For stage reports, prerequisites run outside the timed/profiled launch and then L2 is swept before the measured stage. This keeps each stage report tied to one target kernel while still preparing valid inputs.
 - Added the three stage ops to `kernel_manifests/qwen3.toml`; each currently covers `batch_size=[1]` and the same `seq_len` grid as the full prefill report.
 - Preserved stage JSONs under `<kernel-report-dir>`.
@@ -182,7 +182,7 @@
   - KV scatter: `40.663us`, `gpu__time_duration.sum=75.232us`, DRAM `65.342MB`, L2 `83.175MB`, SM throughput `1.900%`, active warps `78.045%`.
   - Attention core: `4031.471us`, `gpu__time_duration.sum=4043.648us`, DRAM `205.315MB`, L2 `6650.592MB`, SM throughput `41.410%`, active warps `16.020%`.
   - Full wrapper: `4310.998us`, `gpu__time_duration.sum=4320.128us`, DRAM `458.553MB`, L2 `7032.714MB`, SM throughput `38.654%`, active warps `21.252%`.
-- Initial conclusion from the stage split: long-sequence prefill time is dominated by `batch_prefill_paged_cuda`, not QK+RoPE or KV scatter. The low full-wrapper SM throughput is largely the attention core's behavior; the core has very high L2 traffic and low active-warps percentage.
+- Initial conclusion from the stage split: long-sequence prefill time is dominated by `batch_prefill_paged_cuda_with_cta_tile_q`, not QK+RoPE or KV scatter. The low full-wrapper SM throughput is largely the attention core's behavior; the core has very high L2 traffic and low active-warps percentage.
 
 ### Step 13: Compare paged and single prefill attention core at 10k
 - Added report support for `single_prefill_attention_core`, backed by `single_prefill_cuda` with contiguous HND K/V buffers. This is a comparison point for the same single-request causal prefill attention core without paged KV indirection.
@@ -247,7 +247,7 @@
 - Confirmed the current PegaInfer wrapper calls FlashInfer's FA2 paged prefill path:
   - `crates/pegainfer-kernels/csrc/paged_attention.cu` computes `cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, head_dim)` and dispatches `BatchPrefillWithPagedKVCacheDispatched<CTA_TILE_Q, 128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, ...>`.
   - For Qwen3 `seq_len=10000`, `packed_qo_len = seq_len * (num_qo_heads / num_kv_heads) = 40000`, and FlashInfer's `FA2DetermineCtaTileQ` selects `CTA_TILE_Q=128`.
-  - Rust prefill planning also calls `batch_prefill_cta_tile_q`, so any `CTA_TILE_Q` override must be plumbed into both the plan metadata and the kernel launch.
+  - Rust prefill planning also calls `batch_prefill_cta_tile_q_with_override`, so any `CTA_TILE_Q` override must be plumbed into both the plan metadata and the kernel launch.
 - Matched the NCU kernel traits to FlashInfer source:
   - `KernelTraits<1,128,2,2,8,8,4,1,...>` means causal mask, `CTA_TILE_Q=128`, `NUM_MMA_Q=2`, `NUM_MMA_KV=2`, `NUM_WARPS_Q=4`, `NUM_WARPS_KV=1`, and 128 threads/block.
   - `NUM_MMA_KV` is not a free runtime flag in the current wrapper. FlashInfer derives it from register and shared-memory limits with `DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), ...)`.
@@ -467,7 +467,7 @@
   - Full manifest profiling is cheap enough for Qwen3 paged decode attention on the CUDA validation host with the previous grid: about three minutes for 126 CUPTI-covered cases.
   - Warm-cache latency is not a useful selector metric for paged decode attention because the production path is dominated by KV reads that should be treated as cold or streaming.
   - Metric interpretation should stay out of the runner. Store raw CUPTI values in the JSON, then compute bandwidth, utilization labels, or IO-model checks in a separate report/notebook layer.
-  - The prefill wrapper should stay reportable as a whole, but stage reports are necessary for actionable optimization. Whole-op CUPTI hid that `batch_prefill_paged_cuda` dominates long prompts.
+  - The prefill wrapper should stay reportable as a whole, but stage reports are necessary for actionable optimization. Whole-op CUPTI hid that `batch_prefill_paged_cuda_with_cta_tile_q` dominates long prompts.
   - At `seq_len=10000`, switching from paged to contiguous single-request FlashInfer barely changes latency or CUPTI counters. The next useful work is attention-core kernel investigation or alternative kernels, not removing page metadata.
   - Prefer CUPTI/NVPerf's tensor-path peak metrics over runner-side MFU calculations for kernel reports. The runner should collect the raw metric name/value; interpretation stays in the human report.
   - A 42% tensor peak can still be the expected result for this FlashInfer tile: NCU shows 245 registers/thread and 50 KiB shared memory/block limit occupancy to 16%, leaving too few eligible warps to keep tensor pipes full.

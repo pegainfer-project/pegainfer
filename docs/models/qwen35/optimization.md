@@ -2,7 +2,7 @@
 
 > **TL;DR:** Hybrid 24 linear + 8 full attn. This file is the historical optimization ledger; the current RTX 5090 comparison is in [Qwen3.5 serving: pegainfer vs vLLM on RTX 5090](../../benchmarks/qwen35-4b-serving-vllm-rtx5090.md). The decode-tuning refresh fuses MLP gate/up and tunes decode cuBLASLt buckets, improving direct TPOT by `2.1-3.2%`; vLLM still leads 1024/256 HTTP decode and high-concurrency throughput.
 >
-> **Last touched:** 2026-08. Qwen3.5 runtime code lives in top-level `pegainfer-qwen35`. Current accuracy coverage is `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
+> **Last touched:** 2026-09. Qwen3.5 runtime code lives in top-level `pegainfer-qwen35`. Current accuracy coverage is `PEGAINFER_CUDA_SM=120 PEGAINFER_TEST_MODEL_PATH=<absolute Qwen3.5-4B path> cargo test --release -p pegainfer-qwen35 --test hf_golden_gate -- --nocapture`; run `e2e_scheduler` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
 Historical command logs below keep the command paths that were actually run at the time (the in-process `bench_serving` bin they reference is retired as of 2026-08). For new Qwen3.5 accuracy tests, use `-p pegainfer-qwen35 --test hf_golden_gate`; for serving benchmarks, use HTTP-level benching (`scripts/bench_http_serving.py` / vllm-bench, see [profiling-guide](../../playbooks/profiling-guide.md)).
 
@@ -254,10 +254,12 @@ Trace note: the `nsys` capture includes one warmup run plus one measured run, so
 
 The GEMV family can be split further by launch shape (`gridX`) because each output width maps to a distinct projection class in the current Qwen3.5 decode path:
 
+The LM-head rows below were measured while selection still spanned the full 248,320-row checkpoint. The output projection now runs at the tile-aligned selection width (248,192 on 4B) — see [decode-kernel-attribution](decode-kernel-attribution.md) — so read those rows as a shape class, not the current cost.
+
 | GEMV subfamily | Time/step | % | Count/step | Avg each | Mapping |
 |----------------|-----------|---|------------|----------|---------|
 | Q / QKV (8192-dim) | 1.65ms | 13.1% | 32 | 51.5μs | 8 full-attn `q_proj` + 24 linear-attn `in_proj_qkv` |
-| LM head (248320-dim) | 1.50ms | 12.0% | 1 | 1.50ms | final logits projection |
+| LM head (248320-dim, pre-alignment) | 1.50ms | 12.0% | 1 | 1.50ms | final logits projection |
 | O projection (2560-dim) | 0.84ms | 6.7% | 32 | 26.2μs | 8 full-attn `o_proj` + 24 linear-attn `out_proj` |
 | Z projection (4096-dim) | 0.65ms | 5.2% | 24 | 27.1μs | 24 linear-attn `in_proj_z` |
 | B / A projection (32-dim) | 0.20ms | 1.6% | 48 | 4.2μs | 24 linear-attn `in_proj_b` + 24 `in_proj_a` |

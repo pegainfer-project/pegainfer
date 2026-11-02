@@ -29,6 +29,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use half::bf16;
 use pegainfer_kernels::ffi;
+use pegainfer_kernels::ops::ffi_status_detail;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::active_cu_stream;
@@ -118,11 +119,7 @@ pub(crate) fn k3_gemm_partial(
     ensure!(
         status == 0,
         "K3 dense GEMM ({out_features}x{k}, rows={rows}) failed: {}",
-        if status >= 100_000 {
-            format!("cublasStatus={}", status - 100_000)
-        } else {
-            format!("cudaError={status}")
-        }
+        ffi_status_detail(status)
     );
     Ok(())
 }

@@ -1147,9 +1147,16 @@ def main() -> None:
         template_include = Path(TILELANG_TEMPLATE_PATH)
         cutlass_include = Path(CUTLASS_INCLUDE_DIR)
 
-    lines = [f"CU_PATH={path}" for path in cu_paths]
-    lines.append(f"TILELANG_TEMPLATE_PATH={template_include}")
-    lines.append(f"CUTLASS_INCLUDE_DIR={cutlass_include}")
+    # Relative where it can be, so a vendored directory survives being copied.
+    def named(path: Path) -> str:
+        try:
+            return str(Path(path).relative_to(out_dir))
+        except ValueError:
+            return str(path)
+
+    lines = [f"CU_PATH={named(path)}" for path in cu_paths]
+    lines.append(f"TILELANG_TEMPLATE_PATH={named(template_include)}")
+    lines.append(f"CUTLASS_INCLUDE_DIR={named(cutlass_include)}")
     if args.arch:
         # The bodies are lowered for exactly this arch and may use
         # arch-conditional instructions, so the consumer has to assemble them

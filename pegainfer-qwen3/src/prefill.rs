@@ -421,7 +421,7 @@ impl Qwen3Model {
     ///
     /// Used when `all_position_logits=true` to return prompt token log-probabilities.
     /// Applies final RMS norm + lm_head projection in a single batched GEMM.
-    /// Returns `HiddenStates` with shape `[vocab_size, total_tokens]`.
+    /// Returns `HiddenStates` with shape `[logits_rows, total_tokens]`.
     fn compute_all_position_logits(&self, hidden: &HiddenStates) -> Result<HiddenStates> {
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, hidden.seq_len)?;
         ops::rms_norm_batch_into(
@@ -431,12 +431,14 @@ impl Qwen3Model {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        ops::gemm(&self.ctx, self.output_projection(), &normed)
+        let mut logits = HiddenStates::zeros(&self.ctx, self.config.logits_rows, hidden.seq_len)?;
+        self.project_logits(&self.ctx, &normed, &mut logits)?;
+        Ok(logits)
     }
 
     /// Batched last-token logits: gather the given token columns out of
     /// `hidden`, then apply final RMSNorm and lm_head as single batched ops.
-    /// Returns `HiddenStates [vocab_size, n]`, one column per index.
+    /// Returns `HiddenStates [logits_rows, n]`, one column per index.
     pub(crate) fn batch_token_logits(
         &self,
         hidden: &HiddenStates,
@@ -448,7 +450,7 @@ impl Qwen3Model {
         let indices_d = self.ctx.stream.clone_htod(token_indices)?;
         let mut gathered = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
-        let mut logits = HiddenStates::zeros(&self.ctx, self.output_projection().rows, n)?;
+        let mut logits = HiddenStates::zeros(&self.ctx, self.config.logits_rows, n)?;
         crate::green_ctx::fence_producers_before_override(&self.ctx)?;
 
         let gather =
@@ -465,8 +467,7 @@ impl Qwen3Model {
             self.config.rms_norm_eps,
             &mut normed,
         );
-        let gemm =
-            ops::gemm_into_checked(&self.ctx, self.output_projection(), &normed, &mut logits);
+        let gemm = self.project_logits(&self.ctx, &normed, &mut logits);
         park(gathered);
         park(normed);
         if let Err(e) = gemm {
@@ -478,11 +479,11 @@ impl Qwen3Model {
 
     /// Concatenates all prompts' tokens, runs one GEMM per layer for the
     /// entire batch, and uses FlashInfer's multi-request causal attention.
-    /// Returns batched last-token logits `[vocab_size, batch]`, one column
+    /// Returns batched last-token logits `[logits_rows, batch]`, one column
     /// per request.
     ///
     /// If `all_position_logits` is true, also returns all-position logits as a
-    /// `HiddenStates [vocab_size, total_tokens]` for prompt logprobs.
+    /// `HiddenStates [logits_rows, total_tokens]` for prompt logprobs.
     /// Batch prefill forward.
     ///
     /// `capture_layer_ids`, when set, copies the residual-stream hidden states

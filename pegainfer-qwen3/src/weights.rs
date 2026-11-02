@@ -334,6 +334,8 @@ pub(crate) struct Qwen3Model {
     pub(super) config: Config,
     pub(super) embed_tokens: DeviceMatrix,
     lm_head: Option<DeviceMatrix>,
+    /// Device-resident ids for the aligned, non-decodable logits tail.
+    logits_tail_suppress: Option<pegainfer_core::ops::SuppressIds>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
     pub(super) cos_cache: DeviceVec,
@@ -355,8 +357,30 @@ unsafe impl Send for Qwen3Model {}
 unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
+    /// Only the GEMM tuning samples this directly; logits go through
+    /// [`Qwen3Model::project_logits`] so the tail mask cannot be skipped.
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
+    }
+
+    pub(crate) fn project_logits(
+        &self,
+        ctx: &DeviceContext,
+        x: &HiddenStates,
+        out: &mut HiddenStates,
+    ) -> Result<()> {
+        pegainfer_kernels::ops::gemm_rows_into_checked(
+            ctx,
+            self.output_projection(),
+            0,
+            self.config.logits_rows,
+            x,
+            out,
+        )?;
+        if let Some(ids) = &self.logits_tail_suppress {
+            pegainfer_core::ops::suppress_logits_bf16_in_place(ctx, out, ids)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn config(&self) -> &Config {
@@ -726,7 +750,7 @@ impl Qwen3Model {
             self.local_q_dim(),
             self.local_kv_dim(),
             self.local_intermediate_size(),
-            self.config.vocab_size,
+            self.config.logits_rows,
             max_decode_batch_size,
             geometry.block_size,
             0,
@@ -739,7 +763,7 @@ impl Qwen3Model {
 
         let mut sample_scratch = pegainfer_sample::SampleScratch::new(
             self.device_ctx(),
-            self.config.vocab_size,
+            self.config.logits_rows,
             profile_rows,
         )
         .context("Qwen3 memory profile sampling scratch alloc failed")?;

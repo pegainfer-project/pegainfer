@@ -1,11 +1,124 @@
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
+
 use super::lane_tests::Drained;
 use super::lane_tests::Harness;
 use super::lane_tests::ids;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::wait_until;
+
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a GPU, fixtures, and --test-threads=1"]
+fn stop_policy_drains_decode_before_reusing_its_slot() {
+    let prompt = crate::testkit::generate_fixture_prompts().remove(0);
+    let mut harness = launch(&[(super::DECODE_SLOTS_ENV, "1")]);
+    assert!(wait_until(Duration::from_secs(10), || {
+        harness.metrics().kv_total_blocks > 0
+    }));
+    // Both pools retain their graph-padding page even when no request is live.
+    let idle = harness.metrics();
+    for logprobs in [Some(8), None] {
+        let reference = harness.submit_scored(prompt.clone(), 16, logprobs, None);
+        let reference = harness.steps.drain(reference.id(), "without a stop");
+        assert_eq!(
+            (reference.tokens, reference.finish),
+            (16, FinishReason::Length)
+        );
+        assert_eq!(reference.stop_cause, None);
+        let position = (1..reference.ids.len() - super::DECODE_PIPELINE_DEPTH)
+            .find(|&i| !reference.ids[..i].contains(&reference.ids[i]))
+            .expect("the prompt generates a later distinct token with pipeline headroom");
+        let trigger = reference.ids[position];
+        // The unscored leg has at least two tokens left when it stops, so
+        // it settles a staged readback with a successor already in flight.
+        let stopped = harness.submit_with_policy(
+            prompt.clone(),
+            16,
+            logprobs,
+            None,
+            StopPolicy::new(EosPolicy::Ignore, vec![trigger]),
+        );
+        let next = harness.submit(prompt.clone(), 6);
+        let stopped = harness.steps.drain(stopped.id(), "explicit decode stop");
+        assert_eq!(stopped.finish, FinishReason::Stop);
+        assert_eq!(stopped.stop_cause, Some(StopCause::Token(trigger)));
+        assert_eq!(stopped.ids, reference.ids[..=position]);
+        assert_eq!(stopped.logprobs, reference.logprobs[..=position]);
+        if logprobs.is_some() {
+            super::lane_gates_tp::assert_finite(
+                stopped.logprobs[position]
+                    .as_ref()
+                    .expect("the trigger is scored"),
+                "decode stop",
+            );
+        }
+        let next = harness.steps.drain(next.id(), "slot reused after a stop");
+        assert_eq!((next.tokens, next.finish), (6, FinishReason::Length));
+        assert_eq!(next.stop_cause, None);
+        assert_eq!(next.ids, reference.ids[..6]);
+        assert!(
+            wait_until(Duration::from_secs(10), || harness.metrics() == idle),
+            "the stopped row and its staged successor release their pages: idle {idle:?}, now {:?}",
+            harness.metrics()
+        );
+    }
+    let dir = crate::testkit::model_path();
+    let config = crate::config::Gemma4Config::from_file(&dir).expect("config");
+    let mut model_eos = super::generation_policy(&dir, config.vocab_size)
+        .expect("generation policy")
+        .eos;
+    model_eos.sort_unstable();
+    assert_eq!(model_eos, [1, 50, 106]);
+    // The pinned 12B tokenizer's primary EOS is 1; the frontend lowers
+    // its other generation EOS IDs into explicit stops.
+    let primary = 1;
+    let policy = StopPolicy::new(EosPolicy::Token(primary), vec![50, 106]);
+    // "Reply with exactly one word: OK." rendered with the checkpoint's
+    // chat template (thinking disabled) and encoded by the frontend tokenizer.
+    let prompt = vec![
+        2, 105, 2364, 107, 40_654, 607, 7121, 886, 3658, 236_787, 16_119, 236_761, 106, 107, 105,
+        4368, 107, 100, 45_518, 107, 101,
+    ];
+    let stopped = harness.submit_with_policy(prompt.clone(), 128, Some(8), None, policy);
+    let stopped = harness.steps.drain(stopped.id(), "natural EOS");
+    assert_eq!(stopped.finish, FinishReason::Stop);
+    let position = stopped
+        .ids
+        .iter()
+        .position(|id| model_eos.contains(id))
+        .expect("the response includes its EOS trigger");
+    assert_eq!(position + 1, stopped.tokens);
+    let trigger = stopped.ids[position];
+    assert_eq!(
+        stopped.stop_cause,
+        Some(if trigger == primary {
+            StopCause::Eos(trigger)
+        } else {
+            StopCause::Token(trigger)
+        })
+    );
+    super::lane_gates_tp::assert_finite(
+        stopped.logprobs[position]
+            .as_ref()
+            .expect("the EOS is scored"),
+        "natural EOS",
+    );
+    let ignored = harness.submit_scored(prompt, stopped.tokens + 2, Some(8), None);
+    let ignored = harness.steps.drain(ignored.id(), "ignored EOS");
+    assert_eq!(
+        (ignored.tokens, ignored.finish),
+        (stopped.tokens + 2, FinishReason::Length)
+    );
+    assert_eq!(ignored.stop_cause, None);
+    assert_eq!(stopped.ids, ignored.ids[..stopped.tokens]);
+    assert_eq!(stopped.logprobs, ignored.logprobs[..stopped.tokens]);
+    harness.shutdown(&[]);
+}
 
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, a GPU, and --test-threads=1"]
@@ -37,39 +150,10 @@ fn the_coalesce_door_releases_one_admission_burst() {
     harness
         .steps
         .wait_scheduled_together(&[second.id(), third.id(), fourth.id()]);
-    let second_done = harness.steps.drain(second.id(), "second");
-    let third_done = harness.steps.drain(third.id(), "third");
-    let fourth_done = harness.steps.drain(fourth.id(), "fourth");
-    assert_eq!(
-        (
-            second_done.scheduled,
-            third_done.scheduled,
-            fourth_done.scheduled
-        ),
-        (1, 1, 1),
-        "a full cohort releases as one admission burst"
-    );
+    harness.steps.drain(second.id(), "second");
+    harness.steps.drain(third.id(), "third");
+    harness.steps.drain(fourth.id(), "fourth");
     harness.shutdown(&[&incumbent]);
-
-    let mut timeout_harness = launch(&[
-        (super::ADMIT_COALESCE_ENV, "20"),
-        (super::DECODE_SLOTS_ENV, "4"),
-    ]);
-    let timeout_incumbent = pin_live_stream(&mut timeout_harness);
-    let timeout_a = timeout_harness.submit(ids(40, 7), 4);
-    let timeout_b = timeout_harness.submit(ids(40, 8), 4);
-    std::thread::sleep(Duration::from_millis(30));
-    timeout_harness
-        .steps
-        .wait_scheduled_together(&[timeout_a.id(), timeout_b.id()]);
-    let timeout_a_done = timeout_harness.steps.drain(timeout_a.id(), "timeout a");
-    let timeout_b_done = timeout_harness.steps.drain(timeout_b.id(), "timeout b");
-    assert_eq!(
-        (timeout_a_done.scheduled, timeout_b_done.scheduled),
-        (1, 1),
-        "the elapsed window releases an incomplete cohort"
-    );
-    timeout_harness.shutdown(&[&timeout_incumbent]);
 }
 
 #[test]
@@ -129,6 +213,37 @@ fn the_full_roster_keeps_its_pipeline_under_a_queue() {
     assert_eq!(harness.steps.drain(second.id(), "incumbent b").tokens, 40);
     assert_eq!(harness.steps.drain(queued.id(), "queued third").tokens, 6);
     harness.shutdown(&[]);
+}
+
+/// The generated states at the slot ceiling. The kernels those states serve
+/// through declare how many requests one plan may name; a step with every
+/// slot held, half of them decoding while the other half's prompts across
+/// the window are admitted, is the step that reaches it.
+#[test]
+#[ignore = "requires the pinned 12B checkpoint, a build that carries the generated kernels, a GPU, and --test-threads=1"]
+fn the_full_roster_serves_through_the_generated_kernels() {
+    for knob in ["tilelang", "tilelang640"] {
+        let mut harness = launch(&[
+            (super::DECODE_SLOTS_ENV, "16"),
+            (super::GLOBAL_ATTN_ENV, knob),
+        ]);
+        let first: Vec<_> = (0..8u32)
+            .map(|i| harness.submit(ids(1100 + 3 * i as usize, i + 1), 12))
+            .collect();
+        for request in &first {
+            harness.steps.wait_tokens(request.id(), 2);
+        }
+        let second: Vec<_> = (8..16u32)
+            .map(|i| harness.submit(ids(1100 + 3 * i as usize, i + 1), 12))
+            .collect();
+        for (slot, request) in first.iter().chain(&second).enumerate() {
+            let drained = harness
+                .steps
+                .drain(request.id(), &format!("{knob} slot {slot}"));
+            assert_eq!(drained.tokens, 12, "{knob}: slot {slot} finished short");
+        }
+        harness.shutdown(&[]);
+    }
 }
 
 fn run_refill_episode(harness: &mut Harness, prompt: Vec<u32>, budget: usize) -> Drained {

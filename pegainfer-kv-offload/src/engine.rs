@@ -31,7 +31,6 @@ use crate::handle::QueryHit;
 use crate::handle::QueryOutcome;
 use crate::handle::SaveHandle;
 use crate::host::OffloadHost;
-use crate::layout::KvArena;
 use crate::layout::Registration;
 
 /// Single-GPU, single-rank topology. The dense Qwen3 path runs one offload
@@ -111,37 +110,6 @@ impl OffloadEngine {
             &config.namespace,
             config.device_id,
             reg,
-            false,
-        )
-    }
-
-    /// Build the engine over explicit arenas (instead of one fused
-    /// [`KvBuffer`]) onto an existing shared host: this rank becomes
-    /// one more pegaflow instance over the host's single pool. Ranks that
-    /// should see each other's blocks pass the same `namespace`. Every
-    /// arena's device allocation must stay live and pointer-stable for the
-    /// engine's lifetime (the registration bakes raw device addresses), and
-    /// all arenas must be indexed by the same pool block ids.
-    /// `page_first` must match how the namespace's writer stores blocks: the
-    /// vLLM connector stores MLA-model blocks page-first (all layers of a
-    /// block concatenated into one host page, offsets by lexicographic layer
-    /// name), so joining a vLLM MLA namespace requires `true` — with layer
-    /// names and per-layer block bytes identical to the writer's.
-    pub fn with_arenas_on(
-        host: Arc<OffloadHost>,
-        instance_id: impl Into<String>,
-        namespace: &str,
-        device_id: i32,
-        arenas: &[KvArena],
-        page_first: bool,
-    ) -> Result<Self, EngineError> {
-        Self::register(
-            host,
-            instance_id.into(),
-            namespace,
-            device_id,
-            Registration::from_arenas(arenas),
-            page_first,
         )
     }
 
@@ -151,7 +119,6 @@ impl OffloadEngine {
         namespace: &str,
         device_id: i32,
         reg: Registration,
-        page_first: bool,
     ) -> Result<Self, EngineError> {
         host.engine.register_context_layer_batch_strided(
             &instance_id,
@@ -183,11 +150,8 @@ impl OffloadEngine {
             },
             // Layer-first (false): one pegaflow layer per model layer, the
             // page-interleaved gap expressed via `block_stride_bytes` — the
-            // native pegainfer layout. Page-first (true) instead stores each
-            // block as one host page holding every layer at its
-            // name-sorted offset; used only to join a namespace whose writer
-            // (the vLLM connector on MLA models) stores blocks that way.
-            page_first,
+            // native pegainfer layout.
+            false,
         )?;
 
         Ok(Self {

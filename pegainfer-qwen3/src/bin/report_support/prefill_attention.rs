@@ -462,7 +462,7 @@ impl AttentionPrefillCase {
         };
         if result != 0 {
             bail!(
-                "segmented batch_prefill_paged_cuda failed with error {result}{}",
+                "segmented batch_prefill_paged_cuda_with_cta_tile_q failed with error {result}{}",
                 pegainfer_kernels::ops::ffi_exception_message(result)
             );
         }

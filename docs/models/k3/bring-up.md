@@ -34,7 +34,7 @@ HTTP ready **126.27 → 22.08 s (5.72x)**, and the same rank-local path serves
 the full 896-expert EP16 fleet. Next: CUDA graphs over the EP4 fused path,
 kv-store integration.
 
-Last touched: 2026-08
+Last touched: 2026-10
 
 ## Architecture
 
@@ -341,17 +341,17 @@ bytes, the whole battery drops to ~3 minutes on a warm page cache):
 # Paged gates: page-permutation bitwise, long-context (2048-ctx, 1100 steps,
 # rerun + graphs-vs-eager bitwise), on a GPU box with the checkpoint:
 PEGAINFER_K3_TEST_224=<checkpoint> cargo test --release -p pegainfer-k3 \
-  --test paged_kv -- --ignored --test-threads 1
+  --features k3 --test paged_kv -- --ignored --test-threads 1
 
 # Absorbed-vs-expanded certification: dump per-step logits on the expanded
 # revision (M1) and on this one, then compare per step in bf16 ULP:
 PEGAINFER_K3_TEST_224=<checkpoint> PEGAINFER_K3_LOGIT_DUMP=/tmp/logits.bin \
-  cargo test --release -p pegainfer-k3 --test paged_kv \
+  cargo test --release -p pegainfer-k3 --features k3 --test paged_kv \
   dump_forced_replay_logits -- --ignored
 
 # And the existing suites must stay green:
 PEGAINFER_K3_TEST_224=<checkpoint> cargo test --release -p pegainfer-k3 \
-  --test golden_decode -- --ignored --test-threads 1
+  --features k3 --test golden_decode -- --ignored --test-threads 1
 ```
 
 Certified (4-layer golden inputs, absorbed vs expanded per step): argmax

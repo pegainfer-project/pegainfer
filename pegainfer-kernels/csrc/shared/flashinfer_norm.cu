@@ -23,6 +23,8 @@
 
 #include <flashinfer/norm.cuh>
 
+#include "ffi_guard.cuh"
+
 using DType = __nv_bfloat16;
 
 namespace pegainfer {
@@ -524,25 +526,6 @@ __global__ void DualRMSNormAddKernel(const T* __restrict__ a,
 }  // namespace norm
 }  // namespace pegainfer
 
-__global__ void rms_norm_batched_serial_kernel(const DType *x, const DType *weight, DType *out,
-                                               int hidden_dim, int seq_len, float eps) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = hidden_dim * seq_len;
-    if (idx >= total) return;
-
-    int dim = idx % hidden_dim;
-    int row = idx / hidden_dim;
-    const DType *row_x = x + row * hidden_dim;
-    float sum_sq = 0.0f;
-    for (int k = 0; k < hidden_dim; ++k) {
-        float value = __bfloat162float(row_x[k]);
-        sum_sq += value * value;
-    }
-    float inv_rms = rsqrtf(sum_sq / hidden_dim + eps);
-    float value = __bfloat162float(row_x[dim]) * inv_rms * __bfloat162float(weight[dim]);
-    out[row * hidden_dim + dim] = __float2bfloat16(value);
-}
-
 extern "C" {
 
 // ============================================================================
@@ -580,7 +563,7 @@ CUresult rms_norm_batched_dual_cuda(const DType *x, const DType *weight_a, const
         pegainfer::norm::DualRMSNormKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             x, weight_a, weight_b, out_a, out_b, d, eps, scale_a);
     });
-    return static_cast<CUresult>(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 CUresult dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, const DType *b,
@@ -597,7 +580,7 @@ CUresult dual_rms_norm_add_batched_cuda(const DType *a, const DType *weight_a, c
         pegainfer::norm::DualRMSNormAddKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             a, weight_a, b, weight_b, out, d, eps);
     });
-    return static_cast<CUresult>(cudaGetLastError());
+    return map_cuda_error(cudaGetLastError());
 }
 
 CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *weight_post,
@@ -625,7 +608,7 @@ CUresult rms_norm_add_rms_norm_round_batched_cuda(const DType *x, const DType *w
             err = cudaGetLastError();
         }
     });
-    return static_cast<CUresult>(err);
+    return map_cuda_error(err);
 }
 
 CUresult rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight,
@@ -643,27 +626,7 @@ CUresult rms_norm_add_scale_batched_cuda(const DType *x, const DType *weight,
         pegainfer::norm::RMSNormAddScaleKernel<VEC_SIZE, DType><<<nblks, nthrs, smem_size, stream>>>(
             x, weight, residual, out, d, eps, scale);
     });
-    return static_cast<CUresult>(cudaGetLastError());
-}
-
-// ============================================================================
-// Fused Add + RMSNorm (single vector, decode path)
-//   hidden += residual; out = norm(hidden, weight)
-// ============================================================================
-void fused_add_rms_norm_cuda(DType *hidden, const DType *residual,
-                             const DType *weight, DType *out,
-                             int n, float eps, cudaStream_t stream) {
-    // Copy residual → out so FlashInfer can read it as the "input" addend.
-    cudaMemcpyAsync(out, residual, static_cast<size_t>(n) * sizeof(DType),
-                    cudaMemcpyDeviceToDevice, stream);
-
-    // FlashInfer: hidden(=residual_arg) += out(=input_arg); out = norm(hidden)
-    flashinfer::norm::FusedAddRMSNorm<DType>(
-        /*input=*/out, /*residual=*/hidden, const_cast<DType*>(weight),
-        /*batch_size=*/1, /*d=*/static_cast<uint32_t>(n),
-        /*stride_input=*/static_cast<uint32_t>(n),
-        /*stride_residual=*/static_cast<uint32_t>(n),
-        eps, /*enable_pdl=*/false, stream);
+    return map_cuda_error(cudaGetLastError());
 }
 
 // ============================================================================
@@ -698,7 +661,7 @@ CUresult fused_add_rms_norm_round_batched_cuda(DType *hidden, const DType *resid
         /*stride_residual=*/static_cast<uint32_t>(hidden_dim),
         /*stride_out=*/static_cast<uint32_t>(hidden_dim),
         eps, stream);
-    return static_cast<CUresult>(err);
+    return map_cuda_error(err);
 }
 
 // ============================================================================
@@ -734,8 +697,7 @@ void rms_norm_batched_offset_cuda(const DType *x, const DType *weight, DType *ou
 // HAND-WRITTEN: FlashInfer's generalLayerNorm template depends on
 // tensorrt_llm::common::packed_as / num_elems traits that are not available in
 // this build's include path. This kernel is a simple single-token LayerNorm
-// (mean + variance + affine with bias), memory-bound elementwise — same
-// pattern as the hand-written rms_norm_batched_serial_kernel above.
+// (mean + variance + affine with bias), memory-bound elementwise.
 // eps=1e-6, with bias (unlike RMSNorm which has no bias).
 // Aligned to vllm DeepseekV32Indexer: nn.LayerNorm(head_dim, eps=1e-6).
 // ============================================================================
@@ -822,24 +784,7 @@ CUresult layer_norm_cuda(const DType *x, const float *gamma, const float *beta,
     size_t shmem_size = std::min(block_size / 32, (n + 31) / 32) * sizeof(float);
     layer_norm_kernel<<<rows, block_size, shmem_size, stream>>>(x, gamma, beta, out, n, eps);
     cudaError_t err = cudaGetLastError();
-    return static_cast<CUresult>(err);
-}
-
-// ============================================================================
-// Fused Add + (1+weight) RMSNorm — Qwen3.5 / Gemma style
-// ============================================================================
-void fused_add_rms_norm_offset_cuda(DType *hidden, const DType *residual,
-                                    const DType *weight, DType *out,
-                                    int n, float eps, cudaStream_t stream) {
-    cudaMemcpyAsync(out, residual, static_cast<size_t>(n) * sizeof(DType),
-                    cudaMemcpyDeviceToDevice, stream);
-
-    flashinfer::norm::GemmaFusedAddRMSNorm<DType>(
-        /*input=*/out, /*residual=*/hidden, const_cast<DType*>(weight),
-        /*batch_size=*/1, /*d=*/static_cast<uint32_t>(n),
-        /*stride_input=*/static_cast<uint32_t>(n),
-        /*stride_residual=*/static_cast<uint32_t>(n),
-        eps, /*enable_pdl=*/false, stream);
+    return map_cuda_error(err);
 }
 
 } // extern "C"

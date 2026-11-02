@@ -25,6 +25,7 @@ pub struct GenerationStats {
     pub nccl_combine_calls: usize,
     pub nccl_dense_exchange_elements: usize,
     pub nccl_combine_elements: usize,
+    pub device_decode_steps: usize,
     pub output_token_sha256: String,
 }
 
@@ -66,6 +67,7 @@ pub(super) struct DecodeGraphBlocker {
     pub(super) reason: &'static str,
 }
 
+#[allow(clippy::struct_excessive_bools)] // the flags are keys of the serialized report
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct FullDecodeGraphProbeReport {
     pub(super) requested: bool,

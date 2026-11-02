@@ -33,5 +33,6 @@ pub(super) fn publish_load(
         // mid-resolve and never counts a request twice.
         num_waiting_reqs: (pending.len() + resolving) as u64,
         spec_decode: None,
+        prefix_cache: None,
     });
 }

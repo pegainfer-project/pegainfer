@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use log::debug;
 use log::warn;
 use pegainfer_frontend::engine::Request;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::ModelExecutor;
@@ -34,6 +35,7 @@ pub(crate) struct ActiveRequestState {
     pub(crate) max_tokens: usize,
     pub(crate) prompt_len: usize,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
     /// Completion top-k count; None disables scoring, Some(0) scores only the chosen token.
     pub(crate) logprobs: Option<usize>,
 }
@@ -47,6 +49,7 @@ pub(crate) struct PendingRequest {
     pub(crate) lora_adapter: Option<String>,
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
     pub(crate) max_tokens: usize,
     pub(crate) logprobs: Option<usize>,
     pub(crate) prompt_logprobs: Option<usize>,
@@ -61,9 +64,6 @@ pub(crate) struct PendingRequest {
     /// Prompt tokens to forward in the upcoming step. Set by
     /// `take_prefill_chunks` when the request is packed into a step.
     pub(crate) step_chunk: usize,
-    /// Prefix-cache hits reported by the first chunk, carried across later
-    /// chunks so the final result still reports them truthfully.
-    pub(crate) cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -73,13 +73,13 @@ impl PendingRequest {
             lora_adapter: req.lora_adapter,
             prompt_tokens: req.prompt_tokens,
             params: req.params,
+            stop_policy: req.stop_policy,
             max_tokens: req.max_tokens,
             logprobs: req.logprobs,
             prompt_logprobs: req.prompt_logprobs,
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 0,
-            cached_tokens: 0,
         }
     }
 
@@ -363,28 +363,40 @@ pub(crate) fn admitted_future_blocks<E: ModelExecutor>(
     executor: &E,
     active: &[ActiveRequestState],
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
 ) -> usize {
     let block_size = executor.block_size();
     active_future_blocks(active, block_size)
-        + prefilling_future_blocks(prefilling, block_size, |id| executor.prefetched_blocks(id))
+        + prefilling_future_blocks(prefilling, inflight, block_size, |id| {
+            executor.prefetched_blocks(id)
+        })
 }
 
+/// An in-flight prefill already holds its launched chunk, so its debt starts at
+/// `prefill_pos + step_chunk`; a queued one starts at `prefill_pos`.
 fn prefilling_future_blocks(
     prefilling: &[PendingRequest],
+    inflight: &[PendingRequest],
     block_size: usize,
     // Blocks a request already holds via a settled prefetch (zero once its
     // first chunk absorbs them). They are out of the free pool, so counting
     // them as future need would double-charge the budget.
     prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> usize {
-    prefilling
+    let owed = |req: &PendingRequest, allocated_tokens: usize| {
+        pending_lifetime_blocks(req, block_size)
+            .saturating_sub(blocks_needed(allocated_tokens, block_size))
+            .saturating_sub(prefetch_credit(req.request_id))
+    };
+    let queued: usize = prefilling
         .iter()
-        .map(|req| {
-            pending_lifetime_blocks(req, block_size)
-                .saturating_sub(blocks_needed(req.prefill_pos, block_size))
-                .saturating_sub(prefetch_credit(req.request_id))
-        })
-        .sum()
+        .map(|req| owed(req, req.prefill_pos))
+        .sum();
+    let launched: usize = inflight
+        .iter()
+        .map(|req| owed(req, req.prefill_pos + req.step_chunk))
+        .sum();
+    queued + launched
 }
 
 /// Default for `max_prefill_tokens`: prompt tokens forwarded in a single step
@@ -411,6 +423,9 @@ pub(crate) fn admit_deferred_requests(
     // chunks and will take a decode slot when they promote, so admission
     // must reserve both or completing chunks can overshoot capacity.
     prefilling: &[PendingRequest],
+    // Decode-overlap prefills still running on the GPU: out of `prefilling`
+    // until their result is applied, but owed the same KV tail and slot.
+    inflight: &[PendingRequest],
     block_size: usize,
     available_blocks: usize,
     max_request_blocks: usize,
@@ -427,12 +442,14 @@ pub(crate) fn admit_deferred_requests(
         .saturating_sub(active_future_blocks(active, block_size))
         .saturating_sub(prefilling_future_blocks(
             prefilling,
+            inflight,
             block_size,
             &prefetch_credit,
         ));
     let mut decode_slots = max_decode_batch_size
         .saturating_sub(active.len())
-        .saturating_sub(prefilling.len());
+        .saturating_sub(prefilling.len())
+        .saturating_sub(inflight.len());
     let mut pending = Vec::new();
     let mut still_deferred = Vec::new();
     let mut rejected = Vec::new();
@@ -501,14 +518,36 @@ pub(crate) fn runtime_plan(
     active: &[ActiveRequestState],
     pending: Vec<PendingRequest>,
 ) -> Option<plan::ExecutionPlan> {
-    if plan::should_speculative_decode(executor, active) {
-        if pending.is_empty() {
-            Some(plan::ExecutionPlan::SpeculativeDecode)
-        } else {
-            Some(plan::ExecutionPlan::Prefill { pending })
+    runtime_plan_at(executor, active, pending, plan::spec_max_batch())
+}
+
+/// [`runtime_plan`] with the load gate's threshold passed in, so the gate is
+/// testable without mutating process-wide env state.
+fn runtime_plan_at(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    pending: Vec<PendingRequest>,
+    max_batch: usize,
+) -> Option<plan::ExecutionPlan> {
+    use plan::SpeculationDecision;
+    match plan::speculation_decision_at(executor, active, max_batch) {
+        SpeculationDecision::Speculate => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::SpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
         }
-    } else {
-        plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        SpeculationDecision::Gated => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
+        }
+        SpeculationDecision::NotReady => {
+            plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        }
     }
 }
 
@@ -523,7 +562,9 @@ pub(crate) fn failure_target_ids(
         plan::ExecutionPlan::Prefill { pending } => {
             targets.extend(pending.iter().map(|req| req.request_id));
         }
-        plan::ExecutionPlan::Decode | plan::ExecutionPlan::SpeculativeDecode => {
+        plan::ExecutionPlan::Decode
+        | plan::ExecutionPlan::SpeculativeDecode
+        | plan::ExecutionPlan::GatedSpeculativeDecode => {
             targets.extend(active.iter().map(|req| req.request_id));
         }
         plan::ExecutionPlan::Unified { pending } => {

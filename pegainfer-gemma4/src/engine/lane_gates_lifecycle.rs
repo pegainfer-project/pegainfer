@@ -1,9 +1,12 @@
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 
-use super::lane_test_env::scoped_engine_env;
 use super::lane_tests::assert_warm_result;
 use super::lane_tests::ids;
+use super::lane_tests::knob_table;
 use super::lane_tests::launch;
 use super::lane_tests::pin_live_stream;
 use super::lane_tests::warm_prompt;
@@ -24,17 +27,12 @@ fn the_raise_reaches_the_frontend() {
 }
 
 #[test]
-#[ignore = "requires the pinned 12B checkpoint and --test-threads=1"]
 fn the_raise_refuses_without_its_prerequisites() {
-    let dir = crate::testkit::model_path();
-    let load = |overrides: &[(&str, &str)]| {
-        let policy = super::generation_policy(&dir).expect("policy");
-        let _env = scoped_engine_env(overrides);
-        super::EngineState::load(&dir, 0, policy, 0x5EED, true)
-    };
+    let config = crate::manifest::schema::sample_config();
+    let load =
+        |overrides: &[(&str, &str)]| super::ServingKnobs::resolve(&knob_table(overrides), &config);
     let error = load(&[(super::MAX_CONTEXT_ENV, "32768")])
-        .err()
-        .expect("a raise without chunking must refuse");
+        .expect_err("a raise without chunking must refuse");
     assert!(
         format!("{error:#}").contains("needs PEGAINFER_MIX_CHUNK_TOKENS"),
         "unexpected refusal: {error:#}"
@@ -44,22 +42,23 @@ fn the_raise_refuses_without_its_prerequisites() {
         (super::MIX_CHUNK_TOKENS_ENV, "2048"),
         (super::ASYNC_PREFILL_ENV, "green:35"),
     ])
-    .err()
-    .expect("the lane over the default ceiling must refuse");
+    .expect_err("the lane over the default ceiling must refuse");
     assert!(format!("{error:#}").contains("unsupported over"));
     let error = load(&[
         (super::ADMIT_COALESCE_ENV, "300"),
         (super::ASYNC_PREFILL_ENV, "green:35"),
     ])
-    .err()
-    .expect("the coalesce door and async lane must refuse");
+    .expect_err("the coalesce door and async lane must refuse");
     assert!(format!("{error:#}").contains("the door could only delay it"));
 }
 
 fn lane_lifecycle_script(mode: &str) {
+    let slots = std::env::var(super::DECODE_SLOTS_ENV)
+        .unwrap_or_else(|_| super::MAX_CONCURRENCY.to_string());
     let mut harness = launch(&[
         (super::ASYNC_PREFILL_ENV, mode),
         (super::PREFIX_CACHE_ENV, "4"),
+        (super::DECODE_SLOTS_ENV, &slots),
     ]);
     let streamer = pin_live_stream(&mut harness);
 
@@ -76,6 +75,25 @@ fn lane_lifecycle_script(mode: &str) {
         (queued_done.tokens, queued_done.finish),
         (4, FinishReason::Length)
     );
+
+    let config =
+        crate::config::Gemma4Config::from_file(&crate::testkit::model_path()).expect("config");
+    let stopped = harness.submit_with_policy(
+        ids(1500, 19),
+        1,
+        Some(0),
+        None,
+        StopPolicy::new(EosPolicy::Ignore, (0..config.vocab_size as u32).collect()),
+    );
+    let stopped = harness.steps.drain(stopped.id(), "stop after lane prefill");
+    assert_eq!((stopped.tokens, stopped.finish), (1, FinishReason::Stop));
+    assert_eq!(stopped.stop_cause, Some(StopCause::Token(stopped.ids[0])));
+    super::lane_gates_tp::assert_finite(
+        stopped.logprobs[0].as_ref().expect("the trigger is scored"),
+        "lane stop",
+    );
+    let seen = harness.steps.buffered_tokens(streamer.id());
+    harness.steps.wait_tokens(streamer.id(), seen + 2);
 
     let warm = harness.submit(warm_prompt(&long_prompt), 4);
     assert_warm_result(&mut harness, warm.id(), 1500, "warm suffix on lane");
@@ -173,15 +191,38 @@ fn the_gathered_lifecycle_completes() {
     gather_lifecycle_script();
 }
 
+/// The knob is refused for a geometry the bodies were not compiled for,
+/// before any weight is read rather than at the first global prefill.
 #[test]
-fn pool_pages_follow_the_knobs() {
-    assert_eq!(
-        super::pool_pages(512, 65, 512, 16, 0, 256),
-        Some((1488, 8193))
+fn the_knob_is_refused_for_a_geometry_the_build_does_not_carry() {
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        assert!(
+            std::env::var("PEGAINFER_REQUIRE_GPU").as_deref() != Ok("1"),
+            "PEGAINFER_REQUIRE_GPU=1 but this build carries the stub"
+        );
+        eprintln!("skipping: this build carries the stub, which has no geometry to refuse");
+        return;
+    }
+    let (heads, kv_heads, head_dim, _page) =
+        pegainfer_kernels::ops::gemma4_hd512_prefill_geometry()
+            .expect("a build that carries the bodies states the geometry they were compiled for");
+    let mut config = crate::manifest::schema::sample_config();
+    config.num_attention_heads = heads;
+    config.num_global_key_value_heads = kv_heads;
+    config.global_head_dim = head_dim;
+    super::tilelang_geometry_refusal(&config).expect("its own geometry is accepted");
+
+    config.num_global_key_value_heads = kv_heads + 1;
+    let refusal = super::tilelang_geometry_refusal(&config)
+        .expect_err("one KV head more is a geometry the bodies have no kernel for");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains(&(kv_heads + 1).to_string()) && refusal.contains(&kv_heads.to_string()),
+        "the refusal must name both geometries: {refusal}"
     );
-    assert_eq!(
-        super::pool_pages(196, 65, 2048, 2, 0, 1024),
-        Some((262, 4097))
-    );
+}
+
+#[test]
+fn a_pool_budget_that_overflows_is_refused() {
     assert_eq!(super::pool_pages(usize::MAX, 65, 512, 16, 0, 256), None);
 }

@@ -15,6 +15,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "../shared/ffi_guard.cuh"
+
 namespace {
 
 constexpr int kGroup = 16;
@@ -95,7 +97,7 @@ CUresult gemma4_marlin_nvfp4_prepare_scales_cuda(const unsigned char *checkpoint
   }
   nvfp4_prepare_scales_kernel<<<(int)grid, block, 0, stream>>>(
       checkpoint, prepared, out_dim, scale_k, rescale, total);
-  return (CUresult)cudaGetLastError();
+  return map_cuda_error(cudaGetLastError());
 }
 
 } // extern "C"

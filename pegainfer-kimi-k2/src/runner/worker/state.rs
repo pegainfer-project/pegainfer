@@ -369,7 +369,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
             pegainfer_sample::gpu_sample_batch_into(
@@ -382,12 +382,10 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} batched decode sampling"))?
         };
 
-        let local_top1 = read_local_top1_batch_values(
+        let local_top1 = decode_arena.scratch.sampling.read_top1(
             &device_ctx,
-            &decode_arena.logits,
             active_len,
-            &mut decode_arena.scratch.sampling.top1_value_scratch,
-            &mut decode_arena.scratch.sampling.top1_out,
+            decode_arena.logits.hidden_dim,
         )?;
         let mut picks: Vec<(u32, f32)> = local_top1;
         for (sampling_row, token) in sampling_rows.iter().zip(&sampled) {
@@ -627,7 +625,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let sampling_rows = [pegainfer_sample::BatchSamplingRow {
                 row: 0,

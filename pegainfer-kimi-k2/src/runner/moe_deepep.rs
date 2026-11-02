@@ -19,7 +19,7 @@
 //! # Router scale
 //!
 //! W2 applies the per-slot router weight; combine reduces the weighted
-//! expert outputs back to source tokens in bf16. `KIMI_K2_ROUTER_SCALE` is
+//! expert outputs back to source tokens in bf16. `KIMI_K2_ROUTED_SCALING_FACTOR` is
 //! applied at the residual add ([`kimi_residual_add_scaled_bf16`]), matching
 //! the NCCL backend's convention.
 
@@ -31,7 +31,7 @@ use pegainfer_kernels::ops::DeepEp;
 use pegainfer_kernels::ops::DeepEpDispatchScratch;
 use pegainfer_kernels::ops::KIMI_K2_EP_WORLD;
 use pegainfer_kernels::ops::KIMI_K2_LOCAL_EXPERTS;
-use pegainfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use pegainfer_kernels::ops::KIMI_K2_ROUTED_SCALING_FACTOR;
 use pegainfer_kernels::ops::KIMI_K2_SHARED_GATE_UP;
 use pegainfer_kernels::ops::KimiMarlinInt4ExpertWeights;
 use pegainfer_kernels::ops::KimiMarlinRouteWorkspace;
@@ -379,7 +379,7 @@ pub(super) fn forward_moe_layer_decode_deepep_normed(
         &scratch.mla.hidden,
         &scratch.mla.projected,
         &dp.combined,
-        KIMI_K2_ROUTER_SCALE,
+        KIMI_K2_ROUTED_SCALING_FACTOR,
         &mut scratch.mla.normed,
     )?;
     std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
@@ -554,7 +554,7 @@ pub(super) fn forward_moe_layer_prefill_deepep(
         hidden,
         &shared_out,
         &pf.combined,
-        KIMI_K2_ROUTER_SCALE,
+        KIMI_K2_ROUTED_SCALING_FACTOR,
         next_hidden,
     )?;
     std::mem::swap(hidden, next_hidden);

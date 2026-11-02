@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use super::event::FinishReason;
 use super::event::TokenLogprob;
+use super::stop::StopCause;
+use super::stop::StopPolicy;
 
 /// In-process routing id for one generate request, minted by
 /// [`super::SchedulerHandle::submit`] from a per-scheduler counter. `Copy` and
@@ -49,6 +51,21 @@ impl std::fmt::Display for RequestId {
 pub struct Request {
     pub prompt_tokens: Vec<u32>,
     pub params: crate::sampler::SamplingParams,
+    /// Count of leading prompt tokens that render the conversation's messages;
+    /// the chat template's generation prompt follows them. The next turn of
+    /// the conversation repeats exactly these tokens, so a scheduler that
+    /// snapshots its state there serves that turn from the snapshot. `None`
+    /// when the frontend did not measure it (a completion, or a chat body the
+    /// chat layer could not read).
+    pub history_tokens: Option<usize>,
+    /// Where the conversation's earlier turns ended, newest first: the
+    /// `history_tokens` of the requests that carried them, as the chat layer
+    /// re-measures them from the messages. Each is a point an earlier turn's
+    /// snapshot may be found at, by a scheduler that keeps snapshots beyond
+    /// the one that made them; strictly less than `history_tokens`. Empty
+    /// when the frontend did not measure them.
+    pub history_marks: Vec<usize>,
+    pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
     /// Opaque router/P-D metadata from the request's
@@ -75,9 +92,9 @@ pub struct QueuedRequest {
     pub request: Request,
 }
 
-/// Everything one scheduler step produced, in one message. The scheduler-side
-/// ledger sends exactly one per step that touched any request; an idle step
-/// sends nothing.
+/// Everything one scheduler step produced, in one message. Empty `updates`
+/// notify the frontend of changed metrics, for example after cancellation.
+/// A step with no request updates or metric changes sends nothing.
 #[derive(Debug, Default)]
 pub struct StepOutputs {
     pub updates: Vec<RequestUpdate>,
@@ -242,6 +259,9 @@ impl fmt::Display for RejectReason {
 pub enum Terminal {
     Finished {
         reason: FinishReason,
+        /// Present for token-driven stop finishes. The triggering token remains
+        /// in `RequestUpdate.tokens`, with its matching logprob when requested.
+        stop_cause: Option<StopCause>,
         prompt_tokens: usize,
         completion_tokens: usize,
     },
@@ -258,20 +278,4 @@ pub enum Terminal {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_rejection_names_the_engine_feature() {
-        let reason = RejectReason::Unsupported {
-            feature: "frontend-resolved prefix".to_string(),
-        };
-        assert_eq!(
-            reason.to_string(),
-            "this engine does not support frontend-resolved prefix"
-        );
-    }
 }

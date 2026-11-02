@@ -23,9 +23,9 @@ pub(super) fn tp_prefill_items(chunk: &ScheduledChunk) -> Result<Vec<TpPrefillCh
             TpPrefillChunkItem::new_with_sampling(
                 *request_id,
                 window.clone(),
-                req.logprobs,
-                req.params,
-                *end == req.prompt_tokens.len(),
+                req.request.logprobs,
+                req.request.params,
+                *end == req.request.prompt_tokens.len(),
             )
         })
         .collect())
@@ -74,7 +74,7 @@ pub(super) fn align_prefill_results(
         .zip(&chunk.reqs)
         .zip(&chunk.ends)
         .filter_map(|((&request_id, req), &end)| {
-            (end == req.prompt_tokens.len()).then_some(request_id)
+            (end == req.request.prompt_tokens.len()).then_some(request_id)
         })
         .collect();
     let mut by_id = HashMap::with_capacity(result.requests.len());
@@ -109,7 +109,7 @@ pub(super) fn align_prefill_results(
         .zip(&chunk.reqs)
         .zip(&chunk.ends)
         .map(|((&request_id, req), &end)| {
-            if end == req.prompt_tokens.len() {
+            if end == req.request.prompt_tokens.len() {
                 by_id.remove(&request_id).map(Some).ok_or_else(|| {
                     anyhow::anyhow!(
                         "Qwen3.5 TP prefill result is missing final request id {}",

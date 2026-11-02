@@ -22,6 +22,7 @@ use pegainfer_kv_cache::RequestKv;
 use tokio::sync::mpsc;
 
 use crate::runner::executor::ForwardExecutor;
+use crate::runner::executor::tp8_row_refusal;
 use crate::runner::worker::KimiKvStepPages;
 use crate::runner::worker::KimiRowOptions;
 
@@ -157,16 +158,12 @@ impl KimiK2Scheduler {
             let Some(req) = preflight_prefill_candidate(req) else {
                 continue;
             };
-            // Honor-or-reject (#237): this scheduler drives the TP8 path,
-            // where each rank holds a vocab shard and cannot sample the
-            // global distribution (#226). Rejecting here keeps one bad
-            // request from failing the whole decode batch in the executor.
-            if !req.params.is_greedy() {
+            // This scheduler drives the TP8 path. Refusing here keeps one request the executor
+            // cannot serve from failing every request in its batch.
+            if let Some(message) = tp8_row_refusal(&row_options(&req)) {
                 send_scheduled(&req);
                 let _ = req.token_tx.send(TokenEvent::Rejected {
-                    message: "Kimi TP8 path does not support sampling yet: use \
-                              TP1/DP8 or temperature=0 (#237, #226)"
-                        .to_string(),
+                    message: message.to_string(),
                     prompt_tokens: req.prompt_tokens.len(),
                     completion_tokens: 0,
                 });
@@ -827,11 +824,8 @@ mod tests {
     }
 
     #[test]
-    fn tp8_scheduler_rejects_sampling_requests_before_forward() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut scheduler = test_scheduler(&calls, test_pool());
-
-        let (mut sampling_req, mut token_rx) = request_with_channel(vec![11, 22], 4);
+    fn tp8_scheduler_rejects_sampling_and_logprobs_before_forward() {
+        let (mut sampling_req, sampling_rx) = request_with_channel(vec![11, 22], 4);
         sampling_req.params = SamplingParams {
             temperature: 0.8,
             top_k: -1,
@@ -840,24 +834,34 @@ mod tests {
             seed: None,
             ignore_eos: false,
         };
+        let (mut logprobs_req, logprobs_rx) = request_with_channel(vec![11], 4);
+        logprobs_req.logprobs = Some(1);
 
-        scheduler.handle_request_batch(vec![sampling_req]);
+        for (req, mut token_rx, feature) in [
+            (sampling_req, sampling_rx, "sampling"),
+            (logprobs_req, logprobs_rx, "logprobs"),
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut scheduler = test_scheduler(&calls, test_pool());
 
-        assert!(
-            calls.lock().unwrap().is_empty(),
-            "a rejected sampling request must not reach the executor"
-        );
-        // Scheduled event precedes the rejection.
-        let Ok((_, TokenEvent::Scheduled { .. })) = token_rx.try_recv() else {
-            panic!("expected Scheduled event");
-        };
-        let Ok((_, TokenEvent::Rejected { message, .. })) = token_rx.try_recv() else {
-            panic!("expected Rejected event");
-        };
-        assert!(
-            message.contains("TP8"),
-            "rejection names the path: {message}"
-        );
+            scheduler.handle_request_batch(vec![req]);
+
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "a rejected {feature} request must not reach the executor"
+            );
+            // Scheduled event precedes the rejection.
+            let Ok((_, TokenEvent::Scheduled { .. })) = token_rx.try_recv() else {
+                panic!("expected Scheduled event");
+            };
+            let Ok((_, TokenEvent::Rejected { message, .. })) = token_rx.try_recv() else {
+                panic!("expected Rejected event");
+            };
+            assert!(
+                message.contains("TP8") && message.contains(feature),
+                "rejection names the path and the feature: {message}"
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@
 //!
 //! Manual gate — CI compiles this but never runs it.
 
+#![cfg(feature = "gemma4")]
+
 mod common;
 
 use cudarc::driver::CudaSlice;

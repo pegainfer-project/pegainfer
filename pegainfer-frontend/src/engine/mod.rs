@@ -1,6 +1,6 @@
 //! The engine contract, split by cohesion.
 //!
-//! Step-driven contract (current; qwen3 is migrated, other lines follow):
+//! Step-driven contract (current):
 //!
 //! - [`step`] — the wire types: `Request`, `RequestId`, `StepOutputs` with
 //!   one flat `RequestUpdate` per touched request per step.
@@ -39,6 +39,7 @@ mod request;
 mod request_lifecycle;
 mod sink;
 mod step;
+mod stop;
 mod wiring;
 
 pub use control::*;
@@ -52,4 +53,5 @@ pub use request::*;
 pub use request_lifecycle::*;
 pub use sink::*;
 pub use step::*;
+pub use stop::*;
 pub use wiring::*;

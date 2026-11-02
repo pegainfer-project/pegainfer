@@ -1,4 +1,5 @@
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -180,16 +181,6 @@ __global__ void silu_and_mul_per_token_group_quant_bf16_k128_masked_kernel(
   }
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 // f32 mn-major scales [groups, scale_cols, cap] → packed UE8M0 i32
 // [groups, scale_cols/4, cap], LSB-first exponent bytes
 // (u32 = b0 | b1<<8 | b2<<16 | b3<<24 — smxx_layout.cuh's
@@ -274,8 +265,6 @@ __global__ void fp8_weight_scale_pack_ue8m0_kernel(
     group_packed[(size_t)i * n + row] = static_cast<int>(word);
   }
 }
-
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 // Row-grid cap for the grid-strided quant kernels: enough blocks to fill the
 // SMs at 128 threads/block, small enough that a capacity-sized (2080-row)

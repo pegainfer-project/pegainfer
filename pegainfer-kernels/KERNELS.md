@@ -10,9 +10,8 @@ Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, 
 | --- | --- | --- | --- | --- | --- | --- |
 | `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/shared/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
 | `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/shared/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
-| `shared.elementwise.accumulate_bf16_token_scaled_to_f32` | DeepSeek-V2-Lite NCCL device combine | `ops::accumulate_bf16_token_scaled_to_f32_into` | `accumulate_bf16_token_scaled_to_f32_cuda` | `csrc/shared/elementwise.cu` | CUDA | accumulates one bf16 expert-output token into a selected row of reusable f32 device scratch before the NCCL combine all-reduce |
-| `shared.sampling.argmax_batch_bf16_indexed` | selected batched greedy gates | `ops::argmax_batch_bf16_indexed_into` | `argmax_batch_bf16_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy top-1 results for selected source rows over `HiddenStates` logits |
-| `shared.sampling.batch_topk_topp` | mixed greedy/non-greedy decode epilogues | `ops::gpu_sample_batch_into` / `pegainfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, gather/cast bf16 logits to f32, FlashInfer OnlineSoftmax + Sampling/TopP/TopKTopP by active per-row filters |
+| `shared.elementwise.accumulate_bf16_token_scaled_to_f32` | DeepSeek-V2-Lite NCCL device combine | `ops::dsv2_lite_accumulate_route_row_into` | `accumulate_bf16_token_scaled_to_f32_cuda` | `csrc/shared/elementwise.cu` | CUDA | accumulates one bf16 expert-output token into a selected row of reusable f32 device scratch before the NCCL combine all-reduce |
+| `shared.sampling.batch_topk_topp` | mixed greedy/non-greedy decode epilogues | `ops::gpu_sample_batch_into` / `pegainfer_sample::select_batch` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, gather/cast bf16 logits to f32, FlashInfer OnlineSoftmax + Sampling/TopP/TopKTopP by active per-row filters |
 
 ## Qwen3-4B Dense Full-Attention Path
 
@@ -27,14 +26,14 @@ Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_
 | `qwen3_4b.linear.gemm` | o/mlp/lm_head | `ops::gemm_into` / `ops::gemm` | `gemm_cuda` | `csrc/shared/linear.cu` | cuBLAS | weight row-major, hidden column-major |
 | `qwen3_4b.attn.qk_norm_rope` | attention prep | `ops::qk_norm_rope_batch_decode_into` or direct FFI in unified path | `qk_norm_rope_batched_decode_cuda` | `csrc/shared/prefill_attention.cu` | CUDA | full RoPE, `head_dim=128`, per-token positions |
 | `qwen3_4b.kv.scatter` | prefill/decode/unified | direct FFI from model paths | `paged_kv_scatter_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer-layout CUDA wrapper | page-first `KvLayout`, NHD K/V blocks |
-| `qwen3_4b.attn.prefill_paged` | prefill/unified | `ops::prefill_attention_paged_into` or direct FFI in unified path | `batch_prefill_paged_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, causal, paged KV |
+| `qwen3_4b.attn.prefill_paged` | prefill/unified | `ops::prefill_attention_paged_into` or direct FFI in unified path | `batch_prefill_paged_cuda_with_cta_tile_q` | `csrc/shared/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, causal, paged KV |
 | `qwen3_4b.attn.decode_paged` | decode/unified | `ops::paged_attention_batch_decode_into` or direct FFI in unified path | `paged_attention_decode_cuda` | `csrc/shared/paged_attention.cu` | FlashInfer CUDA | `HEAD_DIM=128`, no partition-KV |
 | `qwen3_4b.norm.fused_add_rms` | residual | `ops::fused_add_rms_norm_batch_into` | `fused_add_rms_norm_batched_cuda` | `csrc/shared/flashinfer_norm.cu` | FlashInfer CUDA | residual add plus RMSNorm over batch |
 | `qwen3_4b.mlp.silu_mul_fused` | MLP | `ops::silu_mul_fused_batch_into` | `silu_mul_fused_cuda` | `csrc/shared/fused_proj.cu` | CUDA | input `[2 * intermediate, batch]`, output `[intermediate, batch]` |
 | `qwen3_4b.attn.split_qkv` | Attention projection | `ops::split_qkv_into` | `split_qkv_cuda` | `csrc/shared/fused_proj.cu` | CUDA | BF16 bitwise split from rank-local `[Q;K;V, tokens]` into compact Q/K/V buffers after one fused projection GEMM. |
 | `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/shared/elementwise.cu` | CUDA | same-shape `HiddenStates` |
-| `qwen3_4b.sampling.greedy` | decode output | `pegainfer-core::ops::select_batch_tokens_into` | `argmax_batch_bf16_split_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy rows, one indexed batched argmax read-back per step |
-| `qwen3_4b.sampling.random` | decode output | `pegainfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, one batched FlashInfer sampling call per step |
+| `qwen3_4b.sampling.greedy` | decode output | `pegainfer_sample::select_batch` | `argmax_batch_bf16_split_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy rows, one indexed batched argmax read-back per step |
+| `qwen3_4b.sampling.random` | decode output | `pegainfer_sample::select_batch` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, one batched FlashInfer sampling call per step |
 
 ## Kimi-K2 Text TP8/EP8 Path
 
@@ -81,7 +80,6 @@ until the model crate proves their contracts.
 
 | op_id | Runtime owner | Rust wrapper | FFI symbols | Source | Backend | Shape / layout notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| `glm52.deepgemm.scale_layout` | future GLM5.2 model crate | `ops::glm52_deepgemm_mn_major_tma_aligned_f32_launch` | `glm52_deepgemm_mn_major_tma_aligned_f32_cuda` | `csrc/glm52/glm52_deepgemm_layout.cu` | CUDA layout helper for DeepGEMM | Converts row-major f32 scales `[rows, scale_cols]` into MN-major/TMA-aligned storage with `aligned_rows` padded to 16-byte f32 row alignment. |
 | `glm52.flashmla.sparse_decode` | future GLM5.2 model crate | `ops::glm52_flashmla_sparse_decode_num_sm_parts`, `ops::glm52_flashmla_sparse_decode_metadata_launch`, `ops::glm52_flashmla_sparse_decode_launch` | `glm52_flashmla_sparse_decode_num_sm_parts_cuda`, `glm52_flashmla_sparse_decode_metadata_cuda`, `glm52_flashmla_sparse_decode_launch_cuda` | `csrc/glm52/glm52_flashmla_sparse.cu` | FlashMLA SM90 sparse decode | SM90-only sparse decode for V32 layout: `batch<=128`, `heads=64`, `qk_dim=576`, `v_dim=512`, `page_size=64`, packed KV token stride `656`, fixed `topk=2048`, and `num_sm_parts<=160`. Dynamic `topk_length` is intentionally not exposed because this kernel asserts it must be null. |
 
 ## Kimi-K3 TileLang Decode Surface
@@ -227,13 +225,13 @@ reference implementation.
 
 ## Non-Qwen3 Compatibility
 
-The crate still builds CUDA/Triton symbols needed by the current root binary:
+The `qwen35` feature builds the Qwen3.5 CUDA/Triton symbols:
 
-- Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/shared/paged_attention.cu`.
+- Qwen3.5 HD256 full-attention kernels: `csrc/qwen35/prefill_attention_hd256.cu`, `csrc/qwen35/paged_attention_hd256.cu`.
 - Qwen3.5 linear-attention decode kernels: `csrc/qwen35/conv1d.cu`, `csrc/qwen35/gated_delta_rule.cu`.
 - Qwen3.5 chunk-wise GDR prefill Triton AOT kernels: `tools/triton/gated_delta_rule_chunkwise_kernels.py`.
 
-These are preserved for build compatibility. They are not part of the Qwen3-4B Phase 1 API surface.
+They are not part of the Qwen3-4B Phase 1 API surface.
 
 ## Editing Rule
 

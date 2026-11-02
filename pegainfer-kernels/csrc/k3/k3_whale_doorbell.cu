@@ -55,9 +55,7 @@ CUresult k3_whale_doorbell_ring(const unsigned long long* flag_addrs, int flag_c
   args.value = value;
   args.flag_count = flag_count;
   whale_doorbell_kernel<<<1, 1, 0, stream>>>(args);
-  cudaError_t err = cudaGetLastError();
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  return err == cudaErrorInvalidValue ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(cudaGetLastError());
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 

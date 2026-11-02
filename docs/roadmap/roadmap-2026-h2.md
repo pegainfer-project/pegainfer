@@ -32,7 +32,7 @@ Formalize what "supported" means, so users know which model to run and every lin
 | --- | --- | --- |
 | **Stable** | Accuracy gate always green; bench-regression tracking per `conventions/bench-regression.md`; serving flags don't break without notice; a website recipe page; the reference implementation new models copy from | Qwen3-4B |
 | **Maturing** | Accuracy gate exists and passes; perf ledger active; serving contract may still move | Qwen3.5-4B, DeepSeek-V2-Lite, Kimi-K2 |
-| **Bring-up** | Under construction; correctness fixtures may be partial; no serving promises | GLM5.2, higgs-audio |
+| **Bring-up** | Under construction; correctness fixtures may be partial; no serving promises | GLM5.2 |
 
 Qwen3-4B earns Stable on evidence: golden-gate accuracy, full-sweep serving wins vs vLLM, prefix cache + KV offload + speculative decoding + TP all landed, regression tracking in place. Being Stable also means it is the **scaffolding reference**: a new model starts by copying the closest crate (per `direction.md`), and Qwen3-4B is the canonical one to copy.
 
@@ -77,7 +77,7 @@ None of this needs more than one GPU.
 
 ### 6. One new single-GPU model line
 
-The next model we add should be runnable by contributors, so the model roster matches the hardware people actually have. Candidates: a small MoE (Qwen3-30B-A3B class — also gives the shared-MoE substrate a single-GPU testbed) or continuing the higgs-audio bring-up chain (#395–#400). A new line needs an accuracy gate and a bench from day one (per the model-roadmap template in #203's appendix).
+The next model we add should be runnable by contributors, so the model roster matches the hardware people actually have. Candidate: a small MoE (Qwen3-30B-A3B class — also gives the shared-MoE substrate a single-GPU testbed). The higgs-audio line (#395–#400, #864) moved to pega-omni, which serves speech models. A new line needs an accuracy gate and a bench from day one (per the model-roadmap template in #203's appendix).
 
 ### 7. Kernel ledger → simulator MVP
 
@@ -107,7 +107,7 @@ Related positioning: **multi-instance concerns (routing, P/D orchestration) are 
 - A prebuilt runtime Docker image (per-SM binary maintenance treadmill; revisit if demand shows up).
 - Chasing vLLM/SGLang on model breadth or ecosystem surface. Depth in named lanes over coverage.
 - Weight quantization as a general feature (BF16 stays the default; Marlin INT4 exists where a model line demands it, e.g. Kimi-K2).
-- Multimodal/VLM beyond the higgs-audio line, pipeline parallel, embedding/rerank endpoints — unless a concrete need lands.
+- Multimodal/VLM (speech and image models are served by pega-omni), pipeline parallel, embedding/rerank endpoints — unless a concrete need lands.
 - A universal scheduler or KV abstraction. The per-model boundary from `direction.md` stands; it moves on evidence from new model lines, not on aesthetics.
 
 ## Tracking issues to open

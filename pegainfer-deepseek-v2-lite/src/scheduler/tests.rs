@@ -61,7 +61,7 @@ fn active_state(
         generated,
         last_token,
         finish_policy: FinishPolicy {
-            eos_token_id: config.eos_token_id,
+            eos_token_ids: config.eos_token_ids.clone(),
             ignore_eos: false,
         },
         cache: DecodeCache::new(config),
@@ -294,7 +294,7 @@ fn eos_retirement_is_independent_per_request() {
     let mut stop_state = active_state("stop", tx_stop, 3, 1, 10, &config);
     let mut live_state = active_state("live", tx_live, 2, 1, 11, &config);
 
-    assert!(stop_state.emit_token_or_finish(config.eos_token_id, 2, 0));
+    assert!(stop_state.emit_token_or_finish(config.eos_token_ids[0], 2, 0));
     assert!(!live_state.emit_token_or_finish(12, 2, 0));
 
     match recv_event(&mut rx_stop) {
@@ -327,7 +327,7 @@ fn batch_decoded_tokens_retire_eos_independently() {
     let survivors = apply_decoded_tokens_to_rows(
         vec![0, 1],
         vec![stop_state, live_state],
-        vec![config.eos_token_id, 12],
+        vec![config.eos_token_ids[0], 12],
         &mut active_remaining,
         0,
     );
@@ -464,7 +464,11 @@ fn cross_group_terminal_accounting_uses_shared_active_remaining() {
     );
     assert_eq!(active_remaining, 1);
 
-    assert!(third.emit_token_or_finish(config.eos_token_id, active_remaining.saturating_sub(1), 0));
+    assert!(third.emit_token_or_finish(
+        config.eos_token_ids[0],
+        active_remaining.saturating_sub(1),
+        0
+    ));
     active_remaining = active_remaining.saturating_sub(1);
     assert_eq!(active_remaining, 0);
 
@@ -682,7 +686,12 @@ fn take_decode_position_groups_preserves_original_indices() {
 
     assert!(active.is_empty());
     assert_eq!(groups.len(), 2);
-    assert_eq!(groups[0].position, 4);
+    assert!(
+        groups[0]
+            .rows
+            .iter()
+            .all(|(_, state)| state.next_decode_position() == 4)
+    );
     assert_eq!(
         groups[0]
             .rows
@@ -691,7 +700,7 @@ fn take_decode_position_groups_preserves_original_indices() {
             .collect::<Vec<_>>(),
         vec![0, 2]
     );
-    assert_eq!(groups[1].position, 5);
+    assert_eq!(groups[1].rows[0].1.next_decode_position(), 5);
     assert_eq!(
         groups[1]
             .rows

@@ -310,7 +310,7 @@ impl K3WhaleGang {
             })
             .collect();
         if !publish_flags.is_empty() {
-            k3_whale_doorbell_ring(&publish_flags, doorbell, active_cu_stream(ctx))
+            k3_whale_doorbell_ring(ctx, &publish_flags, doorbell)
                 .context("K3 whale publish doorbell ring")?;
         }
         // Beat 2: wait for every publication I read this window.
@@ -328,7 +328,7 @@ impl K3WhaleGang {
             })
             .collect();
         if !consume_flags.is_empty() {
-            k3_whale_doorbell_ring(&consume_flags, doorbell, active_cu_stream(ctx))
+            k3_whale_doorbell_ring(ctx, &consume_flags, doorbell)
                 .context("K3 whale consume doorbell ring")?;
         }
         // Beat 4: wait for my readers, so my next window's publish writes
@@ -518,7 +518,7 @@ mod tests {
         let (base, _wire) = k3_whale_slab_alloc(0, &layout).expect("fabric slab");
         let value = K3WhaleGang::window_value(0, 0).unwrap();
         let flags: Vec<u64> = (0..8).map(|from| layout.publish_flag(base, from)).collect();
-        k3_whale_doorbell_ring(&flags, value, active_cu_stream(&ctx)).expect("doorbell ring");
+        k3_whale_doorbell_ring(&ctx, &flags, value).expect("doorbell ring");
         for (from, &flag) in flags.iter().enumerate() {
             stream_wait_value(&ctx, flag, value)
                 .unwrap_or_else(|e| panic!("publish wait from={from}: {e:#}"));

@@ -10,13 +10,13 @@ use super::helpers::ensure_same_prompt_batch_rows_match;
 fn append_generated_token_handles_eos_stop_vs_ignore() {
     // EOS hit with ignore_eos=false: stop, do not append the EOS token.
     let mut generated = vec![10, 11];
-    let finish_reason = append_generated_token(&mut generated, 100_001, 100_001, false);
+    let finish_reason = append_generated_token(&mut generated, 100_001, &[100_001], false);
     assert_eq!(finish_reason, Some(FinishReason::Stop));
     assert_eq!(generated, vec![10, 11]);
 
     // EOS hit with ignore_eos=true: keep going, append the token.
     let mut generated = vec![10, 11];
-    let finish_reason = append_generated_token(&mut generated, 100_001, 100_001, true);
+    let finish_reason = append_generated_token(&mut generated, 100_001, &[100_001], true);
     assert_eq!(finish_reason, None);
     assert_eq!(generated, vec![10, 11, 100_001]);
 }

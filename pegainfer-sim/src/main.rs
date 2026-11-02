@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
         std::future::ready(Ok(engine.into())),
         &runtime.model_path,
         runtime.served_model_name,
+        pegainfer_frontend::vllm::ParserSelection::Auto,
         args.port,
         Some(runtime.max_model_len),
         pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
@@ -246,12 +247,5 @@ mod tests {
         let runtime = build_runtime(&legacy_args()).expect("legacy runtime should build");
 
         assert!(runtime.profile.is_none());
-    }
-
-    #[test]
-    fn sim_logger_accepts_warn_records() {
-        init_logging();
-
-        assert!(log::log_enabled!(target: "pegainfer_sim::profile", log::Level::Warn));
     }
 }

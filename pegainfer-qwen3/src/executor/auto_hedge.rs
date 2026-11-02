@@ -102,6 +102,18 @@ impl AutoHedge {
         self.committed.unwrap_or(self.cur_c)
     }
 
+    /// Sever the timing window: the next [`Self::tick`] only re-anchors, so the
+    /// interval it spans is never charged to a chain count. Used when a round
+    /// is outside the hedging configuration space (a load-gated one-token
+    /// verify round) — booking it to `C = 0` would feed gated throughput into
+    /// the no-hedge candidate and advance the exploration and commit counters.
+    pub(super) fn break_window(&mut self) {
+        self.last_tick = None;
+        self.cur_tokens = 0.0;
+        self.cur_secs = 0.0;
+        self.rounds_in_window = 0;
+    }
+
     /// Record one verify round's outcome. `executed_c` is the chain count
     /// the round actually ran — 0 when a guard disabled hedging, whatever
     /// [`Self::current_c`] requested.
@@ -282,5 +294,27 @@ mod tests {
         let mut auto = AutoHedge::new(3);
         drive(&mut auto, WINDOW_ROUNDS * 4 * EXPLORE_CYCLES + 1, |_| 25);
         assert_eq!(auto.committed, Some(0));
+    }
+
+    #[test]
+    fn break_window_never_charges_the_gated_interval() {
+        let mut auto = AutoHedge::new(2);
+        drive(&mut auto, 3, |_| 10);
+        assert!(auto.cur_tokens > 0.0 && auto.rounds_in_window > 0);
+
+        // A gated stretch is outside the hedging configuration space: sever the
+        // window, and the first tick back only re-anchors.
+        auto.break_window();
+        assert!(auto.cur_tokens.abs() < f64::EPSILON);
+        assert_eq!(auto.rounds_in_window, 0);
+        auto.tick(0, 5);
+        assert!(auto.cur_tokens.abs() < f64::EPSILON);
+        assert_eq!(auto.rounds_in_window, 0);
+
+        // The next tick measures from the new anchor, not from the gated round.
+        auto.last_tick = Instant::now().checked_sub(Duration::from_millis(10));
+        auto.tick(0, 7);
+        assert!((auto.cur_tokens - 7.0).abs() < f64::EPSILON);
+        assert_eq!(auto.rounds_in_window, 1);
     }
 }

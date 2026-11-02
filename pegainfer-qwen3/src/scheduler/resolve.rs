@@ -1,4 +1,6 @@
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
 
 use super::ActiveRequestState;
 use super::PendingRequest;
@@ -12,6 +14,14 @@ use crate::executor::DecodeRequestResult;
 use crate::executor::ModelExecutor;
 use crate::executor::PrefillRequestResult;
 use crate::speculative::VerifyRequestResult;
+
+fn classify_stop(
+    executor: &impl ModelExecutor,
+    policy: &StopPolicy,
+    token: u32,
+) -> Option<StopCause> {
+    policy.classify(token, |token_id| executor.is_stop_token(token_id))
+}
 
 pub(crate) fn resolve_step(
     executor: &impl ModelExecutor,
@@ -27,12 +37,16 @@ pub(crate) fn resolve_step(
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_decode_outputs(executor, active, &result.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::SpeculativeDecode { verify } => StepEffects {
             cached: Vec::new(),
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: resolve_speculative_outputs(executor, active, &verify.requests),
+            prefix_queries: 0,
+            prefix_hits: 0,
         },
         ExecutionArtifacts::Unified { pending, result } => {
             let mut effects = resolve_prefill_outputs(executor, pending, result.prefill_requests);
@@ -44,8 +58,9 @@ pub(crate) fn resolve_step(
 
 /// Turn each request's accepted speculative span into a decode effect. A span
 /// commits 1..=K+1 tokens at once; we walk it in order so a stop token or the
-/// max-output budget truncates exactly where it lands (the executor already
-/// suppressed nothing — stop handling lives here, mirroring single-token decode).
+/// max-output budget lands exactly where expected. Workers truncate terminal
+/// suffixes before recording context, and the executor checks that invariant
+/// before KV commit; the resolver classifies the retained trigger here.
 pub(crate) fn resolve_speculative_outputs(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
@@ -60,26 +75,30 @@ pub(crate) fn resolve_speculative_outputs(
                 .expect("speculative request_id must exist in active set");
             let mut emitted = Vec::new();
             let mut completion_tokens = req.generated_count;
+
             for &token in &result.accepted_tokens {
                 completion_tokens += 1;
-                let is_eos = !req.params.ignore_eos && executor.is_stop_token(token);
-                if is_eos {
-                    return DecodeEffect::EmitManyAndFinish {
+                emitted.push(token);
+
+                if let Some(stop_cause) = classify_stop(executor, &req.stop_policy, token) {
+                    return DecodeEffect::FinishMany {
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Stop,
+                        stop_cause: Some(stop_cause),
                     };
                 }
-                emitted.push(token);
+
                 if completion_tokens >= req.max_tokens {
-                    return DecodeEffect::EmitManyAndFinish {
+                    return DecodeEffect::FinishMany {
                         request_id: result.request_id,
                         tokens: emitted,
                         finish_reason: FinishReason::Length,
+                        stop_cause: None,
                     };
                 }
             }
-            DecodeEffect::EmitManyAndContinue {
+            DecodeEffect::ContinueMany {
                 request_id: result.request_id,
                 tokens: emitted,
                 completion_tokens,
@@ -100,18 +119,37 @@ fn resolve_prefill_outputs(
         // release builds too.
         assert_eq!(req.request_id, result.request_id);
 
-        // Report the prefix-cache hit count on the request's first chunk only
-        // — that is where it is determined. Later chunks must not re-report.
+        // Report the prefix-cache counters on the request's first chunk only —
+        // that is where they are determined. Later chunks must not re-report.
+        //
+        // The counters are TOKEN-granular, matching vLLM's `PrefixCacheStats`
+        // (the frontend reads them as hit tokens / queried tokens). Whether a
+        // lookup ran at all is the executor's call, and it reports that here
+        // rather than the resolver re-deriving it. The external (connector)
+        // family is not counted here: a consulted request can leave before
+        // its first prefill, so the executor settles it (see
+        // `ConnectorLookupCounters`).
         if req.prefill_pos == 0 {
+            // The usage field reports what the executor reused, so it stays
+            // unconditional and simply reads zero when nothing was looked up.
             effects.cached.push(CachedTokensEffect {
                 request_id: req.request_id,
-                cached_tokens: result.cached_tokens,
+                cached_tokens: result.cached_tokens.unwrap_or(0),
             });
+            // `Some(matched)` is a lookup that ran — `Some(0)` is a miss, which
+            // still counts its query. `None` is no lookup at all, and
+            // contributes nothing, so the rate is not diluted by phantom
+            // queries.
+            if let Some(matched) = result.cached_tokens {
+                // Whatever the connector restored is not a local hit.
+                let local = matched.saturating_sub(result.external_hit_tokens.unwrap_or(0));
+                effects.prefix_queries += req.prompt_tokens.len() as u64;
+                effects.prefix_hits += local as u64;
+            }
         }
 
         if !result.completed {
             req.prefill_pos = result.prefill_pos;
-            req.cached_tokens = req.cached_tokens.max(result.cached_tokens);
             effects.pending.push(PendingEffect::ContinuePrefill { req });
             continue;
         }
@@ -124,10 +162,13 @@ fn resolve_prefill_outputs(
             });
         }
 
-        if !req.params.ignore_eos && executor.is_stop_token(result.first_token) {
-            effects.pending.push(PendingEffect::Finish {
+        if let Some(stop_cause) = classify_stop(executor, &req.stop_policy, result.first_token) {
+            effects.pending.push(PendingEffect::EmitAndFinish {
                 request_id: req.request_id,
+                token: result.first_token,
+                logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Stop,
+                stop_cause: Some(stop_cause),
             });
             continue;
         }
@@ -138,6 +179,7 @@ fn resolve_prefill_outputs(
                 token: result.first_token,
                 logprob: result.first_token_logprob,
                 finish_reason: FinishReason::Length,
+                stop_cause: None,
             });
             continue;
         }
@@ -152,6 +194,7 @@ fn resolve_prefill_outputs(
                 max_tokens: req.max_tokens,
                 prompt_len,
                 params: req.params,
+                stop_policy: req.stop_policy,
                 logprobs: req.logprobs,
             },
             first_token: result.first_token,
@@ -175,22 +218,27 @@ fn resolve_decode_outputs(
                 .find(|req| req.request_id == result.request_id)
                 .expect("decode request_id must exist in active set");
             let completion_tokens = req.generated_count + 1;
-            let is_eos = !req.params.ignore_eos && executor.is_stop_token(result.token);
+            let stop_cause = classify_stop(executor, &req.stop_policy, result.token);
             let at_limit = completion_tokens >= req.max_tokens;
-            if is_eos {
+
+            if let Some(stop_cause) = stop_cause {
                 DecodeEffect::Finish {
                     request_id: result.request_id,
+                    token: result.token,
+                    logprob: result.logprob.clone(),
                     finish_reason: FinishReason::Stop,
+                    stop_cause: Some(stop_cause),
                 }
             } else if at_limit {
-                DecodeEffect::EmitAndFinish {
+                DecodeEffect::Finish {
                     request_id: result.request_id,
                     token: result.token,
                     logprob: result.logprob.clone(),
                     finish_reason: FinishReason::Length,
+                    stop_cause: None,
                 }
             } else {
-                DecodeEffect::EmitAndContinue {
+                DecodeEffect::Continue {
                     request_id: result.request_id,
                     token: result.token,
                     logprob: result.logprob.clone(),

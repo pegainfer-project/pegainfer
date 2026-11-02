@@ -80,7 +80,7 @@ impl MarkovHead {
     /// Sample `block_size` draft tokens per request, left-to-right with the
     /// Markov bias.
     ///
-    /// `base_logits` are the backbone draft logits `[rows*block_size, vocab]`
+    /// `base_logits` are the backbone draft logits `[rows*block_size, logits_rows]`
     /// (request-major: request `i` owns rows `[i*block_size, (i+1)*block_size)`),
     /// `current_tokens` are the per-request anchors (the verified token each block
     /// extends). Returns the `rows*block_size` request-major drafts, anchor-first:
@@ -102,7 +102,7 @@ impl MarkovHead {
         let rows = current_tokens.len();
         anyhow::ensure!(rows > 0, "DSpark markov sample needs active requests");
         anyhow::ensure!(block_size > 0, "DSpark markov block_size must be > 0");
-        let vocab = base_logits.hidden_dim;
+        let logits_rows = base_logits.hidden_dim;
         anyhow::ensure!(
             base_logits.seq_len == rows * block_size,
             "DSpark markov base logits rows {} != rows*block_size {}",
@@ -110,12 +110,12 @@ impl MarkovHead {
             rows * block_size
         );
         anyhow::ensure!(
-            vocab == self.w2.rows,
-            "DSpark markov vocab {} != w2 rows {}",
-            vocab,
+            logits_rows <= self.w2.rows,
+            "DSpark markov logits rows {} exceeds w2 rows {}",
+            logits_rows,
             self.w2.rows
         );
-        scratch.activate(rows, vocab)?;
+        scratch.activate(rows, logits_rows)?;
 
         // prev = anchors (only the active prefix; the kernels read the first
         // `rows` ids/rows of the max-batch buffers).
@@ -145,7 +145,7 @@ impl MarkovHead {
                         (&*next_tokens, &mut *prev_tokens)
                     };
                     ops::embedding_batch(ctx, &self.w1, input, w1emb)?;
-                    ops::gemm_into_checked(ctx, &self.w2, w1emb, bias)?;
+                    ops::gemm_rows_into_checked(ctx, &self.w2, 0, logits_rows, w1emb, bias)?;
                     markov_step_argmax_into(
                         ctx,
                         base_logits,
@@ -172,7 +172,14 @@ impl MarkovHead {
                     };
                     ops::embedding_batch(ctx, &self.w1, input, &mut scratch.w1emb)?;
                 }
-                ops::gemm_into_checked(ctx, &self.w2, &scratch.w1emb, &mut scratch.bias)?;
+                ops::gemm_rows_into_checked(
+                    ctx,
+                    &self.w2,
+                    0,
+                    logits_rows,
+                    &scratch.w1emb,
+                    &mut scratch.bias,
+                )?;
                 let output = if input_is_prev {
                     &mut scratch.next_tokens
                 } else {
@@ -217,7 +224,7 @@ impl MarkovHead {
     ) -> Result<Vec<u32>> {
         let rows = current_tokens.len();
         anyhow::ensure!(rows > 0, "DSpark markov sample needs active requests");
-        let vocab = base_logits.hidden_dim;
+        let logits_rows = base_logits.hidden_dim;
         anyhow::ensure!(
             base_logits.seq_len == rows * block_size,
             "DSpark markov base logits rows {} != rows*block_size {}",
@@ -232,7 +239,7 @@ impl MarkovHead {
                 && branch_positions.last().is_none_or(|&p| p < block_size),
             "DSpark branch positions must be sorted, deduped and < block_size: {branch_positions:?}"
         );
-        scratch.activate(rows, vocab)?;
+        scratch.activate(rows, logits_rows)?;
         {
             let mut prev_dst = scratch.prev_tokens.slice_mut(..rows);
             ctx.stream.memcpy_htod(current_tokens, &mut prev_dst)?;
@@ -266,7 +273,7 @@ impl MarkovHead {
                         };
                         ops::embedding_batch(ctx, &self.w1, input, w1emb)?;
                     }
-                    ops::gemm_into_checked(ctx, &self.w2, w1emb, bias)?;
+                    ops::gemm_rows_into_checked(ctx, &self.w2, 0, logits_rows, w1emb, bias)?;
                     let output: &mut CudaSlice<u32> = if input_is_prev {
                         next_tokens
                     } else {
@@ -322,7 +329,14 @@ impl MarkovHead {
                     };
                     ops::embedding_batch(ctx, &self.w1, input, &mut scratch.w1emb)?;
                 }
-                ops::gemm_into_checked(ctx, &self.w2, &scratch.w1emb, &mut scratch.bias)?;
+                ops::gemm_rows_into_checked(
+                    ctx,
+                    &self.w2,
+                    0,
+                    logits_rows,
+                    &scratch.w1emb,
+                    &mut scratch.bias,
+                )?;
                 if branch_positions.contains(&step) {
                     // One expression, three disjoint field borrows: splitting
                     // it would re-borrow `scratch` a second time.
@@ -428,14 +442,14 @@ impl MarkovHead {
             "chain ladder req_map exceeds chain_a requests"
         );
         let rows = n * c;
-        let vocab = base_logits.hidden_dim;
+        let logits_rows = base_logits.hidden_dim;
         anyhow::ensure!(
             base_logits.seq_len == total * block_size,
             "chain ladder base logits rows {} != total*block_size {}",
             base_logits.seq_len,
             total * block_size
         );
-        scratch.activate(rows, vocab)?;
+        scratch.activate(rows, logits_rows)?;
         let max_batch = scratch.max_batch;
         {
             let map_i32: Vec<i32> = req_map.iter().map(|&r| r as i32).collect();
@@ -503,7 +517,7 @@ impl MarkovHead {
                         };
                         ops::embedding_batch(ctx, &self.w1, input, w1emb)?;
                     }
-                    ops::gemm_into_checked(ctx, &self.w2, w1emb, bias)?;
+                    ops::gemm_rows_into_checked(ctx, &self.w2, 0, logits_rows, w1emb, bias)?;
                     let output: &mut CudaSlice<u32> = if input_is_prev {
                         next_tokens
                     } else {
@@ -566,7 +580,14 @@ impl MarkovHead {
                     };
                     ops::embedding_batch(ctx, &self.w1, input, &mut scratch.w1emb)?;
                 }
-                ops::gemm_into_checked(ctx, &self.w2, &scratch.w1emb, &mut scratch.bias)?;
+                ops::gemm_rows_into_checked(
+                    ctx,
+                    &self.w2,
+                    0,
+                    logits_rows,
+                    &scratch.w1emb,
+                    &mut scratch.bias,
+                )?;
                 {
                     let output = if input_is_prev {
                         &mut scratch.next_tokens
@@ -648,16 +669,20 @@ impl MarkovHead {
         if !config.uses_markov_head() {
             return Ok(0);
         }
-        let vocab = config.vocab_size;
         let rank = config.markov_rank;
-        let weights = sizing::product(&[2, vocab, rank, BF16])?;
-        let scratch = MarkovScratch::bytes(vocab, rank, config.block_size, max_decode_batch_size)?;
+        let weights = sizing::product(&[2, config.vocab_size, rank, BF16])?;
+        let scratch = MarkovScratch::bytes(
+            config.logits_rows,
+            rank,
+            config.block_size,
+            max_decode_batch_size,
+        )?;
         sizing::sum(&[weights, scratch])
     }
 }
 
 /// Scratch for the Markov sample loop, allocated once for the max decode batch.
-/// `bias` is the per-step `[rows, vocab]` logit bias; `partial_*` back the
+/// `bias` is the per-step `[rows, logits_rows]` logit bias; `partial_*` back the
 /// two-stage argmax; `prev`/`next` ping-pong the per-step token ids on device;
 /// `sampled_tokens` stores the full request-major block so the host reads once.
 pub(crate) struct MarkovScratch {
@@ -712,14 +737,14 @@ impl MarkovScratch {
             max_decode_batch_size > 0,
             "DSpark markov scratch needs a non-zero batch size"
         );
-        let vocab = config.vocab_size;
+        let logits_rows = config.logits_rows;
         let rank = config.markov_rank;
-        let partials = markov_step_argmax_partials_len(max_decode_batch_size, vocab);
+        let partials = markov_step_argmax_partials_len(max_decode_batch_size, logits_rows);
         let sampled = sizing::product(&[max_decode_batch_size, config.block_size])?;
         Ok(Self {
             max_batch: max_decode_batch_size,
             w1emb: HiddenStates::zeros(ctx, rank, max_decode_batch_size)?,
-            bias: HiddenStates::zeros(ctx, vocab, max_decode_batch_size)?,
+            bias: HiddenStates::zeros(ctx, logits_rows, max_decode_batch_size)?,
             partial_values: ctx.stream.alloc_zeros(partials)?,
             partial_indices: ctx.stream.alloc_zeros(partials)?,
             partial_values2: ctx.stream.alloc_zeros(partials)?,
@@ -753,7 +778,7 @@ impl MarkovScratch {
 
     /// Point the dense scratch at the active `rows` prefix. Allocated for the max
     /// decode batch, so this only shrinks `seq_len`; it never reallocates.
-    fn activate(&mut self, rows: usize, vocab: usize) -> Result<()> {
+    fn activate(&mut self, rows: usize, logits_rows: usize) -> Result<()> {
         anyhow::ensure!(
             rows <= self.max_batch,
             "DSpark markov batch {} exceeds scratch capacity {}",
@@ -761,10 +786,10 @@ impl MarkovScratch {
             self.max_batch
         );
         anyhow::ensure!(
-            self.bias.hidden_dim == vocab,
+            self.bias.hidden_dim == logits_rows,
             "DSpark markov scratch vocab {} != base vocab {}",
             self.bias.hidden_dim,
-            vocab
+            logits_rows
         );
         self.w1emb.seq_len = rows;
         self.bias.seq_len = rows;
@@ -772,15 +797,15 @@ impl MarkovScratch {
     }
 
     fn bytes(
-        vocab: usize,
+        logits_rows: usize,
         rank: usize,
         block_size: usize,
         max_decode_batch_size: usize,
     ) -> Result<usize> {
         const BF16: usize = 2;
-        let partials = markov_step_argmax_partials_len(max_decode_batch_size, vocab);
+        let partials = markov_step_argmax_partials_len(max_decode_batch_size, logits_rows);
         let w1emb = sizing::product(&[max_decode_batch_size, rank, BF16])?;
-        let bias = sizing::product(&[max_decode_batch_size, vocab, BF16])?;
+        let bias = sizing::product(&[max_decode_batch_size, logits_rows, BF16])?;
         // Two partials pairs: the argmax pair plus the hedge's top-2 pair.
         let partial_bytes = sizing::product(&[
             2,

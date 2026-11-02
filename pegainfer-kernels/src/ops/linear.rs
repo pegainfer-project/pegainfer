@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -10,6 +11,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -382,16 +384,9 @@ pub fn gemm_lt_pin_into_checked(
             weight.rows,
             weight.cols
         ),
-        s if s >= 100_000 => bail!(
-            "cublasLt pin GEMM failed: cublas_status={}, m={}, n={}, k={}",
-            s - 100_000,
-            weight.rows,
-            x.seq_len,
-            weight.cols
-        ),
         s => bail!(
-            "cublasLt pin GEMM launch failed: cuda_status={}, m={}, n={}, k={}",
-            s,
+            "cublasLt pin GEMM failed: {}, m={}, n={}, k={}",
+            ffi_status_detail(s),
             weight.rows,
             x.seq_len,
             weight.cols
@@ -676,18 +671,9 @@ fn gemm_per_token_into_checked(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={}, batch={}, k={}",
-                    status - 100_000,
-                    weight.rows,
-                    x.seq_len,
-                    weight.cols
-                );
-            }
             bail!(
-                "CUDA per-token GEMM launch failed: cuda_status={}, m={}, batch={}, k={}",
-                status,
+                "per-token GEMM failed: {}, m={}, batch={}, k={}",
+                ffi_status_detail(status),
                 weight.rows,
                 x.seq_len,
                 weight.cols
@@ -763,6 +749,7 @@ pub enum NumericPolicy {
 static NUMERIC_POLICY: AtomicU8 = AtomicU8::new(NumericPolicy::Tuned as u8);
 static PIN_SERVED: AtomicU64 = AtomicU64::new(0);
 static PER_TOKEN_SERVED: AtomicU64 = AtomicU64::new(0);
+static N1_MATVEC: AtomicBool = AtomicBool::new(false);
 
 /// Set the process-global policy. Must run before executor construction / graph capture (the
 /// captured algo is the one live at capture). Tests drive baseline/pin/per-token through it.
@@ -806,6 +793,29 @@ pub fn per_token_served() -> u64 {
 pub fn reset_numeric_policy_counters() {
     PIN_SERVED.store(0, Ordering::Relaxed);
     PER_TOKEN_SERVED.store(0, Ordering::Relaxed);
+}
+
+/// Route batch-1 projections through the matvec. Must run before executor
+/// construction / graph capture (the captured launch is the one live at capture).
+pub fn set_n1_matvec(enabled: bool) {
+    N1_MATVEC.store(enabled, Ordering::Release);
+}
+
+fn n1_matvec_enabled() -> bool {
+    N1_MATVEC.load(Ordering::Acquire)
+}
+
+/// Smallest output width the matvec serves. Below it the grid cannot fill the
+/// device either way, so the tiled GEMM stays.
+const GEMV_MIN_ROWS: usize = 256;
+
+/// Whether one decode token should take the matvec: the weight matrix must be
+/// read in whole 16-byte beats and both buffers 16-byte aligned.
+fn gemv_eligible(m: usize, k: usize, w: *const ffi::Half, x: *const ffi::Half) -> bool {
+    m >= GEMV_MIN_ROWS
+        && k.is_multiple_of(8)
+        && (w as usize).is_multiple_of(16)
+        && (x as usize).is_multiple_of(16)
 }
 
 /// Fixed representative N at which every (M,K) pin is resolved — one algo for ALL
@@ -860,13 +870,10 @@ fn launch_gemm_pin(
                  LoRA prefill-delta shape), or the numeric policy was set after executor \
                  construction. Run without --batch-invariant or report this shape"
             ),
-            s if s >= 100_000 => {
-                bail!(
-                    "cuBLAS pin GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    s - 100_000
-                )
-            }
-            s => bail!("CUDA pin GEMM launch failed: cuda_status={s}, m={m}, n={n}, k={k}"),
+            s => bail!(
+                "pin GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(s)
+            ),
         }
     }
 }
@@ -892,13 +899,10 @@ fn launch_gemm_pertoken(
             crate::tensor::active_cu_stream(ctx),
         );
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS per-token GEMM failed: cublas_status={}, m={m}, n={n}, k={k}",
-                    status - 100_000
-                );
-            }
-            bail!("CUDA per-token GEMM launch failed: cuda_status={status}, m={m}, n={n}, k={k}");
+            bail!(
+                "per-token GEMM failed: {}, m={m}, n={n}, k={k}",
+                ffi_status_detail(status)
+            );
         }
     }
     PER_TOKEN_SERVED.fetch_add(1, Ordering::Relaxed);
@@ -920,6 +924,28 @@ fn launch_gemm(
         NumericPolicy::Pin => return launch_gemm_pin(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::PerToken => return launch_gemm_pertoken(w_ptr, x_ptr, y_ptr, m, n, k, ctx),
         NumericPolicy::Tuned => {}
+    }
+    // Nothing is reused at N=1, so the bandwidth-shaped kernel in gemv.cu serves it.
+    if n1_matvec_enabled() && n == 1 && gemv_eligible(m, k, w_ptr, x_ptr) {
+        let status = unsafe {
+            ffi::gemv_bf16_cuda(
+                w_ptr,
+                x_ptr,
+                y_ptr,
+                m as i32,
+                k as i32,
+                crate::tensor::active_cu_stream(ctx),
+            )
+        };
+        if status != 0 {
+            bail!(
+                "GEMV failed: {}, m={}, k={}",
+                ffi_status_detail(status),
+                m,
+                k
+            );
+        }
+        return Ok(());
     }
     // Split-concurrent prefill must keep even N=1 projections on its dedicated
     // handle so it cannot rebind the graph-safe decode handle.
@@ -969,19 +995,9 @@ fn launch_gemm(
             };
         }
         if status != 0 {
-            if status >= 100_000 {
-                bail!(
-                    "cuBLAS GEMM failed: cublas_status={}, m={}, n={}, k={}, graphsafe={}",
-                    status - 100_000,
-                    m,
-                    n,
-                    k,
-                    graphsafe
-                );
-            }
             bail!(
-                "CUDA GEMM launch failed: cuda_status={}, m={}, n={}, k={}, graphsafe={}",
-                status,
+                "GEMM failed: {}, m={}, n={}, k={}, graphsafe={}",
+                ffi_status_detail(status),
                 m,
                 n,
                 k,

@@ -7,14 +7,16 @@
 use std::collections::HashSet;
 
 use anyhow::Result;
-use pegainfer_core::kv_pool::KvState;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
+use pegainfer_kv_cache::KvCacheManager;
+use pegainfer_kv_cache::RequestKv;
 
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::decode_buffers::BatchDecodeBuffers35;
 use crate::logprobs::snapshot_requested_logprobs;
+use crate::prefix_cache::Qwen35PrefixCache;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
@@ -101,23 +103,29 @@ pub struct DecodeResult {
 
 struct ActiveRequest {
     request_id: RequestId,
-    kv: KvState,
+    kv: RequestKv,
     graph_slot_idx: usize,
 }
 
 pub struct Qwen35Executor {
     model: Qwen35Model,
+    kv_cache: Qwen35PrefixCache,
     graph_state: BatchDecodeGraphState,
     active: Vec<ActiveRequest>,
 }
 
 impl Qwen35Executor {
     pub fn from_runtime(model_path: &str, device_ordinal: usize, max_batch: usize) -> Result<Self> {
-        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+        let model = Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch, 0)?;
         model.tune_decode_gemm_algos()?;
-        let graph_state = model.create_batch_decode_graph_state()?;
+        let manager =
+            KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
+        let kv_cache = Qwen35PrefixCache::new(manager, 0)?;
+        let graph_state =
+            model.create_batch_decode_graph_state(kv_cache.pool().padding_block_id())?;
         Ok(Self {
             model,
+            kv_cache,
             graph_state,
             active: Vec::new(),
         })
@@ -132,12 +140,20 @@ impl Qwen35Executor {
             self.active.len() + plan.requests.len() <= self.graph_state.slot_states.len(),
             "Qwen3.5 prefill would exceed logits executor capacity"
         );
+        let max_position_embeddings = self.model.config().max_position_embeddings;
         let mut seen = HashSet::with_capacity(plan.requests.len());
         for req in plan.requests {
             anyhow::ensure!(
                 !req.prompt_tokens.is_empty(),
                 "Qwen3.5 logits executor prefill request {} has an empty prompt",
                 req.request_id.get()
+            );
+            anyhow::ensure!(
+                req.prompt_tokens.len() < max_position_embeddings,
+                "Qwen3.5 logits executor prefill request {} with {} prompt tokens leaves no room in the {}-token context window",
+                req.request_id.get(),
+                req.prompt_tokens.len(),
+                max_position_embeddings
             );
             anyhow::ensure!(
                 seen.insert(req.request_id),
@@ -159,11 +175,32 @@ impl Qwen35Executor {
             .iter()
             .map(|req| req.prompt_tokens.as_slice())
             .collect();
-        let mut kv_states: Vec<KvState> = plan
+        let mut kv_states: Vec<RequestKv> = plan
             .requests
             .iter()
-            .map(|_| self.model.alloc_kv())
+            .map(|req| {
+                self.kv_cache.pool().new_request(
+                    req.prompt_tokens.clone(),
+                    max_position_embeddings - req.prompt_tokens.len(),
+                    None,
+                )
+            })
             .collect();
+        for scheduled in 0..kv_states.len() {
+            if let Err(error) = self.kv_cache.schedule_prefill(
+                &mut kv_states[scheduled],
+                plan.requests[scheduled].prompt_tokens.len(),
+            ) {
+                self.kv_cache
+                    .revert_scheduled_requests(kv_states.iter_mut().take(scheduled));
+                return Err(error);
+            }
+        }
+        let views = kv_states
+            .iter()
+            .zip(plan.requests)
+            .map(|(kv, req)| self.kv_cache.prefill_view(kv, req.prompt_tokens.len()))
+            .collect::<Vec<_>>();
         let mut recurrent_states: Vec<RecurrentState> = plan
             .requests
             .iter()
@@ -176,9 +213,18 @@ impl Qwen35Executor {
             })
             .collect::<Result<_>>()?;
         let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits =
-            self.model
-                .batch_prefill_logits(&prompts, &mut kv_states, &mut recurrent_refs)?;
+        let logits = match self.model.batch_prefill_logits(
+            &prompts,
+            &views,
+            &mut recurrent_refs,
+            self.kv_cache.buffer(),
+        ) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.kv_cache.revert_scheduled_requests(&mut kv_states);
+                return Err(error);
+            }
+        };
 
         let requested_logprobs: Vec<Option<usize>> =
             plan.requests.iter().map(|req| req.logprobs).collect();
@@ -188,8 +234,9 @@ impl Qwen35Executor {
             select_default_tokens_from_logits(&self.model, &logits, &mut self.graph_state.buffers)?;
 
         let mut results = Vec::with_capacity(plan.requests.len());
-        for (i, (req, kv)) in plan.requests.iter().zip(kv_states).enumerate() {
+        for (i, (req, mut kv)) in plan.requests.iter().zip(kv_states).enumerate() {
             let first_token = tokens[i];
+            self.kv_cache.apply_prefill(&mut kv, Some(first_token))?;
             let first_token_logprob = cpu_logits[i].as_ref().and_then(|(row, top_k)| {
                 pegainfer_sample::token_logprob_from_row(row, first_token, *top_k)
             });
@@ -231,14 +278,36 @@ impl Qwen35Executor {
         }
 
         let token_ids: Vec<u32> = plan.requests.iter().map(|req| req.token_id).collect();
-        let mut kv_refs: Vec<&mut KvState> =
-            self.active.iter_mut().map(|req| &mut req.kv).collect();
-        self.model.batch_decode_graph(
+        for scheduled in 0..self.active.len() {
+            if let Err(error) = self
+                .kv_cache
+                .schedule_decode(&mut self.active[scheduled].kv)
+            {
+                self.kv_cache.revert_scheduled_requests(
+                    self.active
+                        .iter_mut()
+                        .take(scheduled)
+                        .map(|active| &mut active.kv),
+                );
+                return Err(error);
+            }
+        }
+        let views = self
+            .active
+            .iter()
+            .map(|req| self.kv_cache.decode_view(&req.kv))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.model.batch_decode_graph(
             &token_ids,
-            &mut kv_refs,
+            &views,
+            self.kv_cache.buffer(),
             &mut self.graph_state,
             crate::batch_decode::DecodeGraphUse::Serve,
-        )?;
+        ) {
+            self.kv_cache
+                .revert_scheduled_requests(self.active.iter_mut().map(|active| &mut active.kv));
+            return Err(error);
+        }
 
         let requested_logprobs: Vec<Option<usize>> =
             plan.requests.iter().map(|req| req.logprobs).collect();
@@ -258,6 +327,7 @@ impl Qwen35Executor {
         let mut results = Vec::with_capacity(plan.requests.len());
         for (i, req) in plan.requests.iter().enumerate() {
             let token = tokens[i];
+            self.kv_cache.apply_decode(&mut self.active[i].kv, token)?;
             let logprob = cpu_logits[i].as_ref().and_then(|(row, top_k)| {
                 pegainfer_sample::token_logprob_from_row(row, token, *top_k)
             });
@@ -281,9 +351,11 @@ impl Qwen35Executor {
         self.compact_slot(idx)
     }
 
+    /// Remove one active request and keep the dense CUDA Graph slot layout.
     fn compact_slot(&mut self, idx: usize) -> Result<()> {
         let last = self.active.len() - 1;
-        self.active.swap_remove(idx);
+        let mut removed = self.active.swap_remove(idx);
+        let release_result = self.kv_cache.release_request(&mut removed.kv);
 
         if idx < self.active.len() {
             anyhow::ensure!(
@@ -323,7 +395,7 @@ impl Qwen35Executor {
             self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
             self.active[idx].graph_slot_idx = idx;
         }
-        Ok(())
+        release_result
     }
 }
 

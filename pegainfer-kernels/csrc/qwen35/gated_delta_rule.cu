@@ -127,17 +127,19 @@ __global__ void gated_delta_rule_decode_kernel(
     float* my_state = state + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_J_PER_SLICE;
-    int j_end = j_start + GDR_J_PER_SLICE;
 
     // ========================================================================
-    // Pass 1: Decay + partial kv_mem (each j_slice handles 32 j-iterations)
+    // Pass 1: Decay + partial kv_mem. The key slice lives in registers across
+    // the kv_mem reduction: global memory sees one read and one write per
+    // element instead of a decay-store/reload round-trip.
     // ========================================================================
+    float s_reg[GDR_J_PER_SLICE];
     float partial_kv = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s *= exp_g;
-        my_state[j * val_dim + val_idx] = s;
-        partial_kv += s * smem_k[j];
+#pragma unroll
+    for (int r = 0; r < GDR_J_PER_SLICE; ++r) {
+        int j = j_start + r;
+        s_reg[r] = my_state[j * val_dim + val_idx] * exp_g;
+        partial_kv += s_reg[r] * smem_k[j];
     }
 
     // Reduce partial kv_mem across j_slices
@@ -150,14 +152,15 @@ __global__ void gated_delta_rule_decode_kernel(
     float my_delta = (v_val - kv_mem) * beta;
 
     // ========================================================================
-    // Pass 2: Rank-1 update + partial output
+    // Pass 2: Rank-1 update + partial output (registers -> single store)
     // ========================================================================
     float partial_out = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s += my_delta * smem_k[j];
-        my_state[j * val_dim + val_idx] = s;
-        partial_out += s * smem_q[j];
+#pragma unroll
+    for (int r = 0; r < GDR_J_PER_SLICE; ++r) {
+        int j = j_start + r;
+        s_reg[r] += my_delta * smem_k[j];
+        my_state[j * val_dim + val_idx] = s_reg[r];
+        partial_out += s_reg[r] * smem_q[j];
     }
 
     // Reduce partial output across j_slices, j_slice=0 writes result
@@ -171,6 +174,9 @@ __global__ void gated_delta_rule_decode_kernel(
     }
 }
 
+// `b_proj_batch` and `a_proj_batch` may be bands of one fused beta/alpha
+// projection: the caller says how far apart two slots sit in the tensor each is
+// a band of, and the band's own width is `num_value_heads`.
 __global__ void gated_delta_rule_decode_batch_kernel(
     const __nv_bfloat16* __restrict__ qkv_batch,   // [batch, qkv_dim]
     const __nv_bfloat16* __restrict__ b_proj_batch, // [batch, num_value_heads]
@@ -182,7 +188,9 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     int num_key_heads,
     int num_value_heads,
     int key_dim,
-    int val_dim
+    int val_dim,
+    int b_stride,
+    int a_stride
 ) {
     int slot = blockIdx.y;
     int v_head = blockIdx.x;
@@ -197,8 +205,8 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     int qkv_dim = q_dim_total + k_dim_total + num_value_heads * val_dim;
 
     const __nv_bfloat16* qkv = qkv_batch + (size_t)slot * qkv_dim;
-    const __nv_bfloat16* b_proj = b_proj_batch + (size_t)slot * num_value_heads;
-    const __nv_bfloat16* a_proj = a_proj_batch + (size_t)slot * num_value_heads;
+    const __nv_bfloat16* b_proj = b_proj_batch + (size_t)slot * b_stride;
+    const __nv_bfloat16* a_proj = a_proj_batch + (size_t)slot * a_stride;
 
     __shared__ float smem_q[GDR_KEY_DIM];
     __shared__ float smem_k[GDR_KEY_DIM];
@@ -264,14 +272,17 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     float* my_state = state + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_J_PER_SLICE;
-    int j_end = j_start + GDR_J_PER_SLICE;
 
+    // The key slice lives in registers across the kv_mem reduction: global
+    // memory sees one read and one write per element instead of a
+    // decay-store/reload round-trip between the two passes.
+    float s_reg[GDR_J_PER_SLICE];
     float partial_kv = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s *= exp_g;
-        my_state[j * val_dim + val_idx] = s;
-        partial_kv += s * smem_k[j];
+#pragma unroll
+    for (int r = 0; r < GDR_J_PER_SLICE; ++r) {
+        int j = j_start + r;
+        s_reg[r] = my_state[j * val_dim + val_idx] * exp_g;
+        partial_kv += s_reg[r] * smem_k[j];
     }
 
     smem_kv_partial[j_slice][val_idx] = partial_kv;
@@ -282,11 +293,12 @@ __global__ void gated_delta_rule_decode_batch_kernel(
     float my_delta = (v_val - kv_mem) * beta;
 
     float partial_out = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s += my_delta * smem_k[j];
-        my_state[j * val_dim + val_idx] = s;
-        partial_out += s * smem_q[j];
+#pragma unroll
+    for (int r = 0; r < GDR_J_PER_SLICE; ++r) {
+        int j = j_start + r;
+        s_reg[r] += my_delta * smem_k[j];
+        my_state[j * val_dim + val_idx] = s_reg[r];
+        partial_out += s_reg[r] * smem_q[j];
     }
 
     smem_out_partial[j_slice][val_idx] = partial_out;
@@ -337,12 +349,15 @@ void gated_delta_rule_decode_batch_cuda(
     int num_value_heads,
     int key_dim,
     int val_dim,
+    int b_stride,
+    int a_stride,
     cudaStream_t stream
 ) {
     dim3 grid(num_value_heads, batch_size);
     gated_delta_rule_decode_batch_kernel<<<grid, GDR_BLOCK_DIM, 0, stream>>>(
         qkv_batch, b_proj_batch, a_proj_batch, dt_bias, A_log, state_ptrs,
-        output_batch, num_key_heads, num_value_heads, key_dim, val_dim
+        output_batch, num_key_heads, num_value_heads, key_dim, val_dim,
+        b_stride, a_stride
     );
 }
 

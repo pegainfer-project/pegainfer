@@ -51,9 +51,9 @@ async fn qwen35_tp2_serves_openai_completions_over_http() -> Result<()> {
     };
     let frontend_model_path = PathBuf::from(frontend_model_path);
     // P2c graph acceptance smoke: CUDA Graph requested at TP2. Models with a
-    // compiled TP-local decode GQA group (4B/9B) replay pre-captured decode
-    // graphs; uncompiled groups (27B group 6) stay on the batched eager path
-    // under the same serving flow.
+    // compiled TP-local decode GQA group replay pre-captured decode graphs;
+    // uncompiled groups stay on the batched eager path under the same serving
+    // flow.
     let server = spawn_ready_server(engine_model_path, frontend_model_path, 1).await?;
     let client = test_client()?;
 
@@ -93,11 +93,12 @@ async fn spawn_ready_server(
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
         pegainfer_frontend::vllm::serve(
-            std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Handle(
+            std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Stepped(
                 handle,
             ))),
             &frontend_model_path,
             vec![MODEL_NAME.to_string()],
+            pegainfer_frontend::vllm::ParserSelection::Auto,
             port,
             None,
             server_shutdown,

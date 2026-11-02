@@ -1,27 +1,15 @@
-use std::sync::Arc;
-
 use dynamo_kv_hashing::compute_salt_hash;
-use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_logical::blocks::MutableBlock;
-use kvbm_logical::events::EventsManager;
-use kvbm_logical::events::KvCacheEvent;
 use kvbm_logical::integrations::DecodeOutcome;
 use kvbm_logical::integrations::SchedulableSequence;
 use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
-use tokio::sync::broadcast;
 
 use crate::view::KvView;
-
-/// Broadcast capacity for the opt-in KV-event feed. Generous: the scheduler
-/// drains it every step, but a step can register/evict many blocks, and a
-/// dropped event silently desyncs the router's prefix tree. Only allocated on
-/// the [`BlockPool::with_events`] path.
-const KV_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -36,44 +24,12 @@ pub struct BlockPool {
 
 impl BlockPool {
     pub fn new(block_size: usize, num_blocks: usize) -> anyhow::Result<Self> {
-        Self::build(block_size, num_blocks, BlockRegistry::builder().build())
-    }
-
-    /// Like [`new`](Self::new), but the pool also emits block store/remove
-    /// events for an out-of-band cache-aware router, returned as a raw broadcast
-    /// receiver to drain synchronously. The stream carries `Create` events too
-    /// (the emission policy can't separate them) — the consumer ignores `Create`
-    /// and sources richer store events from the seal site, and maps the lineage
-    /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
-    /// default: plain single-machine serving uses [`new`](Self::new) and pays
-    /// neither the per-block event attachment nor the channel.
-    pub(crate) fn with_events(
-        block_size: usize,
-        num_blocks: usize,
-    ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
-        // Default emission policy is AllEventsPolicy (every block tracked).
-        let events = Arc::new(
-            EventsManager::builder()
-                .channel_capacity(KV_EVENT_CHANNEL_CAPACITY)
-                .build(),
-        );
-        let rx = events.subscribe_receiver();
-        let registry = BlockRegistry::builder().event_manager(events).build();
-        let pool = Self::build(block_size, num_blocks, registry)?;
-        Ok((pool, rx))
-    }
-
-    fn build(
-        block_size: usize,
-        num_blocks: usize,
-        registry: BlockRegistry,
-    ) -> anyhow::Result<Self> {
         anyhow::ensure!(num_blocks >= 2, "need at least 2 blocks (1 for padding)");
 
         let block_manager = BlockManager::builder()
             .block_count(num_blocks)
             .block_size(block_size)
-            .registry(registry)
+            .registry(BlockRegistry::builder().build())
             .duplication_policy(BlockDuplicationPolicy::Allow)
             .with_lru_backend()
             .build()
@@ -130,6 +86,21 @@ impl BlockPool {
         self.block_manager.evict_inactive();
     }
 
+    /// Return active prompt-prefix hashes without promoting inactive entries or
+    /// keeping the matched blocks alive.
+    pub fn active_prefix_hashes(
+        &self,
+        prompt_tokens: Vec<u32>,
+        lora_name: Option<&str>,
+    ) -> Vec<[u8; 16]> {
+        let num_input = prompt_tokens.len();
+        let request = self.new_request(prompt_tokens, 0, lora_name);
+        let hashes = request.seq.inner().sequence().all_sequence_hashes();
+        let cacheable = num_input.saturating_sub(1) / self.block_size;
+        let active = self.block_manager.active_prefix_len(&hashes).min(cacheable);
+        hashes[..active].iter().map(sequence_hash_bytes).collect()
+    }
+
     /// `lora_name` scopes the prefix cache: blocks registered under one
     /// adapter (or the base model, `None`) never match a request running
     /// under a different adapter — the name is folded into the block-hash
@@ -165,10 +136,7 @@ impl BlockPool {
             None,
             Some(salt_hash),
         );
-        RequestKv {
-            seq,
-            emitted_blocks: 0,
-        }
+        RequestKv { seq }
     }
 
     // ── KV-offload prefetch (CPU-tier load before prefill) ─────────────
@@ -208,6 +176,7 @@ impl BlockPool {
             seq_hashes,
             gpu_hit,
             cacheable,
+            block_size: self.block_size,
             held: gpu_guard,
         }
     }
@@ -251,6 +220,8 @@ pub struct PrefixProbe {
     gpu_hit: usize,
     /// Reuse cap: blocks past this are never matched (the final chunk forwards).
     cacheable: usize,
+    /// Tokens represented by one complete KV block.
+    block_size: usize,
     /// Strong refs keeping matched/loaded blocks resident until prefill.
     held: Vec<ImmutableBlock<()>>,
 }
@@ -267,6 +238,37 @@ impl PrefixProbe {
     /// request's block need (avoiding a double-count against `available_blocks`).
     pub fn held_blocks(&self) -> usize {
         self.held.len()
+    }
+
+    /// Complete prefix blocks eligible for request reuse.
+    ///
+    /// This is capped by the final-token rule even if a caller extended the
+    /// probe with additional loaded blocks.
+    pub fn reusable_blocks(&self) -> usize {
+        self.held.len().min(self.cacheable)
+    }
+
+    /// Returns the lineage hash identifying the complete reusable prefix ending
+    /// at `boundary_tokens`.
+    ///
+    /// `boundary_tokens` is measured in tokens. For example,
+    /// with a 16-token block size, `boundary_hash(32)` identifies the token
+    /// prefix `[0, 32)`. The returned hash covers the full prefix lineage,
+    /// rather than only the contents of the final block.
+    ///
+    /// Returns `None` when the boundary is zero, is not block-aligned, or
+    /// exceeds the reusable prefix.
+    pub fn boundary_hash(&self, boundary_tokens: usize) -> Option<[u8; 16]> {
+        if boundary_tokens == 0 || !boundary_tokens.is_multiple_of(self.block_size) {
+            return None;
+        }
+        let block_count = boundary_tokens / self.block_size;
+        if block_count > self.reusable_blocks() {
+            return None;
+        }
+        self.seq_hashes
+            .get(block_count - 1)
+            .map(sequence_hash_bytes)
     }
 
     /// Content hashes to query the CPU tier with: the blocks past the GPU hit,
@@ -329,13 +331,6 @@ impl LoadReservation {
 /// loop (`revert_schedule` undoes a reservation whose step failed).
 pub struct RequestKv {
     seq: SchedulableSequence<()>,
-    /// Cursor for [`Self::take_newly_registered_blocks`]: how many of this
-    /// request's sequence blocks have already been surfaced as KV-router store
-    /// events. Starts past the prefix-cache hit (those were stored by whoever
-    /// first sealed them — this assumes GPU-resident reuse, i.e. KV offload off,
-    /// which holds wherever the event feed is enabled). Untouched on the plain
-    /// path where the feed is off.
-    emitted_blocks: usize,
 }
 
 impl RequestKv {
@@ -349,15 +344,47 @@ impl RequestKv {
     /// Matching always leaves at least one prompt token uncached so the
     /// final prefill chunk can emit the first generated token.
     pub fn match_and_add_prefix(&mut self, pool: &BlockPool) -> anyhow::Result<usize> {
+        self.match_and_add_prefix_up_to(pool, usize::MAX)
+    }
+
+    /// Match and attach no more than `max_blocks` of the resident prefix.
+    ///
+    /// The underlying sequence still enforces the final-token cap. A caller
+    /// can hold a [`PrefixProbe`] while invoking this method to ensure the
+    /// selected blocks remain resident between joint-state lookup and attach.
+    pub fn match_and_add_prefix_up_to(
+        &mut self,
+        pool: &BlockPool,
+        max_blocks: usize,
+    ) -> anyhow::Result<usize> {
         let blocks = self
             .seq
-            .match_and_add_prefix(&pool.block_manager)
-            .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
-        // Prefix-hit blocks are already in the router's tree (whoever first
-        // sealed them stored them, and a GPU hit means they were never evicted),
-        // so the store-event cursor skips them.
-        self.emitted_blocks = self.seq.assigned_blocks();
+            .match_and_add_prefix_up_to(&pool.block_manager, max_blocks)
+            .map_err(|e| anyhow::anyhow!("match_and_add_prefix_up_to: {e}"))?;
         Ok(blocks * self.seq.block_size())
+    }
+
+    /// Returns the lineage hash identifying the registered prefix ending at
+    /// `boundary_tokens`.
+    ///
+    /// `boundary_tokens` must be a non-zero multiple of the KV `block_size`,
+    /// and be no more than the number of blocks already registered by this request;
+    /// otherwise this method returns `None`.
+    pub fn registered_boundary_hash(&self, boundary_tokens: usize) -> Option<[u8; 16]> {
+        let block_size = self.seq.block_size();
+        if boundary_tokens == 0 || !boundary_tokens.is_multiple_of(block_size) {
+            return None;
+        }
+        let block_count = boundary_tokens / block_size;
+        if block_count > self.seq.assigned_blocks() {
+            return None;
+        }
+        self.seq
+            .inner()
+            .sequence()
+            .all_sequence_hashes()
+            .get(block_count - 1)
+            .map(sequence_hash_bytes)
     }
 
     // ── Scheduling (allocates blocks) ──────────────────────────────────
@@ -599,52 +626,6 @@ impl RequestKv {
     pub fn prefix_matched_blocks(&self) -> usize {
         self.seq.inner().prefix_matched_blocks()
     }
-
-    /// Blocks this request has registered (made cacheable) since the last call,
-    /// in the u64 hash space a KV-router consumes plus the kvbm lineage hash.
-    ///
-    /// A block becomes reusable by other requests once it is *registered*
-    /// (assigned an `ImmutableBlock`), which lags sealing the token block by a
-    /// step. Diffs the registered count against an internal cursor and returns
-    /// the new run in sequence order; prefix-cache hits are skipped (see
-    /// [`Self::emitted_blocks`]). Empty when nothing new registered this step.
-    pub fn take_newly_registered_blocks(&mut self) -> Vec<RegisteredBlock> {
-        let registered = self.seq.assigned_blocks();
-        if registered <= self.emitted_blocks {
-            return Vec::new();
-        }
-        let blocks = self.seq.inner().sequence().blocks();
-        debug_assert!(
-            registered <= blocks.len(),
-            "registered blocks ({registered}) exceed sealed token blocks ({})",
-            blocks.len()
-        );
-        let new = blocks[self.emitted_blocks..registered]
-            .iter()
-            .map(|b| RegisteredBlock {
-                plh: b.kvbm_sequence_hash().as_u128(),
-                sequence_hash: b.sequence_hash(),
-                tokens_hash: b.block_hash(),
-                parent_sequence_hash: b.parent_sequence_hash(),
-            })
-            .collect();
-        self.emitted_blocks = registered;
-        new
-    }
-}
-
-/// One full KV block a request just registered, ready to become a KV-router
-/// store event. `sequence_hash`/`tokens_hash`/`parent_sequence_hash` are the
-/// router's u64 hashes (`dynamo_tokens::TokenBlock` accessors, identical by
-/// construction to what the router recomputes); `plh` is the engine's 128-bit
-/// lineage hash, kept only to correlate an eviction event (which carries the
-/// lineage hash) back to `sequence_hash`.
-#[derive(Clone, Copy, Debug)]
-pub struct RegisteredBlock {
-    pub plh: u128,
-    pub sequence_hash: u64,
-    pub tokens_hash: u64,
-    pub parent_sequence_hash: Option<u64>,
 }
 
 /// Pack a kvbm [`SequenceHash`] (lineage hash) into the 16-byte content key the
@@ -691,6 +672,19 @@ mod tests {
     }
 
     #[test]
+    fn active_prefix_hashes_exclude_reclaimable_entries() {
+        let pool = BlockPool::new(16, 8).expect("pool");
+        let prompt = vec![7; 40];
+        let mut request = pool.new_request(prompt.clone(), 0, None);
+        request.schedule_prefill(32, &pool).expect("schedule");
+        request.apply_prefill_chunk(&pool).expect("apply");
+
+        assert_eq!(pool.active_prefix_hashes(prompt.clone(), None).len(), 2);
+        request.release().expect("release");
+        assert!(pool.active_prefix_hashes(prompt, None).is_empty());
+    }
+
+    #[test]
     fn cache_salt_isolates_request_and_probe_prefixes() {
         let pool = BlockPool::new(16, 32).unwrap();
         let prompt = vec![7u32; 48]; // 3 full blocks
@@ -734,6 +728,57 @@ mod tests {
             32,
             "the same cache salt must preserve ordinary prefix reuse"
         );
+    }
+
+    #[test]
+    fn probe_and_attach_can_select_a_shorter_exact_boundary() {
+        let pool = BlockPool::new(16, 32).unwrap();
+        let prompt = (0..80u32).collect::<Vec<_>>();
+
+        let mut seed = pool.new_request(prompt[..64].to_vec(), 4, None);
+        seed.schedule_prefill(64, &pool).expect("seed schedule");
+        seed.apply_prefill(9000, &pool).expect("seed apply");
+        assert_eq!(
+            seed.registered_boundary_hash(32),
+            Some(seed.prompt_block_hashes()[1])
+        );
+        seed.release().expect("seed release");
+
+        let probe = pool.probe_prefix(prompt.clone(), None);
+        assert_eq!(probe.gpu_hit_blocks(), 4);
+        assert_eq!(probe.reusable_blocks(), 4);
+        let boundary_hash = probe.boundary_hash(32).expect("32-token boundary");
+
+        let mut warm = pool.new_request(prompt, 4, None);
+        let matched = warm
+            .match_and_add_prefix_up_to(&pool, 2)
+            .expect("exact attach");
+        assert_eq!(matched, 32);
+        assert_eq!(warm.kv_position(), 32);
+        assert_eq!(warm.prefix_matched_blocks(), 2);
+        assert_eq!(warm.registered_boundary_hash(32), Some(boundary_hash));
+    }
+
+    #[test]
+    fn probe_boundary_hash_obeys_reusable_cap_and_final_token_rule() {
+        let pool = BlockPool::new(16, 32).unwrap();
+        let prompt = (0..64u32).collect::<Vec<_>>();
+        let mut seed = pool.new_request(prompt.clone(), 4, None);
+        seed.schedule_prefill(64, &pool).expect("seed schedule");
+        seed.apply_prefill(9000, &pool).expect("seed apply");
+        seed.release().expect("seed release");
+
+        let probe = pool.probe_prefix(prompt, None);
+        assert_eq!(probe.gpu_hit_blocks(), 4);
+        assert_eq!(
+            probe.reusable_blocks(),
+            3,
+            "one prompt token must remain uncached"
+        );
+        assert!(probe.boundary_hash(0).is_none());
+        assert!(probe.boundary_hash(47).is_none());
+        assert!(probe.boundary_hash(48).is_some());
+        assert!(probe.boundary_hash(64).is_none());
     }
 
     fn complete_non_retained_speculative_request(

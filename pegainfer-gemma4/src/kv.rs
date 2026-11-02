@@ -3,13 +3,13 @@
 
 use std::collections::VecDeque;
 
+use anyhow::Context as _;
 use anyhow::Result;
-use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::kv_pool::KvReservation;
 use pegainfer_core::kv_pool::KvState;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct ReleaseState {
     frontier: usize,
     origin_pages: usize,
@@ -23,11 +23,26 @@ struct ReleaseStep {
     page_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct ReleasePlan {
     frontier: usize,
     origin_pages: usize,
     release_pages: usize,
+}
+
+/// The release law: the sliding family's first resident page at `frontier`.
+pub(crate) fn origin_pages_at(frontier: usize, window: usize, page_size: usize) -> usize {
+    frontier.saturating_sub(window) / page_size
+}
+
+/// The least frontier whose origin reaches `origin_pages`, the inverse of
+/// [`origin_pages_at`].
+pub(crate) fn frontier_reaching(origin_pages: usize, window: usize, page_size: usize) -> usize {
+    if origin_pages == 0 {
+        0
+    } else {
+        origin_pages * page_size + window
+    }
 }
 
 fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
@@ -35,7 +50,7 @@ fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
         .frontier
         .checked_add(step.tokens)
         .ok_or_else(|| anyhow::anyhow!("the KV frontier overflows while advancing"))?;
-    let origin_pages = frontier.saturating_sub(step.window) / step.page_size;
+    let origin_pages = origin_pages_at(frontier, step.window, step.page_size);
     let release_pages = origin_pages.checked_sub(state.origin_pages).ok_or_else(|| {
         anyhow::anyhow!(
             "the origin is already {} pages in where a frontier of {frontier} allows {origin_pages}",
@@ -53,6 +68,14 @@ fn plan_release(state: ReleaseState, step: ReleaseStep) -> Result<ReleasePlan> {
         origin_pages,
         release_pages,
     })
+}
+
+/// A step over `[start, kv_len)` seen from the resident row, whose first page
+/// is position zero.
+pub(crate) struct ResidentSpan {
+    pub(crate) start: usize,
+    pub(crate) pages: usize,
+    pub(crate) last_page_len: usize,
 }
 
 /// The local family's state once the window can move: pages are held as
@@ -119,15 +142,38 @@ impl SlidingLocalKv {
         }
     }
 
-    pub(crate) fn layout(&self) -> &KvLayout {
-        self.pool.layout()
+    /// The step writing `[start, kv_len)`, whose admission left the row
+    /// holding exactly the pages that cover it.
+    pub(crate) fn resident_span(&self, start: usize, kv_len: usize) -> Result<ResidentSpan> {
+        let page = self.pool.layout().page_size;
+        let origin_tokens = self.origin_pages * page;
+        let rel_kv_len = kv_len
+            .checked_sub(origin_tokens)
+            .context("the resident window starts past the step's frontier")?;
+        let rel_start = start
+            .checked_sub(origin_tokens)
+            .context("the step starts before the resident window")?;
+        let pages = rel_kv_len.div_ceil(page);
+        anyhow::ensure!(
+            self.resident.len() == pages,
+            "local resident row of {} pages against {rel_kv_len} tokens",
+            self.resident.len()
+        );
+        Ok(ResidentSpan {
+            start: rel_start,
+            pages,
+            last_page_len: match rel_kv_len % page {
+                0 => page,
+                remainder => remainder,
+            },
+        })
     }
 
     pub(crate) fn belongs_to(&self, pool: &KvPool) -> bool {
         std::ptr::eq(self.pool.buffer(), pool.buffer())
     }
 
-    pub(crate) fn extend_resident(&mut self, pages: Vec<KvReservation>) {
+    fn extend_resident(&mut self, pages: Vec<KvReservation>) {
         self.resident.extend(pages);
     }
 
@@ -164,16 +210,124 @@ impl SlidingLocalKv {
     }
 }
 
-pub(crate) struct GemmaKv {
+/// One rank's KV families. The per-rank entry points take this, so a step
+/// drives exactly the families of the rank it was activated on.
+pub(crate) struct RankKv {
     pub(crate) local: SlidingLocalKv,
     pub(crate) global: KvState,
+    /// The request's id, shared by every rank of one multi-rank state.
+    id: u64,
+}
+
+/// The id a [`RankKv`] carries until [`GemmaKv::multi`] hands every rank of one
+/// request the same one. It is distinct from every id `multi` issues, so a state
+/// built outside `multi` can neither collide with — nor fool the steady-decode
+/// fingerprint of — a real request.
+const NO_REQUEST_ID: u64 = u64::MAX;
+
+impl RankKv {
+    pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
+        Self {
+            local,
+            global,
+            id: NO_REQUEST_ID,
+        }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// A request's KV across the tensor-parallel group: rank 0's families in
+/// `core`, the other ranks' in `twins`. [`Deref`](std::ops::Deref) exposes
+/// `core`, so single-rank code and rank-0 steps read `kv.local` / `kv.global`
+/// unchanged; the engine drives a rank-`r` step through
+/// [`GemmaKv::core_mut`] with that rank's own serve.
+pub(crate) struct GemmaKv {
+    core: RankKv,
+    twins: Vec<RankKv>,
+}
+
+impl std::ops::Deref for GemmaKv {
+    type Target = RankKv;
+
+    fn deref(&self) -> &RankKv {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for GemmaKv {
+    fn deref_mut(&mut self) -> &mut RankKv {
+        &mut self.core
+    }
+}
+
+impl GemmaKv {
+    pub(crate) fn new(local: SlidingLocalKv, global: KvState) -> Self {
+        Self::multi(RankKv::new(local, global), Vec::new())
+    }
+
+    /// One `RankKv` per rank: `core` is rank 0's, `twins` the rest. Every rank
+    /// carries the same request id. The caller hands in exactly one twin per
+    /// extra rank, in rank order — the same world the geometry was built for.
+    pub(crate) fn multi(mut core: RankKv, mut twins: Vec<RankKv>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        core.id = id;
+        for twin in &mut twins {
+            twin.id = id;
+        }
+        Self { core, twins }
+    }
+
+    /// The family pair `rank` owns, for reading (0 is `core`). A rank past the
+    /// twins is a caller bug rather than a runtime condition, so say which rank
+    /// was asked for instead of an index panic.
+    pub(crate) fn core(&self, rank: usize) -> &RankKv {
+        if rank == 0 {
+            &self.core
+        } else {
+            match self.twins.get(rank - 1) {
+                Some(twin) => twin,
+                None => panic!(
+                    "rank {rank} is outside the {}-rank KV",
+                    self.twins.len() + 1
+                ),
+            }
+        }
+    }
+
+    /// The family pair `rank` owns (0 is `core`).
+    pub(crate) fn core_mut(&mut self, rank: usize) -> &mut RankKv {
+        if rank == 0 {
+            &mut self.core
+        } else {
+            let twins = self.twins.len() + 1;
+            match self.twins.get_mut(rank - 1) {
+                Some(twin) => twin,
+                None => panic!("rank {rank} is outside the {twins}-rank KV"),
+            }
+        }
+    }
+
+    /// Both halves at once: rank 0's `core` and one `&mut` per twin, so a driver
+    /// that hands each rank to its own thread gets disjoint borrows.
+    pub(crate) fn split(&mut self) -> (&mut RankKv, &mut [RankKv]) {
+        (&mut self.core, &mut self.twins)
+    }
+
+    /// How many ranks this request's KV spans.
+    pub(crate) fn world(&self) -> usize {
+        self.twins.len() + 1
+    }
 }
 
 /// Pages a family still has to reserve to cover `kv_len` tokens, given what
 /// its account already holds — the exact frontier account, a ceiling over
 /// the post-step kv_len. `None` means the account is already past the
 /// frontier: a bookkeeping error, not a surplus to spend.
-pub(crate) fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
+fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize) -> Option<usize> {
     kv_len.div_ceil(page_size).checked_sub(accounted)
 }
 
@@ -182,7 +336,7 @@ pub(crate) fn pages_to_reserve(kv_len: usize, accounted: usize, page_size: usize
 pub(crate) fn admit_tokens(
     local_pool: &KvPool,
     global_pool: &KvPool,
-    kv: &mut GemmaKv,
+    kv: &mut RankKv,
     new_tokens: usize,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -270,7 +424,19 @@ pub(crate) fn admit_tokens(
     }
 }
 
-pub(crate) const PAGE_SIZE: usize = 16;
+/// The sliding family's page, the generated prefill's key tile: a tile load
+/// has to be one copy spanning the whole tile, and a tile assembled from
+/// four 16-row pages costs more than the generic kernel it replaces. The
+/// front is released page by page, so the resident window carries at most
+/// 63 tokens past the window -- 6% of it, and a few dozen megabytes a
+/// request across the family.
+pub(crate) const LOCAL_PAGE_SIZE: usize = 64;
+
+/// The global family's page, sized so one key block is one tile load: at this
+/// head dim a 64-row page keeps nearly a contiguous tensor's throughput where
+/// four 16-row pages keep about half. The pool never releases a global page,
+/// so the coarser granularity costs at most 63 tokens per request.
+pub(crate) const GLOBAL_PAGE_SIZE: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -278,17 +444,17 @@ mod tests {
 
     use super::*;
 
+    /// The local family has to be able to grant what the global one refuses,
+    /// or the refusal lands before any reservation exists to roll back and
+    /// the atomicity test passes without exercising the rollback.
     fn tiny_pools(ctx: &DeviceContext) -> (KvPool, KvPool) {
-        let local = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 4).expect("local pool");
-        let global = KvPool::new(ctx, 1, 1, 1, PAGE_SIZE, 2).expect("global pool");
+        let local = KvPool::new(ctx, 1, 1, 1, LOCAL_PAGE_SIZE, 8).expect("local pool");
+        let global = KvPool::new(ctx, 1, 1, 1, GLOBAL_PAGE_SIZE, 2).expect("global pool");
         (local, global)
     }
 
     fn kv_from(local: &KvPool, global: &KvPool) -> GemmaKv {
-        GemmaKv {
-            local: SlidingLocalKv::new(local.clone()),
-            global: global.alloc(),
-        }
+        GemmaKv::new(SlidingLocalKv::new(local.clone()), global.alloc())
     }
 
     #[test]
@@ -297,14 +463,24 @@ mod tests {
         let ctx = DeviceContext::new().expect("GPU required");
         let (local, global) = tiny_pools(&ctx);
         let mut kv = kv_from(&local, &global);
-        let refused = admit_tokens(&local, &global, &mut kv, 17);
-        assert!(refused.is_err(), "partial admission must refuse");
-        assert_eq!(local.available_pages(), 3, "local occupancy must roll back");
-        assert_eq!(global.available_pages(), 1, "global occupancy untouched");
+        let before = (local.available_pages(), global.available_pages());
+        let over_global = GLOBAL_PAGE_SIZE + 1;
+        let refused = admit_tokens(&local, &global, &mut kv, over_global)
+            .expect_err("partial admission must refuse");
+        let refusal = refused.to_string();
+        assert!(
+            refusal.contains("(granted, rolled back)"),
+            "the local family must be the one rolled back, got: {refusal}"
+        );
+        assert_eq!(
+            (local.available_pages(), global.available_pages()),
+            before,
+            "a refused admission leaves both pools as it found them"
+        );
         assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (0, 0));
 
-        admit_tokens(&local, &global, &mut kv, PAGE_SIZE).expect("one page each");
-        assert_eq!((local.available_pages(), global.available_pages()), (2, 0));
+        admit_tokens(&local, &global, &mut kv, LOCAL_PAGE_SIZE).expect("one page each");
+        assert_eq!((local.available_pages(), global.available_pages()), (6, 0));
         assert_eq!((kv.local.held_pages(), kv.global.held_pages()), (1, 1));
     }
 }

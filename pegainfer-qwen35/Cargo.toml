@@ -13,6 +13,7 @@ half = { workspace = true }
 log = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-frontend = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
 pegainfer-kernels = { workspace = true }
 pegainfer-sample = { workspace = true }
 rand = { workspace = true }
@@ -52,6 +53,10 @@ required-features = ["qwen35"]
 
 [[test]]
 name = "chunked_prefill"
+required-features = ["qwen35"]
+
+[[test]]
+name = "prefix_cache"
 required-features = ["qwen35"]
 
 [[test]]
