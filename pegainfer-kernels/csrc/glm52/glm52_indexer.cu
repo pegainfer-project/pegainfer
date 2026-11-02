@@ -162,8 +162,6 @@ __global__ void indexer_weights_fold_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 bool valid_cache_layout(int head_dim, int quant_block_size,
                         int cache_block_size,
                         int64_t cache_block_stride_bytes) {

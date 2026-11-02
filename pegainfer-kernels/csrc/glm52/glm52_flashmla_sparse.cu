@@ -30,8 +30,6 @@ constexpr int kBlockSizeTopk = 64;
 constexpr int kFixedOverheadBlocks = 5;
 constexpr float kLog2E = 1.4426950408889634f;
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 template <typename Fn>
 CUresult run_flashmla_host(Fn&& fn) {
   try {

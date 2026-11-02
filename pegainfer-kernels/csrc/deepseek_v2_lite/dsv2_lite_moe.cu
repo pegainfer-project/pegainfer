@@ -247,11 +247,6 @@ __global__ void accumulate_fixed_expert_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() {
-  cudaError_t err = cudaGetLastError();
-  return map_cuda_error(err);
-}
-
 }  // namespace
 
 extern "C" {

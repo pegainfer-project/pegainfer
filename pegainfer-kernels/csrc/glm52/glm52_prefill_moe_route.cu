@@ -34,8 +34,6 @@ constexpr int kScanThreads = 256;
 constexpr int kMaxBlocks = 65535;
 constexpr int kVecWidth = 8;  // bf16 per float4
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 int grid_blocks(long long work) {
   const long long blocks = (work + kThreads - 1) / kThreads;
   return blocks > kMaxBlocks ? kMaxBlocks : static_cast<int>(blocks);

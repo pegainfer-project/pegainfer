@@ -129,8 +129,6 @@ __global__ void deepgemm_sm100_masked_out_to_aligned_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 extern "C" {
