@@ -369,7 +369,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
             pegainfer_sample::gpu_sample_batch_into(
@@ -625,7 +625,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let sampling_rows = [pegainfer_sample::BatchSamplingRow {
                 row: 0,
