@@ -1,8 +1,8 @@
 # Calibration campaigns and proxy evidence
 
-> **TL;DR:** Complete cold/decode campaigns connect qualified training, immutable profiles and source-verified held-out raw TTFT reports. A five-knot prefill recollection now has 462 requests and six fresh held-out cells: cold relative TTFT error p50 is 7.22%, while queueing p95 remains 199.14%. Mixed stays additive; evidence completeness does not approve accuracy. C8 now supports source-verified offline cached collection and fitting; cached simulator runtime remains disabled.
+> **TL;DR:** C9 adds independent offline cached-prefill surface validation: collect held-out target/zero-cost pairs, report effective-cost errors and reconstructed TTFT, and recompute saved reports. The retained two-model matrix is historical evidence; cached simulator runtime remains disabled.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 ## Preparation
 
@@ -86,7 +86,7 @@ A complete input example, including timing/retry contracts and named matrices, i
 
 ## Exact pairing and offline normalization (C3)
 
-Normalize requires explicit `scope=train` or `scope=validation`. Train selects every declared cold/decode/cached train cell and requires target/zero_cost. Validation selects every declared non-train cold/decode cell and requires all three roles; original split names remain in the observations. There is no arbitrary cell selector for a successful normalized scope. Empty scopes fail. Cached validation cells remain explicitly unsupported, with the full campaign required-scope digest retained; offline cached training success does not establish online cached acceptance.
+Normalize requires explicit `scope=train` or `scope=validation`. Train selects every declared cold/decode/cached train cell and requires target/zero_cost. Validation selects every declared non-train cold/decode cell and requires all three roles; original split names remain in the observations. There is no arbitrary cell selector for a successful normalized scope. Empty scopes fail. Online cached validation remains explicitly unsupported, with the full campaign required-scope digest retained; the separate C9 offline surface report does not establish online cached acceptance.
 
 `artifacts.execution_snapshot` reads the execution index under the driver's existing lock. `sealed_reference` pins the selected attempt number/path, plan, binding and measurement/workload/raw references. `read_sealed_attempt` checks indexed bytes and the same measurement links used at sealing. `normalize.verify_normalized_sources` later follows the pinned references, independently of the current execution index. Adding sim or other cells therefore does not invalidate an existing training source snapshot; changing a selected source file does. The original execution-index digest is an audit fact, not a requirement that the current index remain byte-identical.
 
@@ -297,6 +297,74 @@ The two effective grids (rows P256/P512, columns N64/N128, ms) are vLLM `[[57.27
 
 Before user test review, the final frozen-source full regression passed 61 tests in 466.350s; the compiler group, including the additional required-scope test, then passed all eight methods in 3.143s (62 distinct passing methods in total), including installed original-bench HTTP recovery and cached-only/mixed artifact validation. Python compilation, cargo formatting and diff checks passed. Earlier regression errors arose while parallel edits changed the frozen source identity; the final run compiled and verified against stable sources. Final review also closes the default-execution scope boundary: automatic cached-only completion applies only when no held-out was declared; required cached online validation is rejected before generation, while explicit through-fit remains scoped offline execution. Earlier dev roots are retained as development evidence before this final source change. No Rust predictor, worker or scheduler was changed. On 2026-10-27, user review removed nine added methods (review numbers 1/2/4/5/6/9/10/11/12), retaining cached input nesting and the two proxy qualification/fault methods. Imports, the empty cached pairing class and fixture branches used only by the removed tests were cleaned up; all retained test bodies and production sources are unchanged. The retained full suite passed all 53 methods in 269.241s; log: `/tmp/c8-test-reduction-20261027-loopback.log`. The initial sandboxed attempt encountered 22 socket-permission errors; the complete rerun used an environment allowing local loopback sockets. AST inventory, Python compilation, cargo formatting and diff checks passed. Historical GPU evidence and its original test receipts remain unchanged.
 
+## Independent cached surface validation (C9)
+
+`cached_prefill_validate.py` consumes the C8 calibration surface directly. It does not load a cached predictor into Rust or change the three-role online report gate. Training and calibration must already be complete; `collect` acquires every declared non-training cached cell with the existing target driver and zero-cost profile server, then publishes the report. `validate` and `verify` operate offline on sealed evidence. Their output is schema-1 `cached_prefill_validation_report`, with `runtime_enabled=false` and accuracy acceptance explicitly unassessed.
+
+For each measured key, the cost observation is target TTFT minus its paired zero-cost TTFT. The script evaluates the existing bilinear surface at the frozen P/N coordinates and records predicted-minus-observed signed error and its absolute value. The primary cell comparison uses the median of paired differences, matching the fit policy. Per-request distributions remain separate. Relative cost error divides by positive effective cost; zero or negative observations retain their absolute errors and have null relative error with explicit counts. There is no clipping, epsilon denominator or dropped slow sample. Prediction plus the same-key zero-cost TTFT produces a separately labelled raw-TTFT reconstruction diagnostic, not an online simulator measurement.
+
+The complete declared cached held-out scope and target/zero_cost keys are required. Existing C8 role readers check actual IDs, exact observed P, recovery/bootstrap ordering, content, transport and reference bindings. Missing roles/repeats, duplicate keys or out-of-domain coordinates fail. Each held-out role is loaded once per cell and all repeats use that data. The report records selected attempts and the calibration path; offline verification reconstructs the report from those inputs and compares the reported numerical results. This adds no cached predictor to Rust and does not modify the shared compiler, driver, storage or training modules.
+
+### Standalone commit validation (2026-11-02)
+
+The reconstructed C9 passed all 53 existing Python tests; no test file or method was added. A one-time run reusing the existing fixtures completed a cached-only 2×2 training grid, calibration materialization, one held-out cell with two measured keys, report generation and offline verification. Effective-cost zero denominators remained undefined and TTFT reconstruction remained separate. CLI help and formatting checks passed. This confirms the C8 API adaptation, not GPU performance or cached runtime support. The suite log is `/tmp/sim-cali-c9-rebuild-python-20261102.log`; the small local receipt is `/tmp/sim-cali-c9-split-20261102/c9-fixture-result.json`. Fixture artifacts used a temporary directory and were removed on exit.
+
+### Historical two-model matrix (2026-10-27)
+
+The following results describe the retained 2026-10-27 run and its source snapshots. They are not a fresh GPU validation of this standalone validator. The formal run completed at `/home/mgj/artifacts/c9-acceptance-20261027-run01/`. Six independent roots separate the joint smoke, cold/decode and cached experiments for each model. Planned and actual totals match: 112 cells, 242 cell/role executions, 2258 original bench invocations, 2852 requests including bootstrap/warmup, and 1492 measured rows. All 242 roles sealed on attempt1, with no failed/interrupted/unsupported attempts or retries. Main cells use two warmup and five measured repeats; the joint smoke uses one/two. Target is vLLM 0.30.0 on one RTX 3090 per active job, with bfloat16 weights, capacity 4, context ceiling/batched-token budget 16384, eager execution and TRITON_ATTN.
+
+| Main cold/decode scope, per model | Axes | Output tokens |
+| --- | --- | --- |
+| Cold train | input 64/256/1024/2048/4096/8192, B1 | 1 |
+| Decode train | B1/4 × initial total context 256/2048/8192 | 16 |
+| Cold held-out | input 384/768/3072/6144, B1 | 1 |
+| Decode held-out | B2 × total context 1024/4096; B3 × 1536/6144 | 16 |
+
+| Cached scope, per model | Qwen3 P | Qwen3.5 P | N |
+| --- | --- | --- | --- |
+| Train | 256/1024/2048/4096 | 528/2112/4224/8448 | 64/256/512/1024 |
+| Held-out | 512/1536/3072 | 1056/3168/6336 | 128/384/768 |
+
+Cached uses B1, output1 and pure-prefix bootstrap output1, with the existing canonical nested prefixes. Qwen3.5 uses chunked prefill, Mamba align mode and retention interval 528. Its actual alignment is 528: default retention 0 discarded the P snapshot after a pure-prefix bootstrap; the explicit interval preserved exact P for every tested main prefix axis, including P8448 plus N1024. SSM state remains float32. Main cold/decode disables prefix caching; the small joint experiment enables it and resets cold/decode repeats. GPU0/1 run the two models' joint and cold/decode roots; GPU2 runs the cached roots sequentially, leaving GPU3 unused. The full run, including each root's stopped-state recomputation, completed in 2.907 hours from input freeze. Final independent audit receipts completed at 3.074 hours and the acceptance summary at 3.093 hours, inside the approved twelve-hour budget; these timings do not establish model accuracy.
+
+The cached experiment measures interpolation inside these P/N domains at B1/output1 in this environment. Its primary distribution has nine cell medians, derived from 45 measured keys per model. Those p95/p99 values describe this small sample; they do not establish a stable workload tail or confidence interval. Per-request effective-cost and reconstructed-TTFT distributions are reported separately.
+
+Before the historical collection, 53 retained regressions passed in 268.928s and three cached-report tests passed in 14.357s; Python compilation, the new help entry points and Rust formatting checks passed. The dedicated cached-report test file was subsequently removed at the user’s request and is not part of this commit; the nine user-removed C8 methods also remain removed. These receipts describe the historical source snapshots, while the six formal model campaigns supply the retained collection evidence. No Rust source or runtime predictor changed.
+
+### Measured cold/decode results
+
+Both main cold/decode roots have completed independent raw recomputation and stopped-state report/source verification. Each has 70 matched held-out keys: 20 cold and 50 concurrent. Errors compare raw target/sim TTFT before aggregation; held-out observations did not enter fitting or model selection.
+
+| Model / held-out scope | Keys | Relative error p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3-4B cold | 20 | 3.72% | 13.57% | 13.73% |
+| Qwen3-4B concurrent | 50 | 20.41% | 223.48% | 231.80% |
+| Qwen3-4B all | 70 | 9.17% | 221.00% | 231.14% |
+| Qwen3.5-4B cold | 20 | 2.09% | 12.35% | 13.87% |
+| Qwen3.5-4B concurrent | 50 | 30.74% | 72.78% | 75.35% |
+| Qwen3.5-4B all | 70 | 12.18% | 69.49% | 74.92% |
+
+All 120 measured training decode batches qualified: six cells × five repeats × two roles × two models. Minimum full common generation-event windows for target/zero_cost were 374.018/354.095 ms for Qwen3 and 509.107/511.826 ms for Qwen3.5. Held-out zero-reference windows remained unqualified diagnostics; complete raw TTFT pairs were retained. These windows describe observer event overlap, not GPU step time. The lightweight sidecar receipt and its sources are archived under `tools-and-checks/c9-training-window-stats-20261027.json` in the formal root.
+
+### Measured cached results
+
+Both cached reports have passed independent raw recomputation. Each contains nine held-out cells and 45 measured target/zero_cost pairs. Primary errors compare the fitted prediction with each cell's median paired effective cost:
+
+| Model | Absolute error p50 / p95 / p99, ms | Relative error p50 / p95 / p99 |
+| --- | --- | --- |
+| Qwen3-4B | 1.815 / 5.916 / 6.237 | 1.66% / 6.71% / 6.85% |
+| Qwen3.5-4B | 6.746 / 24.735 / 30.110 | 6.44% / 28.10% / 38.30% |
+
+Per-request effective-cost relative errors across 45 keys are 2.59% / 9.45% / 9.90% for Qwen3 and 6.44% / 43.63% / 46.44% for Qwen3.5. Reconstructed raw-TTFT relative errors are 2.53% / 9.10% / 9.67% and 6.26% / 41.97% / 44.78%, respectively. All values are p50/p95/p99; both reports have zero undefined relative denominators in these formal samples. Reconstruction remains an offline diagnostic. No business accuracy threshold was applied, and the larger Qwen3.5 tails are retained without refitting.
+
+### Verification and retained evidence
+
+Independent raw recomputation passed for all six roots, including SSE/read-boundary timing, actual IDs and usage, exact cached P, reset/bootstrap ordering, decode-window differences, pairing and error arithmetic. All 42 missing-role/count/source/OOD/report fault copies were rejected without modifying formal evidence. Every root then passed stopped-state recomputation with identical report bytes and selected-attempt/source snapshots. Both cached roots additionally passed the real `execute_cached_validation` API with all services stopped: 389.133s for Qwen3 and 559.670s for Qwen3.5, no new requests, attempts, artifacts or server directories.
+
+The fixed GPU0/1/2 lanes and 687 successful scheduled-15s telemetry samples show at most three active GPUs, with GPU3 idle in every sample. Peak memory was 14540/14584/14638 MiB on GPU0/1/2; minimum host MemAvailable was 36.550 GiB. Telemetry is sampled, not continuous. Final-state checks found no owned run process groups or compute applications; all four GPUs were at 1 MiB/0%, and all 17 pre-existing untracked files retained their bytes.
+
+`acceptance-summary.json` records all 17 passing checks, actual attempt history, metrics, timing, resource samples and source/report/audit references. `acceptance-report.md` is the readable result. The root also retains six specs, launches, compiled indexes, plans, raw evidence, training/calibration/profile bundles, immutable reports, independent audit/recovery receipts, `final-state.json`, frozen source/test copies and test logs. Source snapshots and the tools under `tools-and-checks/` preserve the temporary runner and audit implementations.
+
 ## Migration defense handoff
 
 | Previous defense / failure mode | Current owner |
@@ -345,7 +413,7 @@ Before user test review, the final frozen-source full regression passed 61 tests
 
 ## Debrief
 
-C2 writes raw evidence and measurements; C3 verifies complete cold/decode scopes and pins their sealed-attempt provenance. File digests alone do not establish plan/content/transport agreement: the validators check both indexed bytes and cross-file identities and commands. Scope and source snapshots remain separate from the evolving execution index. C4 validates training windows; C5 prepares references and paired training; C6 materializes immutable fitted profiles; C7 connects full-stage execution and held-out raw TTFT reporting. C7 evidence completeness passed, while measured TTFT error remains large. Cached integration remains C8; the original11-point held-out campaign still needs wider training coverage and later full collection. Partial-ID false success remains accepted and unfixed. Replaced replay/metric paths are removed after their defenses acquire current owners; cached domain rules remain until migration.
+C9 adds offline cached surface collection and reporting without changing the shared C8 pipeline or Rust runtime. The retained 2026-10-27 two-model matrix supports the documented historical results; it is not a new GPU run of the standalone commit. Concurrent raw-TTFT errors and Qwen3.5 cached tails remain substantial, and no business accuracy threshold was applied. Cached simulator runtime, broader workload accuracy and business thresholds remain follow-up work. Mixed stays additive with intercept0, and partial-ID false success remains an accepted, unchanged limitation.
 
 ## C2 audit findings (2026-10-15)
 
