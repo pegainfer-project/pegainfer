@@ -517,7 +517,7 @@ mod tests {
 
     /// The mega row ceiling (#962): CP16 x one chunk covers 256k in a single
     /// superstep, which is exactly why the protocol was raised to 16896.
-    const CHUNK: usize = 16896;
+    const CHUNK: usize = pegainfer_kernels::ops::K3_MAX_CHUNK;
 
     fn prompt_of(total: usize) -> Arc<[u32]> {
         (0..total as u32).collect()

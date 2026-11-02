@@ -94,6 +94,7 @@
 // exists; otherwise every entry point compiles as a NOT_SUPPORTED stub.
 
 #include "../shared/ffi_guard.cuh"
+#include "k3_mega_moe_limits.cuh"
 
 #include <cuda.h>
 #include <cstdint>
@@ -357,11 +358,7 @@ extern "C" {
 // Token-count alignment the mega API enforces (`layout::kLCMCandidateBlockM`).
 int k3_mega_token_alignment(void) { return 384; }
 
-// Token capacity one rank's slab and the AOT kernels are built for
-// (`num_max_tokens_per_rank`). The launch accepts exactly this value — the
-// ring capacities derived from it are kernel template parameters — so slabs
-// are allocated at exactly this size, whatever the executor's live batch is.
-int k3_mega_max_tokens_per_rank(void) { return 16896; }
+int k3_mega_max_tokens_per_rank(void) { return k3_mega::kProtocolMaxTokensPerRank; }
 
 // Whether the AOT matrix carries a kernel for this world (GLOBAL expert count
 // x rank count, situ activation). One definition of the supported set — the
