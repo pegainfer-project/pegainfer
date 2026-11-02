@@ -11,7 +11,7 @@ Use this file as the LLM entrypoint before editing kernels. Start from `op_id`, 
 | `shared.linear.gemm_per_token` | model-specific decode accuracy gates | `ops::gemm_per_token` / `ops::gemm_per_token_into_checked` | `gemm_per_token_cuda` | `csrc/shared/linear.cu` | cuBLAS | computes each row through the N=1 decode GEMM boundary; used when row-wise parity is required before performance optimization |
 | `shared.sampling.argmax_batch_bf16` | batched greedy gates | `ops::argmax_batch_bf16_into` | `argmax_batch_bf16_cuda` | `csrc/shared/argmax.cu` | CUDA | one greedy top-1 result per row over contiguous `HiddenStates` logits |
 | `shared.elementwise.accumulate_bf16_token_scaled_to_f32` | DeepSeek-V2-Lite NCCL device combine | `ops::dsv2_lite_accumulate_route_row_into` | `accumulate_bf16_token_scaled_to_f32_cuda` | `csrc/shared/elementwise.cu` | CUDA | accumulates one bf16 expert-output token into a selected row of reusable f32 device scratch before the NCCL combine all-reduce |
-| `shared.sampling.batch_topk_topp` | mixed greedy/non-greedy decode epilogues | `ops::gpu_sample_batch_into` / `pegainfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, gather/cast bf16 logits to f32, FlashInfer OnlineSoftmax + Sampling/TopP/TopKTopP by active per-row filters |
+| `shared.sampling.batch_topk_topp` | mixed greedy/non-greedy decode epilogues | `ops::gpu_sample_batch_into` / `pegainfer_sample::select_batch` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, gather/cast bf16 logits to f32, FlashInfer OnlineSoftmax + Sampling/TopP/TopKTopP by active per-row filters |
 
 ## Qwen3-4B Dense Full-Attention Path
 
@@ -33,7 +33,7 @@ Qwen3-4B uses bf16 dense full attention with `hidden_size=2560`, `num_attention_
 | `qwen3_4b.attn.split_qkv` | Attention projection | `ops::split_qkv_into` | `split_qkv_cuda` | `csrc/shared/fused_proj.cu` | CUDA | BF16 bitwise split from rank-local `[Q;K;V, tokens]` into compact Q/K/V buffers after one fused projection GEMM. |
 | `qwen3_4b.elementwise.add` | residual/unified | `ops::add_batch_into` | `add_cuda` | `csrc/shared/elementwise.cu` | CUDA | same-shape `HiddenStates` |
 | `qwen3_4b.sampling.greedy` | decode output | `pegainfer_sample::select_batch` | `argmax_batch_bf16_split_indexed_cuda` | `csrc/shared/argmax.cu` | CUDA | compact greedy rows, one indexed batched argmax read-back per step |
-| `qwen3_4b.sampling.random` | decode output | `pegainfer-core::ops::select_batch_tokens_into` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, one batched FlashInfer sampling call per step |
+| `qwen3_4b.sampling.random` | decode output | `pegainfer_sample::select_batch` | `gpu_sample_batch_flashinfer_cuda` | `csrc/shared/flashinfer_sampling.cu` | FlashInfer CUDA | compact non-greedy rows, one batched FlashInfer sampling call per step |
 
 ## Kimi-K2 Text TP8/EP8 Path
 
