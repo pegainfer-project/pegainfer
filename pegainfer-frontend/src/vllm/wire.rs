@@ -93,8 +93,7 @@ pub(crate) fn convert_sampling(params: &EngineCoreSamplingParams) -> SamplingPar
     // exists for min_tokens masking, not stop detection). This conversion feeds
     // the legacy SamplingParams contract, which has no field for explicit
     // request stop IDs; keep its historical lowering until each producer is
-    // migrated to StopPolicy. The stepped bridge also passes the independent
-    // policy below.
+    // migrated to StopPolicy. Qwen3 receives the independent policy below.
     let ignore_eos = params.eos_token_id.is_none() && params.stop_token_ids.is_empty();
     if params.temperature <= 0.0 {
         return SamplingParams {
@@ -263,7 +262,7 @@ mod tests {
         assert!(!convert_sampling(&params).ignore_eos);
 
         // The legacy SamplingParams contract keeps EOS active when explicit
-        // stop IDs are present; the stepped bridge carries those IDs in
+        // stop IDs are present; the stepped Qwen3 path carries those IDs in
         // StopPolicy instead.
         params.eos_token_id = None;
         params.stop_token_ids = vec![42];

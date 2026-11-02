@@ -248,4 +248,11 @@ mod tests {
 
         assert!(runtime.profile.is_none());
     }
+
+    #[test]
+    fn sim_logger_accepts_warn_records() {
+        init_logging();
+
+        assert!(log::log_enabled!(target: "pegainfer_sim::profile", log::Level::Warn));
+    }
 }
