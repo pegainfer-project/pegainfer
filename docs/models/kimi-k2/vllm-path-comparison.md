@@ -131,23 +131,23 @@ Validation:
 cargo fmt --all --check
 PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
 PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
-  trace --source static --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
+  trace --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
 ```
 
 H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `$PEGAINFER_DIR` with `PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
 
-Runtime model-report validation on H20:
+Model-report validation on H20:
 
 ```bash
 LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
 cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
-  decode --source runtime --batch-size 4 --kv-len 28 --iters 1 --format text \
+  decode --batch-size 4 --kv-len 28 --iters 1 --format text \
   --out $RESULT_ROOT/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
 ```
 
-The fused-qkv runtime report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
+The fused-qkv report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
 
 - `all_reduce`: `123` calls, multi-rank H20 provider needed.
 - `reduce_scatter`: `60` calls, multi-rank H20 provider needed.

@@ -1,17 +1,5 @@
 use anyhow::Result;
 use anyhow::ensure;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_core::ops::call_trace;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_frontend::engine::EngineLoadOptions;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_frontend::engine::GenerateRequest;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_frontend::engine::TokenEvent;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_frontend::engine::TokenSink;
-#[cfg(feature = "kernel-call-trace")]
-use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::KIMI_K2_EXPERT_INTERMEDIATE;
 use pegainfer_kernels::ops::KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8;
 use pegainfer_kernels::ops::KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8;
@@ -50,15 +38,7 @@ const DENSE_LAYERS: usize = KIMI_K2_LAYERS - KIMI_K2_MOE_LAYERS;
 const LOCAL_DENSE_INTERMEDIATE: usize = KIMI_K2_DENSE_INTERMEDIATE / TP_WORLD_SIZE;
 const LOCAL_SHARED_INTERMEDIATE: usize = KIMI_K2_EXPERT_INTERMEDIATE / TP_WORLD_SIZE;
 
-pub fn trace_decode_kernel_calls(
-    _model_path: &str,
-    batch_size: usize,
-    kv_len: usize,
-) -> Result<Vec<KernelCall>> {
-    trace_static_decode_kernel_calls(batch_size, kv_len)
-}
-
-fn trace_static_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<Vec<KernelCall>> {
+pub fn trace_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<Vec<KernelCall>> {
     ensure!(batch_size > 0, "batch_size must be greater than zero");
     ensure!(kv_len > 0, "kv_len must be greater than zero");
 
@@ -112,84 +92,6 @@ fn trace_static_decode_kernel_calls(batch_size: usize, kv_len: usize) -> Result<
             ),
     );
 
-    Ok(calls)
-}
-
-#[cfg(feature = "kernel-call-trace")]
-pub fn trace_runtime_decode_kernel_calls(
-    model_path: &str,
-    batch_size: usize,
-    kv_len: usize,
-) -> Result<Vec<KernelCall>> {
-    ensure!(batch_size > 0, "batch_size must be greater than zero");
-    ensure!(kv_len > 1, "runtime decode trace requires --kv-len > 1");
-
-    let prompt_len = kv_len - 1;
-    let engine = crate::start_engine(
-        std::path::Path::new(model_path),
-        EngineLoadOptions {
-            enable_cuda_graph: false,
-            device_ordinals: (0..TP_WORLD_SIZE).collect(),
-            seed: 42,
-            ..EngineLoadOptions::default()
-        },
-    )?;
-    let ((), calls) = call_trace::collect_result(|| {
-        let mut receivers = Vec::with_capacity(batch_size);
-        for request_idx in 0..batch_size {
-            let (token_tx, mut token_rx) = TokenSink::standalone();
-            engine.submit(GenerateRequest {
-                trace_parent: None,
-                request_id: Some(format!("kimi-trace-{request_idx}")),
-                queued_at_unix_s: None,
-                data_parallel_rank: None,
-                prompt_tokens: vec![0_u32; prompt_len],
-                params: SamplingParams {
-                    temperature: 0.0,
-                    top_k: 1,
-                    top_p: 1.0,
-                    min_p: 0.0,
-                    seed: None,
-                    ignore_eos: true,
-                },
-                max_tokens: 2,
-                lora_adapter: None,
-                kv_transfer_params: None,
-                token_tx,
-                logprobs: None,
-                prompt_logprobs: None,
-            })?;
-            receivers.push(std::thread::spawn(move || -> Result<()> {
-                while let Some((_, event)) = token_rx.blocking_recv() {
-                    match event {
-                        TokenEvent::Scheduled { .. }
-                        | TokenEvent::Token { .. }
-                        | TokenEvent::PromptTokens { .. }
-                        | TokenEvent::KvTransfer { .. } => {}
-                        TokenEvent::Finished { .. } => return Ok(()),
-                        TokenEvent::Error { message, .. } => {
-                            anyhow::bail!("Kimi runtime trace request failed: {message}")
-                        }
-                        TokenEvent::Rejected { message, .. } => {
-                            anyhow::bail!("Kimi runtime trace request rejected: {message}")
-                        }
-                    }
-                }
-                anyhow::bail!("Kimi runtime trace token stream closed before Finished")
-            }));
-        }
-        for receiver in receivers {
-            receiver
-                .join()
-                .map_err(|_| anyhow::anyhow!("Kimi runtime trace receiver thread panicked"))??;
-        }
-        Ok(())
-    })?;
-    drop(engine);
-    ensure!(
-        !calls.is_empty(),
-        "Kimi runtime decode trace produced no KernelCall records"
-    );
     Ok(calls)
 }
 
