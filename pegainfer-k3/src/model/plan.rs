@@ -4,7 +4,7 @@
 //! Every slot below is one entry of the certified decode engine's per-layer
 //! weight struct, under the same name, so the executor reads the same things
 //! the reference step reads. The plan is pure (names, shapes, dtypes, byte
-//! counts) so the routing can be proven on the host: [`k3_model_slots`] must
+//! counts) so the routing can be proven on the host: `k3_model_slots` must
 //! consume exactly the non-expert tensor set the loader makes resident, each
 //! name once, each slot's byte count agreeing with the loader's contract.
 //!
@@ -451,6 +451,7 @@ fn push_dense_slots(slots: &mut Vec<K3SlotPlan>, p: &str) {
 }
 
 /// Every slot of a `num_layers`-deep model, bookends first.
+#[cfg(test)]
 pub(crate) fn k3_model_slots(
     num_layers: usize,
     routed_experts: K3RoutedExperts,
