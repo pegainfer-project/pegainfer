@@ -34,6 +34,7 @@
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
+#include "qwen4_qsa_norm_rope.cuh"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -60,46 +61,6 @@ constexpr int kWarps = kThreads / WARP_SIZE;
 
 static_assert(kRotaryDim / 2 == WARP_SIZE, "a rope pair must be one lane's dims 0 and 1");
 static_assert(kHeadDim % WARP_SIZE == 0, "a head must split into whole lanes");
-
-// Sum across all 32 lanes, leaving it in every lane (common.cuh's
-// `warp_reduce_sum` leaves it in lane 0, which the norm needs broadcast).
-__device__ __forceinline__ float warp_all_sum(float value) {
-#pragma unroll
-  for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-    value += __shfl_xor_sync(0xffffffffu, value, mask);
-  }
-  return value;
-}
-
-// One `(1 + w)` RMSNorm element, rounded to bf16 exactly once: the reference
-// normalizes in float32, scales by `1 + w` in float32, and then casts to the
-// activation dtype.
-__device__ __forceinline__ float indexer_norm_elem(float x, float inv_rms,
-                                                  float weight) {
-  return __bfloat162float(__float2bfloat16(x * inv_rms * (1.0f + weight)));
-}
-
-// Partial RoPE over the pair (d, d + rotary_dim/2), for d < 32, at the shared
-// attention table's row for the position. The table is bf16 (built by
-// `pegainfer_core::rope`, already rounded like the reference), and the
-// reference rotates in bf16, so each product and their sum round as well.
-__device__ __forceinline__ void indexer_rope_pair(float& lo, float& hi,
-                                                  float cos_v, float sin_v) {
-  const float lo_rot = __bfloat162float(__float2bfloat16(lo * cos_v)) +
-                       __bfloat162float(__float2bfloat16(-hi * sin_v));
-  const float hi_rot = __bfloat162float(__float2bfloat16(hi * cos_v)) +
-                       __bfloat162float(__float2bfloat16(lo * sin_v));
-  lo = __bfloat162float(__float2bfloat16(lo_rot));
-  hi = __bfloat162float(__float2bfloat16(hi_rot));
-}
-
-// The table pair for dimension `dim` at `pos`; the table stores
-// `[max_pos, kRotaryDim]` with the half split duplicated, so dim and
-// dim + rotary_dim/2 hold the same cos/sin.
-__device__ __forceinline__ float indexer_table_at(
-    const __nv_bfloat16* __restrict__ table, int64_t pos, int dim) {
-  return __bfloat162float(table[pos * kRotaryDim + dim]);
-}
 
 // One pooled key per complete micro-block: the float32 mean of the block's raw
 // keys, cast back to bf16 the way the reference casts it, then `(1 + w)` RMSNorm
@@ -137,19 +98,19 @@ __global__ void qwen4_qsa_pool_keys_kernel(
     squares += mean[i] * mean[i];
   }
   const float inv_rms =
-      rsqrtf(warp_all_sum(squares) / static_cast<float>(kHeadDim) + rms_eps);
+      rsqrtf(qsa_warp_all_sum(squares) / static_cast<float>(kHeadDim) + rms_eps);
 
   float pooled[kDimPerLane];
 #pragma unroll
   for (int i = 0; i < kDimPerLane; ++i) {
     const int d = lane + i * WARP_SIZE;
     pooled[i] =
-        indexer_norm_elem(mean[i], inv_rms, __bfloat162float(k_norm_weight[d]));
+        qsa_norm_elem(mean[i], inv_rms, __bfloat162float(k_norm_weight[d]));
   }
   if (lane < kRotaryDim / 2) {
-    indexer_rope_pair(pooled[0], pooled[1],
-                      indexer_table_at(cos_table, first, lane),
-                      indexer_table_at(sin_table, first, lane));
+    qsa_rope_pair(pooled[0], pooled[1],
+                  qsa_table_at(cos_table, first, lane, kRotaryDim),
+                  qsa_table_at(sin_table, first, lane, kRotaryDim));
   }
 #pragma unroll
   for (int i = 0; i < kDimPerLane; ++i) {
@@ -226,15 +187,15 @@ __global__ void qwen4_qsa_block_scores_kernel(
     for (int i = 0; i < kDimPerLane; ++i) {
       const int d = lane + i * WARP_SIZE;
       q[h][i] =
-          indexer_norm_elem(q[h][i], inv_rms, __bfloat162float(q_norm_weight[d]));
+          qsa_norm_elem(q[h][i], inv_rms, __bfloat162float(q_norm_weight[d]));
     }
   }
   if (lane < kRotaryDim / 2) {
-    const float cos_v = indexer_table_at(cos_table, pos, lane);
-    const float sin_v = indexer_table_at(sin_table, pos, lane);
+    const float cos_v = qsa_table_at(cos_table, pos, lane, kRotaryDim);
+    const float sin_v = qsa_table_at(sin_table, pos, lane, kRotaryDim);
 #pragma unroll
     for (int h = 0; h < kHeads; ++h) {
-      indexer_rope_pair(q[h][0], q[h][1], cos_v, sin_v);
+      qsa_rope_pair(q[h][0], q[h][1], cos_v, sin_v);
     }
   }
 

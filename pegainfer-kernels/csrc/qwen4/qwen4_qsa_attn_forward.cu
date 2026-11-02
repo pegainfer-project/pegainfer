@@ -1,4 +1,4 @@
-// Qwen3.8-Flash-Next QSA sparse full-attention forward (Stage 2, plan P2).
+// Qwen3.8-Flash-Next QSA sparse full-attention forward.
 //
 // Frozen semantics: transformers 5.16.1 `qwen4_exp`,
 // `Qwen4ExpTextAttention.forward` with the eager attention interface. Over one
@@ -25,18 +25,20 @@
 // result in. A masked score is set to `torch.finfo(bfloat16).min` rather than
 // -inf, which is what the reference's additive float mask carries at a position
 // one of its two masks hid (where both hid it the two mins sum to -inf, which
-// softmax treats identically as long as one key in the row is visible) and what
-// makes a fully hidden row come out uniform instead of NaN, exactly as the
-// reference's does.
+// softmax treats identically as long as one key in the row is visible), and what
+// makes a fully hidden row come out uniform here instead of NaN. That row is
+// outside the contract: the reference's two masks would sum to -inf and its
+// softmax would be NaN, while causality plus the indexer's unconditional tail
+// guarantees at least one visible key for every in-contract row.
 //
 // Rounding is reproduced at every point the reference rounds, because the whole
 // chain is bf16 and the compared tensors are bf16: the norms normalize in float32
-// and cast once, cos/sin are cast to bf16 and then rotate in bf16 (each product
-// and their sum rounding), the score is the bf16 GEMM result rounded before the
-// scale, the softmax runs in float32 and its weights are rounded to bf16 *before*
-// the context GEMM reads them, and the gate's sigmoid rounds before the final
-// product. Float32 reduction *order* is this kernel's own, which is where the
-// parity bound's residual comes from.
+// and cast once, cos/sin are read from the shared attention table in bf16 and
+// then rotate in bf16 (each product and their sum rounding), the score is the
+// bf16 GEMM result rounded before the scale, the softmax runs in float32 and its
+// weights are rounded to bf16 *before* the context GEMM reads them, and the gate's
+// sigmoid rounds before the final product. Float32 reduction *order* is this
+// kernel's own, which is where the parity bound's residual comes from.
 //
 // Two kernels own one half each. `norm_rope_keys` prepares every token's two key
 // heads once, because all `group` query heads of a KV head read the same prepared
@@ -46,20 +48,18 @@
 // memory is what bounds `tokens` at `kMaxTokens`; a longer context needs the
 // streaming (online-softmax) form, which is a later stage's business.
 //
-// Target: the sm_89-first portable subset (decision D3-B) — no TMA, no cluster,
-// no wgmma. Both kernels are SIMT shuffle reductions: one CTA's score is a
-// 256-wide dot and its context a 256-wide column reduction, neither of which
-// wants an mma tile at these extents.
+// Target: the sm_89-first portable subset — no TMA, no cluster, no wgmma. Both
+// kernels are SIMT shuffle reductions: one CTA's score is a 256-wide dot and its
+// context a 256-wide column reduction, neither of which wants an mma tile at
+// these extents.
 //
-// The `(1 + w)` RMSNorm and partial-RoPE helpers here are deliberately the same
-// code as the QSA token-indexer kernel's in `qwen4_qsa_indexer_score.cu`,
-// which this directory gets from its own change: both reproduce the same
-// reference rounding points, so a shared header would move the duplication
-// rather than remove it, and lifting them belongs to whichever of the two lands
-// second.
+// The `(1 + w)` RMSNorm and partial-RoPE rounding points are shared with the QSA
+// token-indexer kernel through `qwen4_qsa_norm_rope.cuh`, and both kernels read
+// the same shared cos/sin table, so they cannot drift on either.
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
+#include "qwen4_qsa_norm_rope.cuh"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -98,22 +98,12 @@ constexpr int kMaxTokens = 8192;
 static_assert(kHeadDim == kThreads, "one thread owns one head dim");
 static_assert(kGroup * kKvHeads == kHeads, "the GQA group must divide the heads");
 
-// Sum across all 32 lanes, leaving it in every lane (common.cuh's
-// `warp_reduce_sum` leaves it in lane 0, which the norms need broadcast).
-__device__ __forceinline__ float warp_all_sum(float value) {
-#pragma unroll
-  for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
-    value += __shfl_xor_sync(0xffffffffu, value, mask);
-  }
-  return value;
-}
-
 // Sum across the whole CTA, leaving it in every thread: each warp's partial goes
 // to shared and every thread folds the `kWarps` partials in the same order, so
 // one value is what all of them see. The leading barrier is what lets a caller
 // reuse `scratch` for a second reduction.
 __device__ __forceinline__ float block_all_sum(float value, float* scratch) {
-  value = warp_all_sum(value);
+  value = qsa_warp_all_sum(value);
   __syncthreads();
   if (threadIdx.x % WARP_SIZE == 0) {
     scratch[threadIdx.x / WARP_SIZE] = value;
@@ -131,51 +121,16 @@ __device__ __forceinline__ float load_bf16(const __nv_bfloat16* value) {
   return __bfloat162float(*value);
 }
 
-__device__ __forceinline__ float round_bf16(float value) {
-  return __bfloat162float(__float2bfloat16(value));
-}
-
-// One `(1 + w)` RMSNorm element, rounded to bf16 exactly once: the reference
-// normalizes in float32, scales by `1 + w` in float32, and then casts to the
-// activation dtype.
-__device__ __forceinline__ float norm_elem(float x, float inv_rms, float weight) {
-  return round_bf16(x * inv_rms * (1.0f + weight));
-}
-
-// `1 / (theta ** (arange(0, rotary_dim, 2) / rotary_dim))`, rounded to float32
-// once. The reference builds this table in float32 on the host, where the
-// power is correctly rounded; CUDA's `powf` is specified to up to 8 ulp, which
-// at the 2054-token case's positions is a 1e-3 radian angle error — an eighth of
-// a bf16 ulp in every cos and sin it feeds. The double power, rounded once, is
-// the same table the reference has.
-__device__ __forceinline__ float inv_freq(int pair) {
-  const double exponent =
-      static_cast<double>(2 * pair) / static_cast<double>(kRotaryDim);
-  return static_cast<float>(
-      1.0 / pow(static_cast<double>(kRopeTheta), exponent));
-}
-
-// Partial RoPE at `pos` over the pair (d, d + rotary_dim/2), for d < 32. The
-// reference casts cos/sin to the activation dtype and rotates in bf16, so each
-// product and their sum round as well.
-__device__ __forceinline__ void rope_pair(float& lo, float& hi, int pos,
-                                          float freq) {
-  const float angle = static_cast<float>(pos) * freq;
-  const float cos_v = round_bf16(cosf(angle));
-  const float sin_v = round_bf16(sinf(angle));
-  const float lo_rot = round_bf16(lo * cos_v) + round_bf16(-hi * sin_v);
-  const float hi_rot = round_bf16(hi * cos_v) + round_bf16(lo * sin_v);
-  lo = round_bf16(lo_rot);
-  hi = round_bf16(hi_rot);
-}
-
 // Every token's key heads, `(1 + w)` RMSNormed and rotated at the token's own
 // position. One CTA per (token, KV head) row, one thread per dim.
 __global__ void qwen4_qsa_norm_rope_keys_kernel(
     const __nv_bfloat16* __restrict__ keys,           // [tokens, kKvWidth]
     const __nv_bfloat16* __restrict__ k_norm_weight,  // [kHeadDim]
     const int* __restrict__ positions,                // [tokens]
+    const __nv_bfloat16* __restrict__ cos_table,      // [tokens, kRotaryDim]
+    const __nv_bfloat16* __restrict__ sin_table,      // [tokens, kRotaryDim]
     __nv_bfloat16* __restrict__ normed_keys,          // [tokens, kKvWidth]
+    int tokens,
     float rms_eps) {
   const int row = blockIdx.x;
   const int token = row / kKvHeads;
@@ -184,16 +139,25 @@ __global__ void qwen4_qsa_norm_rope_keys_kernel(
   __shared__ float scratch[kWarps];
   __shared__ float head[kHeadDim];
 
+  // `positions[token]` indexes the shared table, whose rows are the key array's
+  // tokens. A negative or past-the-array position is a contract violation and
+  // traps rather than reading another row's cos/sin.
+  const int pos = positions[token];
+  if (pos < 0 || pos >= tokens) {
+    __trap();
+  }
+
   const float x = load_bf16(&keys[base + dim]);
   const float mean = block_all_sum(x * x, scratch) / static_cast<float>(kHeadDim);
   // The reference's `torch.rsqrt` on the host is `1 / sqrt` to the last bit, so
   // the correctly rounded pair is what reproduces it.
   const float inv_rms = 1.0f / sqrtf(mean + rms_eps);
-  head[dim] = norm_elem(x, inv_rms, load_bf16(&k_norm_weight[dim]));
+  head[dim] = qsa_norm_elem(x, inv_rms, load_bf16(&k_norm_weight[dim]));
   __syncthreads();
   if (dim < kRotaryDim / 2) {
-    rope_pair(head[dim], head[dim + kRotaryDim / 2], positions[token],
-              inv_freq(dim));
+    qsa_rope_pair(head[dim], head[dim + kRotaryDim / 2],
+                  qsa_table_at(cos_table, pos, dim, kRotaryDim),
+                  qsa_table_at(sin_table, pos, dim, kRotaryDim));
   }
   __syncthreads();
   normed_keys[base + dim] = __float2bfloat16(head[dim]);
@@ -209,6 +173,8 @@ __global__ void qwen4_qsa_attn_kernel(
     const int* __restrict__ rows,                    // [query_rows]
     const int* __restrict__ positions,               // [tokens]
     const __nv_bfloat16* __restrict__ q_norm_weight, // [kHeadDim]
+    const __nv_bfloat16* __restrict__ cos_table,     // [tokens, kRotaryDim]
+    const __nv_bfloat16* __restrict__ sin_table,     // [tokens, kRotaryDim]
     __nv_bfloat16* __restrict__ attn_weights,        // [kHeads, rows, tokens]
     __nv_bfloat16* __restrict__ attn_out,            // [query_rows, kOutWidth]
     int query_rows,
@@ -226,22 +192,28 @@ __global__ void qwen4_qsa_attn_kernel(
   extern __shared__ float row_scores[];
 
   // `rows[row]` is the token this query row belongs to, and so the position its
-  // query is rotated at. Contract: 0 <= rows[row] < tokens — clamped, so a
-  // broken caller reads a wrong row rather than memory it does not own.
-  const int raw_token = rows[row];
-  const int token =
-      raw_token < 0 ? 0 : (raw_token >= tokens ? tokens - 1 : raw_token);
+  // query is rotated at. Contract: 0 <= rows[row] < tokens; anything else traps
+  // rather than silently reading another token's row or position.
+  const int token = rows[row];
+  if (token < 0 || token >= tokens) {
+    __trap();
+  }
   const int pos = positions[token];
+  if (pos < 0 || pos >= tokens) {
+    __trap();
+  }
   const int64_t query_base =
       static_cast<int64_t>(row) * kQueryWidth + head * (2 * kHeadDim);
 
   const float x = load_bf16(&queries[query_base + tid]);
   const float mean = block_all_sum(x * x, scratch) / static_cast<float>(kHeadDim);
   const float inv_rms = 1.0f / sqrtf(mean + rms_eps);
-  query[tid] = norm_elem(x, inv_rms, load_bf16(&q_norm_weight[tid]));
+  query[tid] = qsa_norm_elem(x, inv_rms, load_bf16(&q_norm_weight[tid]));
   __syncthreads();
   if (tid < kRotaryDim / 2) {
-    rope_pair(query[tid], query[tid + kRotaryDim / 2], pos, inv_freq(tid));
+    qsa_rope_pair(query[tid], query[tid + kRotaryDim / 2],
+                  qsa_table_at(cos_table, pos, tid, kRotaryDim),
+                  qsa_table_at(sin_table, pos, tid, kRotaryDim));
   }
   __syncthreads();
 
@@ -268,11 +240,11 @@ __global__ void qwen4_qsa_attn_kernel(
     for (int i = 0; i < kDimsPerLane; ++i) {
       acc += qreg[i] * load_bf16(&key[i]);
     }
-    acc = warp_all_sum(acc);
+    acc = qsa_warp_all_sum(acc);
     if (lane == 0) {
       // The reference's bf16 GEMM rounds, then scales: the rounding comes first
       // and the scale is exact.
-      const float scaled = round_bf16(acc) * kScale;
+      const float scaled = qsa_round_bf16(acc) * kScale;
       const float score = mask_row[s] != 0 ? scaled : kHiddenScore;
       row_scores[s] = score;
       warp_max = fmaxf(warp_max, score);
@@ -303,7 +275,7 @@ __global__ void qwen4_qsa_attn_kernel(
   const int64_t weight_base =
       (static_cast<int64_t>(head) * query_rows + row) * tokens;
   for (int s = tid; s < tokens; s += kThreads) {
-    const float weight = round_bf16(row_scores[s] / sum);
+    const float weight = qsa_round_bf16(row_scores[s] / sum);
     row_scores[s] = weight;
     attn_weights[weight_base + s] = __float2bfloat16(weight);
   }
@@ -323,9 +295,9 @@ __global__ void qwen4_qsa_attn_kernel(
   // Both factors are bf16, so their product is exact in float32 and the single
   // cast below is the reference's own.
   const float gate = load_bf16(&queries[query_base + kHeadDim + tid]);
-  const float sigmoid = round_bf16(1.0f / (1.0f + expf(-gate)));
+  const float sigmoid = qsa_round_bf16(1.0f / (1.0f + expf(-gate)));
   attn_out[static_cast<int64_t>(row) * kOutWidth + head * kHeadDim + tid] =
-      __float2bfloat16(round_bf16(context) * sigmoid);
+      __float2bfloat16(qsa_round_bf16(context) * sigmoid);
 }
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
@@ -342,7 +314,9 @@ extern "C" {
 // 256 query dims followed by that head's 256 gate dims. `rows` gives the token
 // each evaluated query row belongs to and `positions` the position of every
 // token, so the query rows may be any subset of the key array in any order.
-// `mask` is the caller's visibility, one byte per (query row, token).
+// Every `rows` and `positions` entry must be in `0..tokens`; an out-of-range
+// entry traps. `mask` is the caller's visibility, one byte per (query row,
+// token), and `cos_table`/`sin_table` are the shared attention RoPE tables.
 //
 // Writes every element of `attn_weights` ([kHeads, query_rows, tokens], the
 // reference's head-major eager layout) and of `attn_out` ([query_rows,
@@ -350,8 +324,8 @@ extern "C" {
 // `tokens * kKvWidth` bf16; it is one entry point because every query head of a
 // KV head reads all of it and no row depends on the query side.
 //
-// Refuses a `tokens` whose score row would not fit the shared-memory budget —
-// that shape needs the streaming softmax, not a longer row.
+// An empty call is a no-op. Refuses a `tokens` whose score row would not fit the
+// shared-memory budget — that shape needs the streaming softmax, not a longer row.
 CUresult qwen4_qsa_attn_forward_cuda(
     const __nv_bfloat16* queries,
     const __nv_bfloat16* keys,
@@ -361,6 +335,8 @@ CUresult qwen4_qsa_attn_forward_cuda(
     const int* positions,
     const __nv_bfloat16* q_norm_weight,
     const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_table,
+    const __nv_bfloat16* sin_table,
     __nv_bfloat16* attn_weights,
     __nv_bfloat16* attn_out,
     __nv_bfloat16* normed_keys,
@@ -373,7 +349,8 @@ CUresult qwen4_qsa_attn_forward_cuda(
   if (queries == nullptr || keys == nullptr || values == nullptr ||
       mask == nullptr || rows == nullptr || positions == nullptr ||
       q_norm_weight == nullptr || k_norm_weight == nullptr ||
-      attn_weights == nullptr || attn_out == nullptr || normed_keys == nullptr) {
+      cos_table == nullptr || sin_table == nullptr || attn_weights == nullptr ||
+      attn_out == nullptr || normed_keys == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (query_rows < 0 || tokens < 0) {
@@ -396,7 +373,8 @@ CUresult qwen4_qsa_attn_forward_cuda(
   const int64_t key_rows = static_cast<int64_t>(tokens) * kKvHeads;
   qwen4_qsa_norm_rope_keys_kernel<<<static_cast<unsigned>(key_rows),
                                        kThreads, 0, stream>>>(
-      keys, k_norm_weight, positions, normed_keys, rms_eps);
+      keys, k_norm_weight, positions, cos_table, sin_table, normed_keys, tokens,
+      rms_eps);
   const CUresult key_status = consume_last_cuda_error();
   if (key_status != CUDA_SUCCESS) {
     return key_status;
@@ -405,7 +383,7 @@ CUresult qwen4_qsa_attn_forward_cuda(
   const size_t shared = static_cast<size_t>(tokens) * sizeof(float);
   qwen4_qsa_attn_kernel<<<grid, kThreads, shared, stream>>>(
       queries, normed_keys, values, mask, rows, positions, q_norm_weight,
-      attn_weights, attn_out, query_rows, tokens, rms_eps);
+      cos_table, sin_table, attn_weights, attn_out, query_rows, tokens, rms_eps);
   return consume_last_cuda_error();
 }
 

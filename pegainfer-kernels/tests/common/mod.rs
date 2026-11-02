@@ -63,6 +63,41 @@ pub(crate) fn fill(seed: u64, n: usize) -> Vec<half::bf16> {
         .collect()
 }
 
+/// The attention line's cos/sin tables, built like
+/// `pegainfer_core::rope::RopeTableSpec::tables` with `frequency_dim` equal to
+/// `rotary_dim`: `[max_pos, rotary_dim]`, position-major, half-split
+/// duplicated, bf16. The gates build them here because `pegainfer-kernels`
+/// cannot depend on `pegainfer-core` (the crate dependency runs the other way);
+/// production builds the same table and passes it in, which is why the QSA
+/// kernels read it instead of computing trig.
+#[allow(dead_code)]
+pub(crate) fn rope_tables(
+    rotary_dim: usize,
+    theta: f32,
+    max_pos: usize,
+) -> (Vec<half::bf16>, Vec<half::bf16>) {
+    assert!(rotary_dim > 0 && rotary_dim.is_multiple_of(2) && max_pos > 0);
+    let half_dim = rotary_dim / 2;
+    let inv_freq: Vec<f32> = (0..half_dim)
+        .map(|i| 1.0 / theta.powf(i as f32 * 2.0 / rotary_dim as f32))
+        .collect();
+    let mut cos = vec![half::bf16::ZERO; max_pos * rotary_dim];
+    let mut sin = vec![half::bf16::ZERO; max_pos * rotary_dim];
+    for pos in 0..max_pos {
+        let base = pos * rotary_dim;
+        for i in 0..half_dim {
+            let angle = pos as f32 * inv_freq[i];
+            let c = half::bf16::from_f32(angle.cos());
+            let s = half::bf16::from_f32(angle.sin());
+            cos[base + i] = c;
+            cos[base + i + half_dim] = c;
+            sin[base + i] = s;
+            sin[base + i + half_dim] = s;
+        }
+    }
+    (cos, sin)
+}
+
 /// The largest absolute difference and where it is. A NaN compares false
 /// against everything, so it would leave the largest at zero: it fails here
 /// instead of passing a comparison silently.

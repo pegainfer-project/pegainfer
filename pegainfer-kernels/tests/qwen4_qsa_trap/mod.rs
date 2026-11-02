@@ -1,8 +1,12 @@
-//! Shared launch for the QSA indexer trap binaries. Each binary fires one trap,
-//! because `__trap()` leaves the context in a sticky error state and anything
-//! sharing the process afterwards would fail for the wrong reason.
+//! Shared launch for the QSA trap binaries. Each binary fires one trap, because
+//! `__trap()` leaves the context in a sticky error state and anything sharing
+//! the process afterwards would fail for the wrong reason.
+
+#![allow(dead_code)]
 
 use half::bf16;
+use pegainfer_kernels::ops::QsaAttnGeometry;
+use pegainfer_kernels::ops::qsa_attn_forward_into;
 use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
 use pegainfer_kernels::tensor::DeviceVec;
 
@@ -65,5 +69,64 @@ pub(crate) fn assert_traps(row: i32, visible: i32) {
     assert!(
         message.contains("CUDA_ERROR_LAUNCH_FAILED"),
         "row {row} seeing {visible} tokens must end in the kernel's trap, got: {message}"
+    );
+}
+
+/// Run the sparse-attention forward with one query row whose `rows` entry is
+/// out of range, and require the kernel's trap.
+pub(crate) fn assert_attn_row_traps(row: i32) {
+    let Some(ctx) = crate::common::device_or_skip() else {
+        return;
+    };
+    let ctx = &ctx;
+    let geometry = QsaAttnGeometry::qwen38_flash_next();
+    let zeros = |len: usize| ctx.stream.clone_htod(&vec![bf16::ZERO; len]).expect("H2D");
+    let queries = zeros(geometry.query_width());
+    let keys = zeros(TOKENS * geometry.kv_width());
+    let values = zeros(TOKENS * geometry.kv_width());
+    let q_norm = zeros(geometry.head_dim);
+    let k_norm = zeros(geometry.head_dim);
+    let mask = ctx.stream.clone_htod(&vec![1u8; TOKENS]).expect("mask H2D");
+    let rows = ctx.stream.clone_htod(&[row]).expect("rows H2D");
+    let positions = ctx
+        .stream
+        .clone_htod(&(0..TOKENS as i32).collect::<Vec<_>>())
+        .expect("positions H2D");
+    let (cos_host, sin_host) =
+        crate::common::rope_tables(geometry.rotary_dim, geometry.rope_theta, TOKENS);
+    let cos = DeviceVec::from_host(ctx, &cos_host).expect("cos");
+    let sin = DeviceVec::from_host(ctx, &sin_host).expect("sin");
+    let mut weights = zeros(geometry.heads * TOKENS);
+    let mut out = zeros(geometry.out_width());
+    let mut normed_keys = zeros(TOKENS * geometry.kv_width());
+
+    let launch = qsa_attn_forward_into(
+        ctx,
+        &geometry,
+        &queries,
+        &keys,
+        &values,
+        &mask,
+        &rows,
+        &positions,
+        &q_norm,
+        &k_norm,
+        &cos,
+        &sin,
+        &mut weights,
+        &mut out,
+        &mut normed_keys,
+    );
+    let error = match launch {
+        Ok(()) => ctx
+            .sync()
+            .err()
+            .unwrap_or_else(|| panic!("row {row} outside the key array must fail visibly")),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("CUDA_ERROR_LAUNCH_FAILED"),
+        "row {row} outside the key array must end in the kernel's trap, got: {message}"
     );
 }

@@ -12,10 +12,16 @@
 //! before `o_proj`, and the indexer that produced the mask has its own oracle.
 //!
 //! The cases cover S=8/10/64 with every row evaluated, and the real budget
-//! boundary at S=2055 with six evaluated rows (2049..2055) — the last of which
+//! boundary at S=2055 with six evaluated rows (2049..=2054) — the last of which
 //! is where the 2048-token budget starts dropping a 4-token block, so its mask
 //! is sparse where the first three cases' masks are exactly causal. Case 3 is
 //! also the only one whose evaluated rows are a strict subset of its key array.
+//!
+//! The short cases are compared bit-for-bit, not only through the tolerance:
+//! the kernel is deterministic and the fixture is fixed, so a dropped bf16
+//! rounding in the short path fails here. The 2055-token case keeps the
+//! calibrated tolerance because its float32 reduction order differs from the
+//! reference's; the kernel reads the same shared cos/sin table the indexer does.
 //!
 //! Provenance is asserted, not assumed: the fixture records the reference
 //! version and the sha256 of the frozen config it was dumped from, and that
@@ -52,6 +58,7 @@ use half::bf16;
 use pegainfer_kernels::ops::QsaAttnGeometry;
 use pegainfer_kernels::ops::qsa_attn_forward_into;
 use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::DeviceVec;
 use safetensors::SafeTensors;
 use sha2::Digest;
 use sha2::Sha256;
@@ -68,51 +75,30 @@ const CASES: usize = 4;
 /// Weight parity bound, `abs(got - want) <= ATOL + RTOL * abs(want)`.
 ///
 /// All 102240 weights of the first three cases are bit-identical, and so are
-/// 295332 of case 3's 295920 — the one with 2055 keys and positions past 63. Of
-/// its 588 deviations, 532 are one bf16 quantum, 56 are over one and 7 over two,
-/// the worst 1.68e-2 of the weight (8 quanta at that magnitude).
+/// 295911 of case 3's 295920 — the one with 2055 keys and positions past 63. Its
+/// nine deviations are one bf16 quantum each, max abs 7.6e-6. The short cases are
+/// asserted bit-for-bit; case 3 keeps this bound because its float32 reduction
+/// order differs from the reference's.
 ///
-/// That is a rounding decision, not a semantic difference, and it is the
-/// reference's own floor rather than this kernel's error. A weight is
-/// `exp(score - max) / sum`, and the score it reads is the bf16 rounding of a
-/// 256-wide float32 dot, so one ulp of a score at this fixture's largest (6.28)
-/// moves its weight by `exp(0.049) - 1` = 5%. The reference rounds its float32
-/// reductions — the norm's 256-wide mean of squares, the GEMM's dot, the
-/// softmax's sum — in a torch-defined order that differs from this kernel's
-/// shuffle trees, so where a value sits within a float32 ulp of a bf16 midpoint
-/// the two round apart; one flipped norm weight on a key element is worth the 72
-/// scores that read it, which is why case 3 carries a few hundred deviations and
-/// the short cases, whose means land further from a midpoint, carry none. The
-/// deviations are also sign-balanced around a worst of 8 quanta, which a
-/// systematic error does not produce.
-///
-/// So the bound is one score ulp at this fixture's largest score — 5e-2 relative,
-/// against a measured worst of a third of it — plus an absolute term far under the
+/// The bound is one score ulp at this fixture's largest score — 5e-2 relative —
+/// against a measured worst of 0.17 of it, plus an absolute term far under the
 /// smallest weight a visible key can have here (`exp(-12)`). A real fault is
-/// orders out: the three controls below land at 4.1e4, 5.5e4 and 1.3e2 of the
-/// bound.
+/// orders out: the controls below land at 4.1e4, 5.5e4 and 1.3e2 of the bound.
 const WEIGHT_ATOL: f32 = 1.0e-7;
 const WEIGHT_RTOL: f32 = 5.0e-2;
 /// Output parity bound, same form. The output folds every visible key's rounded
 /// weight, so it inherits the weights' flips and adds the context reduction's own
-/// order: case 2 leaves 9 of 393216 elements one ulp off, case 3 is 95.4%
-/// bit-identical with 479 elements over a ulp and 181 over two, max abs 4.9e-4
-/// and max rel 3.0e-2 over the elements big enough to read relatively.
+/// order: cases 0 and 1 are bit-identical (and asserted as such), case 2 leaves 9
+/// of 393216 elements one ulp off, and case 3 is 99.81% bit-identical with 13
+/// elements over one ulp and 4 over two, max abs 1.2e-4 and max rel 1.1e-2 over
+/// the elements big enough to read relatively.
 ///
-/// The absolute term is what the near-zero elements need, and why one relative
-/// bound cannot serve both observables: case 3's outputs cancel down through
-/// zero, where the float32 accumulation's own noise (a 2050-term sum of ~5e-4
-/// products, plus the weights' flips at ~1e-5 each) is large against the value
-/// however small it is in absolute terms. The worst element by bound fraction is
-/// 2.19e-4 against 2.67e-4 — 50 quanta and 18% of it, but only 4.8e-5 absolute,
-/// which is the same order as the max abs over all 36864 elements. That is the
-/// reading `REL_FLOOR` keeps out of the relative column: below it, quantum
-/// counts and percentages describe the cancellation, not the kernel.
-///
-/// Measured, the relative term alone leaves 3.4e-5 uncovered; the absolute term
-/// is set at three times that, against outputs that reach 1.6 in case 2. The
-/// closest a control comes to passing is 2.2e1 of the bound, so the term is not
-/// what makes this gate pass.
+/// The absolute term is what the near-zero elements need: case 3's outputs cancel
+/// down through zero, where the float32 accumulation's own noise is large against
+/// the value however small it is in absolute terms. Measured, the relative term
+/// alone leaves 8.2e-7 uncovered; the 1e-4 absolute term is deliberately
+/// conservative. The closest a control comes to passing is 2.2e1 of the bound, so
+/// the term is not what makes this gate pass.
 const OUT_ATOL: f32 = 1.0e-4;
 const OUT_RTOL: f32 = 5.0e-2;
 
@@ -460,6 +446,8 @@ fn replay(
     geometry: &QsaAttnGeometry,
     q_norm: &CudaSlice<bf16>,
     k_norm: &CudaSlice<bf16>,
+    cos: &DeviceVec,
+    sin: &DeviceVec,
     case: &Case,
     mode: Replay,
 ) -> (Vec<bf16>, Vec<bf16>) {
@@ -526,6 +514,8 @@ fn replay(
         &positions_dev,
         q_norm,
         k_norm,
+        cos,
+        sin,
         &mut weights_dev,
         &mut out_dev,
         &mut normed_keys_dev,
@@ -662,10 +652,12 @@ fn measure(
     geometry: &QsaAttnGeometry,
     q_norm: &CudaSlice<bf16>,
     k_norm: &CudaSlice<bf16>,
+    cos: &DeviceVec,
+    sin: &DeviceVec,
     case: &Case,
     mode: Replay,
 ) -> (Stats, Stats) {
-    let (weights, out) = replay(ctx, geometry, q_norm, k_norm, case, mode);
+    let (weights, out) = replay(ctx, geometry, q_norm, k_norm, cos, sin, case, mode);
     (
         stats(
             &weights,
@@ -699,6 +691,19 @@ fn upload_norms(
     (
         ctx.stream.clone_htod(&q_norm).expect("q norm upload"),
         ctx.stream.clone_htod(&k_norm).expect("k norm upload"),
+    )
+}
+
+/// The shared attention RoPE tables the kernel reads, one row per token.
+fn upload_rope_tables(
+    ctx: &DeviceContext,
+    geometry: &QsaAttnGeometry,
+    tokens: usize,
+) -> (DeviceVec, DeviceVec) {
+    let (cos, sin) = common::rope_tables(geometry.rotary_dim, geometry.rope_theta, tokens);
+    (
+        DeviceVec::from_host(ctx, &cos).expect("cos table upload"),
+        DeviceVec::from_host(ctx, &sin).expect("sin table upload"),
     )
 }
 
@@ -746,6 +751,8 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
                 byte,
                 int,
                 int,
+                half,
+                half,
                 half,
                 half,
                 half,
@@ -820,56 +827,34 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
         assert_eq!(result, invalid, "{what} must be refused");
     }
 
-    // One position per kind of argument — a fused-projection input, the
-    // visibility, the two outputs and the workspace — so the chain is pinned to
-    // cover the pointers, not just the extents. All five entries are `*mut`, the
-    // type the dangling handles above carry, so the rows share one type and the
-    // const parameters take them by coercion.
-    for (what, queries, mask, attn_weights, attn_out, normed_keys) in [
-        (
-            "a null queries",
-            std::ptr::null_mut(),
-            byte,
-            half,
-            half,
-            half,
-        ),
-        ("a null mask", half, std::ptr::null_mut(), half, half, half),
-        (
-            "a null attn_weights",
-            half,
-            byte,
-            std::ptr::null_mut(),
-            half,
-            half,
-        ),
-        (
-            "a null attn_out",
-            half,
-            byte,
-            half,
-            std::ptr::null_mut(),
-            half,
-        ),
-        (
-            "a null normed_keys workspace",
-            half,
-            byte,
-            half,
-            half,
-            std::ptr::null_mut(),
-        ),
-    ] {
-        let result = unsafe {
+    // Every pointer parameter gets its own null case. Each is checked before a
+    // launch, and the table keeps the other twelve non-null so one missing guard
+    // cannot hide behind another.
+    let full = |queries,
+                keys,
+                values,
+                mask,
+                rows,
+                positions,
+                q_norm,
+                k_norm,
+                cos,
+                sin,
+                attn_weights,
+                attn_out,
+                normed_keys| {
+        (unsafe {
             entry(
                 queries,
-                half,
-                half,
+                keys,
+                values,
                 mask,
-                int,
-                int,
-                half,
-                half,
+                rows,
+                positions,
+                q_norm,
+                k_norm,
+                cos,
+                sin,
                 attn_weights,
                 attn_out,
                 normed_keys,
@@ -880,9 +865,282 @@ fn the_entry_point_refuses_a_geometry_it_was_not_compiled_for() {
                 1.0e-6,
                 std::ptr::null_mut(),
             )
-        } as i32;
+        }) as i32
+    };
+    for (what, result) in [
+        (
+            "a null queries",
+            full(
+                std::ptr::null_mut(),
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null keys",
+            full(
+                half,
+                std::ptr::null_mut(),
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null values",
+            full(
+                half,
+                half,
+                std::ptr::null_mut(),
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null mask",
+            full(
+                half,
+                half,
+                half,
+                std::ptr::null_mut(),
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null rows",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                std::ptr::null_mut(),
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null positions",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                std::ptr::null_mut(),
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null q_norm_weight",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                std::ptr::null_mut(),
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null k_norm_weight",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                std::ptr::null_mut(),
+                half,
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null cos_table",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                std::ptr::null_mut(),
+                half,
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null sin_table",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                std::ptr::null_mut(),
+                half,
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null attn_weights",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                std::ptr::null_mut(),
+                half,
+                half,
+            ),
+        ),
+        (
+            "a null attn_out",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                std::ptr::null_mut(),
+                half,
+            ),
+        ),
+        (
+            "a null normed_keys workspace",
+            full(
+                half,
+                half,
+                half,
+                byte,
+                int,
+                int,
+                half,
+                half,
+                half,
+                half,
+                half,
+                half,
+                std::ptr::null_mut(),
+            ),
+        ),
+    ] {
         assert_eq!(result, invalid, "{what} must be refused");
     }
+}
+
+/// An empty call is a no-op in the C entry and in the sibling wrappers; the
+/// Rust wrapper must not turn an empty `CudaSlice` into a null-pointer launch.
+#[test]
+fn an_empty_launch_is_a_no_op() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    let geometry = QsaAttnGeometry::qwen38_flash_next();
+    let bf16_empty = || ctx.stream.null::<bf16>().expect("empty bf16 slice");
+    let i32_empty = || ctx.stream.null::<i32>().expect("empty i32 slice");
+    let u8_empty = || ctx.stream.null::<u8>().expect("empty u8 slice");
+    let empty_table = DeviceVec::from_host(&ctx, &Vec::<bf16>::new()).expect("empty rope table");
+    let mut weights = bf16_empty();
+    let mut out = bf16_empty();
+    let mut normed_keys = bf16_empty();
+
+    qsa_attn_forward_into(
+        &ctx,
+        &geometry,
+        &bf16_empty(),
+        &bf16_empty(),
+        &bf16_empty(),
+        &u8_empty(),
+        &i32_empty(),
+        &i32_empty(),
+        &bf16_empty(),
+        &bf16_empty(),
+        &empty_table,
+        &empty_table,
+        &mut weights,
+        &mut out,
+        &mut normed_keys,
+    )
+    .expect("an empty launch must be a no-op");
 }
 
 /// The token cap is a launch limit, not a policy: one row of float32 scores lives
@@ -946,6 +1204,7 @@ fn the_token_cap_is_a_launch_it_can_actually_form() {
         .stream
         .alloc_zeros::<bf16>(tokens * geometry.kv_width())
         .expect("normed key workspace");
+    let (cos_dev, sin_dev) = upload_rope_tables(&ctx, &geometry, tokens);
 
     qsa_attn_forward_into(
         &ctx,
@@ -958,6 +1217,8 @@ fn the_token_cap_is_a_launch_it_can_actually_form() {
         &positions_dev,
         &q_norm_dev,
         &k_norm_dev,
+        &cos_dev,
+        &sin_dev,
         &mut weights_dev,
         &mut out_dev,
         &mut normed_keys_dev,
@@ -1031,11 +1292,36 @@ fn qsa_attention_matches_the_reference() {
                     .any(|(before, after)| after < before),
         );
 
-        let (weights, out) = measure(&ctx, &geometry, &q_norm, &k_norm, &case, Replay::Reference);
+        let (cos, sin) = upload_rope_tables(&ctx, &geometry, case.tokens);
+        let (weights, out) = measure(
+            &ctx,
+            &geometry,
+            &q_norm,
+            &k_norm,
+            &cos,
+            &sin,
+            &case,
+            Replay::Reference,
+        );
         report("weights", weights, WEIGHT_ATOL, WEIGHT_RTOL);
         report("output ", out, OUT_ATOL, OUT_RTOL);
         assert_within(weights, WEIGHT_ATOL, WEIGHT_RTOL, "weights", index);
         assert_within(out, OUT_ATOL, OUT_RTOL, "output", index);
+        // The short cases are deterministic and the fixture is fixed, so their
+        // comparison is bit-for-bit. This is what catches a dropped bf16
+        // rounding that stays inside the calibrated 2055-token tolerance.
+        if index <= 2 {
+            assert_eq!(
+                weights.exact, weights.compared,
+                "case {index}: every weight must be bit-identical"
+            );
+        }
+        if index <= 1 {
+            assert_eq!(
+                out.exact, out.compared,
+                "case {index}: every output must be bit-identical"
+            );
+        }
         println!(
             "case {index}: {} rows of {} tokens ({} weight elements, {} output \
              elements), visible per row {:?}, mask is causality: {is_causal}",
@@ -1091,7 +1377,17 @@ fn a_causal_mask_alone_loses_the_budget_boundary() {
     let mut broken = 0usize;
     for index in 0..CASES {
         let case = load_case(&fixture, index, &geometry);
-        let (weights, out) = measure(&ctx, &geometry, &q_norm, &k_norm, &case, Replay::CausalMask);
+        let (cos, sin) = upload_rope_tables(&ctx, &geometry, case.tokens);
+        let (weights, out) = measure(
+            &ctx,
+            &geometry,
+            &q_norm,
+            &k_norm,
+            &cos,
+            &sin,
+            &case,
+            Replay::CausalMask,
+        );
         let fails = weights.max_scaled > 1.0 || out.max_scaled > 1.0;
         println!(
             "case {index} with a causal mask: weights {:.3} of the bound, output \
@@ -1140,11 +1436,14 @@ fn a_wrong_gqa_mapping_does_not_reproduce_the_reference() {
 
     for index in 0..CASES {
         let case = load_case(&fixture, index, &geometry);
+        let (cos, sin) = upload_rope_tables(&ctx, &geometry, case.tokens);
         let (weights, out) = measure(
             &ctx,
             &geometry,
             &q_norm,
             &k_norm,
+            &cos,
+            &sin,
             &case,
             Replay::SwappedKvHeads,
         );
@@ -1180,11 +1479,14 @@ fn an_ungated_output_does_not_reproduce_the_reference() {
 
     for index in 0..CASES {
         let case = load_case(&fixture, index, &geometry);
+        let (cos, sin) = upload_rope_tables(&ctx, &geometry, case.tokens);
         let (weights, out) = measure(
             &ctx,
             &geometry,
             &q_norm,
             &k_norm,
+            &cos,
+            &sin,
             &case,
             Replay::UngatedOutput,
         );

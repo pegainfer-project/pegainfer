@@ -70,7 +70,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// The QSA sparse-attention forward over one layer's captured activations:
     /// the key pass, then one CTA per (query row, head) for the scores, the
-    /// weights and the gated context. `normed_keys` is the key pass's workspace.
+    /// weights and the gated context. `normed_keys` is the key pass's workspace;
+    /// `cos_table`/`sin_table` are the shared attention RoPE tables.
     pub fn qwen4_qsa_attn_forward_cuda(
         queries: *const Half,
         keys: *const Half,
@@ -80,6 +81,8 @@ unsafe extern "C" {
         positions: *const i32,
         q_norm_weight: *const Half,
         k_norm_weight: *const Half,
+        cos_table: *const Half,
+        sin_table: *const Half,
         attn_weights: *mut Half,
         attn_out: *mut Half,
         normed_keys: *mut Half,
