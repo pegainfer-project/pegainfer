@@ -77,14 +77,6 @@ impl ModelLine for Qwen35Line {
     }
 
     fn probe(&self, config: &serde_json::Value) -> Result<(), String> {
-        let model_type = config.get("model_type").and_then(serde_json::Value::as_str);
-        let text_model_type = config
-            .get("text_config")
-            .and_then(|text| text.get("model_type"))
-            .and_then(serde_json::Value::as_str);
-        if model_type != Some("qwen3_5") && text_model_type != Some("qwen3_5_text") {
-            return Err(format!("model_type {model_type:?} is not \"qwen3_5\""));
-        }
         crate::probe_config_json(config).map_err(|error| error.to_string())
     }
 
@@ -116,36 +108,13 @@ impl ModelLine for Qwen35Line {
                 "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
             ));
         }
-        if let Some(max_batch) = cli.max_batch {
-            if !(1..=crate::MAX_DECODE_BATCH).contains(&max_batch) {
-                return Err(CliError::rule(format!(
-                    "--max-batch must be in 1..={} for Qwen3.5, got {max_batch}",
-                    crate::MAX_DECODE_BATCH
-                )));
-            }
-        }
-        if decode_overlap != Qwen35DecodeOverlap::Off {
-            let max_batch = cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH);
-            if max_batch > crate::MAX_SHARED_SM_DECODE_BATCH {
-                return Err(CliError::rule(format!(
-                    "Qwen3.5 --decode-overlap=stream requires --max-batch <= {}; got {max_batch}",
-                    crate::MAX_SHARED_SM_DECODE_BATCH
-                )));
-            }
-        }
-        if ctx.shared.tp_size > 1 && decode_overlap != Qwen35DecodeOverlap::Off {
-            return Err(CliError::rule(
-                "--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap",
-            ));
-        }
-        if ctx.shared.tp_size > 1
-            && matches!(cli.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
-        {
-            return Err(CliError::rule(
-                "--qwen35-scheduler-policy=auto is single-GPU only; Qwen3.5 TP uses the fixed off policy",
-            ));
-        }
-        Ok(())
+        crate::check_launch(
+            cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+            ctx.shared.tp_size > 1,
+            cli.qwen35_scheduler_policy.resolve(),
+            decode_overlap,
+        )
+        .map_err(|error| CliError::rule(error.to_string()))
     }
 
     fn serve_plan(&self, _ctx: &LaunchContext<'_>) -> Result<ServePlan, CliError> {
