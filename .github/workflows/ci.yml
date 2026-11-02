@@ -252,8 +252,9 @@ jobs:
       # files reach: a model crate reaches its own row; a shared crate, the
       # workspace manifests, the submodule list, the toolchain or this workflow
       # reaches every row; any other file reaches the rows of the crates whose
-      # Rust source names it, as `include_str!` does. A rename counts at both
-      # its old and its new path.
+      # Rust source names it, as `include_str!` does, and a Markdown file
+      # reaches rows only that way. A rename counts at both its old and its
+      # new path.
       - name: Select rows
         id: select
         env:
@@ -301,12 +302,21 @@ jobs:
             esac
           }
           rows_for_path() {
+            local name=${1##*/}
+            local -a names=(-e "$name")
             case "$1" in
               Cargo.toml | Cargo.lock | rust-toolchain.toml | .gitmodules | .github/workflows/ci.yml) echo all ;;
+              *.md)
+                names=(-e "\"$name")
+                if [[ $1 == */* ]]; then
+                  local parent=${1%/*}
+                  names+=(-e "${parent##*/}/$name")
+                fi
+                ;;
               pegainfer-*/* | kvbm/*) rows_for_crate "${1%%/*}" ;;
             esac
             if [[ $1 != *.rs ]]; then
-              { git grep -l -F -- "${1##*/}" -- '*.rs' || true; } | while read -r file; do
+              { git grep -l -F "${names[@]}" -- '*.rs' || true; } | while read -r file; do
                 rows_for_crate "${file%%/*}"
               done
             fi
