@@ -328,7 +328,7 @@ pub fn deserialize_shards(mmaps: &[Mmap]) -> Result<Vec<SafeTensors<'_>>> {
         .collect()
 }
 
-fn find_tensor<'a>(
+pub fn find_tensor<'a>(
     shards: &'a [SafeTensors<'a>],
     weight_map: &HashMap<String, usize>,
     name: &str,
