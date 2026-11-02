@@ -109,11 +109,4 @@ impl KvCapacity {
     pub(crate) fn total_tokens(self) -> usize {
         self.total_blocks.saturating_mul(self.block_size)
     }
-
-    /// Blocks a single request of `tokens` tokens occupies — whole-block
-    /// allocation rounds up.
-    #[must_use]
-    pub fn blocks_for(self, tokens: usize) -> usize {
-        tokens.div_ceil(self.block_size.max(1))
-    }
 }

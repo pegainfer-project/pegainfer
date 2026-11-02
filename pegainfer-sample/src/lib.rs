@@ -15,7 +15,7 @@
 //! Layering: the `.cu`/FFI and the low-level batch primitives live in
 //! `pegainfer-kernels` (the CUDA build owner); this crate owns the policy
 //! (greedy/non-greedy routing, logprob math) and the reusable scratch.
-//! `SamplingParams`/`TokenLogprob` stay in `pegainfer-engine` (the CUDA-free
+//! `SamplingParams`/`TokenLogprob` stay in `pegainfer-frontend` (the CUDA-free
 //! contract crate) and are reachable from here.
 //!
 //! Kimi-K2 keeps its own greedy path — a sharded-vocab local argmax whose top-1

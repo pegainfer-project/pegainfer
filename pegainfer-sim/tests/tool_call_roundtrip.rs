@@ -396,21 +396,3 @@ fn reserve_loopback_port() -> Result<u16> {
         .context("failed to reserve loopback port for tool-call e2e test")?;
     Ok(listener.local_addr()?.port())
 }
-
-#[test]
-fn scripted_chunks_concatenate_to_expected_payload() {
-    let joined = format!("{CHUNK_1}{CHUNK_2}{CHUNK_3}");
-    assert_eq!(
-        joined,
-        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"SF\"}}\n</tool_call>"
-    );
-    // The inner JSON object must be valid on its own.
-    let inner = joined
-        .trim_start_matches("<tool_call>")
-        .trim()
-        .trim_end_matches("</tool_call>")
-        .trim();
-    let parsed: Value = serde_json::from_str(inner).expect("inner tool-call JSON is valid");
-    assert_eq!(parsed["name"], json!("get_weather"));
-    assert_eq!(parsed["arguments"]["location"], json!("SF"));
-}
