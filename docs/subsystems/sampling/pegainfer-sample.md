@@ -1,8 +1,8 @@
 # pegainfer-sample — the shared sampling layer
 
-**TL;DR:** `pegainfer-sample` is the crate qwen3, qwen35, and Kimi-K2 route through to turn a logits arena into next-token ids (`select_batch`) and into host logprobs (`token_logprob_from_row`). It replaces `pegainfer-core::ops::select_batch_tokens_into` (deleted) and the three copies of `compute_logprobs_from_cpu`/`host_token_logprob`. Kimi keeps its sharded-vocab greedy argmax (a DP concern the crate can't express) but routes non-greedy sampling and logprobs through here. The DeepSeek lines do **not** route through — both are greedy-only and pick with a bare argmax (v2-lite on the GPU via `core::ops::argmax`, v4 on the host via `argmax_f32`), so they need no batched sampling policy. See *Next step* for the V4 host-argmax caveat.
+**TL;DR:** `pegainfer-sample` is the crate qwen3, qwen35, Gemma 4, GLM5.2 and Kimi-K2 route through to turn a logits arena into next-token ids (`select_batch`) and into host logprobs (`token_logprob_from_row`). It replaces `pegainfer-core::ops::select_batch_tokens_into` (deleted) and the three copies of `compute_logprobs_from_cpu`/`host_token_logprob`. Kimi keeps its sharded-vocab greedy argmax (a DP concern the crate can't express) but routes non-greedy sampling and logprobs through here. DeepSeek-V2-Lite does **not** route through: it is greedy-only and picks with a bare GPU argmax via `core::ops::argmax`, so it needs no batched sampling policy.
 
-Last touched: 2026-06
+Last touched: 2026-11
 
 ## Why a crate
 
@@ -10,7 +10,7 @@ Token selection and host logprob math are model-agnostic — the only model-shap
 
 A dedicated crate makes the door from logits to tokens explicit and lets `pegainfer-core::ops` drop the sampling *policy* it used to forward (`select_batch_tokens_into`, `sampling_params_effectively_greedy`). The bare argmax primitives (`argmax`, `argmax_batch_bf16_into`) stay in the `core::ops` facade — they are kernel ops, not sampling policy, and DeepSeek-V2-Lite's single-rank greedy still reaches them there. The crate sits **beside** `pegainfer-core`, atop the two lower layers it actually needs:
 
-- `pegainfer-engine` — the CUDA-free contract crate: `SamplingParams`, `TokenLogprob`.
+- `pegainfer-frontend` — the CUDA-free contract crate: `SamplingParams`, `TokenLogprob`.
 - `pegainfer-kernels` — the CUDA build owner: `gpu_sample_batch_into`, the batched argmax, scratch sizing.
 
 It deliberately does **not** depend on `pegainfer-core` (which would be a cycle in spirit — core is the per-model runtime contract, sampling is a leaf utility).
