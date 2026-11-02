@@ -122,16 +122,6 @@ impl DeferredFinish {
         }
     }
 
-    fn inner(&self) -> &DeferredInner {
-        self.inner
-            .as_ref()
-            .expect("deferred finish accessed after consumption")
-    }
-
-    pub fn id(&self) -> RequestId {
-        self.inner().update.id
-    }
-
     /// Deliver the terminal. Consumes the finish.
     pub fn send(mut self) {
         let inner = self.inner.take().expect("deferred finish sent twice");
