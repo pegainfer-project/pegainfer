@@ -1366,10 +1366,11 @@ impl Qwen3Executor {
                     // Hedge-chain scratch KV pages (PEGAINFER_SPEC_HEDGE)
                     // live in the KV buffer but outside the pool; bill them
                     // via the margin so the profiled block budget shrinks to
-                    // fit instead of OOMing. Two bounds: the effective
-                    // geometry (worst-case span pages per chain) and the
-                    // expanded verify batch, which holds at most
-                    // `max_verify_batch - 1` hedge spans at once.
+                    // fit instead of OOMing. Each chain span touches at most
+                    // `pages_per_chain` pages, and two bounds cap the spans:
+                    // the effective geometry and the expanded verify batch,
+                    // which holds at most `max_verify_batch - 1` hedge spans
+                    // at once.
                     let geometry = dflash_lane::spec_hedge_effective(reservation.block_size);
                     let pages_per_chain = dflash_lane::hedge_pages_per_chain(
                         reservation.block_size,
@@ -1377,10 +1378,9 @@ impl Qwen3Executor {
                     );
                     let pages = if reservation.uses_markov_head {
                         geometry
-                            .cap
+                            .chain_spans
+                            .min(max_verify_batch - 1)
                             .saturating_mul(pages_per_chain)
-                            .saturating_mul(geometry.positions.len())
-                            .min(pages_per_chain.saturating_mul(max_verify_batch - 1))
                     } else {
                         // A plain DFlash drafter can never hedge; a nonzero
                         // hedge env must not reserve scratch it cannot use.
@@ -3760,11 +3760,10 @@ impl LocalQwen3Lane {
             let drafts_start = usize::from(!dflash.model.anchor_first());
             let pages_per_chain =
                 dflash_lane::hedge_pages_per_chain(dflash.model.block_size(), page_size);
-            let mut hedged_requests = 0usize;
+            // The draft round already chose the hedged requests: it built
+            // `hedge_blocks` for exactly those, so this pass only checks the
+            // verify batch and the scratch pages.
             for (idx, req) in requests.iter().enumerate() {
-                if hedged_requests == cap {
-                    break;
-                }
                 if !req.params.is_greedy() || req.token_ids.len() < 2 {
                     continue;
                 }
@@ -3817,9 +3816,6 @@ impl LocalQwen3Lane {
                     views.push(KvView::new(pages, v.seq_len(), page_size));
                     hedge_spans.push((idx, replaced));
                     added.push(ids);
-                }
-                if !added.is_empty() {
-                    hedged_requests += 1;
                 }
             }
         }

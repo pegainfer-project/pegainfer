@@ -539,17 +539,29 @@ pub(super) fn spec_hedge_auto() -> bool {
 pub(super) struct HedgeGeometry {
     pub(super) cap: usize,
     pub(super) positions: Vec<usize>,
+    /// Most hedge chain spans one verify round can carry.
+    pub(super) chain_spans: usize,
 }
 
 pub(super) fn spec_hedge_effective(block_size: usize) -> HedgeGeometry {
-    let positions = spec_hedge_positions()
+    let positions: Vec<usize> = spec_hedge_positions()
         .iter()
         .copied()
         .filter(|&p| p < block_size)
         .collect();
+    let cap = spec_hedge_cap();
+    let chain_spans = match spec_hedge_knee() {
+        _ if cap == 0 || positions.is_empty() => 0,
+        0 => cap.saturating_mul(positions.len()),
+        // The knee policy hedges the whole batch, so its free zone bounds the
+        // chain spans in place of the request cap; every round keeps at least
+        // one plain span.
+        knee => (knee / (block_size + 1)).saturating_sub(1),
+    };
     HedgeGeometry {
-        cap: spec_hedge_cap(),
+        cap,
         positions,
+        chain_spans,
     }
 }
 
@@ -566,7 +578,8 @@ pub(super) fn hedge_pages_per_chain(block_size: usize, page_size: usize) -> usiz
 }
 
 /// `PEGAINFER_SPEC_HEDGE=<H>` enables the parallel hedge and caps the number
-/// of hedged requests per verify round at `H`. Each hedged request costs one
+/// of hedged requests per verify round at `H`, unless
+/// `PEGAINFER_SPEC_HEDGE_KNEE` plans the round. Each hedged request costs one
 /// extra verify span and [`hedge_pages_per_chain`] lane scratch KV pages PER
 /// CHAIN, so a request branching at C positions costs C of each.
 /// `0`/unset/unparsable = off. Read once.
