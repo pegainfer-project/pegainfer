@@ -266,8 +266,6 @@ __global__ void fp8_weight_scale_pack_ue8m0_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 // Row-grid cap for the grid-strided quant kernels: enough blocks to fill the
 // SMs at 128 threads/block, small enough that a capacity-sized (2080-row)
 // launch does not pay ~100k block-schedules for ~400 real rows.

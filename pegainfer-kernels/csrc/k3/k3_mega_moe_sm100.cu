@@ -113,10 +113,6 @@ constexpr int kTransformSfWordK = kTransformSfGroupK * kTransformSfPerWord;  // 
 // Weight-row interleave granularity for the fused gate|up projection.
 constexpr int kInterleaveGran = 8;
 
-CUresult consume_last_cuda_error() {
-  return map_cuda_error(cudaGetLastError());
-}
-
 // ---------------------------------------------------------------------------
 // Row permutations (host/device agreeing pure index math)
 // ---------------------------------------------------------------------------

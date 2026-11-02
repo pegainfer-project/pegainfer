@@ -41,8 +41,6 @@ constexpr int kRowsPlainShortKHopper = 4;  // k <= 2048, measured on SM90
 constexpr int kRowsPlainBlackwell    = 1;  // all K, measured on SM103
 constexpr int kRowsPlainLongK        = 1;  // k > 2048 on every architecture
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 // The activation is read with 16-byte float4/uint4 loads straight from global (no shared
 // staging absorbs misalignment any more), so its base must be 16-byte aligned. CudaSlice
 // allocation bases are 256B-aligned and satisfy this; guard here so a future misaligned
