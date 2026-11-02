@@ -14,7 +14,7 @@
       "dataset": "random",
       "shuffle": false,
       "prompt_representation": "token_ids",
-      "seed_policy": "phase_repeat"
+      "seed_policy": "stable_coordinates_v1"
     },
     "timing": {
       "clock": "monotonic",
@@ -73,8 +73,7 @@
         "model": "test-model",
         "engine": "pegainfer-sim",
         "engine_version": "test",
-        "model_revision": "test",
-        "model_config_sha256": "62ebdba540b0e9ec54e42b297897ce69f78ddd3212fa6d63da1888db266cb012"
+        "model_revision": "test"
       },
       "runtime": {
         "backend": "pegainfer-sim",
@@ -93,8 +92,7 @@
         "model": "test-model",
         "engine": "pegainfer-sim",
         "engine_version": "test",
-        "model_revision": "test",
-        "model_config_sha256": "62ebdba540b0e9ec54e42b297897ce69f78ddd3212fa6d63da1888db266cb012"
+        "model_revision": "test"
       },
       "runtime": {
         "backend": "pegainfer-sim",
@@ -250,5 +248,5 @@
     "artifact_root": "artifacts"
   },
   "kind": "campaign_spec",
-  "schema_version": 8
+  "schema_version": 10
 }

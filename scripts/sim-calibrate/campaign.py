@@ -4,37 +4,22 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
 import sys
+import uuid
+import platform
+from importlib.metadata import distributions
 from pathlib import Path
 from typing import Any
 
-from artifacts import (ArtifactError, _read_json, checked_path, execution_snapshot, file_reference,
-                       load_compiled_bundle, sealed_reference, write_compiled_bundle, write_derived_document)
-from manifest import ManifestError, compile_manifest, sha256_json
+from artifacts import (ArtifactError, _read_json, checked_path, execution_snapshot,
+                       load_compiled_bundle, read_sealed_attempt, sealed_reference, write_compiled_bundle)
+from manifest import ManifestError, compile_manifest
 from profile import ProfileError
 from request_plan import PlanError, build_plan
-from vllm_bench import VllmBenchError, inspect_binary
-
-TOKENIZER_FILES = (
-    "tokenizer_config.json", "tokenizer.json", "tokenizer.model", "special_tokens_map.json",
-    "added_tokens.json", "vocab.json", "vocab.txt", "merges.txt", "config.json", "chat_template.jinja",
-)
-
-
-def _file_digest(path: Path) -> str:
-    try:
-        with path.open("rb") as stream:
-            checksum = hashlib.sha256()
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                checksum.update(chunk)
-            return checksum.hexdigest()
-    except OSError as exc:
-        raise ManifestError(f"cannot read compiler input {path}: {exc}") from exc
-
+from vllm_bench import VllmBenchError, inspect_assets
 
 def load_json_campaign(path: Path) -> dict[str, Any]:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -57,40 +42,6 @@ def load_json_campaign(path: Path) -> dict[str, Any]:
     return spec
 
 
-def _assets(spec: dict[str, Any], base: Path) -> dict[str, Any]:
-    client = spec.get("client")
-    if not isinstance(client, dict):
-        raise ManifestError("client must be an object")
-    paths = {}
-    for field in ("binary", "tokenizer"):
-        value = client.get(field)
-        if not isinstance(value, str) or not value:
-            raise ManifestError(f"client.{field} must name a readable local path")
-        path = Path(value).expanduser()
-        paths[field] = (base / path).resolve() if not path.is_absolute() else path.resolve()
-        client[field] = str(paths[field])
-    tokenizer = paths["tokenizer"]
-    if not tokenizer.is_dir() or not (tokenizer / "tokenizer_config.json").is_file():
-        raise ManifestError("client.tokenizer must contain tokenizer_config.json")
-    if not any((tokenizer / name).is_file() for name in ("tokenizer.json", "tokenizer.model", "vocab.json", "vocab.txt")):
-        raise ManifestError("client.tokenizer is missing vocabulary/tokenizer data")
-    files = {name: _file_digest(tokenizer / name) for name in TOKENIZER_FILES if (tokenizer / name).is_file()}
-    binary = inspect_binary(paths["binary"])
-    launcher = inspect_binary(Path("/usr/bin/setpriv"))
-    if client.get('version') != binary.version:
-        raise ManifestError(f"client.version must equal actual --version: {binary.version}")
-    from evidence_proxy import observer_identity
-    return {
-        "binary_sha256": binary.sha256,
-        "binary_help_sha256": binary.help_sha256,
-        "process_launcher": {"path": launcher.path, "sha256": launcher.sha256, "version": launcher.version, "help_sha256": launcher.help_sha256},
-        "observer": observer_identity(),
-        "tokenizer_sha256": sha256_json(files),
-        "tokenizer_config_sha256": files["tokenizer_config.json"],
-        "tokenizer_files": files,
-    }
-
-
 def _profile_destination(root: Path, configured: str | None, default: str) -> str:
     path = Path(configured or default).expanduser()
     destination = (root / path).resolve() if not path.is_absolute() else path.resolve()
@@ -111,13 +62,12 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         if not executable.is_absolute():
             executable = spec_path.parent / executable
         launch['argv'][0] = str(executable.absolute())
-        launch['executable'] = file_reference(executable)
         from probe import target_runtime_environment
         environment = launch.get('environment', {})
         if not isinstance(environment, dict):
             raise ManifestError('target launch environment must be an object')
         launch['environment'] = {**target_runtime_environment(dict(os.environ)), **environment}
-    assets = _assets(spec, spec_path.parent)
+    assets = inspect_assets(spec["client"], spec_path.parent)
     compiled = compile_manifest(spec, assets)
     root = output or Path(spec["output"]["artifact_root"]).expanduser()
     if not root.is_absolute():
@@ -131,22 +81,12 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
         name = f"plans/{cell['cell_id']}/request_plan.json"
         documents[name] = plan
         if cell['kind'] == 'cached_prefill':
-            from cached_prefix_workload import workload_documents
+            from cached_prefill import workload_documents
             documents.update(workload_documents(plan))
-        cell["plan"] = {"path": name, "plan_sha256": plan["plan_sha256"]}
-    from cached_prefix_workload import validate_workload_collection
+        cell["plan"] = {"path": name}
+    from cached_prefill import validate_workload_collection
     validate_workload_collection([documents[c['plan']['path']] for c in compiled['workload']['cells']])
-    module_dir = Path(__file__).resolve().parent
-    compiler_files = {name: assets['observer']['sources'][name] for name in (
-        "campaign.py", "manifest.py", "request_plan.py", "measurement_schema.py", "profile.py", "artifacts.py", "steady_state.py",
-    )}
-    if any(c['kind'] == 'cached_prefill' for c in compiled['workload']['cells']):
-        compiler_files['cached_prefix_workload.py'] = assets['observer']['sources']['cached_prefix_workload.py']
-    revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=module_dir, capture_output=True, text=True, timeout=5, check=False)
     compiled["provenance"] = {
-        "compiler_revision": revision.stdout.strip() if revision.returncode == 0 else "unversioned",
-        "compiler_sha256": sha256_json(compiler_files), "compiler_files": compiler_files,
-        "source_spec_sha256": _file_digest(spec_path),
         "compile_argv": argv or ["campaign.py", "compile", "--spec", str(spec_path)],
         "artifact_uri": root.as_uri(),
     }
@@ -160,6 +100,13 @@ def compile_campaign(spec_path: Path, *, output: Path | None = None, argv: list[
     documents["compiled_campaign.json"] = compiled
     if write:
         write_compiled_bundle(root, documents, compiled["campaign_id"])
+        revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                                  capture_output=True, text=True).stdout.strip()
+        packages = {d.metadata['Name']: d.version for d in distributions()}
+        environment = {"python": platform.python_version(), "git_revision": revision, "packages": packages}
+        diagnostics = root / 'diagnostics'
+        diagnostics.mkdir(exist_ok=True)
+        (diagnostics / 'environment.json').write_text(json.dumps(environment, indent=2, sort_keys=True) + '\n')
     return compiled
 
 
@@ -169,29 +116,24 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
     """Run a complete cold/decode scope against an already-running target.
 
     Profile servers are owned here because references differ by cell. Every
-    acquisition still uses the existing driver. Recovery verifies sealed bytes
-    before skipping them, without needing their historical processes alive.
+    acquisition still uses the existing driver. Recovery reuses sealed attempts
+    without needing their historical processes alive.
     """
     import math
     from baseline import prepare_references, resolve_reference, select_reference
-    from evidence_proxy import observer_identity
     from fit import fit_normalized, write_document as write_fit
     from normalize import normalize_campaign, verify_normalized, write_document as write_normalized
-    from pairing import campaign_scope, load_role
+    from pairing import campaign_scope
     from plan_driver import profile_server, run_campaign
     from profile import materialize_calibration, materialize_profile, verify_fitted_bundle
     from artifacts import fitted_bundle_paths
-    from replay import replay_campaign
+    from report import report_campaign
     from report import write_document as write_report
 
     if any(not math.isfinite(value) or value <= 0 for value in (timeout, startup_timeout)):
         raise ArtifactError('campaign timeouts must be finite and positive')
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    if campaign['client']['observer'] != observer_identity():
-        raise ArtifactError('frozen execution sources changed; compile into a new root')
-    if file_reference(model_path.expanduser().resolve() / 'config.json')['sha256'] != campaign['variants']['target']['identity']['model_config_sha256']:
-        raise ArtifactError('model metadata differs from frozen campaign identity')
     if not sim_binary.expanduser().resolve().is_file():
         raise ArtifactError('simulator binary is missing')
     train, train_deferred, _, _ = campaign_scope(campaign, 'train')
@@ -207,14 +149,14 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         remaining = []
         if not (root / 'execution_index.json').exists():
             return cells
-        with execution_snapshot(root, campaign['campaign_id']) as (execution, _):
+        with execution_snapshot(root, campaign['campaign_id']) as execution:
             for cell in cells:
                 entry = execution['cells'].get(f"{cell['cell_id']}:{role}", {})
                 if entry.get('status') != 'sealed':
                     remaining.append(cell)
                     continue
                 plan = _read_json(checked_path(root, cell['plan']['path']))
-                load_role(root, campaign, plan, role, sealed_reference(entry))
+                read_sealed_attempt(root, plan, role, sealed_reference(entry))
         return remaining
 
     async def collect(cells: list[dict], role: str, pid: int | None = None) -> None:
@@ -242,14 +184,14 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         if normalized['status'] != 'succeeded':
             raise ArtifactError('complete qualified training is required before fit')
         write_normalized(normalized_path, normalized)
-        fitted = fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256'])
+        fitted = fit_normalized(normalized)
         if fitted['status'] != 'succeeded':
             raise ArtifactError('required training candidates could not be fitted')
         write_fit(fit_path, fitted)
         result = {'campaign_id': campaign['campaign_id'], 'status': 'succeeded',
                   'stage': 'offline_calibration', 'runtime_enabled': False,
-                  'normalized': {'path': str(normalized_path), **file_reference(normalized_path)},
-                  'fit': {'path': str(fit_path), **file_reference(fit_path)}}
+                  'normalized': {'path': str(normalized_path)},
+                  'fit': {'path': str(fit_path)}}
         if any(c['kind'] == 'cached_prefill' for c in train):
             result['calibration'] = materialize_calibration(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
         return result
@@ -265,18 +207,11 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         if normalized['status'] != 'succeeded':
             raise ArtifactError('complete qualified training is required before fit')
         write_normalized(normalized_path, normalized)
-        fitted = fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256'])
+        fitted = fit_normalized(normalized)
         if fitted['status'] != 'succeeded':
             raise ArtifactError('required training candidates could not be fitted')
         write_fit(fit_path, fitted)
         materialize_profile(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
-    bundle_paths = fitted_bundle_paths(root, campaign)
-    selection = _read_json(bundle_paths['selection'])
-    training_paths = [*bundle_paths.values(), root/'references/preparation.json',
-                      root/'artifact_index.json', root/'compiled_campaign.json',
-                      *(Path(ref['path']) for ref in selection['training'].values())]
-    training_snapshot = {str(path): file_reference(path) for path in training_paths}
-    write_derived_document(root/'derived/training-snapshot.json', training_snapshot, root)
     await collect(pending(heldout, 'target'), 'target')
     await references(heldout)
     remaining = pending(heldout, 'sim')
@@ -284,14 +219,12 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         async with profile_server(root, campaign['variants']['sim'], binary=sim_binary,
                                   model_path=model_path, timeout=startup_timeout) as pid:
             await collect(remaining, 'sim', pid)
-    if {str(path): file_reference(path) for path in training_paths} != training_snapshot:
-        raise ArtifactError('training/profile sources changed during held-out acquisition')
-    report = replay_campaign(root)
+    report = report_campaign(root)
     report_path = root / 'reports' / ('validation.json' if report['status'] == 'succeeded'
-                                    else f"{report['status']}-{sha256_json(report)}.json")
+                                    else f"{report['status']}-{uuid.uuid4().hex}.json")
     write_report(report_path, report)
     return {'campaign_id': campaign['campaign_id'], 'status': report['status'],
-            'report': {'path': str(report_path), **file_reference(report_path)},
+            'report': {'path': str(report_path)},
             'expected_count': report['expected_count'], 'matched_count': report['matched_count']}
 
 

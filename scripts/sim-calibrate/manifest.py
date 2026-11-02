@@ -4,19 +4,17 @@
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import re
 from itertools import product
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, contract as measurement_contract, digest, integer, number, text
+from measurement_schema import canonical_json, sha256_json, TIMING_CONTRACT, RETRY_CONTRACT, DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, contract as measurement_contract, digest, integer, number, text
 
 
-CAMPAIGN_SPEC_SCHEMA_VERSION = 8
-COMPILED_CAMPAIGN_SCHEMA_VERSION = 8
+CAMPAIGN_SPEC_SCHEMA_VERSION = 10
+COMPILED_CAMPAIGN_SCHEMA_VERSION = 11
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
 WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
@@ -24,17 +22,13 @@ _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 
 
 class ManifestError(ValueError):
-    """Raised when a campaign spec cannot be made immutable and safe."""
+    """Raised when a campaign spec cannot describe an executable experiment."""
 
 
-def canonical_json(value: Any) -> str:
-    """Render JSON deterministically for IDs and digest comparisons."""
-
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def sha256_json(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+def execution_identity(identity: dict[str, Any]) -> dict[str, Any]:
+    """Serving identity without the Rust manifest-only model declaration."""
+    return {key: copy.deepcopy(value) for key, value in identity.items()
+            if key != "model_config_sha256"}
 
 
 def _axis_values(value: Any, field: str) -> tuple[int, ...]:
@@ -328,9 +322,8 @@ def canonical_execution_configuration(value: dict[str, Any], field: str) -> dict
         raise ManifestError("generation.shuffle must be false for fixed-batch calibration")
     if generation.get("prompt_representation") not in ("token_ids", "text"):
         raise ManifestError("generation.prompt_representation must be token_ids or text")
-    if generation.get("seed_policy") != "phase_repeat":
-        raise ManifestError("generation.seed_policy must be phase_repeat")
-    from evidence_proxy import TIMING_CONTRACT
+    if generation.get("seed_policy") != "stable_coordinates_v1":
+        raise ManifestError("generation.seed_policy must be stable_coordinates_v1")
     timing = value.get("timing")
     if timing != TIMING_CONTRACT:
         raise ManifestError("timing must use the explicit proxy token-ID/text contract")
@@ -374,7 +367,7 @@ def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> d
     return {**matrix, **execution}
 
 
-def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any], assets: dict[str, Any]) -> dict[str, Any]:
+def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any]) -> dict[str, Any]:
     """Validate shared request limits and freeze the compiled cell identity."""
     for field in ("input_tokens", "output_tokens", "concurrency"):
         integer(cell[field], field, positive=True, maximum=2**32-1)
@@ -385,7 +378,7 @@ def _finalize_cell(cell: dict[str, Any], variants: dict[str, Any], assets: dict[
     if cell["kind"] in REFERENCE_POLICIES:
         cell = {**cell, "reference_policy": reference_policy(cell["kind"], cell["split"])}
     cell = {**cell, "fit_policy": {"train": cell["split"] == "train", "excluded_metrics": ["ttft_ms"] if cell["concurrency"] > 1 else []}}
-    cell["cell_id"] = sha256_json({"schema_version": COMPILED_CAMPAIGN_SCHEMA_VERSION, "client_assets": assets, "cell": cell})
+    cell["cell_id"] = sha256_json(cell)
     return cell
 
 
@@ -403,7 +396,6 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             text(client.get(field), f"client.{field}")
         defaults = canonical_execution_configuration({key: client.get(key) for key in ("seed", "sampling", "generation", "timing")}, "client")
         client = {**client, **defaults}
-        from evidence_proxy import RETRY_CONTRACT
         if client.get("retry") != RETRY_CONTRACT:
             raise ManifestError("client.retry must declare at-most-once proxy forwarding and unavailable client retry control")
         supplied = _fields(spec.get("variants"), {"target", "zero_cost", "sim"}, "variants")
@@ -422,7 +414,10 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             if endpoint.scheme not in ("http", "https") or not endpoint.netloc or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment or endpoint.path not in ("", "/"):
                 raise ManifestError(f"variants.{name}.identity.endpoint must be an HTTP URL without credentials")
             identity["endpoint"] = identity["endpoint"].rstrip("/")
-            digest(identity.get("model_config_sha256"), f"variants.{name}.model_config_sha256")
+            if name == "target":
+                digest(identity.get("model_config_sha256"), "variants.target.model_config_sha256")
+            else:
+                identity = execution_identity(identity)
             raw_runtime = _fields(raw.get("runtime"), {"gpu", "backend", "driver", "cuda", "parallelism", "quantization", "scheduler", "cache"}, f"variants.{name}.runtime")
             runtime = _merge_configuration(target_runtime, raw_runtime)
             runtime["backend"] = raw_runtime.get("backend", identity["engine"])
@@ -451,7 +446,7 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             if "launch" in raw:
                 if name != "target":
                     raise ManifestError("only target may declare launch")
-                launch = _fields(raw["launch"], {"argv", "environment", "startup_timeout", "executable"}, "target.launch")
+                launch = _fields(raw["launch"], {"argv", "environment", "startup_timeout"}, "target.launch")
                 argv = launch.get("argv")
                 if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg for arg in argv) or not Path(argv[0]).is_absolute():
                     raise ManifestError("target.launch.argv must start with an absolute executable")
@@ -461,16 +456,11 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
                 timeout = number(launch.get("startup_timeout", 90), "target.launch.startup_timeout")
                 if timeout <= 0:
                     raise ManifestError("target.launch.startup_timeout must be positive")
-                executable = _fields(launch.get('executable'), {'sha256', 'size'}, 'target.launch.executable')
-                digest(executable.get('sha256'), 'target.launch.executable.sha256')
-                integer(executable.get('size'), 'target.launch.executable.size', positive=True)
-                variants[name]["launch"] = {"argv": list(argv), "environment": dict(environment), "startup_timeout": timeout, 'executable': dict(executable)}
+                variants[name]["launch"] = {"argv": list(argv), "environment": dict(environment), "startup_timeout": timeout}
             if "profile_path" in raw:
                 variants[name]["profile_path"] = text(raw["profile_path"], f"variants.{name}.profile_path")
         if variants["zero_cost"]["runtime"]["scheduler"] != variants["sim"]["runtime"]["scheduler"] or canonical_cache_identity(variants["zero_cost"]["runtime"].get("cache")) != canonical_cache_identity(variants["sim"]["runtime"].get("cache")):
             raise ManifestError("zero_cost and sim must have identical scheduler/cache configuration")
-        if any(v["identity"]["model_config_sha256"] != variants["target"]["identity"]["model_config_sha256"] for v in variants.values()):
-            raise ManifestError("variant model config digests differ")
         workload = _fields(spec.get("workload"), {"matrices"}, "workload")
         matrices = workload.get("matrices")
         if not isinstance(matrices, dict) or not matrices:
@@ -506,19 +496,24 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
                         raise ManifestError("cached prefix must align to the enabled target cache")
                 if cell["kind"] == "steady_decode" and cell["split"] == "train" and any(cell["concurrency"] > v["runtime"]["scheduler"]["max_num_seqs"] for v in variants.values()):
                     raise ManifestError("decode train concurrency exceeds scheduler capacity")
-                cells.append(_finalize_cell(cell, variants, assets))
+                cells.append(_finalize_cell(cell, variants))
         # Output locations and profile bindings are storage metadata, not workload identity.
-        variant_identity = {name: {k: v for k, v in value.items() if k != "profile_path"} for name, value in variants.items()}
+        variant_identity = {
+            name: {"identity": {key: item for key, item in execution_identity(value["identity"]).items()
+                                if key != "endpoint"},
+                   "runtime": value["runtime"], "server_flags": value["server_flags"]}
+            for name, value in variants.items()
+        }
         client_identity = {key: value for key, value in client.items() if key not in ("binary", "tokenizer")}
-        identity = {"kind": "campaign_spec", "schema_version": CAMPAIGN_SPEC_SCHEMA_VERSION, "client": {**client_identity, **assets}, "variants": variant_identity, "workload": {"cells": cells}}
+        identity = {"kind": "campaign_spec", "schema_version": CAMPAIGN_SPEC_SCHEMA_VERSION, "client": client_identity, "variants": variant_identity, "workload": {"cells": cells}}
         campaign_id = sha256_json(identity)
         splits = {split: [cell["cell_id"] for cell in cells if cell["split"] == split] for split in SPLITS}
         return {
             "kind": "compiled_campaign", "schema_version": COMPILED_CAMPAIGN_SCHEMA_VERSION,
-            "campaign_id": campaign_id, "source_digest": campaign_id,
+            "campaign_id": campaign_id,
             "client": {**copy.deepcopy(client), **assets}, "variants": variants,
             "workload": {"cells": cells, "cell_count": len(cells)}, "splits": splits,
-            "required_scope": {"cells": [cell["cell_id"] for cell in cells], "sha256": sha256_json(splits)},
+            "required_scope": {"cells": [cell["cell_id"] for cell in cells]},
             "measurement_contract": measurement_contract(),
         }
     except (MeasurementError, ValueError, TypeError) as exc:

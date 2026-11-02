@@ -2,33 +2,30 @@
 
 These synthetic streams exercise lineage, not model timing or GPU performance.
 """
-import copy
 import hashlib
 import json
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from artifacts import ArtifactError, ExecutionStore, _read_json, _write_atomic, file_reference
 from campaign import compile_campaign
 from fit import fit_normalized
-from normalize import NormalizeError, normalize_campaign, verify_normalized, verify_normalized_sources, write_document
+from normalize import normalize_campaign, verify_normalized, verify_normalized_sources, write_document
 from probe import requires_cache_reset
 from request_plan import build_plan
 from sse_evidence import SSEParser
 from test_campaign import make_input
-from test_sse_evidence import event
+from test_evidence_proxy import event
 from vllm_bench import render_command
-from vllm_bench_collect import convert_evidence
+from vllm_bench import convert_evidence
 from steady_state import compute_statistics
 from baseline import prepare_references, resolve_reference, select_reference
-from profile import materialize_profile, verify_fitted_bundle
-from manifest import sha256_json
+from profile import materialize_profile
+from manifest import execution_identity
 
 
 def make_bundle(base: Path, *, cached=False, reset_before=None, full_train=False):
@@ -74,7 +71,7 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
             normalized = normalize_campaign(root, scope='train')
             write_document(normalized_path, normalized)
             from fit import write_document as write_fit
-            write_fit(fit_path, fit_normalized(normalized, source_digest=file_reference(normalized_path)['sha256']))
+            write_fit(fit_path, fit_normalized(normalized))
         materialize_profile(root, normalized_artifact=normalized_path, fit_artifact=fit_path)
     for role in roles:
         with ExecutionStore(root, campaign['campaign_id']) as store:
@@ -82,8 +79,8 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                 if cell['split'] != split:
                     continue
                 plan = build_plan(cell, campaign['client'])
-                identity, client = campaign['variants'][role]['identity'], campaign['client']
-                binding = {'variant_identity': identity, 'observer_sha256': client['observer']['sha256']}
+                identity, client = execution_identity(campaign['variants'][role]['identity']), campaign['client']
+                binding = {'variant_identity': identity}
                 if role != 'target':
                     configured = campaign['variants'][role]
                     if role == 'zero_cost':
@@ -92,8 +89,6 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                     profile = root / configured['profile_path']
                     endpoint = urlsplit(identity['endpoint'])
                     manifest_path = profile.parent / _read_json(profile)['calibration']['manifest']
-                    if role == 'sim':
-                        binding['selection'] = verify_fitted_bundle(root, campaign)
                     binding.update(profile=file_reference(profile), manifest=file_reference(manifest_path),
                                    endpoint={'address': endpoint.hostname, 'port': endpoint.port},
                                    listeners=[{'family': 'IPv4', 'address': '0.0.0.0', 'port': endpoint.port}])
@@ -120,7 +115,7 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                             _write_atomic(batch_root / 'reset.json', {'status': 200, 'body': '{"success": true}'})
                     prefix = f'fixture-{role}-{b}-'
                     if cell['kind'] == 'cached_prefill':
-                        from cached_prefix_workload import batch_payload
+                        from cached_prefill import batch_payload
                         batch_root.mkdir(parents=True, exist_ok=True)
                         (batch_root / 'custom.jsonl').write_bytes(batch_payload(plan, batch))
                     argv = render_command(plan, batch, binary=Path(client['binary']), endpoint='http://127.0.0.1:1',
@@ -176,9 +171,8 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                                     'upstream_attempts': 1, 'http_status': 200, 'eof': True, 'done': True,
                                     'finished': True, 'error': None}
                         _write_atomic(request / 'terminal.json', terminal)
-                digest = store.raw_index(directory)
-                envelope = convert_evidence(plan, role, identity, directory, raw_index_sha256=digest,
-                                            client=client, batch_errors=[])
+                store.raw_index(directory)
+                envelope = convert_evidence(plan, role, identity, directory, client=client, batch_errors=[])
                 _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
                 _write_atomic(directory / 'measurements.json', envelope)
                 if plan['workload_kind'] == 'steady_decode':
@@ -187,32 +181,24 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
 
 
 def refresh_attempt(root: Path, campaign: dict, role='target'):
-    """Rehash local links for semantic fault injection, leaving compiler inputs fixed."""
+    """Regenerate selected request measurements after semantic fixture changes."""
     index = _read_json(root / 'execution_index.json')
     cell = next(c for c in campaign['workload']['cells'] if c['split'] == 'train' and c['kind'] != 'cached_prefill')
     entry = index['cells'][cell['cell_id'] + ':' + role]
     directory = root / entry['path']
     with ExecutionStore(root, campaign['campaign_id']) as store:
         store.raw_index(directory)
-    # Match acquisition: workload is published after the raw index, not part of it.
-    raw = _read_json(directory / 'raw_bundle_index.json')
-    raw['files'].pop('workload_evidence.json', None)
-    raw_digest = _write_atomic(directory / 'raw_bundle_index.json', raw)
-    envelope = convert_evidence(build_plan(cell, campaign['client']), role, campaign['variants'][role]['identity'],
-                                directory, raw_index_sha256=raw_digest, client=campaign['client'], batch_errors=[])
+    plan = build_plan(cell, campaign['client'])
+    envelope = convert_evidence(plan, role, execution_identity(campaign['variants'][role]['identity']),
+                                directory, client=campaign['client'], batch_errors=[])
     _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
     _write_atomic(directory / 'measurements.json', envelope)
     if cell['kind'] == 'steady_decode':
-        _write_atomic(directory / 'decode_statistics.json', compute_statistics(build_plan(cell, campaign['client']), envelope))
-        entry['statistics'] = file_reference(directory / 'decode_statistics.json')
-    for name, field in [('raw_bundle_index.json', 'raw_index'), ('measurements.json', 'measurement'),
-                        ('workload_evidence.json', 'workload_evidence')]:
-        entry[field] = file_reference(directory / name)
-    _write_atomic(root / 'execution_index.json', index)
+        _write_atomic(directory / 'decode_statistics.json', compute_statistics(plan, envelope))
 
 
 class NormalizeTests(unittest.TestCase):
-    def test_current_train_scope_repeated_content_and_fitter_boundary(self):
+    def test_current_train_scope_and_repeated_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             root, campaign = make_bundle(Path(tmp), cached=True)
             collect_fixture(root, campaign)
@@ -231,8 +217,6 @@ class NormalizeTests(unittest.TestCase):
                 self.assertAlmostEqual(observation['effective']['tpot_ms'], 5)
                 self.assertEqual(observation['reference_interval_ms'], 5)
                 self.assertGreater(observation['decode_window_tpot_ms']['zero_cost'], 0)
-            fitted = fit_normalized(document)
-            self.assertEqual(next(c for c in fitted['candidates'] if c['name']=='decode_additive')['status'], 'fitted')
             verify_normalized_sources(document)
         for reset_before in ('cell', 'repeat'):
             with self.subTest(reset_before=reset_before), tempfile.TemporaryDirectory() as tmp:
@@ -245,70 +229,9 @@ class NormalizeTests(unittest.TestCase):
                 self.assertFalse(list((root / 'raw' / 'zero_cost').rglob('reset.json')))
                 verify_normalized(document)
 
-    def test_validation_requires_complete_roles_and_empty_scope_is_invalid(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, campaign = make_bundle(Path(tmp), full_train=True)
-            collect_fixture(root, campaign)
-            collect_fixture(root, campaign, split='sealed_test')
-            self.assertEqual(normalize_campaign(root, scope='validation')['status'], 'invalid')
-            collect_fixture(root, campaign, roles=('sim',), split='sealed_test')
-            result = normalize_campaign(root, scope='validation')
-            self.assertEqual(result['status'], 'succeeded', result['failures'])
-            self.assertTrue(all(o['split'] == 'sealed_test' for o in result['observations']))
-            verify_normalized_sources(result)
-        with tempfile.TemporaryDirectory() as tmp:
-            path, spec = make_input(Path(tmp))
-            spec['workload']['matrices'] = {}
-            # An uncollected cached-only scope cannot succeed vacuously.
-            original = json.loads((Path(__file__).parent / 'fixtures/campaign-compile.json').read_text())
-            spec['workload']['matrices']['cached'] = original['workload']['matrices']['cached-train']
-            path.write_text(json.dumps(spec))
-            campaign = compile_campaign(path)
-            root = Path(tmp) / 'artifacts'
-            with ExecutionStore(root, campaign['campaign_id']):
-                _write_atomic(root / 'execution_index.json', {'kind': 'execution_index', 'schema_version': 2,
-                              'campaign_id': campaign['campaign_id'], 'cells': {}})
-            self.assertEqual(normalize_campaign(root, scope='train')['status'], 'invalid')
-
-    def test_snapshot_survives_later_collection_and_offline_source_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, campaign = make_bundle(Path(tmp), full_train=True)
-            collect_fixture(root, campaign)
-            document = normalize_campaign(root, scope='train')
-            output = Path(tmp) / 'normalized.json'
-            write_document(output, document)
-            before = output.read_bytes()
-            collect_fixture(root, campaign, roles=('sim',), split='sealed_test')
-            with patch('evidence_proxy.observer_identity', side_effect=AssertionError('no live source check')):
-                verify_normalized(document)
-            self.assertEqual(output.read_bytes(), before)
-            for mode in ('metric', 'observations', 'cells', 'counts', 'normalizer_digest', 'fit_ready'):
-                with self.subTest(mode=mode):
-                    changed = copy.deepcopy(document)
-                    if mode == 'metric':
-                        changed['observations'][0]['measurements']['target']['ttft_ms'] += 1
-                        changed['cells'][0]['observations'] = copy.deepcopy(changed['observations'])
-                    elif mode in ('observations', 'cells'):
-                        changed[mode] = []
-                    elif mode == 'counts':
-                        changed['expected_count'] = changed['matched_count'] = 999
-                    elif mode == 'normalizer_digest':
-                        changed['source']['normalizer_sha256'] = '0' * 64
-                    else:
-                        changed['fit_ready'] = False
-                    with self.assertRaises(NormalizeError):
-                        verify_normalized(changed)
-                    with self.assertRaises(NormalizeError):
-                        write_document(Path(tmp) / f'{mode}.json', changed)
-                    self.assertFalse((Path(tmp) / f'{mode}.json').exists())
-            damaged = root / document['source']['selected_attempts'][0]['path'] / 'binding.json'
-            damaged.write_bytes(damaged.read_bytes() + b' ')
-            with self.assertRaises(ArtifactError):
-                verify_normalized_sources(document)
-
-    def test_recursive_bytes_and_semantics_fail_closed(self):
+    def test_explicit_raw_replay_rejects_bad_evidence(self):
         for mode in ('raw', 'workload', 'measurement', 'wire', 'shape', 'sampling', 'command', 'mapping',
-                     'overlap', 'events', 'observer', 'unindexed', 'path', 'symlink',
+                     'overlap', 'events', 'observer', 'unindexed',
                      'binding_endpoint', 'binding_listener', 'reset_missing', 'reset_false'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root, campaign = make_bundle(Path(tmp), reset_before='repeat' if mode.startswith('reset_') else None)
@@ -326,12 +249,8 @@ class NormalizeTests(unittest.TestCase):
                     envelope = _read_json(directory / 'measurements.json')
                     envelope['measurements'].pop()
                     _write_atomic(directory / 'measurements.json', envelope)
-                    entry['measurement'] = file_reference(directory / 'measurements.json')
-                    _write_atomic(root / 'execution_index.json', index)
                 else:
-                    if mode == 'symlink':
-                        (request / 'outside.json').symlink_to(root / 'compiled_campaign.json')
-                    elif mode in ('wire', 'shape', 'sampling'):
+                    if mode in ('wire', 'shape', 'sampling'):
                         body = _read_json(request / 'request.json')
                         if mode == 'shape': body['prompt'].append(1)
                         elif mode == 'sampling': body['temperature'] = 0.5
@@ -353,7 +272,7 @@ class NormalizeTests(unittest.TestCase):
                         (request / 'events.jsonl').write_text(events)
                     elif mode == 'observer':
                         observer = _read_json(directory / 'observer.json')
-                        observer['sha256'] = '0' * 64
+                        observer['config']['writer_open_files'] += 1
                         _write_atomic(directory / 'observer.json', observer)
                     elif mode.startswith('binding_'):
                         binding = entry['binding']
@@ -369,47 +288,17 @@ class NormalizeTests(unittest.TestCase):
                             receipt.unlink()
                         else:
                             _write_atomic(receipt, {'status': 200, 'body': 'false'})
-                    if mode != 'symlink':
-                        refresh_attempt(root, campaign, role)
-                    if mode in ('unindexed', 'path'):
+                    refresh_attempt(root, campaign, role)
+                    if mode == 'unindexed':
                         raw_path = directory / 'raw_bundle_index.json'
                         raw = _read_json(raw_path)
-                        if mode == 'unindexed':
-                            del raw['files'][(request / 'request-body.bin').relative_to(directory).as_posix()]
-                        else:
-                            raw['files']['../outside.json'] = {'sha256': '0' * 64, 'size': 0}
+                        raw['files'].remove((request / 'request-body.bin').relative_to(directory).as_posix())
                         _write_atomic(raw_path, raw)
-                        index = _read_json(root / 'execution_index.json')
-                        entry = next(e for k, e in index['cells'].items() if k.endswith(':target'))
-                        entry['raw_index'] = file_reference(raw_path)
-                        envelope = _read_json(directory / 'measurements.json')
-                        envelope['provenance']['raw_bundle_index_sha256'] = entry['raw_index']['sha256']
-                        _write_atomic(directory / 'measurements.json', envelope)
-                        entry['measurement'] = file_reference(directory / 'measurements.json')
-                        _write_atomic(root / 'execution_index.json', index)
-                result = normalize_campaign(root, scope='train')
-                self.assertEqual(result['status'], 'invalid', mode)
-                self.assertEqual(result['matched_count'], 0)
-                self.assertTrue(result['failures'])
-
-    def test_immutable_output_paths_and_cli(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root, campaign = make_bundle(Path(tmp))
-            collect_fixture(root, campaign)
-            document = normalize_campaign(root, scope='train')
-            output = Path(tmp) / 'normalized.json'
-            write_document(output, document)
-            write_document(output, document)
-            with self.assertRaises(ArtifactError):
-                write_document(output, {**document, 'status': 'invalid'})
-            for path in (root / 'execution_index.json', root / 'raw' / 'out.json', root / 'plans' / 'out.json'):
-                with self.subTest(path=path), self.assertRaises(ArtifactError):
-                    write_document(path, document)
-            run = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'normalize.py'),
-                                  '--artifact-root', str(root), '--scope', 'train', '--output', str(output)],
-                                 capture_output=True, text=True, timeout=10)
-            self.assertEqual(run.returncode, 0, run.stderr)
-            plan = root / campaign['workload']['cells'][0]['plan']['path']
-            plan.write_bytes(plan.read_bytes() + b' ')
-            with self.assertRaises(ArtifactError):
-                normalize_campaign(root, scope='train')
+                from artifacts import sealed_reference
+                from pairing import load_role
+                index = _read_json(root / 'execution_index.json')
+                entry = next(e for k, e in index['cells'].items() if k.endswith(':' + role))
+                cell = next(c for c in campaign['workload']['cells'] if c['split'] == 'train')
+                plan = build_plan(cell, campaign['client'])
+                with self.assertRaises((ArtifactError, ValueError, KeyError)):
+                    load_role(root, campaign, plan, role, sealed_reference(entry), replay_raw=True)

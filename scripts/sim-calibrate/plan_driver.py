@@ -17,15 +17,14 @@ import aiohttp
 from artifacts import (ExecutionStore, _read_json, _write_atomic,
                        checked_path, file_reference, load_compiled_bundle)
 from baseline import resolve_reference, select_reference
-from evidence_proxy import EvidenceError, EvidenceProxy, observer_identity
-from manifest import canonical_scheduler_identity
-from profile import verify_fitted_bundle
+from evidence_proxy import EvidenceError, EvidenceProxy
+from manifest import canonical_scheduler_identity, execution_identity
 from probe import (probe_endpoint, profile_endpoint, profile_listener_matches, requires_cache_reset,
                    target_runtime_environment, validate_cache_recovery_receipt,
                    validate_profile_binding, validate_reset_receipt)
 from steady_state import compute_statistics
-from vllm_bench import render_command, run_command
-from vllm_bench_collect import convert_evidence
+from vllm_bench import render_command, run_command, convert_evidence
+from request_plan import validate_plan
 
 
 @asynccontextmanager
@@ -36,8 +35,6 @@ async def profile_server(root: Path, variant: dict, *, binary: Path, model_path:
         raise EvidenceError('server startup timeout must be finite and positive')
     endpoint = profile_endpoint(variant['identity']['endpoint'])
     binary, model_path = binary.expanduser().resolve(), model_path.expanduser().resolve()
-    if file_reference(model_path / 'config.json')['sha256'] != variant['identity']['model_config_sha256']:
-        raise EvidenceError('server model metadata differs from frozen model identity')
     profile = checked_path(root, variant['profile_path'])
     flags = variant['server_flags']
     reserved = ('--profile', '--model-id', '--model-path', '--port')
@@ -47,8 +44,7 @@ async def profile_server(root: Path, variant: dict, *, binary: Path, model_path:
             '--port', str(endpoint.port), '--profile', str(profile), *flags]
     directory = root / 'servers' / uuid.uuid4().hex
     directory.mkdir(parents=True)
-    _write_atomic(directory / 'command.json', {'argv': argv, 'executable': file_reference(binary),
-                                             'profile': file_reference(profile)})
+    _write_atomic(directory / 'command.json', {'argv': argv})
     environment = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
     with (directory / 'server.log').open('wb') as log:
         child = await asyncio.create_subprocess_exec(*argv, stdout=log, stderr=asyncio.subprocess.STDOUT,
@@ -62,7 +58,6 @@ async def profile_server(root: Path, variant: dict, *, binary: Path, model_path:
                 try:
                     await asyncio.to_thread(probe_endpoint, variant['identity']['endpoint'],
                                             expected_model=variant['identity']['model'], timeout=min(1, timeout))
-                    profile_binding(root, variant, child.pid)
                     break
                 except (OSError, ValueError, RuntimeError) as exc:
                     if time.monotonic() >= deadline:
@@ -117,7 +112,7 @@ def process_binding(base_url: str, pid: int) -> dict:
     start_ticks = int(stat[19])
     return {**binding, 'server_pid': pid, 'process_start_ticks': start_ticks,
             'network_namespace': {'device': namespace.st_dev, 'inode': namespace.st_ino},
-            'executable': file_reference((process / 'exe').resolve()), 'argv': args}
+            'executable': str((process / 'exe').resolve()), 'argv': args}
 
 
 def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
@@ -155,7 +150,7 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
     manifest = _read_json(manifest_path)
     if profile.get('schema_version') != 3 or manifest.get('schema_version') != 2:
         raise EvidenceError('unsupported runtime profile/calibration version')
-    if manifest.get('model_id') != variant['identity']['model'] or manifest.get('model_config_sha256') != variant['identity']['model_config_sha256']:
+    if manifest.get('model_id') != variant['identity']['model']:
         raise EvidenceError('profile/model identity mismatch')
     if profile.get('scheduler') != canonical_scheduler_identity(variant['runtime']['scheduler']):
         raise EvidenceError('profile scheduler differs from configured runtime')
@@ -163,15 +158,11 @@ def profile_binding(root: Path, variant: dict, pid: int | None) -> dict:
 
 
 def verify_attempt_binding(campaign: dict, variant_name: str, root: Path, binding: dict, cell_id: str) -> None:
-    if observer_identity() != campaign['client']['observer']:
-        raise EvidenceError('frozen observer changed; recompile campaign into a new artifact root')
     if variant_name != 'target':
         variant = campaign['variants'][variant_name]
         if variant_name == 'zero_cost':
             variant = {**variant, **resolve_reference(root, campaign, binding['reference'], cell_id)}
-        if variant_name == 'sim' and verify_fitted_bundle(root, campaign) != binding.get('selection'):
-            raise EvidenceError('fitted profile selection changed')
-        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'observer_sha256', 'reference', 'selection')}
+        expected = {k: v for k, v in binding.items() if k not in ('variant_identity', 'reference')}
         if profile_binding(root, variant, binding['server_pid']) != expected:
             raise EvidenceError('profile server binding changed')
 
@@ -232,10 +223,6 @@ class TargetProcess:
         else:
             connection.close()
             raise EvidenceError('managed target endpoint is already occupied')
-        if file_reference(Path(launch['argv'][0])) != launch['executable']:
-            raise EvidenceError('frozen target executable changed')
-        if file_reference(Path(self.launcher['path']))['sha256'] != self.launcher['sha256']:
-            raise EvidenceError('frozen process launcher changed')
         self.directory = directory
         self.log = (directory / 'target-server.log').open('xb')
         environment = {k: v for k, v in os.environ.items() if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
@@ -263,13 +250,12 @@ class TargetProcess:
 
 async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
                       store: ExecutionStore, *, timeout: float, binding: dict) -> dict:
-    verify_attempt_binding(campaign, variant_name, store.root, binding, plan['cell_id'])
     previous = store.sealed(plan, variant_name, binding)
     if previous:
         return {**previous, 'skipped': True}
     directory, attempt = store.begin(plan, variant_name, binding)
     variant = campaign['variants'][variant_name]
-    identity, client = variant['identity'], campaign['client']
+    identity, client = execution_identity(variant['identity']), campaign['client']
     errors = []
     interrupted = None
     proxy = None
@@ -309,7 +295,7 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
                     else:
                         await reset_cache(identity['endpoint'], batch_root, min(10, timeout))
                 if plan['workload_kind'] == 'cached_prefill':
-                    from cached_prefix_workload import batch_payload
+                    from cached_prefill import batch_payload
                     (batch_root / 'custom.jsonl').write_bytes(batch_payload(plan, batch))
                 prefix = f"c2-{campaign['campaign_id'][:12]}-{variant_name}-{attempt}-{uuid.uuid4().hex}-{name}-"
                 proxy.register(batch, prefix, batch_root)
@@ -341,15 +327,13 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
     _write_atomic(directory / 'attempt.json', {'attempt': attempt, 'errors': errors,
                                                'cell_id': plan['cell_id'], 'variant': variant_name})
     try:
-        raw_digest = store.raw_index(directory)
-        envelope = convert_evidence(plan, variant_name, identity, directory, raw_index_sha256=raw_digest,
+        store.raw_index(directory)
+        envelope = convert_evidence(plan, variant_name, identity, directory,
                                     client=client, batch_errors=errors)
         _write_atomic(directory / 'workload_evidence.json', envelope.pop('workload_evidence'))
-        # workload_evidence is derived from raw, indexed separately to avoid a digest cycle.
         _write_atomic(directory / 'measurements.json', envelope)
         if plan['workload_kind'] == 'steady_decode':
             _write_atomic(directory / 'decode_statistics.json', compute_statistics(plan, envelope))
-        verify_attempt_binding(campaign, variant_name, store.root, binding, plan['cell_id'])
         entry = store.finish(plan, variant_name, directory)
     except Exception as exc:
         _write_atomic(directory / 'conversion_failure.json', {'error': f'{type(exc).__name__}: {exc}'})
@@ -383,30 +367,20 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
     if any(c['kind'] == 'cached_prefill' for c in cells) and 'sim' in variants:
         raise EvidenceError('cached simulator runtime is not implemented; collect target/zero_cost for offline calibration')
     client = campaign['client']
-    from campaign import _assets
-    import copy
-    checked = copy.deepcopy({'client': {k: v for k, v in client.items() if k != 'observer'}})
-    assets = _assets(checked, root)
-    for key in ('binary_sha256','binary_help_sha256','tokenizer_sha256','tokenizer_files','process_launcher'):
-        if assets[key] != client[key]:
-            raise EvidenceError(f'frozen client input changed: {key}')
-    if assets['observer'] != client['observer']:
-        raise EvidenceError('frozen observer changed; recompile campaign')
     results = []
     with ExecutionStore(root, campaign['campaign_id']) as store:
         for variant_name in variants:
             variant = campaign['variants'][variant_name]
             for cell in cells:
-                binding = {'variant_identity': variant['identity'], 'observer_sha256': client['observer']['sha256']}
+                binding = {'variant_identity': execution_identity(variant['identity'])}
                 configured = variant
                 if variant_name == 'zero_cost':
                     binding['reference'] = select_reference(root, campaign, cell['cell_id'])
                     configured = {**variant, **resolve_reference(root, campaign, binding['reference'], cell['cell_id'])}
-                if variant_name == 'sim':
-                    binding['selection'] = verify_fitted_bundle(root, campaign)
                 if variant_name != 'target':
                     binding.update(profile_binding(root, configured, (server_pids or {}).get(variant_name)))
                 plan = _read_json(checked_path(root, cell['plan']['path']))
+                validate_plan(plan)
                 result = await run_attempt(campaign, cell, plan, variant_name, store,
                                            timeout=timeout, binding=binding)
                 results.append({'cell_id': cell['cell_id'], 'variant': variant_name, **result})

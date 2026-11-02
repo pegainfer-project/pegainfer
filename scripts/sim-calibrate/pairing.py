@@ -7,7 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from manifest import SPLITS, sha256_json
+from manifest import SPLITS, sha256_json, execution_identity
 
 
 class PairingContractError(ValueError):
@@ -24,7 +24,7 @@ def campaign_scope(campaign: dict, scope: str) -> tuple[list, list, tuple, dict]
         raise PairingContractError('duplicate compiled cell identity or inconsistent cell count')
     splits = {split: [cell['cell_id'] for cell in all_cells if cell['split'] == split] for split in SPLITS}
     if (splits != campaign['splits'] or campaign['required_scope'] != {
-            'cells': [cell['cell_id'] for cell in all_cells], 'sha256': sha256_json(splits)}):
+            'cells': [cell['cell_id'] for cell in all_cells]}):
         raise PairingContractError('compiled required scope/splits mismatch')
     for cell in all_cells:
         if cell['split'] not in SPLITS or cell['kind'] not in ('cold_prefill', 'steady_decode', 'cached_prefill'):
@@ -38,14 +38,12 @@ def campaign_scope(campaign: dict, scope: str) -> tuple[list, list, tuple, dict]
             cells.append(cell)
     roles = ('target', 'zero_cost') if scope == 'train' else ('target', 'zero_cost', 'sim')
     definition = {'scope': scope, 'required_roles': list(roles),
-                  'plans': [{'cell_id': cell['cell_id'], 'plan_sha256': cell['plan']['plan_sha256']}
-                            for cell in cells]}
+                  'cells': [cell['cell_id'] for cell in cells]}
     return cells, deferred, roles, definition
 
 
 def index_plan_measurements(plan: dict, envelope: dict, workload: dict, variant: str) -> dict[str, dict]:
     """Exact current-schema identities; no metric qualification or ordinal fallback."""
-    from manifest import sha256_json
     from measurement_schema import validate_envelope
     from request_plan import validate_plan
 
@@ -56,7 +54,7 @@ def index_plan_measurements(plan: dict, envelope: dict, workload: dict, variant:
                                                 'wire_body_sha256', 'transport_request_id', 'request_instance_id')):
             raise PairingContractError(f'{variant}: unsupported_pairing: incomplete content/identity evidence')
     validate_envelope(envelope)
-    if envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant:
+    if envelope['cell_id'] != plan['cell_id'] or envelope['variant'] != variant:
         raise PairingContractError(f'{variant}: measurement plan/role mismatch')
     expected = {row['pairing_key']: row for row in plan['logical_requests']}
     rows = {row['pairing_key']: row for row in envelope['measurements']}
@@ -118,11 +116,11 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
     from probe import requires_cache_reset, validate_reset_receipt, validate_cache_recovery_receipt
     from sse_evidence import SSEParser
     from vllm_bench import render_command
-    from vllm_bench_collect import convert_evidence
+    from vllm_bench import convert_evidence
 
     directory, raw = attempt['directory'], attempt['raw_index']
     envelope, workload = attempt['envelope'], attempt['workload']
-    rows = index_plan_measurements(plan, envelope, workload, variant)
+    rows = {row['pairing_key']: row for row in envelope['measurements']}
     logical_rows = {row['pairing_key']: row for row in plan['logical_requests']}
 
     def required_path(name):
@@ -133,12 +131,11 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
     def read(name):
         return _read_json(required_path(name))
 
+    identity = execution_identity(identity)
     if envelope['variant_identity'] != identity or read('observer.json') != client['observer']:
         raise PairingContractError(f'{variant}: frozen variant/observer identity mismatch')
     provenance = envelope['provenance']
-    for field, expected in (('client_name', 'vllm-bench'), ('client_version', client['version']),
-                            ('binary_sha256', client['binary_sha256']), ('tokenizer_sha256', client['tokenizer_sha256']),
-                            ('observer_sha256', client['observer']['sha256'])):
+    for field, expected in (('client_name', 'vllm-bench'), ('client_version', client['version'])):
         if provenance[field] != expected:
             raise PairingContractError(f'{variant}: frozen {field} mismatch')
     attempt_record = read('attempt.json')
@@ -188,7 +185,7 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
             raise PairingContractError(f'{variant}:{batch_path}: command length differs from frozen plan')
         expected_argv[result_index] = argv[result_index]
         if plan['workload_kind'] == 'cached_prefill':
-            from cached_prefix_workload import batch_payload
+            from cached_prefill import batch_payload
             dataset_index = expected_argv.index('--dataset-path') + 1
             # Preserve the original absolute invocation path in copied bundles,
             # but require its exact relationship to the recorded result directory.
@@ -251,9 +248,7 @@ def validate_attempt_evidence(plan: dict, attempt: dict, variant: str, client: d
     if plan['workload_kind'] == 'cached_prefill' and {
             name for name in raw['files'] if name.endswith(('/recovery.json', '/reset.json'))} != expected_recoveries:
         raise PairingContractError(f'{variant}: extra/missing cache restoration breaks the bootstrap lifecycle')
-    reconstructed = convert_evidence(plan, variant, identity, directory,
-                                     raw_index_sha256=provenance['raw_bundle_index_sha256'],
-                                     client=client, batch_errors=[])
+    reconstructed = convert_evidence(plan, variant, identity, directory, client=client, batch_errors=[])
     reconstructed_workload = reconstructed.pop('workload_evidence')
     if reconstructed != envelope or reconstructed_workload != workload:
         raise PairingContractError(f'{variant}: measurement/workload differs from raw conversion')
@@ -270,32 +265,27 @@ def _profile_sources(root: Path, campaign: dict, variant: str, reference: dict) 
     if variant == 'zero_cost':
         from baseline import resolve_reference
         configured = {**configured, **resolve_reference(root, campaign, binding['reference'], binding['reference']['cell_id'])}
-    if variant == 'sim':
-        from profile import verify_fitted_bundle
-        if verify_fitted_bundle(root, campaign) != binding.get('selection'):
-            raise PairingContractError('saved fitted selection differs from verified training')
-
     validate_profile_binding(configured['identity']['endpoint'], binding)
     profile_path = checked_path(root, configured['profile_path'])
     if file_reference(profile_path) != binding.get('profile'):
         raise PairingContractError(f'{variant}: saved profile bytes changed')
     profile = _read_json(profile_path)
     manifest_path = checked_path(profile_path.parent, profile['calibration']['manifest'])
-    if (file_reference(manifest_path) != binding.get('manifest')
-            or file_reference(manifest_path)['sha256'] != profile['calibration']['sha256']):
+    if file_reference(manifest_path) != binding.get('manifest'):
         raise PairingContractError(f'{variant}: saved calibration manifest bytes changed')
 
 
 
-def load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict) -> dict:
+def load_role(root: Path, campaign: dict, plan: dict, role: str, reference: dict, *, replay_raw: bool = False) -> dict:
     from artifacts import _read_json, read_sealed_attempt
     if role == 'zero_cost' and reference['binding'].get('reference', {}).get('cell_id') != plan['cell_id']:
         raise PairingContractError('reference binding belongs to another cell')
     _profile_sources(root, campaign, role, reference)
     attempt = read_sealed_attempt(root, plan, role, reference)
     configured = campaign['variants'][role]
-    validate_attempt_evidence(plan, attempt, role, campaign['client'], configured['identity'], runtime=configured['runtime'],
-                              launch=configured.get('launch'))
+    if replay_raw:
+        validate_attempt_evidence(plan, attempt, role, campaign['client'], configured['identity'], runtime=configured['runtime'],
+                                  launch=configured.get('launch'))
     if _read_json(attempt['directory'] / 'attempt.json')['attempt'] != reference['attempt']:
         raise PairingContractError(f'{role}: raw attempt number differs from selected attempt')
     return attempt

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import re
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 ENVELOPE_KIND = "measurement_envelope"
 ROW_KIND = "measurement_row"
 PHASES = ("warmup", "bootstrap", "measured")
@@ -15,6 +17,40 @@ CONTENT_DIGESTS = ("prompt_sha256", "token_sha256", "body_sha256", "wire_body_sh
 TIMESTAMPS = ("actual_dispatch_timestamp", "first_token_timestamp", "last_token_timestamp", "stream_end_timestamp")
 METRICS = ("ttft_ms", "tpot_ms", "first_text_latency_ms", "e2e_ms")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+OBSERVER_CONFIG = {
+    'implementation': 'aiohttp_streaming', 'clock': 'monotonic_ns',
+    'request_start': 'proxy_upstream_dispatch', 'event_observation': 'proxy_upstream_read',
+    'compression': 'identity', 'connection_reuse': False, 'http_version': '1.1',
+    'redirects': False, 'upstream_retries': 0, 'trust_env': False,
+    'bench_optional_metrics': 'disabled_at_proxy',
+    'writer_open_files': 64, 'writer_queue_records': 4096, 'max_event_bytes': 4 * 1024 * 1024,
+}
+RETRY_CONTRACT = {'max_upstream_attempts_per_key': 1, 'duplicate_policy': 'fail_batch',
+                  'client_retry_control': 'unavailable'}
+TIMING_CONTRACT = {
+    'clock': 'monotonic', 'first_token': 'first_output_token_ids_event',
+    'last_token': 'last_output_token_ids_event', 'first_text': 'first_nonempty_output_text_event',
+    'text_fallback': 'disabled', 'return_token_ids': True, 'echo': False,
+    'decode_interval_tokens': 'right_event_output_token_count',
+    'measurement_origin': 'http_sse_proxy', 'request_start': 'proxy_upstream_dispatch',
+    'event_observation': 'proxy_upstream_read',
+}
+
+
+def canonical_json(value: Any) -> str:
+    """Render JSON deterministically for IDs and recorded content digests."""
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def sha256_json(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def observer_contract() -> dict[str, Any]:
+    return {"schema_version": 1, "config": dict(OBSERVER_CONFIG),
+            "timing": dict(TIMING_CONTRACT), "retry": dict(RETRY_CONTRACT)}
+
 
 DECODE_STATISTICS_POLICY = {
     "source": "fixed_batch_decode_window",
@@ -97,7 +133,6 @@ def validate_row(row: dict[str, Any]) -> None:
         raise MeasurementError("unsupported measurement row kind/schema_version")
     key = text(row.get("pairing_key"), "pairing_key")
     cell_id = digest(row.get("cell_id"), "cell_id")
-    digest(row.get("plan_sha256"), "plan_sha256")
     phase = row.get("phase")
     if phase not in PHASES:
         raise MeasurementError("unknown measurement phase")
@@ -196,7 +231,7 @@ def validate_row(row: dict[str, Any]) -> None:
 def validate_envelope(envelope: dict[str, Any]) -> None:
     if not isinstance(envelope, dict) or envelope.get("kind") != ENVELOPE_KIND or type(envelope.get("schema_version")) is not int or envelope["schema_version"] != SCHEMA_VERSION:
         raise MeasurementError("unsupported measurement envelope kind/schema_version")
-    digest(envelope.get("plan_sha256"), "plan_sha256")
+    digest(envelope.get("cell_id"), "cell_id")
     if envelope.get("variant") not in ("target", "zero_cost", "sim"):
         raise MeasurementError("unknown measurement envelope variant")
     identity = envelope.get("variant_identity")
@@ -204,12 +239,9 @@ def validate_envelope(envelope: dict[str, Any]) -> None:
         raise MeasurementError("measurement variant_identity must be an object")
     for field in ("endpoint", "model", "engine", "engine_version", "model_revision"):
         text(identity.get(field), f"variant_identity.{field}")
-    digest(identity.get("model_config_sha256"), "variant_identity.model_config_sha256")
     provenance = envelope.get("provenance")
     if not isinstance(provenance, dict):
         raise MeasurementError("measurement provenance must be an object")
-    for field in ("binary_sha256", "tokenizer_sha256", "observer_sha256", "raw_bundle_index_sha256", "source_command_sha256"):
-        digest(provenance.get(field), field)
     for field in ("client_name", "client_version"):
         text(provenance.get(field), field)
     rows = envelope.get("measurements")
@@ -220,8 +252,8 @@ def validate_envelope(envelope: dict[str, Any]) -> None:
     transport_ids: set[str] = set()
     for row in rows:
         validate_row(row)
-        if row["plan_sha256"] != envelope["plan_sha256"] or row["variant"] != envelope["variant"]:
-            raise MeasurementError("measurement row belongs to a different plan/variant")
+        if row["cell_id"] != envelope["cell_id"] or row["variant"] != envelope["variant"]:
+            raise MeasurementError("measurement row belongs to a different cell/variant")
         if row["pairing_key"] in seen:
             raise MeasurementError("duplicate measurement pairing_key")
         seen.add(row["pairing_key"])

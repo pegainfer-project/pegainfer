@@ -6,10 +6,10 @@ import copy
 import re
 from typing import Any
 
-from manifest import canonical_execution_configuration, canonical_sampling_configuration, sha256_json
-from measurement_schema import DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, digest, integer, number, text
+from manifest import canonical_execution_configuration, canonical_sampling_configuration
+from measurement_schema import observer_contract, RETRY_CONTRACT, sha256_json, DECODE_STATISTICS_POLICY, REFERENCE_POLICIES, reference_policy, MeasurementError, digest, integer, number, text
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 KIND = "request_plan"
 
 
@@ -17,8 +17,25 @@ class PlanError(ValueError):
     """A logical request plan cannot be executed without guessing its meaning."""
 
 
-def _seed(base: int, identity: str, phase: str, repeat: int) -> int:
-    return int(sha256_json([SCHEMA_VERSION, base, identity, phase, repeat])[:8], 16)
+def seed_coordinates(value: dict) -> dict:
+    """Stable experiment coordinates, independent of code, identity and ordering."""
+    shape = value.get('shape', value)
+    return {'matrix_name': value['matrix_name'], 'split': value['split'],
+            'kind': value.get('workload_kind', value.get('kind')),
+            'input_tokens': shape['input_tokens'], 'output_tokens': shape['output_tokens'],
+            'concurrency': value['concurrency'],
+            **{field: value[field] for field in ('num_ctx', 'prefix_tokens', 'new_tokens') if field in value}}
+
+
+def _seed(base: int, coordinates: dict, phase: str, repeat: int, *,
+          before_phase: str | None = None, before_repeat: int | None = None,
+          bootstrap_repeat: int = 0) -> int:
+    position = [before_phase, before_repeat, bootstrap_repeat] if phase == 'bootstrap' else repeat
+    return int(sha256_json(['stable_coordinates_v1', base, coordinates, phase, position])[:8], 16)
+
+
+def _prefix_seed(base: int, identity: str) -> int:
+    return int(sha256_json(['nested_prefix_v1', base, identity])[:8], 16)
 
 
 def _plan_fields(value: Any, allowed: set[str], field: str) -> dict[str, Any]:
@@ -47,12 +64,13 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
         bootstrap_index = 0
         prefix_seed = None
         if cell["kind"] == "cached_prefill":
-            prefix_seed = _seed(base, cell["shared_prefix"]["identity"], "prefix", 0)
+            prefix_seed = _prefix_seed(base, cell["shared_prefix"]["identity"])
 
-        def append(phase: str, repeat: int, *, before_phase: str | None = None, before_repeat: int | None = None) -> None:
+        def append(phase: str, repeat: int, *, before_phase: str | None = None, before_repeat: int | None = None, bootstrap_repeat: int = 0) -> None:
             batch = {
                 "phase": phase, "repeat": repeat,
-                "seed": _seed(base, cell["cell_id"], phase, repeat),
+                "seed": _seed(base, seed_coordinates(cell), phase, repeat, before_phase=before_phase,
+                              before_repeat=before_repeat, bootstrap_repeat=bootstrap_repeat),
                 "request_keys": [],
             }
             if before_phase is not None:
@@ -74,16 +92,15 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
         for phase, count in (("warmup", warmups), ("measured", repeats)):
             for repeat in range(count):
                 if bootstrap_repeats and (lifecycle.get("reset_before") == "repeat" or not batches):
-                    for _ in range(bootstrap_repeats):
-                        append("bootstrap", bootstrap_index, before_phase=phase, before_repeat=repeat)
+                    for ordinal in range(bootstrap_repeats):
+                        append("bootstrap", bootstrap_index, before_phase=phase, before_repeat=repeat, bootstrap_repeat=ordinal)
                         bootstrap_index += 1
                 append(phase, repeat)
         plan = {
             "kind": KIND, "schema_version": SCHEMA_VERSION, "cell_id": cell["cell_id"],
             "matrix_name": cell["matrix_name"], "split": cell["split"], "workload_kind": cell["kind"],
             "concurrency": concurrency, "warmup_repeats": warmups, "repeats": repeats,
-            "client": {"driver": "vllm-bench", "version": client["version"],
-                       "binary_sha256": client["binary_sha256"], "tokenizer_sha256": client["tokenizer_sha256"]},
+            "client": {"driver": "vllm-bench", "version": client["version"]},
             "generation": {**copy.deepcopy(cell["generation"]), "seed": base},
             "timing": copy.deepcopy(cell["timing"]),
             "retry": copy.deepcopy(client["retry"]),
@@ -100,7 +117,7 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
             plan['phase_shapes'] = {phase: {'input_tokens': cell['prefix_tokens'] if phase == 'bootstrap' else cell['input_tokens'],
                                            'output_tokens': cell['bootstrap_output_tokens'] if phase == 'bootstrap' else cell['output_tokens']}
                                     for phase in ('bootstrap', 'warmup', 'measured')}
-            from cached_prefix_workload import prepare_plan_workload, validate_cached_workload
+            from cached_prefill import prepare_plan_workload
             if frozen_workload is None:
                 prepare_plan_workload(plan, client)
             else:
@@ -116,11 +133,8 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
                         if field in frozen:
                             row[field] = copy.deepcopy(frozen[field])
                 plan['cached_workload'] = copy.deepcopy(frozen_workload.get('cached_workload'))
-                validate_cached_workload(plan)
         elif frozen_workload is not None:
             raise PlanError('frozen custom workload is only supported for cached-prefill')
-        plan["plan_sha256"] = sha256_json(plan)
-        validate_plan(plan)
         return plan
     except (MeasurementError, KeyError, TypeError, ValueError) as exc:
         raise PlanError(str(exc)) from exc
@@ -131,11 +145,8 @@ def validate_plan(plan: dict[str, Any]) -> None:
     try:
         if not isinstance(plan, dict) or plan.get("kind") != KIND or type(plan.get("schema_version")) is not int or plan["schema_version"] != SCHEMA_VERSION:
             raise PlanError("unsupported request plan kind/schema_version")
-        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "split", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "plan_sha256", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy", "phase_shapes", "cached_workload"}, "plan")
+        _plan_fields(plan, {"kind", "schema_version", "cell_id", "matrix_name", "split", "workload_kind", "concurrency", "warmup_repeats", "repeats", "client", "generation", "timing", "shape", "sampling", "retry", "observer", "arrival", "batches", "logical_requests", "cache_lifecycle", "shared_prefix", "prefix_tokens", "new_tokens", "num_ctx", "decode_statistics", "reference_policy", "phase_shapes", "cached_workload"}, "plan")
         digest(plan.get("cell_id"), "cell_id")
-        digest(plan.get("plan_sha256"), "plan_sha256")
-        if sha256_json({k: v for k, v in plan.items() if k != "plan_sha256"}) != plan["plan_sha256"]:
-            raise PlanError("request plan digest mismatch")
         matrix_name = text(plan.get("matrix_name"), "matrix_name")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", matrix_name):
             raise PlanError("matrix_name must be a safe identifier")
@@ -145,31 +156,18 @@ def validate_plan(plan: dict[str, Any]) -> None:
         workload = plan.get("workload_kind")
         if workload not in ("cold_prefill", "steady_decode", "cached_prefill"):
             raise PlanError("unsupported workload_kind")
-        client = _plan_fields(plan.get("client"), {"driver", "version", "binary_sha256", "tokenizer_sha256"}, "client")
+        client = _plan_fields(plan.get("client"), {"driver", "version"}, "client")
         if client.get("driver") != "vllm-bench":
             raise PlanError("client.driver must be vllm-bench")
         text(client.get("version"), "client.version")
-        for field in ("binary_sha256", "tokenizer_sha256"):
-            digest(client.get(field), f"client.{field}")
         generation = _plan_fields(plan.get("generation"), {"dataset", "shuffle", "prompt_representation", "seed_policy", "seed"}, "generation")
         base_seed = integer(generation.get("seed"), "generation.seed", maximum=2**32 - 1)
         canonical_execution_configuration({
             "seed": base_seed, "sampling": plan.get("sampling"), "timing": plan.get("timing"),
             "generation": {key: value for key, value in generation.items() if key != "seed"},
         }, "plan")
-        from evidence_proxy import RETRY_CONTRACT, OBSERVER_CONFIG, OBSERVER_SOURCES
-        if plan.get("retry") != RETRY_CONTRACT or not isinstance(plan.get("observer"), dict):
-            raise PlanError("missing observer/retry contract")
-        observer = _plan_fields(plan["observer"], {"config", "dependencies", "sources", "sha256"}, "observer")
-        digest(observer.get("sha256"), "observer.sha256")
-        if observer.get("config") != OBSERVER_CONFIG or not isinstance(observer.get("dependencies"), dict) or not isinstance(observer.get("sources"), dict):
-            raise PlanError("invalid observer configuration")
-        if set(observer['sources']) != set(OBSERVER_SOURCES):
-            raise PlanError('incomplete observer sources; recompile campaign')
-        for name, checksum in observer['sources'].items():
-            digest(checksum, f'observer.sources.{name}')
-        if observer["sha256"] != sha256_json([observer["config"], observer["dependencies"], observer["sources"]]):
-            raise PlanError("observer identity digest mismatch")
+        if plan.get("retry") != RETRY_CONTRACT or plan.get("observer") != observer_contract():
+            raise PlanError("unsupported observer/retry contract")
         c = integer(plan.get("concurrency"), "concurrency", positive=True, maximum=2**32 - 1)
         repeats = integer(plan.get("repeats"), "repeats", positive=True, maximum=2**32 - 1)
         warmups = integer(plan.get("warmup_repeats"), "warmup_repeats", maximum=2**32 - 1)
@@ -198,7 +196,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
             text(shared.get("identity"), "shared_prefix.identity")
             if shared.get("suffix_mode") != "request_index":
                 raise PlanError("shared_prefix.suffix_mode must be request_index")
-            prefix_seed = _seed(base_seed, shared["identity"], "prefix", 0)
+            prefix_seed = _prefix_seed(base_seed, shared["identity"])
             phases = _plan_fields(plan.get('phase_shapes'), {'bootstrap', 'warmup', 'measured'}, 'phase_shapes')
             if set(phases) != {'bootstrap', 'warmup', 'measured'}:
                 raise PlanError('cached phase_shapes must explicitly declare every phase')
@@ -252,14 +250,14 @@ def validate_plan(plan: dict[str, Any]) -> None:
         for phase, count in (("warmup", warmups), ("measured", repeats)):
             for repeat in range(count):
                 if lifecycle.get("bootstrap_repeats", 0) and (lifecycle.get("reset_before") == "repeat" or not expected_batches):
-                    for _ in range(lifecycle["bootstrap_repeats"]):
-                        expected_batches.append(("bootstrap", bootstrap, phase, repeat))
+                    for ordinal in range(lifecycle["bootstrap_repeats"]):
+                        expected_batches.append(("bootstrap", bootstrap, phase, repeat, ordinal))
                         bootstrap += 1
-                expected_batches.append((phase, repeat, None, None))
+                expected_batches.append((phase, repeat, None, None, 0))
         if len(batches) != len(expected_batches):
             raise PlanError("batch count does not match phase/repeat contract")
         seen = []
-        for batch, (phase, repeat, before_phase, before_repeat) in zip(batches, expected_batches):
+        for batch, (phase, repeat, before_phase, before_repeat, ordinal) in zip(batches, expected_batches):
             _plan_fields(batch, {"phase", "repeat", "seed", "request_keys", "before_phase", "before_repeat", "prefix_seed"}, "batch")
             integer(batch.get("repeat"), "batch.repeat")
             integer(batch.get("seed"), "batch.seed", maximum=2**32 - 1)
@@ -274,7 +272,8 @@ def validate_plan(plan: dict[str, Any]) -> None:
             keys = [f"{plan['cell_id']}:{phase}:{repeat}:{i}" for i in range(c)]
             if batch.get("request_keys") != keys:
                 raise PlanError("fixed batch must contain exactly concurrency keys")
-            if batch.get("seed") != _seed(base_seed, plan["cell_id"], phase, repeat):
+            if batch.get("seed") != _seed(base_seed, seed_coordinates(plan), phase, repeat, before_phase=before_phase,
+                                          before_repeat=before_repeat, bootstrap_repeat=ordinal):
                 raise PlanError("batch seed differs from phase_repeat mapping")
             if prefix_seed is not None:
                 integer(batch.get("prefix_seed"), "batch.prefix_seed", maximum=2**32 - 1)
@@ -291,7 +290,7 @@ def validate_plan(plan: dict[str, Any]) -> None:
         if seen != [row["pairing_key"] for row in rows]:
             raise PlanError("request order or key set differs from batches")
         if workload == 'cached_prefill':
-            from cached_prefix_workload import validate_cached_workload
+            from cached_prefill import validate_cached_workload
             validate_cached_workload(plan)
     except (MeasurementError, KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, PlanError):

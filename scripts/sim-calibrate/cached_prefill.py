@@ -1,9 +1,10 @@
-"""Shared cached-prefill qualification from attributable HTTP/SSE evidence."""
+"""Nested cached text preparation and attributable HTTP/SSE qualification."""
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
-from manifest import sha256_json
+from measurement_schema import canonical_json, sha256_json
 
 
 class CachedPrefillError(ValueError):
@@ -151,3 +152,130 @@ def validate_cached_measurement(plan: dict, row: dict, logical: dict | None = No
             or row.get('first_token_timestamp') != finish/1e9
             or row.get('actual_dispatch_timestamp') != start/1e9):
         raise CachedPrefillError('cached TTFT does not include complete P+N request processing')
+
+
+GENERATOR = {"name": "nested_ascii_words", "version": 1, "add_special_tokens": False,
+             "alphabet": "abcdefghijklmnopqrstuvwxyz", "suffix_mode": "request_index"}
+
+
+def _words(seed: int, count: int) -> list[str]:
+    alphabet = GENERATOR['alphabet']
+    return [alphabet[int(sha256_json([GENERATOR['version'], seed, index])[:8], 16) % len(alphabet)]
+            for index in range(count)]
+
+
+def suffix_seed(plan: dict, row: dict) -> int:
+    batch = next(batch for batch in plan['batches']
+                 if (batch['phase'], batch['repeat']) == (row['phase'], row['repeat']))
+    return int(sha256_json(['stable_coordinates_v1', batch['seed'], row['index'], 'suffix'])[:8], 16)
+
+
+def batch_payload(plan: dict, batch: dict) -> bytes:
+    """Exact importer bytes, in logical request order, without oversampling."""
+    rows = {row['pairing_key']: row for row in plan['logical_requests']}
+    return ''.join(canonical_json({'prompt': rows[key]['prompt'],
+                                   'output_tokens': rows[key]['output_tokens']}) + '\n'
+                   for key in batch['request_keys']).encode('utf-8')
+
+
+def _batch_manifest(plan: dict, batch: dict) -> dict:
+    return {'phase': batch['phase'], 'repeat': batch['repeat'],
+            'path': f"workloads/{plan['cell_id']}/{batch['phase']}-{batch['repeat']}.jsonl",
+            'rows': [{'line': index + 1, 'pairing_key': key}
+                     for index, key in enumerate(batch['request_keys'])]}
+
+
+def workload_documents(plan: dict) -> dict[str, bytes]:
+    """Canonical compiled files. The driver copies the same bytes into each batch."""
+    if plan['workload_kind'] != 'cached_prefill':
+        return {}
+    return {_batch_manifest(plan, batch)['path']: batch_payload(plan, batch)
+            for batch in plan['batches']}
+
+
+def prepare_plan_workload(plan: dict, client: dict) -> None:
+    """Attach actual text, expected IDs and exact row/file mappings."""
+    from tokenizers import Tokenizer
+    path = Path(client['tokenizer']) / 'tokenizer.json'
+    try:
+        tokenizer = Tokenizer.from_file(str(path))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f'cached custom preparation requires a readable local tokenizer.json: {exc}') from exc
+    prefix_length = plan['prefix_tokens']
+    prefix_seed = plan['batches'][0]['prefix_seed']
+    prefix = ' '.join(_words(prefix_seed, prefix_length))
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False).ids
+    if len(prefix_ids) != prefix_length:
+        raise ValueError('tokenizer cannot represent this canonical nested prefix at the requested length')
+    seen_suffixes = set()
+    for row in plan['logical_requests']:
+        if row['phase'] == 'bootstrap':
+            prompt = prefix
+        else:
+            row['suffix_seed'] = suffix_seed(plan, row)
+            suffix = ' '.join(_words(row['suffix_seed'], plan['new_tokens']))
+            if suffix in seen_suffixes:
+                raise ValueError('independent suffixes collided; choose a new seed or larger new_tokens')
+            seen_suffixes.add(suffix)
+            prompt = prefix + ' ' + suffix
+        ids = tokenizer.encode(prompt, add_special_tokens=False).ids
+        if len(ids) != row['input_tokens'] or ids[:prefix_length] != prefix_ids:
+            raise ValueError('complete custom string does not preserve the frozen prefix/input token shape')
+        if tokenizer.decode(ids, skip_special_tokens=False) != prompt:
+            raise ValueError('cached custom text must round-trip through the actual tokenizer')
+        row['prompt'], row['token_ids'] = prompt, ids
+    plan['cached_workload'] = {
+        'generator': dict(GENERATOR), 'tokenizer': {'implementation': 'tokenizers'},
+        'prefix_seed': prefix_seed, 'prefix_token_ids': prefix_ids,
+        'batches': [_batch_manifest(plan, batch) for batch in plan['batches']],
+    }
+
+
+def validate_cached_workload(plan: dict) -> None:
+    """Validate serialized content and mappings without requiring a live model."""
+    workload = plan.get('cached_workload')
+    expected_fields = {'generator', 'tokenizer', 'prefix_seed', 'prefix_token_ids', 'batches'}
+    if not isinstance(workload, dict) or set(workload) != expected_fields or workload['generator'] != GENERATOR:
+        raise ValueError('missing or unsupported cached workload generation contract')
+    if workload['tokenizer'] != {'implementation': 'tokenizers'}:
+        raise ValueError('invalid cached tokenizer implementation')
+    prefix_ids = workload['prefix_token_ids']
+    if not isinstance(prefix_ids, list) or len(prefix_ids) != plan['prefix_tokens']:
+        raise ValueError('cached canonical prefix IDs/length mismatch')
+    if workload['prefix_seed'] != plan['batches'][0]['prefix_seed']:
+        raise ValueError('cached workload prefix seed mismatch')
+    expected_prefix = ' '.join(_words(workload['prefix_seed'], plan['prefix_tokens']))
+    seen_suffixes = set()
+    for row in plan['logical_requests']:
+        ids = row.get('token_ids')
+        if not isinstance(ids, list) or len(ids) != row['input_tokens'] or any(type(token) is not int or token < 0 for token in ids) or ids[:plan['prefix_tokens']] != prefix_ids:
+            raise ValueError('cached expected IDs do not match phase shape/canonical prefix')
+        if row['phase'] == 'bootstrap':
+            if 'suffix_seed' in row or row.get('prompt') != expected_prefix:
+                raise ValueError('bootstrap must contain only the canonical prefix')
+        else:
+            seed = suffix_seed(plan, row)
+            suffix = ' '.join(_words(seed, plan['new_tokens']))
+            if row.get('suffix_seed') != seed or row.get('prompt') != expected_prefix + ' ' + suffix:
+                raise ValueError('cached independent suffix/content differs from frozen seed')
+            if suffix in seen_suffixes:
+                raise ValueError('independent suffixes collided')
+            seen_suffixes.add(suffix)
+    if workload['batches'] != [_batch_manifest(plan, batch) for batch in plan['batches']]:
+        raise ValueError('cached custom JSONL row mapping mismatch')
+
+
+def validate_workload_collection(plans: list[dict]) -> None:
+    """Enforce actual token nesting across P axes and equal content at equal P."""
+    families = {}
+    for plan in plans:
+        if plan['workload_kind'] != 'cached_prefill':
+            continue
+        key = (plan['shared_prefix']['identity'], plan['generation']['seed'])
+        entries = families.setdefault(key, {})
+        ids = plan['cached_workload']['prefix_token_ids']
+        for other in entries.values():
+            width = min(len(ids), len(other))
+            if ids[:width] != other[:width]:
+                raise ValueError('cached actual token prefixes violate canonical nested slicing')
+        entries[len(ids)] = ids

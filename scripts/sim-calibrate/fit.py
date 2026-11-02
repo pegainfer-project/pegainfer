@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -16,13 +15,10 @@ from typing import Any, Iterable, Sequence
 from steady_state import StatisticsError, aggregate_request_samples
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FIT_SPLITS = ("train",)
 VALIDATION_SPLITS = ("threshold_validation",)
 HELD_OUT_SPLITS = ("held_out_mixed", "sealed_test")
-WEIGHT_EPSILON_MS = 1e-3
-WEIGHT_MIN = 0.01
-WEIGHT_MAX = 100.0
 
 
 class FitError(ValueError):
@@ -40,14 +36,6 @@ def _finite(value: Any, field: str, *, nonnegative: bool = True) -> float:
     return rendered
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _median_mad(values: Iterable[float]) -> dict[str, float | int | None]:
     clean = sorted(float(value) for value in values if math.isfinite(float(value)))
     if not clean:
@@ -62,35 +50,8 @@ def _median_mad(values: Iterable[float]) -> dict[str, float | int | None]:
     }
 
 
-def _percentile(values: Iterable[float], quantile: float) -> float | None:
-    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
-    if not clean:
-        return None
-    position = (len(clean) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(clean) - 1)
-    return clean[lower] + (clean[upper] - clean[lower]) * (position - lower)
-
-
-def _error_metrics(actual: Sequence[float], predicted: Sequence[float]) -> dict[str, Any]:
-    absolute: list[float] = []
-    relative: list[float] = []
-    for observed, estimate in zip(actual, predicted):
-        observed = _finite(observed, "observed")
-        estimate = _finite(estimate, "prediction")
-        error = abs(estimate - observed)
-        absolute.append(error)
-        if observed > 0.0:
-            relative.append(error / observed)
-    return {
-        "count": len(absolute),
-        "absolute_ms": {f"p{int(q * 100)}": _percentile(absolute, q) for q in (0.50, 0.95, 0.99)},
-        "relative": {f"p{int(q * 100)}": _percentile(relative, q) for q in (0.50, 0.95, 0.99)},
-    }
-
-
 def _training_observations(document: dict[str, Any], *, kind: str, metric: str) -> list[dict[str, Any]]:
-    """Only fully verified current training cells reach numerical algorithms."""
+    """Use qualified normalized training cells for the numerical algorithms."""
     result = []
     for cell in document['cells']:
         if cell['kind'] != kind or cell['split'] != 'train' or cell['status'] != 'measured':
@@ -187,13 +148,6 @@ def evaluate_piecewise(candidate: dict[str, Any], input_tokens: float) -> float:
     return _finite(knots[-1]["y"], "piecewise prediction")
 
 
-def _dispersion_weight(mad: float | None) -> float:
-    if mad is None or not math.isfinite(float(mad)):
-        return 1.0
-    raw = 1.0 / max(float(mad), WEIGHT_EPSILON_MS) ** 2
-    return min(WEIGHT_MAX, max(WEIGHT_MIN, raw))
-
-
 def _aggregate_decode_samples(samples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[float, float, float], list[dict[str, Any]]] = {}
     for sample in samples:
@@ -206,82 +160,9 @@ def _aggregate_decode_samples(samples: Sequence[dict[str, Any]]) -> list[dict[st
         except StatisticsError as exc:
             raise FitError(str(exc)) from exc
         cells = sorted({row.get("cell_id") for row in rows if row.get("cell_id")})
-        representative = {**rows[0], **summary,
-                          "fit_weight": _dispersion_weight(summary["dispersion"]["mad"]),
-                          "source_cells": cells}
+        representative = {**rows[0], **summary, "source_cells": cells}
         aggregated.append(representative)
     return aggregated
-
-
-def _nnls_additive(samples: Sequence[dict[str, Any]]) -> tuple[float, float, float]:
-    """Weighted coordinate-descent non-negative fit for d0+d_requests+d_kv."""
-
-    features = [(1.0, sample["requests"] - 1.0, sample["kv_tokens"]) for sample in samples]
-    values = [sample["value"] for sample in samples]
-    weights = [float(sample.get("fit_weight", 1.0)) for sample in samples]
-    coefficients = [max(0.0, statistics.median(values)), 0.0, 0.0]
-    for _ in range(256):
-        changed = 0.0
-        for index in range(3):
-            numerator = 0.0
-            denominator = 0.0
-            for row, value, weight in zip(features, values, weights):
-                residual = value - sum(row[j] * coefficients[j] for j in range(3) if j != index)
-                numerator += weight * row[index] * residual
-                denominator += weight * row[index] * row[index]
-            updated = max(0.0, numerator / denominator) if denominator else 0.0
-            changed = max(changed, abs(updated - coefficients[index]))
-            coefficients[index] = updated
-        if changed < 1e-10:
-            break
-    if not all(math.isfinite(value) and value >= 0.0 for value in coefficients):
-        raise FitError("additive fit produced invalid coefficients")
-    return tuple(coefficients)  # type: ignore[return-value]
-
-
-def _additive_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str, Any]:
-    if not samples:
-        raise FitError("no measured samples for decode additive candidate")
-    aggregated = _aggregate_decode_samples(samples)
-    d0, d_requests, d_kv = _nnls_additive(aggregated)
-    source = _source_metadata(aggregated, metric=metric)
-    source["fit_weighting"] = {
-        "method": "inverse_mad_squared",
-        "center": "repeat_mean",
-        "epsilon_ms": WEIGHT_EPSILON_MS,
-        "min": WEIGHT_MIN,
-        "max": WEIGHT_MAX,
-    }
-    return {
-        "name": "decode_additive",
-        "status": "fitted",
-        "kind": "steady_decode",
-        "metric": metric,
-        "timing_semantics": "fixed_batch_decode_window",
-        "formula": "d0 + d_requests * (requests - 1) + d_kv * kv_tokens",
-        "coefficients": {"d0_ms": d0, "d_requests_ms": d_requests, "d_kv_ms_per_token": d_kv},
-        "coverage": {
-            "requests": {"min": min(sample["requests"] for sample in samples), "max": max(sample["requests"] for sample in samples)},
-            "kv_tokens": {"min": min(sample["kv_tokens"] for sample in samples), "max": max(sample["kv_tokens"] for sample in samples)},
-            "ood_policy": "fail",
-        },
-        "source": source,
-    }
-
-
-def evaluate_additive(candidate: dict[str, Any], requests: float, kv_tokens: float) -> float:
-    requests = _finite(requests, "requests")
-    kv_tokens = _finite(kv_tokens, "kv_tokens")
-    coverage = candidate.get("coverage", {})
-    for field, value in (("requests", requests), ("kv_tokens", kv_tokens)):
-        bounds = coverage.get(field, {})
-        if value < bounds.get("min", value) or value > bounds.get("max", value):
-            raise FitError(f"{field}={value:g} is outside measured domain")
-    coefficients = candidate["coefficients"]
-    return _finite(
-        coefficients["d0_ms"] + coefficients["d_requests_ms"] * (requests - 1.0) + coefficients["d_kv_ms_per_token"] * kv_tokens,
-        "additive prediction",
-    )
 
 
 def _surface_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str, Any]:
@@ -316,25 +197,18 @@ def _surface_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[str,
 
 
 def _cached_observations(document: dict[str, Any], *, metric: str) -> list[dict[str, Any]]:
-    """Reapply the acquisition cache contract before accepting signed differences."""
-    from cached_prefill import validate_cached_measurement
+    """Use the already-qualified cached TTFT differences."""
     samples = []
     for cell in document['cells']:
         if cell['kind'] != 'cached_prefill' or cell['split'] != 'train':
             continue
         if cell['status'] != 'measured' or cell['training']['qualified'] is not True:
             raise FitError('cached-prefill training cell is incomplete or unqualified')
-        plan = cell['plan']
         for row in cell['observations']:
             if metric in row['fit_policy']['excluded_metrics']:
                 raise FitError('required cached-prefill TTFT cannot be excluded from fitting')
-            logical = row['logical_request']
-            for role in ('target', 'zero_cost'):
-                validate_cached_measurement(plan, row['measurements'][role], logical)
             if row['metric_source'] != 'paired_request_ttft' or row['reference_interval_ms'] != 0:
                 raise FitError('cached-prefill requires paired TTFT against the full zero-cost reference')
-            if (row['prefix_tokens'], row['new_tokens']) != (plan['prefix_tokens'], plan['new_tokens']):
-                raise FitError('cached-prefill coordinates differ from the frozen plan')
             samples.append({
                 'cell_id': row['cell_id'], 'split': row['split'], 'repeat': row['repeat'], 'index': row['index'],
                 'prefix_tokens': row['prefix_tokens'], 'new_tokens': row['new_tokens'],
@@ -404,8 +278,7 @@ def _cached_surface_fit(
         'values_ms': grid, 'dispersion': dispersion, 'coverage': domain,
         'runtime_enabled': False, 'validation_status': 'offline_fit_only',
         'source': {**_source_metadata(samples, metric=metric), 'required_cells': required,
-                   'cache_evidence': 'exact_requested_observed_prefix_and_uncached_tail',
-                   'training': document.get('source', {})},
+                   'cache_evidence': 'exact_requested_observed_prefix_and_uncached_tail'},
     }
 
 
@@ -468,7 +341,7 @@ def _fit_or_unsupported(name: str, kind: str, metric: str, fit_fn: Any, samples:
         }
 
 
-def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None) -> dict[str, Any]:
+def fit_normalized(document: dict[str, Any]) -> dict[str, Any]:
     from normalize import SCHEMA_VERSION as NORMALIZED_SCHEMA, verify_normalized
     if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != NORMALIZED_SCHEMA
             or document.get('scope') != 'train' or document.get('status') != 'succeeded'
@@ -483,7 +356,6 @@ def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None
     cached = _cached_observations(document, metric='ttft_ms')
     candidates = [
         _fit_or_unsupported('cold_prefill_piecewise_linear', 'cold_prefill', 'ttft_ms', _piecewise_fit, prefill),
-        _fit_or_unsupported('decode_additive', 'steady_decode', 'tpot_ms', _additive_fit, decode),
         _fit_or_unsupported('decode_2d_surface', 'steady_decode', 'tpot_ms', _surface_fit, decode),
         _fit_or_unsupported('cached_prefill_surface', 'cached_prefill', 'ttft_ms',
                             lambda samples, metric: _cached_surface_fit(samples, metric=metric, document=document), cached),
@@ -491,22 +363,12 @@ def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None
     failures = [c['name'] for c in candidates if c['status'] != 'fitted'
                 and ((c['kind'] == 'steady_decode' and decode) or (c['kind'] == 'cold_prefill' and prefill)
                      or (c['kind'] == 'cached_prefill' and document['cached_requirements']))]
-    normalized_source = document['source']
-    fitter_sources = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                     for name in ('fit.py', 'steady_state.py', 'cached_prefill.py')}
-    if source_digest is None:
-        source_digest = hashlib.sha256((json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + '\n').encode()).hexdigest()
     return {
         "schema_version": SCHEMA_VERSION,
         "campaign_id": document.get("campaign_id"),
         "status": "invalid" if failures else "succeeded",
         "failures": failures,
         "source": {
-            "normalized_sha256": source_digest,
-            "normalized_campaign_id": document.get("campaign_id"),
-            "normalized_schema_version": document['schema_version'],
-            "training": normalized_source,
-            "fitter_sources": fitter_sources,
             "fit_splits": list(FIT_SPLITS),
             "validation_splits": list(VALIDATION_SPLITS),
             "held_out_splits": list(HELD_OUT_SPLITS),
@@ -517,12 +379,10 @@ def fit_normalized(document: dict[str, Any], *, source_digest: str | None = None
     }
 
 
-def verify_fit(document: dict, normalized: dict, *, normalized_digest: str) -> None:
-    """Recompute candidates from pinned qualified training; hashes alone are not proof."""
-    from manifest import canonical_json
-    expected = fit_normalized(normalized, source_digest=normalized_digest)
-    if expected['status'] != 'succeeded' or canonical_json(document) != canonical_json(expected):
-        raise FitError('fit differs from verified train evidence or fitter implementation')
+def verify_fit(document: dict) -> None:
+    """Read the direct fit contract without rerunning normalization or fitting."""
+    if document.get('schema_version') != SCHEMA_VERSION or document.get('status') != 'succeeded':
+        raise FitError('requires a succeeded current fit artifact')
 
 
 def write_document(path: Path, document: dict[str, Any]) -> None:
@@ -555,7 +415,7 @@ def main() -> int:
         document = json.loads(payload.decode("utf-8"))
         if not isinstance(document, dict):
             raise FitError("normalized artifact must be a JSON object")
-        fitted = fit_normalized(document, source_digest=hashlib.sha256(payload).hexdigest())
+        fitted = fit_normalized(document)
         write_document(args.output, fitted)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, FitError) as exc:
         print(f"fit error: {exc}", file=sys.stderr)

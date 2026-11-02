@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import statistics
 
-from manifest import sha256_json
 from measurement_schema import DECODE_STATISTICS_POLICY, validate_envelope
 from request_plan import validate_plan
 
 KIND = 'decode_window_statistics'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StatisticsError(ValueError):
@@ -75,7 +74,7 @@ def compute_statistics(plan: dict, envelope: dict) -> dict:
     validate_envelope(envelope)
     if (plan['workload_kind'] != 'steady_decode'
             or plan.get('decode_statistics') != DECODE_STATISTICS_POLICY
-            or envelope['plan_sha256'] != plan['plan_sha256']):
+            or envelope['cell_id'] != plan['cell_id']):
         raise StatisticsError('decode statistics plan/measurement contract mismatch')
     rows = {row['pairing_key']: row for row in envelope['measurements']}
     if set(rows) != {row['pairing_key'] for row in plan['logical_requests']}:
@@ -84,8 +83,8 @@ def compute_statistics(plan: dict, envelope: dict) -> dict:
     measured = [batch for batch in batches if batch['phase'] == 'measured']
     qualified = len(measured) == plan['repeats'] and all(b['qualified'] for b in measured)
     return {
-        'kind': KIND, 'schema_version': SCHEMA_VERSION, 'plan_sha256': plan['plan_sha256'],
-        'variant': envelope['variant'], 'measurement_sha256': sha256_json(envelope),
+        'kind': KIND, 'schema_version': SCHEMA_VERSION, 'cell_id': plan['cell_id'],
+        'variant': envelope['variant'],
         'policy': dict(DECODE_STATISTICS_POLICY), 'qualified': qualified,
         'coordinate': {'requests': plan['concurrency'], 'num_ctx': plan['num_ctx']},
         'repeat_count': len(measured), 'request_count': len(measured)*plan['concurrency'],
@@ -96,7 +95,7 @@ def compute_statistics(plan: dict, envelope: dict) -> dict:
 
 
 def verify_statistics(plan: dict, envelope: dict, document: dict) -> None:
-    if sha256_json(document) != sha256_json(compute_statistics(plan, envelope)):
+    if document != compute_statistics(plan, envelope):
         raise StatisticsError('decode statistics differ from pinned measurement evidence')
 
 

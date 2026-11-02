@@ -3,24 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
-from artifacts import (ArtifactError, _read_json, checked_path, execution_snapshot, file_reference,
+from artifacts import (ArtifactError, _read_json, checked_path, execution_snapshot,
                        load_compiled_bundle, sealed_reference, write_derived_document)
 from baseline import derive_cell, resolve_reference
-from manifest import sha256_json
-from measurement_schema import digest
 from pairing import campaign_scope as _scope, pair_plan_measurements, load_role
 
-SCHEMA_VERSION = 5
-NORMALIZER_SOURCES = ('normalize.py', 'pairing.py', 'artifacts.py', 'manifest.py', 'request_plan.py',
-                      'measurement_schema.py', 'evidence_proxy.py', 'sse_evidence.py',
-                      'vllm_bench.py', 'vllm_bench_collect.py', 'probe.py', 'steady_state.py', 'profile.py', 'baseline.py',
-                      'cached_prefill.py', 'cached_prefix_workload.py')
+SCHEMA_VERSION = 7
 
 
 class NormalizeError(ValueError):
@@ -30,8 +23,7 @@ class NormalizeError(ValueError):
 def _cell_result(cell: dict, plan: dict) -> dict:
     return {'cell_id': cell['cell_id'], 'name': cell['name'], 'kind': cell['kind'], 'split': cell['split'],
             'status': 'invalid', 'expected_count': sum(row['phase'] == 'measured' for row in plan['logical_requests']),
-            'matched_count': 0, 'observed_count': {}, 'observations': [],
-            **({'plan': plan} if cell['kind'] == 'cached_prefill' else {})}
+            'matched_count': 0, 'observed_count': {}, 'observations': []}
 
 
 def _paired_cell(root: Path, campaign: dict, cell: dict, plan: dict, attempts: dict, sources: dict, scope: str) -> dict:
@@ -46,20 +38,18 @@ def _paired_cell(root: Path, campaign: dict, cell: dict, plan: dict, attempts: d
         'input_tokens': logical['input_tokens'], 'output_tokens': logical['output_tokens'],
         'concurrency': cell['concurrency'], 'sum_decode_ctx_tokens': cell.get('sum_decode_ctx_tokens'),
         'fit_policy': cell['fit_policy'], 'metadata': cell.get('metadata', {}),
-        **({'prefix_tokens': cell['prefix_tokens'], 'new_tokens': cell['new_tokens'],
-            'logical_request': logical} if cell['kind'] == 'cached_prefill' else {}),
-        'measurements': measurements, 'sources': sources,
+        **({'prefix_tokens': cell['prefix_tokens'], 'new_tokens': cell['new_tokens']}
+           if cell['kind'] == 'cached_prefill' else {}),
+        'measurements': measurements,
         'decode_window_tpot_ms': {role: values[logical['pairing_key']] for role, values in request_tpot.items()}
                                  if cell['kind'] == 'steady_decode' else None,
     } for logical, measurements in paired['pairs']]
     result = {**_cell_result(cell, plan), 'status': 'paired', 'matched_count': paired['matched_count'],
-              'observations': observations, 'observed_count': paired['observed_count'],
+              'observations': observations, 'observed_count': paired['observed_count'], 'sources': sources,
               'decode_statistics': {role: attempt['statistics'] for role, attempt in attempts.items()}
               if cell['kind'] == 'steady_decode' else None}
     if scope == 'train':
         reference = resolve_reference(root, campaign, sources['zero_cost']['binding']['reference'], cell['cell_id'])
-        if reference['target'] != sources['target']:
-            raise NormalizeError('paired target differs from the reference interval source')
         result['baseline'] = reference
         result['training'] = derive_cell(cell, observations, reference)
         result['status'] = 'measured' if result['training']['qualified'] else 'invalid'
@@ -74,7 +64,7 @@ def normalize_campaign(root: Path, *, scope: str) -> dict[str, Any]:
     campaign = load_compiled_bundle(root)
     cells, _, roles, _ = _scope(campaign, scope)
     results, selected = [], []
-    with execution_snapshot(root, campaign['campaign_id']) as (execution, execution_digest):
+    with execution_snapshot(root, campaign['campaign_id']) as execution:
         for cell in cells:
             plan = _read_json(checked_path(root, cell['plan']['path']))
             result = _cell_result(cell, plan)
@@ -91,18 +81,13 @@ def normalize_campaign(root: Path, *, scope: str) -> dict[str, Any]:
             except (ArtifactError, ValueError, OSError, KeyError, TypeError) as exc:
                 result.update(reason=f'{role or "pairing"}: {type(exc).__name__}: {exc}')
             results.append(result)
-    source_files = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
-                    for name in NORMALIZER_SOURCES}
-    source = {'artifact_root': str(root), 'compiler_index': file_reference(root / 'artifact_index.json'),
-              'execution_index_sha256_at_read': execution_digest,
-              'selected_attempts': selected, 'selected_attempts_sha256': sha256_json(selected),
-              'normalizer_sources': source_files, 'normalizer_sha256': sha256_json(source_files)}
+    source = {'artifact_root': str(root), 'selected_attempts': selected}
     return _assemble_document(campaign, scope, results, source)
 
 
 def _assemble_document(campaign: dict, scope: str, results: list, source: dict) -> dict:
     """One result contract for normalization and verification of saved output."""
-    cells, deferred, roles, definition = _scope(campaign, scope)
+    cells, deferred, roles, _ = _scope(campaign, scope)
     expected_status = 'measured' if scope == 'train' else 'paired'
     failures = [{'cell_id': cell['cell_id'], 'reason': cell['reason']} for cell in results if cell['status'] != expected_status]
     if not cells:
@@ -112,7 +97,7 @@ def _assemble_document(campaign: dict, scope: str, results: list, source: dict) 
     observations = [row for cell in results for row in cell['observations']]
     return {
         'kind': 'normalized_campaign', 'schema_version': SCHEMA_VERSION, 'campaign_id': campaign['campaign_id'],
-        'status': 'invalid' if failures else 'succeeded', 'scope': scope, 'scope_sha256': sha256_json(definition),
+        'status': 'invalid' if failures else 'succeeded', 'scope': scope,
         'required_roles': list(roles), 'required_cell_ids': [cell['cell_id'] for cell in cells],
         'campaign_required_scope': campaign['required_scope'], 'deferred_cells': deferred,
         'cached_requirements': [
@@ -131,28 +116,13 @@ def _assemble_document(campaign: dict, scope: str, results: list, source: dict) 
 
 
 def verify_normalized_sources(document: dict, *, root: Path | None = None) -> dict:
-    """Recheck pinned sources and return canonical results, without checking saved observations."""
-    if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != SCHEMA_VERSION
-            or document.get('status') != 'succeeded'):
-        raise NormalizeError('source verification requires succeeded current normalized schema')
+    """Explicitly replay the saved attempt selection for offline comparison."""
+    verify_normalized(document)
     source = document['source']
     root = (root or Path(source['artifact_root'])).expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    cells, deferred, roles, definition = _scope(campaign, document['scope'])
-    if (not cells or campaign['campaign_id'] != document['campaign_id']
-            or file_reference(root / 'artifact_index.json') != source['compiler_index']
-            or sha256_json(definition) != document['scope_sha256']
-            or document['required_roles'] != list(roles)
-            or document['required_cell_ids'] != [cell['cell_id'] for cell in cells]
-            or document['campaign_required_scope'] != campaign['required_scope'] or document['deferred_cells'] != deferred):
-        raise NormalizeError('normalized compiler/scope binding mismatch')
-    selected = source['selected_attempts']
-    if sha256_json(selected) != source['selected_attempts_sha256']:
-        raise NormalizeError('selected attempt snapshot digest mismatch')
-    indexed = {(ref['cell_id'], ref['variant']): ref for ref in selected}
-    if (len(indexed) != len(selected)
-            or set(indexed) != {(cell['cell_id'], role) for cell in cells for role in roles}):
-        raise NormalizeError('selected attempt snapshot scope mismatch')
+    cells, _, roles, _ = _scope(campaign, document['scope'])
+    indexed = {(ref['cell_id'], ref['variant']): ref for ref in source['selected_attempts']}
     results = []
     for cell in cells:
         plan = _read_json(checked_path(root, cell['plan']['path']))
@@ -160,30 +130,25 @@ def verify_normalized_sources(document: dict, *, root: Path | None = None) -> di
         for role in roles:
             ref = {k: v for k, v in indexed[cell['cell_id'], role].items() if k not in ('cell_id', 'variant')}
             sources[role] = ref
-            attempts[role] = load_role(root, campaign, plan, role, ref)
+            attempts[role] = load_role(root, campaign, plan, role, ref, replay_raw=True)
         results.append(_paired_cell(root, campaign, cell, plan, attempts, sources, document['scope']))
     return _assemble_document(campaign, document['scope'], results, source)
 
 
 def verify_normalized(document: dict, *, root: Path | None = None) -> None:
-    """Validate a complete succeeded output against its pinned source evidence."""
-    expected = verify_normalized_sources(document, root=root)
-    source = document['source']
-    digest(source['execution_index_sha256_at_read'], 'execution_index_sha256_at_read')
-    source_files = source['normalizer_sources']
-    if not isinstance(source_files, dict) or not source_files:
-        raise NormalizeError('normalizer source map must be nonempty')
-    for name, value in source_files.items():
-        digest(value, f'normalizer_sources.{name}')
-    if sha256_json(source_files) != source['normalizer_sha256']:
-        raise NormalizeError('normalizer source map digest mismatch')
-    if sha256_json(document) != sha256_json(expected):
-        raise NormalizeError('normalized results differ from pinned source evidence')
+    """Check the direct normalized input; training reads do not replay raw evidence."""
+    if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != SCHEMA_VERSION
+            or document.get('status') != 'succeeded'):
+        raise NormalizeError('requires a succeeded current normalized artifact')
+    if (not document['cells'] or document['failure_count'] or
+            document['matched_count'] != document['expected_count']):
+        raise NormalizeError('normalized scope is incomplete')
+    if document['scope'] == 'train' and (not document['fit_ready'] or
+            any(cell['split'] != 'train' or cell['status'] != 'measured' for cell in document['cells'])):
+        raise NormalizeError('training requires qualified train cells')
 
 
 def write_document(path: Path, document: dict) -> None:
-    if document.get('status') == 'succeeded':
-        verify_normalized(document)
     write_derived_document(path, document, Path(document['source']['artifact_root']))
 
 

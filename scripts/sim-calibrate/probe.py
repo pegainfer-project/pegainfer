@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import http.client
 import json
 import socket
 import ssl
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -130,7 +130,7 @@ def validate_cache_recovery_receipt(receipt: dict, plan: dict, batch: dict, *,
         validate_profile_binding(identity['endpoint'], binding)
         if (type(binding.get('server_pid')) is not int or binding['server_pid'] <= 0
                 or type(binding.get('process_start_ticks')) is not int
-                or binding.get('executable') != launch['executable']
+                or binding.get('executable') != str(Path(launch['argv'][0]).resolve())
                 or binding.get('argv') != launch['argv']):
             raise ValueError('restart process does not attest the frozen executable/argv')
     else:
@@ -188,14 +188,10 @@ def _get(
         conn.close()
 
 
-def _safe_body_digest(body: bytes) -> str:
-    return hashlib.sha256(body).hexdigest()
-
-
 def _require_success(result: HttpResult, path: str) -> None:
     if not 200 <= result.status < 300:
         raise ProbeError(
-            f"{path} returned HTTP {result.status}; body_sha256={_safe_body_digest(result.body)}"
+            f"{path} returned HTTP {result.status}"
         )
 
 
@@ -248,7 +244,6 @@ def probe_endpoint(
                     "elapsed_ms": models.elapsed_ms,
                     "model_ids": model_ids,
                     "selected": selected,
-                    "body_sha256": _safe_body_digest(models.body),
                 },
             }
         except ProbeError as exc:

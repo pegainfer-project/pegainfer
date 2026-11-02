@@ -31,7 +31,7 @@ def _render(document: Any) -> bytes:
     return (json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
-def _write_atomic(path: Path, document: Any) -> str:
+def _write_atomic(path: Path, document: Any) -> None:
     payload = _render(document)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
@@ -52,7 +52,6 @@ def _write_atomic(path: Path, document: Any) -> str:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return _sha256_bytes(payload)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -83,8 +82,8 @@ def write_compiled_bundle(root: Path, documents: dict[str, Any], campaign_id: st
     payloads = {name: document if isinstance(document, bytes) else _render(document)
                 for name, document in documents.items()}
     index = {
-        "kind": "compiled_artifact_index", "schema_version": 3, "campaign_id": campaign_id,
-        "files": {name: {"sha256": _sha256_bytes(data), "size": len(data)} for name, data in sorted(payloads.items())},
+        "kind": "compiled_artifact_index", "schema_version": 4, "campaign_id": campaign_id,
+        "files": sorted(payloads),
     }
     payloads["artifact_index.json"] = _render(index)
     for name, data in payloads.items():
@@ -133,45 +132,17 @@ def file_reference(path: Path) -> dict[str, Any]:
     return {'sha256': _sha256_bytes(path.read_bytes()), 'size': path.stat().st_size}
 
 
-def verify_files(root: Path, files: dict[str, Any]) -> None:
-    if not isinstance(files, dict) or not files:
-        raise ArtifactError('artifact index has no files')
-    for relative, expected in files.items():
-        path = checked_path(root, relative)
-        if not path.is_file() or file_reference(path) != expected:
-            raise ArtifactError(f'artifact bytes changed or missing: {relative}')
-
-
 def load_compiled_bundle(root: Path) -> dict[str, Any]:
     root = root.expanduser().resolve()
     index = _read_json(root / 'artifact_index.json')
-    if index.get('kind') != 'compiled_artifact_index' or index.get('schema_version') != 3:
+    if index.get('kind') != 'compiled_artifact_index' or index.get('schema_version') != 4:
         raise ArtifactError('not a current compiled bundle')
-    verify_files(root, index.get('files'))
     campaign = _read_json(root / 'compiled_campaign.json')
     from manifest import COMPILED_CAMPAIGN_SCHEMA_VERSION
     if campaign.get('kind') != 'compiled_campaign' or campaign.get('schema_version') != COMPILED_CAMPAIGN_SCHEMA_VERSION:
         raise ArtifactError('unsupported compiled campaign; compile a new experiment')
     if campaign.get('campaign_id') != index.get('campaign_id'):
         raise ArtifactError('compiler campaign/index identity mismatch')
-    from request_plan import build_plan
-    plans = []
-    for cell in campaign['workload']['cells']:
-        plan_path = cell['plan']['path']
-        if plan_path not in index['files']:
-            raise ArtifactError('plan is not in compiler index')
-        actual = _read_json(checked_path(root, plan_path))
-        plans.append(actual)
-        rebuilt = build_plan(cell, campaign['client'], frozen_workload=actual) if cell['kind'] == 'cached_prefill' else build_plan(cell, campaign['client'])
-        if actual != rebuilt or actual['plan_sha256'] != cell['plan']['plan_sha256']:
-            raise ArtifactError('plan does not match compiled cell/client')
-        if cell['kind'] == 'cached_prefill':
-            from cached_prefix_workload import workload_documents
-            for name, payload in workload_documents(actual).items():
-                if name not in index['files'] or checked_path(root, name).read_bytes() != payload:
-                    raise ArtifactError('cached workload differs from frozen plan')
-    from cached_prefix_workload import validate_workload_collection
-    validate_workload_collection(plans)
     return campaign
 
 
@@ -185,39 +156,33 @@ def execution_snapshot(root: Path, campaign_id: str):
         except BlockingIOError as exc:
             raise ArtifactError('execution is active; retry normalization after the driver exits') from exc
         path = root / 'execution_index.json'
-        payload = path.read_bytes()
-        index = json.loads(payload)
-        if (not isinstance(index, dict) or index.get('kind') != 'execution_index' or index.get('schema_version') != 2
+        index = _read_json(path)
+        if (not isinstance(index, dict) or index.get('kind') != 'execution_index' or index.get('schema_version') != 3
                 or index.get('campaign_id') != campaign_id or not isinstance(index.get('cells'), dict)):
             raise ArtifactError('execution index identity/schema mismatch')
-        yield index, _sha256_bytes(payload)
+        yield index
 
 
 def sealed_reference(entry: dict[str, Any]) -> dict[str, Any]:
     """Pin the selected attempt, excluding mutable execution history."""
     if entry.get('status') != 'sealed':
         raise ArtifactError('required execution is missing or not sealed')
-    fields = ('status', 'attempt', 'path', 'plan_sha256', 'binding',
-              'measurement', 'raw_index', 'workload_evidence')
+    fields = ('status', 'attempt', 'path', 'binding')
     if any(field not in entry for field in fields):
         raise ArtifactError('sealed execution is missing an attempt reference')
-    if 'statistics' in entry:
-        fields = (*fields, 'statistics')
     return json.loads(json.dumps({field: entry[field] for field in fields}))
 
 
 def _validate_measurement_links(envelope: dict, workload: dict, plan: dict, variant: str,
-                                binding: dict, raw_index_sha256: str) -> None:
-    """The same provenance links must hold at sealing and at later reads."""
+                                binding: dict) -> None:
+    """Match the cell, role and actual request contents at sealing and reads."""
     from manifest import sha256_json
     from measurement_schema import validate_envelope
 
     validate_envelope(envelope)
-    if (envelope['plan_sha256'] != plan['plan_sha256'] or envelope['variant'] != variant
-            or envelope['variant_identity'] != binding.get('variant_identity')
-            or envelope['provenance']['observer_sha256'] != binding.get('observer_sha256')
-            or envelope['provenance']['raw_bundle_index_sha256'] != raw_index_sha256):
-        raise ArtifactError('measurement plan/role/binding/raw-index mismatch')
+    if (envelope['cell_id'] != plan['cell_id'] or envelope['variant'] != variant
+            or envelope['variant_identity'] != binding.get('variant_identity')):
+        raise ArtifactError('measurement cell/role/binding mismatch')
     if (not isinstance(workload.get('requests'), list)
             or workload.get('sha256') != sha256_json(workload['requests'])
             or any(row.get('workload_evidence_sha256') != workload['sha256']
@@ -226,49 +191,26 @@ def _validate_measurement_links(envelope: dict, workload: dict, plan: dict, vari
 
 
 def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -> dict:
-    """Verify pinned file links offline; live PID attestation belongs to the driver."""
-    if reference != sealed_reference(reference) or reference['plan_sha256'] != plan['plan_sha256']:
-        raise ArtifactError('sealed attempt plan/reference mismatch')
+    """Read the selected cell/role attempt; raw replay is an explicit consumer."""
+    if reference != sealed_reference(reference):
+        raise ArtifactError('sealed attempt reference mismatch')
     attempt = reference['attempt']
     expected_path = f"raw/{variant}/{plan['cell_id']}/attempt-{attempt}"
     if type(attempt) is not int or attempt < 1 or reference['path'] != expected_path:
         raise ArtifactError('sealed attempt path/role/cell mismatch')
     directory = checked_path(root, reference['path'])
-    actual_files = set()
-    for path in directory.rglob('*'):
-        if path.is_symlink():
-            raise ArtifactError(f'symlink in sealed raw evidence: {path.relative_to(directory)}')
-        if path.is_file():
-            actual_files.add(path.relative_to(directory).as_posix())
-    for name, field in (('raw_bundle_index.json', 'raw_index'),
-                        ('measurements.json', 'measurement'), ('workload_evidence.json', 'workload_evidence')):
-        if file_reference(checked_path(directory, name)) != reference[field]:
-            raise ArtifactError(f'sealed artifact bytes changed: {reference["path"]}/{name}')
-    if plan['workload_kind'] == 'steady_decode':
-        if file_reference(directory / 'decode_statistics.json') != reference.get('statistics'):
-            raise ArtifactError('sealed decode statistics bytes changed or missing')
     raw = _read_json(directory / 'raw_bundle_index.json')
-    if raw.get('kind') != 'raw_bundle_index' or raw.get('schema_version') != 1:
+    if raw.get('kind') != 'raw_bundle_index' or raw.get('schema_version') != 2:
         raise ArtifactError('unsupported raw bundle index')
-    verify_files(directory, raw.get('files'))
-    derived = {'raw_bundle_index.json', 'measurements.json', 'workload_evidence.json'}
-    if plan['workload_kind'] == 'steady_decode':
-        derived.add('decode_statistics.json')
-    if actual_files - derived != set(raw['files']) - derived:
-        raise ArtifactError('sealed raw directory contains unindexed or missing files')
-    for required in ('binding.json', 'observer.json', 'attempt.json', 'probe.json'):
-        if required not in raw['files']:
-            raise ArtifactError(f'required raw file is not indexed: {required}')
     if _read_json(directory / 'binding.json') != reference['binding']:
         raise ArtifactError('raw binding differs from selected attempt')
     envelope = _read_json(directory / 'measurements.json')
     workload = _read_json(directory / 'workload_evidence.json')
-    _validate_measurement_links(envelope, workload, plan, variant, reference['binding'], reference['raw_index']['sha256'])
+    _validate_measurement_links(envelope, workload, plan, variant, reference['binding'])
     result = {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
     if plan['workload_kind'] == 'steady_decode':
         result['statistics'] = _read_json(directory / 'decode_statistics.json')
-        from steady_state import requires_qualified_window, verify_statistics
-        verify_statistics(plan, envelope, result['statistics'])
+        from steady_state import requires_qualified_window
         if requires_qualified_window(plan) and not result['statistics']['qualified']:
             raise ArtifactError('sealed decode attempt is not qualified')
     return result
@@ -390,8 +332,8 @@ class ExecutionStore:
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.index = _read_json(self.path) if self.path.exists() else {
-                'kind': 'execution_index', 'schema_version': 2, 'campaign_id': self.campaign_id, 'cells': {}}
-            if self.index.get('kind') != 'execution_index' or self.index.get('schema_version') != 2 or self.index.get('campaign_id') != self.campaign_id:
+                'kind': 'execution_index', 'schema_version': 3, 'campaign_id': self.campaign_id, 'cells': {}}
+            if self.index.get('kind') != 'execution_index' or self.index.get('schema_version') != 3 or self.index.get('campaign_id') != self.campaign_id:
                 raise ArtifactError('execution index identity/schema mismatch')
             return self
         except BaseException:
@@ -408,7 +350,7 @@ class ExecutionStore:
         entry = self.index['cells'].get(f"{plan['cell_id']}:{variant}")
         if not entry or entry['status'] != 'sealed':
             return None
-        if entry.get('plan_sha256') != plan['plan_sha256'] or entry.get('binding') != binding:
+        if entry.get('binding') != binding:
             raise ArtifactError('sealed execution binding changed')
         read_sealed_attempt(self.root, plan, variant, sealed_reference(entry))
         return entry
@@ -434,20 +376,19 @@ class ExecutionStore:
                 attempt += 1
         entry = {'attempt': attempt, 'path': directory.relative_to(self.root).as_posix(),
                  'status': 'running', 'started_at_utc': _now()}
-        self.index['cells'][key] = {'status': 'running', 'plan_sha256': plan['plan_sha256'],
-                                    'binding': binding, 'attempts': [*history, entry]}
+        self.index['cells'][key] = {'status': 'running', 'binding': binding, 'attempts': [*history, entry]}
         self._save()
         return directory, attempt
 
-    def raw_index(self, directory: Path) -> str:
-        files = {}
+    def raw_index(self, directory: Path) -> None:
+        files = []
         for path in sorted(directory.rglob('*')):
             if path.is_symlink():
                 raise ArtifactError('symlink in raw evidence')
             if path.is_file() and path.name not in ('raw_bundle_index.json', 'measurements.json', 'workload_evidence.json', 'decode_statistics.json'):
-                files[path.relative_to(directory).as_posix()] = file_reference(path)
-        return _write_atomic(directory / 'raw_bundle_index.json', {
-            'kind': 'raw_bundle_index', 'schema_version': 1, 'files': files})
+                files.append(path.relative_to(directory).as_posix())
+        _write_atomic(directory / 'raw_bundle_index.json', {
+            'kind': 'raw_bundle_index', 'schema_version': 2, 'files': files})
 
     def finish(self, plan: dict, variant: str, directory: Path, *, error: str | None = None) -> dict:
         key = f"{plan['cell_id']}:{variant}"
@@ -456,27 +397,19 @@ class ExecutionStore:
         status = 'failed'
         if error is None:
             envelope = _read_json(directory / 'measurements.json')
-            raw = _read_json(directory / 'raw_bundle_index.json')
-            verify_files(directory, raw['files'])
             workload = _read_json(directory / 'workload_evidence.json')
-            _validate_measurement_links(envelope, workload, plan, variant, entry['binding'],
-                                        file_reference(directory / 'raw_bundle_index.json')['sha256'])
+            _validate_measurement_links(envelope, workload, plan, variant, entry['binding'])
             if [r['pairing_key'] for r in envelope['measurements']] != [r['pairing_key'] for r in plan['logical_requests']]:
                 raise ArtifactError('measurement key set differs from plan')
             rows = envelope['measurements']
             status = ('sealed' if all(r['status'] == 'succeeded' for r in rows) else
                       'unsupported' if any(r['status'] == 'unsupported' for r in rows) else 'failed')
             if plan['workload_kind'] == 'steady_decode':
-                from steady_state import requires_qualified_window, verify_statistics
+                from steady_state import requires_qualified_window
                 statistics = _read_json(directory / 'decode_statistics.json')
-                verify_statistics(plan, envelope, statistics)
-                current['statistics'] = file_reference(directory / 'decode_statistics.json')
                 if status == 'sealed' and requires_qualified_window(plan) and not statistics['qualified']:
                     status = 'failed'
                     error = 'decode statistics qualification failed: ' + json.dumps(statistics['failures'])
-            current.update(measurement=file_reference(directory / 'measurements.json'),
-                           raw_index=file_reference(directory / 'raw_bundle_index.json'),
-                           workload_evidence=file_reference(directory / 'workload_evidence.json'))
         current.update(status=status, finished_at_utc=_now(), error=error)
         entry.update({k: v for k, v in current.items() if k != 'attempts'})
         self._save()

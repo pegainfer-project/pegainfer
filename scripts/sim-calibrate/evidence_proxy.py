@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 import hashlib
-import importlib.metadata
 import json
 import os
 import time
@@ -14,37 +13,8 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-from manifest import sha256_json
+from measurement_schema import OBSERVER_CONFIG
 from sse_evidence import EvidenceError, SSEParser
-
-
-OBSERVER_CONFIG = {
-    'implementation': 'aiohttp_streaming', 'clock': 'monotonic_ns',
-    'request_start': 'proxy_upstream_dispatch', 'event_observation': 'proxy_upstream_read',
-    'compression': 'identity', 'connection_reuse': False, 'http_version': '1.1',
-    'redirects': False, 'upstream_retries': 0, 'trust_env': False,
-    'bench_optional_metrics': 'disabled_at_proxy',
-    'writer_open_files': 64, 'writer_queue_records': 4096, 'max_event_bytes': 4 * 1024 * 1024,
-}
-RETRY_CONTRACT = {'max_upstream_attempts_per_key': 1, 'duplicate_policy': 'fail_batch',
-                  'client_retry_control': 'unavailable'}
-TIMING_CONTRACT = {
-    'clock': 'monotonic', 'first_token': 'first_output_token_ids_event',
-    'last_token': 'last_output_token_ids_event', 'first_text': 'first_nonempty_output_text_event',
-    'text_fallback': 'disabled', 'return_token_ids': True, 'echo': False,
-    'decode_interval_tokens': 'right_event_output_token_count',
-    'measurement_origin': 'http_sse_proxy', 'request_start': 'proxy_upstream_dispatch',
-    'event_observation': 'proxy_upstream_read',
-}
-OBSERVER_SOURCES = (
-    'evidence_proxy.py', 'sse_evidence.py', 'requirements-evidence-proxy.txt',
-    'vllm_bench_collect.py', 'plan_driver.py', 'vllm_bench.py',
-    'measurement_schema.py', 'request_plan.py', 'manifest.py', 'artifacts.py',
-    'probe.py', 'campaign.py', 'profile.py', 'steady_state.py', 'baseline.py',
-    'pairing.py', 'normalize.py', 'target_statistics.py',
-    'fit.py', 'replay.py', 'report.py', 'acceptance.py',
-    'cached_prefix_workload.py', 'cached_prefill.py',
-)
 
 
 def validate_request_body(body: dict, plan: dict, model: str, logical: dict | None = None) -> None:
@@ -65,23 +35,6 @@ def validate_request_body(body: dict, plan: dict, model: str, logical: dict | No
         raise EvidenceError('multiple choices are unsupported')
     if body.get('stream_options', {}).get('include_usage') is not True:
         raise EvidenceError('request must include stream usage')
-
-
-def observer_identity() -> dict[str, Any]:
-    directory = Path(__file__).resolve().parent
-    requirements = directory / 'requirements-evidence-proxy.txt'
-    versions = {}
-    for line in requirements.read_text().splitlines():
-        if line and not line.startswith('#'):
-            name, expected = line.split('==')
-            actual = importlib.metadata.version(name)
-            if actual != expected:
-                raise EvidenceError(f'observer dependency mismatch: {name} {actual} != {expected}')
-            versions[name] = actual
-    sources = {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-               for name in OBSERVER_SOURCES}
-    return {'config': dict(OBSERVER_CONFIG), 'dependencies': versions, 'sources': sources,
-            'sha256': sha256_json([OBSERVER_CONFIG, versions, sources])}
 
 
 class EvidenceWriter:

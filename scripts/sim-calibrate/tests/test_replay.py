@@ -5,8 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from replay import replay_campaign
-from report import verify_report
+from report import report_campaign, verify_report
 from test_normalize import make_bundle
 from test_campaign import make_input
 from campaign import compile_campaign
@@ -22,7 +21,7 @@ class ReplayTests(unittest.TestCase):
                     root = Path(tmp)/'artifacts'
                 else:
                     root, _ = make_bundle(Path(tmp), full_train=True)
-                document = replay_campaign(root)
+                document = report_campaign(root)
                 self.assertEqual(document['status'], 'replay_required')
                 self.assertEqual(document['matched_count'], 0)
                 self.assertEqual(document['acceptance']['status'], 'failed')

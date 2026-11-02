@@ -9,15 +9,15 @@ import statistics
 from pathlib import Path
 
 from artifacts import (_read_json, checked_path, execution_snapshot,
-                       load_compiled_bundle, sealed_reference, write_derived_document)
+                       load_compiled_bundle, read_sealed_attempt, sealed_reference, write_derived_document)
 from baseline import resolve_reference, select_reference
 from fit import evaluate_cached_surface
 from pairing import campaign_scope, load_role, pair_plan_measurements
-from profile import CALIBRATION_PATH
+from profile import CALIBRATION_PATH, read_calibration
 from report import _percentiles
 
 KIND = 'cached_prefill_validation_report'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 ROLES = ('target', 'zero_cost')
 DEFAULT_REPORT = 'reports/cached_validation.json'
 
@@ -41,7 +41,7 @@ def _scope(campaign: dict) -> list[dict]:
 def _selected(root: Path, campaign: dict, cells: list[dict], pinned: list | None = None) -> list[dict]:
     required = [(cell['cell_id'], role) for cell in cells for role in ROLES]
     if pinned is None:
-        with execution_snapshot(root, campaign['campaign_id']) as (execution, _):
+        with execution_snapshot(root, campaign['campaign_id']) as execution:
             pinned = [{'cell_id': cell_id, 'variant': role,
                        **sealed_reference(execution['cells'].get(f'{cell_id}:{role}', {}))}
                       for cell_id, role in required]
@@ -54,10 +54,7 @@ def _selected(root: Path, campaign: dict, cells: list[dict], pinned: list | None
 def _open(root: Path) -> tuple[dict, list[dict], dict]:
     campaign = load_compiled_bundle(root)
     cells = _scope(campaign)
-    calibration = _read_json(checked_path(root, CALIBRATION_PATH))
-    if (calibration.get('kind') != 'cached_prefill_calibration' or calibration.get('schema_version') != 1
-            or calibration.get('status') != 'fitted'):
-        raise CachedValidationError('unsupported cached-prefill calibration artifact')
+    calibration = read_calibration(root, campaign)
     for cell in cells:
         prediction = evaluate_cached_surface(calibration['surface'], cell['prefix_tokens'], cell['new_tokens'])
         if not math.isfinite(prediction) or prediction < 0:
@@ -115,7 +112,7 @@ def _median(samples: list[dict], prediction: float) -> dict:
             'absolute_error_ms': abs(signed), 'relative_error': abs(signed)/effective if effective > 0 else None}
 
 
-def _build(root: Path, context: tuple, pinned: list | None = None) -> dict:
+def _build(root: Path, context: tuple, pinned: list | None = None, *, replay_raw: bool = False) -> dict:
     campaign, cells, calibration = context
     selected = _selected(root, campaign, cells, pinned)
     indexed = {(ref['cell_id'], ref['variant']): ref for ref in selected}
@@ -125,7 +122,7 @@ def _build(root: Path, context: tuple, pinned: list | None = None) -> dict:
         references = {role: {key: value for key, value in indexed[cell['cell_id'], role].items()
                              if key not in ('cell_id', 'variant')} for role in ROLES}
         # Exactly one load of each held-out role per cell, then all repeats share it.
-        attempts = {role: load_role(root, campaign, plan, role, references[role]) for role in ROLES}
+        attempts = {role: load_role(root, campaign, plan, role, references[role], replay_raw=replay_raw) for role in ROLES}
         paired = pair_plan_measurements(plan, attempts, ROLES)
         prediction = evaluate_cached_surface(calibration['surface'], plan['prefix_tokens'], plan['new_tokens'])
         samples = [_sample(logical, rows, prediction) for logical, rows in paired['pairs']]
@@ -164,9 +161,9 @@ def validate_cached_campaign(root: Path, *, output: Path | None = None) -> dict:
 
 def verify_report(document: dict, *, root: Path | None = None) -> None:
     if document.get('kind') != KIND or document.get('schema_version') != SCHEMA_VERSION:
-        raise CachedValidationError('current cached validation report schema 1 is required')
+        raise CachedValidationError('current cached validation report schema 3 is required')
     root = (root or Path(document['source']['artifact_root'])).expanduser().resolve()
-    expected = _build(root, _open(root), document['source']['selected_attempts'])
+    expected = _build(root, _open(root), document['source']['selected_attempts'], replay_raw=True)
     if document != expected:
         raise CachedValidationError('cached report differs from selected evidence, scope or statistics')
 
@@ -188,9 +185,16 @@ async def execute_cached_validation(root: Path, *, sim_binary: Path, model_path:
     campaign, cells, _ = context
 
     def pending(role: str) -> list[dict]:
-        with execution_snapshot(root, campaign['campaign_id']) as (execution, _):
-            return [cell for cell in cells
-                    if execution['cells'].get(f"{cell['cell_id']}:{role}", {}).get('status') != 'sealed']
+        remaining = []
+        with execution_snapshot(root, campaign['campaign_id']) as execution:
+            for cell in cells:
+                entry = execution['cells'].get(f"{cell['cell_id']}:{role}", {})
+                if entry.get('status') != 'sealed':
+                    remaining.append(cell)
+                    continue
+                plan = _read_json(checked_path(root, cell['plan']['path']))
+                read_sealed_attempt(root, plan, role, sealed_reference(entry))
+        return remaining
 
     async def collect(chosen: list[dict], role: str, pid: int | None = None) -> None:
         if not chosen:

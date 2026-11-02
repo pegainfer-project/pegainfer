@@ -10,13 +10,14 @@ import math
 from pathlib import Path
 from typing import Any
 
-from artifacts import (_read_json, _render, checked_path, file_reference, fitted_bundle_paths,
+from artifacts import (_read_json, _render, checked_path, fitted_bundle_paths,
                        load_compiled_bundle, write_fitted_bundle, write_derived_document)
 from manifest import (
     canonical_cache_identity,
     canonical_client_identity,
     canonical_scheduler_identity,
     canonical_json,
+    execution_identity,
 )
 
 
@@ -44,7 +45,8 @@ def _calibration_manifest(campaign: dict, variant: str, cells: list[dict], sourc
         "quantization": runtime.get("quantization", "none"),
         "scheduler": canonical_scheduler_identity(serving["runtime"]["scheduler"]),
         "cache": canonical_cache_identity(serving["runtime"].get("cache")),
-        "client": canonical_client_identity(campaign["client"], tokenizer_config_sha256=campaign["client"]["tokenizer_config_sha256"]),
+        "client": canonical_client_identity(campaign["client"], tokenizer_config_sha256=hashlib.sha256(
+            (Path(campaign["client"]["tokenizer"]) / "tokenizer_config.json").read_bytes()).hexdigest()),
         "workload": {
             "cells": [{"id": cell["cell_id"], "family": cell["kind"], "input_tokens": cell["input_tokens"],
                        "output_tokens": cell["output_tokens"], "concurrency": cell["concurrency"],
@@ -54,7 +56,7 @@ def _calibration_manifest(campaign: dict, variant: str, cells: list[dict], sourc
         },
         "split": {name: [cell["cell_id"] for cell in cells if name == cell["split"]] for name in campaign["splits"]},
         "provenance": {
-            "collector_revision": provenance["compiler_revision"], "fitter_revision": fitter_revision,
+            "collector_revision": "sim-calibrate-acquisition-v1", "fitter_revision": fitter_revision,
             "artifact_uri": provenance["artifact_uri"], "source_digest": source_digest,
         },
     }
@@ -164,83 +166,67 @@ def _decode_model(candidate: dict[str, Any]) -> dict[str, Any]:
             "duration_us": [_ms_to_us(value, "decode surface duration") for row in values for value in row]}
 
 
-def _verified_training(root: Path, campaign: dict, normalized_path: Path, fit_path: Path) -> tuple[dict, dict, dict, dict]:
-    """Validate frozen acquisition, paired training and numerical recomputation."""
+def _training_inputs(normalized_path: Path, fit_path: Path) -> tuple[dict, dict, dict]:
+    """Read the two direct materialization inputs without replaying training."""
     from fit import verify_fit
-    from normalize import NORMALIZER_SOURCES
+    from normalize import verify_normalized
     normalized, fitted = _read_json(normalized_path), _read_json(fit_path)
-    if (normalized.get('campaign_id') != campaign['campaign_id']
-            or Path(normalized['source']['artifact_root']).resolve() != root):
-        raise ProfileError('profile training belongs to another campaign/root')
-    frozen_sources = campaign['client']['observer']['sources']
-    if normalized['source']['normalizer_sources'] != {name: frozen_sources[name] for name in NORMALIZER_SOURCES}:
-        raise ProfileError('training normalizer differs from frozen acquisition sources')
-    verify_fit(fitted, normalized, normalized_digest=file_reference(normalized_path)['sha256'])
-    sources = {'normalized': {'path': str(normalized_path), **file_reference(normalized_path)},
-               'fit': {'path': str(fit_path), **file_reference(fit_path)}}
-    generator_sources = {'profile.py': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                         **fitted['source']['fitter_sources']}
-    return normalized, fitted, sources, generator_sources
+    verify_normalized(normalized)
+    if normalized['scope'] != 'train':
+        raise ProfileError('profile materialization requires training input')
+    verify_fit(fitted)
+    return normalized, fitted, {'normalized': str(normalized_path), 'fit': str(fit_path)}
 
 
-def _calibration_document(root: Path, campaign: dict, normalized_path: Path, fit_path: Path) -> dict:
-    normalized, fitted, sources, generator_sources = _verified_training(root, campaign, normalized_path, fit_path)
+def _calibration_document(campaign: dict, normalized: dict, fitted: dict, sources: dict) -> dict:
     surface = _fit_candidate(fitted, 'cached_prefill_surface')
-    source = {'training': sources, 'generator_sources': generator_sources,
-              'compiler_index': file_reference(root / 'artifact_index.json'),
-              'plans': [{'cell_id': cell['cell_id'], **cell['plan']} for cell in campaign['workload']['cells']
-                        if cell['split'] == 'train' and cell['kind'] == 'cached_prefill'],
-              'sealed_training': normalized['source']}
-    return {'kind': 'cached_prefill_calibration', 'schema_version': 1,
+    return {'kind': 'cached_prefill_calibration', 'schema_version': 3,
             'campaign_id': campaign['campaign_id'], 'status': 'fitted',
-            'target_identity': campaign['variants']['target']['identity'],
+            'target_identity': execution_identity(campaign['variants']['target']['identity']),
             'cache_policy': campaign['variants']['target']['runtime']['cache'],
-            'surface': surface, 'source': source,
-            'source_sha256': hashlib.sha256(_render(source)).hexdigest(),
+            'surface': surface, 'source': sources,
             'runtime_enabled': False, 'validation_status': 'offline_fit_only'}
 
 
-def verify_calibration(root: Path, campaign: dict) -> dict:
-    """Recompute the offline surface and all bindings from sealed source bytes."""
-    path = checked_path(root, CALIBRATION_PATH)
-    document = _read_json(path)
-    if document.get('kind') != 'cached_prefill_calibration' or document.get('schema_version') != 1:
+def read_calibration(root: Path, campaign: dict) -> dict:
+    """Read the standalone cached surface; training intermediates are not required."""
+    document = _read_json(checked_path(root, CALIBRATION_PATH))
+    if (document.get('kind') != 'cached_prefill_calibration' or document.get('schema_version') != 3
+            or document.get('status') != 'fitted'):
         raise ProfileError('unsupported cached-prefill calibration artifact')
-    sources = document['source']['training']
-    expected = _calibration_document(root, campaign, Path(sources['normalized']['path']), Path(sources['fit']['path']))
-    if path.read_bytes() != _render(expected):
-        raise ProfileError('cached-prefill calibration differs from verified training')
-    return {'path': CALIBRATION_PATH, **file_reference(path)}
+    surface = document['surface']
+    prefixes = _axis(surface['axes']['prefix_tokens'], 'cached.prefix_tokens', 2**32 - 1)
+    new = _axis(surface['axes']['new_tokens'], 'cached.new_tokens', 2**32 - 1)
+    if len(surface['values_ms']) != len(prefixes) or any(len(row) != len(new) for row in surface['values_ms']):
+        raise ProfileError('cached surface dimensions do not match axes')
+    return document
+
+
+def verify_calibration(root: Path, campaign: dict) -> dict:
+    return read_calibration(root, campaign)
 
 
 def materialize_calibration(root: Path, *, normalized_artifact: Path, fit_artifact: Path) -> dict:
     """Publish the cached-only endpoint; no runtime curves or replay are required."""
-    from evidence_proxy import observer_identity
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    if campaign['client']['observer'] != observer_identity():
-        raise ProfileError('frozen materializer changed; compile and collect into a new root')
-    document = _calibration_document(root, campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    normalized, fitted, sources = _training_inputs(normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    document = _calibration_document(campaign, normalized, fitted, sources)
     write_derived_document(root / CALIBRATION_PATH, document, root)
-    verify_calibration(root, campaign)
     return document
 
 
-def _fitted_documents(root: Path, campaign: dict, normalized_path: Path, fit_path: Path) -> dict:
-    """Reconstruct the entire runtime bundle from verified, pinned training bytes."""
-    normalized, fitted, sources, generator_sources = _verified_training(root, campaign, normalized_path, fit_path)
+def _fitted_documents(root: Path, campaign: dict, normalized: dict, fitted: dict, sources: dict) -> dict:
+    """Encode the selected fit as a self-contained simulator bundle."""
     prefill_candidate = _fit_candidate(fitted, 'cold_prefill_piecewise_linear')
     decode_candidate = _fit_candidate(fitted, 'decode_2d_surface')
     prefill, decode = _prefill_model(prefill_candidate), _decode_model(decode_candidate)
     cached = ({'status': 'fitted', 'candidate': 'cached_prefill_surface', 'runtime_enabled': False,
-               'validation_status': 'offline_fit_only', 'artifact': verify_calibration(root, campaign)}
+               'validation_status': 'offline_fit_only', 'artifact': CALIBRATION_PATH}
               if normalized['cached_requirements'] else {'status': 'not_requested', 'runtime_enabled': False})
-    if normalized['cached_requirements']:
-        sources['cached_prefill'] = {**cached['artifact'], 'path': str(root / cached['artifact']['path'])}
-    source_digest = hashlib.sha256(_render({'training': sources, 'generator_sources': generator_sources})).hexdigest()
+    source_digest = hashlib.sha256(_render({'prefill': prefill, 'decode': decode})).hexdigest()
     manifest = _calibration_manifest(campaign, "sim", campaign["workload"]["cells"], source_digest,
-                                     [value["path"] for value in sources.values()],
-                                     "sim-calibrate-fit-schema-3:" + generator_sources["fit.py"])
+                                     list(sources.values()), "sim-calibrate-fit-schema-4")
     scheduler = manifest["scheduler"]
     max_requests, max_context, max_prefill = decode["decode_reqs"][-1], decode["sum_decode_ctx_tokens"][-1], prefill["input_tokens"][-1]
     if (max_requests > scheduler["max_num_seqs"] or max_prefill > scheduler["max_num_batched_tokens"]
@@ -263,46 +249,37 @@ def _fitted_documents(root: Path, campaign: dict, normalized_path: Path, fit_pat
     }
     documents = {paths["profile"].name: profile, paths["manifest"].name: manifest}
     selection = {
-        "kind": "fitted_profile_selection", "schema_version": 1, "status": "selected",
-        "campaign_id": campaign["campaign_id"], "target": campaign["variants"]["target"]["identity"],
-        "training": sources, "generator_sources": generator_sources,
+        "kind": "fitted_profile_selection", "schema_version": 3, "status": "selected",
+        "campaign_id": campaign["campaign_id"], "target": execution_identity(campaign["variants"]["target"]["identity"]),
+        "source": sources,
         "validation_status": "pending", "selection_policy": "fixed_train_surface",
         "prefill": {"candidate": prefill_candidate["name"], "evidence_split": "train", "source": prefill_candidate["source"]},
         "decode": {"candidate": decode_candidate["name"], "evidence_split": "train", "source": decode_candidate["source"]},
         "mixed": {"candidate": "composition_additive", "intercept_us": 0, "validation_status": "pending"},
         "cached_prefill": cached,
-        "files": {name: {"sha256": hashlib.sha256(_render(value)).hexdigest(), "size": len(_render(value))}
-                  for name, value in documents.items()},
     }
     return {**documents, paths["selection"].name: selection}
 
 
 def verify_fitted_bundle(root: Path, campaign: dict) -> dict:
-    """Offline proof of the selected model, not merely self-reported digests."""
+    """Read selection metadata; the execution binding checks actual runtime files."""
     paths = fitted_bundle_paths(root, campaign)
-    selection = _read_json(paths["selection"])
-    if selection.get("kind") != "fitted_profile_selection" or selection.get("schema_version") != 1:
-        raise ProfileError("sim requires a current complete fitted profile bundle")
-    expected = _fitted_documents(root, campaign, Path(selection["training"]["normalized"]["path"]),
-                                 Path(selection["training"]["fit"]["path"]))
-    for path in paths.values():
-        if not path.is_file() or path.is_symlink() or path.read_bytes() != _render(expected[path.name]):
-            raise ProfileError(f"fitted bundle differs from verified training: {path.name}")
-    return file_reference(paths["selection"])
+    selection = _read_json(paths['selection'])
+    if selection.get('kind') != 'fitted_profile_selection' or selection.get('schema_version') != 3:
+        raise ProfileError('sim requires a current fitted profile bundle')
+    return selection
 
 
 def materialize_profile(root: Path, *, normalized_artifact: Path, fit_artifact: Path) -> dict:
-    from evidence_proxy import observer_identity
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    if campaign["client"]["observer"] != observer_identity():
-        raise ProfileError("frozen materializer changed; compile and collect into a new root")
-    if any(cell['split'] == 'train' and cell['kind'] == 'cached_prefill' for cell in campaign['workload']['cells']):
-        materialize_calibration(root, normalized_artifact=normalized_artifact, fit_artifact=fit_artifact)
-    documents = _fitted_documents(root, campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    normalized, fitted, sources = _training_inputs(normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    if normalized['cached_requirements']:
+        write_derived_document(root / CALIBRATION_PATH,
+                               _calibration_document(campaign, normalized, fitted, sources), root)
+    documents = _fitted_documents(root, campaign, normalized, fitted, sources)
     write_fitted_bundle(root, campaign, documents)
-    verify_fitted_bundle(root, campaign)
-    return documents["selection.json"]
+    return documents['selection.json']
 
 
 def main() -> int:

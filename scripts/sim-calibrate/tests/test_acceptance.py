@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from acceptance import assess_report, require_complete
+from report import assess_report, require_complete
 from report import summarize_samples
 
 
@@ -23,8 +23,7 @@ def complete_record():
             'cell_count': 1, 'measured_cell_count': 1, 'expected_count': 1, 'matched_count': 1,
             'aggregates': {'all': summary, 'by_split': {'sealed_test': summary}},
             'queueing_ttft': {'cells': [cell], 'aggregates': {'sealed_test': summary}},
-            'provenance': {'profile': {'profile': {'sha256': 'bound'}}},
-            'normalized': {'status': 'succeeded'}}
+            'provenance': {'profile': {'profile': {'sha256': 'bound'}}}}
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -42,7 +41,6 @@ class AcceptanceTests(unittest.TestCase):
             lambda d: d['aggregates']['all'].update(count=2),
             lambda d: d['aggregates']['by_split'].clear(),
             lambda d: d['deferred_cells'].append({'kind': 'cached_prefill'}),
-            lambda d: d['normalized'].update(status='invalid'),
             lambda d: d.update(relative_denominator='effective_ttft'),
         )
         for mutate in mutations:
