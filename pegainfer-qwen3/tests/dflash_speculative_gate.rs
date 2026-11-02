@@ -9,28 +9,20 @@
 //! one argmax, and from there two greedy runs fan out completely.
 //!
 //! So an exact `spec == baseline` token match is the wrong gate: it false-fails
-//! on a benign tie flip. We use a *regret* test like `hf_golden_gate`: at the
-//! first position the two sequences disagree (where they still share an
-//! identical context, so the comparison is valid) we ask how far below the
-//! argmax the speculative pick sits — measured *in the prefill kernel's own
-//! distribution*, because that is the kernel the verify path runs. A re-prefill
-//! of the shared context (`prefill_next`) gives that reference distribution.
-//! The verify path's committed KV is built incrementally across batched
-//! speculative spans, while a one-shot prefill builds it in a single forward;
-//! the two K/V differ by a few bf16 ULP, so on a near-tie the argmax flips.
-//! Within `MARGIN_TOL` of the prefill argmax ⇒ a benign numerical tie. Clearly
-//! worse (or outside the prefill top-K) ⇒ the verify/accept/capture logic chose
-//! a token the forward never favored — a real bug. A systematic bug corrupts
-//! the non-tie positions too, so it cannot hide behind the tie band.
-//!
-//! (Empirically the one prompt that flips — "The capital of France is" — sits on
-//! a Germany-vs-Paris near-tie: the prefill kernel scores them -0.71 vs -0.83,
-//! a 0.12-nat gap, well inside `MARGIN_TOL`. The other four prompts are bit
-//! identical. A real verify bug would not single out the one degenerate prompt.)
+//! on a benign tie flip. At the first position the two sequences disagree
+//! (where they still share an identical context, so the comparison is valid)
+//! `common::lossless` reads the forward row that committed the speculative token
+//! from the executor's commit trace. The token must be that row's argmax, the
+//! baseline's token its runner up, and both forwards must put the two within a
+//! couple of bf16 steps at the logit's magnitude. Anything else ⇒ the
+//! verify/accept/capture logic committed a token its forward did not favor, or
+//! the committing forward disagrees with a plain forward beyond bf16 noise — a
+//! real bug. A systematic bug corrupts the non-tie positions too, so it cannot
+//! hide behind the tie band.
 //!
 //! The baseline runs with logprobs on (plain decode); the speculative engine
 //! runs with logprobs off (logprobs force the spec path off by design), so it
-//! reports chosen tokens only — exactly what the regret check needs.
+//! reports chosen tokens only and the commit trace supplies its side.
 //!
 //! Runs the two engines sequentially (baseline dropped before the speculative
 //! engine loads) so only one Qwen3-4B is resident at a time.
@@ -68,10 +60,10 @@ use common::harness::EngineHarness;
 use common::harness::Outcome;
 use common::harness::request;
 use common::lossless::LOGPROBS;
-use common::lossless::Step;
+use common::lossless::Run;
 use common::lossless::check_lossless;
 use common::lossless::generate;
-use common::lossless::to_steps;
+use common::lossless::to_run;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
 const DRAFT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B-DFlash-b16");
@@ -142,9 +134,9 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
 /// run concurrently in the one engine — the scheduler batches them — so with
 /// heterogeneous `max_tokens` the verify spans differ across a batch, exercising
 /// the real bs>1 draft+verify path. Each tuple is `(prompt_tokens, max_tokens)`;
-/// logprobs are off so the speculative path stays active. Returns one step list
-/// per request, in submission order.
-fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>) -> Vec<Vec<Step>> {
+/// logprobs are off so the speculative path stays active. Returns one run per
+/// request, in submission order.
+fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>) -> Vec<Run> {
     // Submit all up front so they coexist in the engine and form real batches.
     let streams: Vec<_> = requests
         .into_iter()
@@ -161,7 +153,7 @@ fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>)
     // the fold order doesn't matter — they all ran concurrently).
     streams
         .into_iter()
-        .map(|stream| to_steps(stream.expect_finished()))
+        .map(|stream| to_run(stream.expect_finished()))
         .collect()
 }
 
@@ -190,8 +182,8 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
         .collect();
 
     // 1. Baseline: plain greedy decode (speculative off), with logprobs so the
-    //    regret check has the reference distribution at the divergence point.
-    let baseline: Vec<Vec<Step>> = {
+    //    lossless check has the decode distribution at the divergence point.
+    let baseline: Vec<Run> = {
         let engine = EngineHarness::new(
             pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
                 .expect("failed to start baseline engine"),
@@ -208,9 +200,6 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     };
 
     // 2. Speculative: DFlash draft + verify (logprobs off ⇒ spec path active).
-    //    Keep the engine alive through analysis: at a divergence we re-prefill
-    //    the shared context to read the prefill-kernel reference (the kernel the
-    //    verify path uses), which the plain-decode baseline cannot provide.
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
             Path::new(&model_path),
@@ -222,15 +211,9 @@ fn dflash_speculative_greedy_matches_plain_greedy() {
     let mut failures = Vec::new();
     for (i, &prompt) in prompts.iter().enumerate() {
         let spec = generate(&engine, encoded[i].clone(), 0, GENERATED_TOKENS);
-        if let Err(failure) = check_lossless(
-            &engine,
-            &tokenizer,
-            i,
-            prompt,
-            &encoded[i],
-            &baseline[i],
-            &spec,
-        ) {
+        if let Err(failure) =
+            check_lossless(&tokenizer, i, prompt, &encoded[i], &baseline[i], &spec)
+        {
             failures.push(failure);
         }
     }
@@ -276,6 +259,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     // stale tail — so the victim diverges early, well clear of its token budget.
     const POISON_MAX_TOKENS: usize = 4;
 
+    common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
     };
@@ -295,7 +279,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
         .expect("encode failed");
 
     // 1. Baseline: the victim's plain-greedy decode (spec off) with logprobs, for
-    //    the regret reference at any divergence.
+    //    the decode distribution at any divergence.
     let baseline = {
         let engine = EngineHarness::new(
             pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
@@ -331,7 +315,6 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
     let spec = generate(&engine, victim_tokens.clone(), 0, GENERATED_TOKENS);
 
     let result = check_lossless(
-        &engine,
         &tokenizer,
         0,
         victim_prompt,
@@ -354,7 +337,7 @@ fn dflash_short_then_long_verify_capture_is_lossless() {
 /// exercise a real batch with requests at *different* verify-span lengths; this
 /// runs several greedy requests concurrently with staggered budgets and asserts
 /// each stays lossless vs its own plain-greedy baseline (tolerating only the
-/// benign bf16 tie-flip via the shared regret check). A batched-draft indexing
+/// benign bf16 tie flip via the shared lossless check). A batched-draft indexing
 /// regression or a capture-shape mismatch at bs>1 would surface here as a real
 /// (non-tie) divergence.
 #[test]
@@ -386,8 +369,8 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
         .collect();
 
     // 1. Baselines: each prompt's plain-greedy decode (spec off) at ITS budget,
-    //    with logprobs for the regret reference. Sequential, one engine.
-    let baselines: Vec<Vec<Step>> = {
+    //    with logprobs for the decode distribution. Sequential, one engine.
+    let baselines: Vec<Run> = {
         let engine = EngineHarness::new(
             pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
                 .expect("failed to start baseline engine"),
@@ -421,15 +404,9 @@ fn dflash_concurrent_heterogeneous_is_lossless() {
 
     let mut failures = Vec::new();
     for (i, (prompt, _)) in cases.iter().enumerate() {
-        if let Err(failure) = check_lossless(
-            &engine,
-            &tokenizer,
-            i,
-            prompt,
-            &encoded[i],
-            &baselines[i],
-            &specs[i],
-        ) {
+        if let Err(failure) =
+            check_lossless(&tokenizer, i, prompt, &encoded[i], &baselines[i], &specs[i])
+        {
             failures.push(failure);
         }
     }
@@ -507,12 +484,6 @@ fn dflash2_native_checkpoint_is_lossless() {
         "long-context fixture must exceed window={window}"
     );
     cases.push(("native long context", long_context, 32));
-    // The regret reference re-prefills the prompt plus its matching output
-    // prefix as one prompt-scoring request, which cannot use chunked prefill.
-    let max_prefill_tokens = cases
-        .iter()
-        .map(|(_, tokens, budget)| tokens.len() + *budget)
-        .fold(DEFAULT_MAX_PREFILL_TOKENS, usize::max);
 
     let fixed_request = |tokens: &[u32], budget, logprobs| {
         let mut req = request(
@@ -535,14 +506,12 @@ fn dflash2_native_checkpoint_is_lossless() {
             outcome.terminal
         );
         assert_eq!(outcome.tokens.len(), budget);
-        to_steps(outcome)
+        to_run(outcome)
     };
 
-    let mut baseline_options = launch_options(None);
-    baseline_options.max_prefill_tokens = max_prefill_tokens;
     let baselines: Vec<_> = {
         let engine = EngineHarness::new(
-            pegainfer_qwen3::launch(Path::new(&model_path), baseline_options)
+            pegainfer_qwen3::launch(Path::new(&model_path), launch_options(None))
                 .expect("failed to start baseline engine"),
         );
         let out = cases
@@ -560,11 +529,12 @@ fn dflash2_native_checkpoint_is_lossless() {
         std::thread::sleep(Duration::from_secs(2));
         out
     };
-    let mut native_options = launch_options(Some(PathBuf::from(&draft_path)));
-    native_options.max_prefill_tokens = max_prefill_tokens;
     let engine = EngineHarness::new(
-        pegainfer_qwen3::launch(Path::new(&model_path), native_options)
-            .expect("failed to start native speculative engine"),
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options(Some(PathBuf::from(&draft_path))),
+        )
+        .expect("failed to start native speculative engine"),
     );
 
     for (name, range) in [
@@ -584,8 +554,8 @@ fn dflash2_native_checkpoint_is_lossless() {
             .zip(&cases[range.clone()])
             .map(|(stream, (_, _, budget))| fixed_steps(stream.expect_finished(), *budget))
             .collect();
-        // Metrics are published before terminal updates; take the delta before
-        // any regret diagnostic adds a separate prompt-scoring request.
+        // Metrics are published before terminal updates, so the delta is
+        // complete once every stream has finished.
         let after = engine
             .metrics()
             .spec_decode
@@ -603,7 +573,7 @@ fn dflash2_native_checkpoint_is_lossless() {
         );
         for (i, spec) in range.zip(specs) {
             let (prompt, tokens, budget) = &cases[i];
-            check_lossless(&engine, &tokenizer, i, prompt, tokens, &baselines[i], &spec)
+            check_lossless(&tokenizer, i, prompt, tokens, &baselines[i], &spec)
                 .unwrap_or_else(|failure| panic!("native {name}: {failure}"));
             eprintln!(
                 "native {name} request {i}: prompt_tokens={}, budget={budget}, generated={}, lossless=pass",
