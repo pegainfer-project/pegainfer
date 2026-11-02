@@ -42,11 +42,12 @@
 //
 // Two kernels own one half each. `norm_rope_keys` prepares every token's two key
 // heads once, because all `group` query heads of a KV head read the same prepared
-// key. `attn` is one CTA per (query row, head): it prepares that head's query in
-// shared memory, scores the whole key row with one warp per key stride, softmaxes
-// it, and reduces the context over the row. Holding the row's scores in shared
-// memory is what bounds `tokens` at `kMaxTokens`; a longer context needs the
-// streaming (online-softmax) form, which is a later stage's business.
+// key. `attn` is one CTA per (query row, one/two/four heads): it prepares each
+// head's query in shared memory, scores the whole key row with one warp per key
+// stride while the CTA's heads share that key read, softmaxes each head, and
+// reduces its context over the row. Holding each head's scores in shared memory
+// is what bounds `tokens` at `kMaxTokens`; a longer context needs the streaming
+// (online-softmax) form, which is a later stage's business.
 //
 // Target: the sm_89-first portable subset — no TMA, no cluster, no wgmma. Both
 // kernels are SIMT shuffle reductions: one CTA's score is a 256-wide dot and its
@@ -97,6 +98,7 @@ constexpr int kMaxTokens = 8192;
 
 static_assert(kHeadDim == kThreads, "one thread owns one head dim");
 static_assert(kGroup * kKvHeads == kHeads, "the GQA group must divide the heads");
+static_assert(kHeads % 4 == 0, "the four-head CTA must split the query heads");
 
 // Sum across the whole CTA, leaving it in every thread: each warp's partial goes
 // to shared and every thread folds the `kWarps` partials in the same order, so
@@ -163,8 +165,10 @@ __global__ void qwen4_qsa_norm_rope_keys_kernel(
   normed_keys[base + dim] = __float2bfloat16(head[dim]);
 }
 
-// One CTA per (query row, head): prepare the head's query, score the whole key
-// row, softmax it, write the weights and reduce the gated context.
+// One CTA per (query row, kHeadsPerCta heads): prepare each head's query, score
+// the whole key row once for all of them, softmax each, write the weights and
+// reduce the gated context. The CTA's heads share one KV head's key/value reads.
+template <int kHeadsPerCta>
 __global__ void qwen4_qsa_attn_kernel(
     const __nv_bfloat16* __restrict__ queries,       // [query_rows, kQueryWidth]
     const __nv_bfloat16* __restrict__ normed_keys,   // [tokens, kKvWidth]
@@ -180,15 +184,19 @@ __global__ void qwen4_qsa_attn_kernel(
     int query_rows,
     int tokens,
     float rms_eps) {
+  static_assert(kHeadsPerCta == 1 || kHeadsPerCta == 2 || kHeadsPerCta == 4,
+                "one CTA owns one, two, or four query heads");
+  static_assert(kGroup % kHeadsPerCta == 0,
+                "a CTA's heads must share one KV head");
   const int row = blockIdx.x;
-  const int head = blockIdx.y;
+  const int head_base = blockIdx.y * kHeadsPerCta;
   const int tid = threadIdx.x;
   const int lane = tid % WARP_SIZE;
   const int warp = tid / WARP_SIZE;
-  __shared__ float scratch[kWarps];
-  __shared__ float query[kHeadDim];
-  // One row of scores, then of exps, then of rounded weights: each pass reads
-  // what the previous one left and a barrier separates them.
+  __shared__ float scratch[kHeadsPerCta][kWarps];
+  __shared__ float query[kHeadsPerCta][kHeadDim];
+  // One row of scores, then of exps, then of rounded weights per head: each
+  // pass reads what the previous one left and a barrier separates them.
   extern __shared__ float row_scores[];
 
   // `rows[row]` is the token this query row belongs to, and so the position its
@@ -202,102 +210,174 @@ __global__ void qwen4_qsa_attn_kernel(
   if (pos < 0 || pos >= tokens) {
     __trap();
   }
-  const int64_t query_base =
-      static_cast<int64_t>(row) * kQueryWidth + head * (2 * kHeadDim);
+  int head[kHeadsPerCta];
+  int64_t query_base[kHeadsPerCta];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    head[h] = head_base + h;
+    query_base[h] =
+        static_cast<int64_t>(row) * kQueryWidth + head[h] * (2 * kHeadDim);
+  }
 
-  const float x = load_bf16(&queries[query_base + tid]);
-  const float mean = block_all_sum(x * x, scratch) / static_cast<float>(kHeadDim);
-  const float inv_rms = 1.0f / sqrtf(mean + rms_eps);
-  query[tid] = qsa_norm_elem(x, inv_rms, load_bf16(&q_norm_weight[tid]));
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    const float x = load_bf16(&queries[query_base[h] + tid]);
+    const float mean =
+        block_all_sum(x * x, scratch[h]) / static_cast<float>(kHeadDim);
+    const float inv_rms = 1.0f / sqrtf(mean + rms_eps);
+    query[h][tid] = qsa_norm_elem(x, inv_rms, load_bf16(&q_norm_weight[tid]));
+  }
   __syncthreads();
   if (tid < kRotaryDim / 2) {
-    qsa_rope_pair(query[tid], query[tid + kRotaryDim / 2],
-                  qsa_table_at(cos_table, pos, tid, kRotaryDim),
-                  qsa_table_at(sin_table, pos, tid, kRotaryDim));
+#pragma unroll
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      qsa_rope_pair(query[h][tid], query[h][tid + kRotaryDim / 2],
+                    qsa_table_at(cos_table, pos, tid, kRotaryDim),
+                    qsa_table_at(sin_table, pos, tid, kRotaryDim));
+    }
   }
   __syncthreads();
 
   // GQA: every head reads the KV head its group maps to, `repeat_kv`'s own
-  // order, so head h takes KV head h / group.
-  const int kv = head / kGroup;
+  // order, so head h takes KV head h / group. The CTA's heads share it.
+  const int kv = head_base / kGroup;
   const __nv_bfloat16* key_base = normed_keys + kv * kHeadDim;
   const unsigned char* mask_row = mask + static_cast<int64_t>(row) * tokens;
 
-  float qreg[kDimsPerLane];
+  float qreg[kHeadsPerCta][kDimsPerLane];
 #pragma unroll
-  for (int i = 0; i < kDimsPerLane; ++i) {
-    qreg[i] = query[lane * kDimsPerLane + i];
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+#pragma unroll
+    for (int i = 0; i < kDimsPerLane; ++i) {
+      qreg[h][i] = query[h][lane * kDimsPerLane + i];
+    }
   }
 
   // Scores: warp `w` owns keys w, w + kWarps, ..., and one lane owns eight dims
-  // of each, so a warp reads a key row as eight consecutive bf16 per lane.
-  float warp_max = kHiddenScore;
+  // of each. Those eight dims are 16 bytes, and the row stride keeps them
+  // 16-byte aligned, so one 128-bit load replaces eight scalar bf16 loads: the
+  // warp's 32 loads then cover the 512-byte key row in 16 sectors, where the
+  // scalar pattern requested one sector per two-byte value. The same row feeds
+  // every head in the CTA.
+  static_assert(kDimsPerLane == 8, "one lane's key slice must be one 16-byte load");
+  float warp_max[kHeadsPerCta];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    warp_max[h] = kHiddenScore;
+  }
   for (int s = warp; s < tokens; s += kWarps) {
     const __nv_bfloat16* key =
         key_base + static_cast<int64_t>(s) * kKvWidth + lane * kDimsPerLane;
-    float acc = 0.0f;
+    const uint4 raw = *reinterpret_cast<const uint4*>(key);
+    const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+    float acc[kHeadsPerCta];
 #pragma unroll
-    for (int i = 0; i < kDimsPerLane; ++i) {
-      acc += qreg[i] * load_bf16(&key[i]);
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      acc[h] = 0.0f;
     }
-    acc = qsa_warp_all_sum(acc);
-    if (lane == 0) {
-      // The reference's bf16 GEMM rounds, then scales: the rounding comes first
-      // and the scale is exact.
-      const float scaled = qsa_round_bf16(acc) * kScale;
-      const float score = mask_row[s] != 0 ? scaled : kHiddenScore;
-      row_scores[s] = score;
-      warp_max = fmaxf(warp_max, score);
+#pragma unroll
+    for (int i = 0; i < kDimsPerLane / 2; ++i) {
+      const float2 value = __bfloat1622float2(pairs[i]);
+#pragma unroll
+      for (int h = 0; h < kHeadsPerCta; ++h) {
+        acc[h] += qreg[h][2 * i] * value.x + qreg[h][2 * i + 1] * value.y;
+      }
+    }
+#pragma unroll
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      acc[h] = qsa_warp_all_sum(acc[h]);
+      if (lane == 0) {
+        // The reference's bf16 GEMM rounds, then scales: the rounding comes
+        // first and the scale is exact.
+        const float scaled = qsa_round_bf16(acc[h]) * kScale;
+        const float score = mask_row[s] != 0 ? scaled : kHiddenScore;
+        row_scores[h * tokens + s] = score;
+        warp_max[h] = fmaxf(warp_max[h], score);
+      }
     }
   }
   __syncthreads();
   if (lane == 0) {
-    scratch[warp] = warp_max;
+#pragma unroll
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      scratch[h][warp] = warp_max[h];
+    }
   }
   __syncthreads();
-  float max_score = kHiddenScore;
+  float max_score[kHeadsPerCta];
 #pragma unroll
-  for (int w = 0; w < kWarps; ++w) {
-    max_score = fmaxf(max_score, scratch[w]);
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    max_score[h] = kHiddenScore;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      max_score[h] = fmaxf(max_score[h], scratch[h][w]);
+    }
   }
 
   // Softmax in float32 over the rounded scores, as the reference upcasts them:
   // subtract the row max, exponentiate, divide by the sum — a division, not a
   // reciprocal multiply, because that is what its epilogue does — then round the
   // weight to bf16 once, which is the value the context GEMM reads.
-  float local_sum = 0.0f;
-  for (int s = tid; s < tokens; s += kThreads) {
-    const float exponent = expf(row_scores[s] - max_score);
-    row_scores[s] = exponent;
-    local_sum += exponent;
+  float local_sum[kHeadsPerCta];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    local_sum[h] = 0.0f;
   }
-  const float sum = block_all_sum(local_sum, scratch);
-  const int64_t weight_base =
-      (static_cast<int64_t>(head) * query_rows + row) * tokens;
   for (int s = tid; s < tokens; s += kThreads) {
-    const float weight = qsa_round_bf16(row_scores[s] / sum);
-    row_scores[s] = weight;
-    attn_weights[weight_base + s] = __float2bfloat16(weight);
+#pragma unroll
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      float* scores = row_scores + h * tokens;
+      const float exponent = expf(scores[s] - max_score[h]);
+      scores[s] = exponent;
+      local_sum[h] += exponent;
+    }
+  }
+  float sum[kHeadsPerCta];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    sum[h] = block_all_sum(local_sum[h], scratch[h]);
+  }
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    const int64_t weight_base =
+        (static_cast<int64_t>(head[h]) * query_rows + row) * tokens;
+    for (int s = tid; s < tokens; s += kThreads) {
+      const float weight = qsa_round_bf16(row_scores[h * tokens + s] / sum[h]);
+      row_scores[h * tokens + s] = weight;
+      attn_weights[weight_base + s] = __float2bfloat16(weight);
+    }
   }
   __syncthreads();
 
   // Context: one thread owns one dim and folds the row's rounded weights over
-  // that dim of every value row, in key order.
+  // that dim of every value row, in key order. The CTA's heads share the value
+  // row, so it is loaded once per token.
   const __nv_bfloat16* value_col = values + kv * kHeadDim + tid;
-  float context = 0.0f;
+  float context[kHeadsPerCta];
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    context[h] = 0.0f;
+  }
   for (int s = 0; s < tokens; ++s) {
-    context += row_scores[s] *
-               load_bf16(&value_col[static_cast<int64_t>(s) * kKvWidth]);
+    const float value =
+        load_bf16(&value_col[static_cast<int64_t>(s) * kKvWidth]);
+#pragma unroll
+    for (int h = 0; h < kHeadsPerCta; ++h) {
+      context[h] += row_scores[h * tokens + s] * value;
+    }
   }
 
   // The output gate is the second half of this head's slice of the fused
   // projection row, and it lands after the context reshape and before `o_proj`.
   // Both factors are bf16, so their product is exact in float32 and the single
   // cast below is the reference's own.
-  const float gate = load_bf16(&queries[query_base + kHeadDim + tid]);
-  const float sigmoid = qsa_round_bf16(1.0f / (1.0f + expf(-gate)));
-  attn_out[static_cast<int64_t>(row) * kOutWidth + head * kHeadDim + tid] =
-      __float2bfloat16(qsa_round_bf16(context) * sigmoid);
+#pragma unroll
+  for (int h = 0; h < kHeadsPerCta; ++h) {
+    const float gate = load_bf16(&queries[query_base[h] + kHeadDim + tid]);
+    const float sigmoid = qsa_round_bf16(1.0f / (1.0f + expf(-gate)));
+    attn_out[static_cast<int64_t>(row) * kOutWidth + head[h] * kHeadDim + tid] =
+        __float2bfloat16(qsa_round_bf16(context[h]) * sigmoid);
+  }
 }
 
 CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
@@ -307,8 +387,8 @@ CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); 
 extern "C" {
 
 // The QSA sparse-attention forward over one layer's captured activations: the
-// key pass, then one CTA per (query row, head) for the scores, the weights and
-// the gated context.
+// key pass, then one CTA per (query row, one/two/four heads) for the scores, the
+// weights and the gated context.
 //
 // `queries` rows are the fused `q_proj` output, `kQueryWidth` wide, each head's
 // 256 query dims followed by that head's 256 gate dims. `rows` gives the token
@@ -379,11 +459,33 @@ CUresult qwen4_qsa_attn_forward_cuda(
   if (key_status != CUDA_SUCCESS) {
     return key_status;
   }
-  const dim3 grid(static_cast<unsigned>(query_rows), kHeads);
-  const size_t shared = static_cast<size_t>(tokens) * sizeof(float);
-  qwen4_qsa_attn_kernel<<<grid, kThreads, shared, stream>>>(
-      queries, normed_keys, values, mask, rows, positions, q_norm_weight,
-      cos_table, sin_table, attn_weights, attn_out, query_rows, tokens, rms_eps);
+  // One CTA owns four query heads while the shared score row fits, then two,
+  // so the heads share one key/value scan. Above that, one head per CTA keeps
+  // the score row inside the default shared-memory budget.
+  constexpr int kFourHeadMaxTokens = 2048;
+  constexpr int kTwoHeadMaxTokens = 4096;
+  if (tokens <= kFourHeadMaxTokens) {
+    const dim3 grid(static_cast<unsigned>(query_rows), kHeads / 4);
+    const size_t shared = static_cast<size_t>(4 * tokens) * sizeof(float);
+    qwen4_qsa_attn_kernel<4><<<grid, kThreads, shared, stream>>>(
+        queries, normed_keys, values, mask, rows, positions, q_norm_weight,
+        cos_table, sin_table, attn_weights, attn_out, query_rows, tokens,
+        rms_eps);
+  } else if (tokens <= kTwoHeadMaxTokens) {
+    const dim3 grid(static_cast<unsigned>(query_rows), kHeads / 2);
+    const size_t shared = static_cast<size_t>(2 * tokens) * sizeof(float);
+    qwen4_qsa_attn_kernel<2><<<grid, kThreads, shared, stream>>>(
+        queries, normed_keys, values, mask, rows, positions, q_norm_weight,
+        cos_table, sin_table, attn_weights, attn_out, query_rows, tokens,
+        rms_eps);
+  } else {
+    const dim3 grid(static_cast<unsigned>(query_rows), kHeads);
+    const size_t shared = static_cast<size_t>(tokens) * sizeof(float);
+    qwen4_qsa_attn_kernel<1><<<grid, kThreads, shared, stream>>>(
+        queries, normed_keys, values, mask, rows, positions, q_norm_weight,
+        cos_table, sin_table, attn_weights, attn_out, query_rows, tokens,
+        rms_eps);
+  }
   return consume_last_cuda_error();
 }
 

@@ -1146,11 +1146,12 @@ fn an_empty_launch_is_a_no_op() {
 /// The token cap is a launch limit, not a policy: one row of float32 scores lives
 /// in dynamic shared memory, and the cap is the longest row that fits what a launch
 /// may ask for without opting in. This runs exactly that shape — `MAX_TOKENS`
-/// keys, the widest shared memory this kernel ever requests, and positions past
-/// anything the fixture carries — so the cap is taken at the cap instead of at
-/// 2055 and at a refusal. The device-free test above pins the refusing side with
-/// the same constant, which is what keeps the Rust cap and the CUDA one from
-/// drifting apart: raise either alone and one of the two tests fails.
+/// keys, the widest dynamic score row this kernel ever requests (the four-head
+/// path reaches the same row size at 2048 keys), and positions past anything the
+/// fixture carries — so the cap is taken at the cap instead of at 2055 and at a
+/// refusal. The device-free test above pins the refusing side with the same
+/// constant, which is what keeps the Rust cap and the CUDA one from drifting
+/// apart: raise either alone and one of the two tests fails.
 ///
 /// The weights' row sums are the check that the largest launch is not merely
 /// legal but complete: a softmax that never ran, or ran over a truncated row,
