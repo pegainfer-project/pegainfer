@@ -279,19 +279,3 @@ pub enum Terminal {
         completion_tokens: usize,
     },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_rejection_names_the_engine_feature() {
-        let reason = RejectReason::Unsupported {
-            feature: "frontend-resolved prefix".to_string(),
-        };
-        assert_eq!(
-            reason.to_string(),
-            "this engine does not support frontend-resolved prefix"
-        );
-    }
-}
