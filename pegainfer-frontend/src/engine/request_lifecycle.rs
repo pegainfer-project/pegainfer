@@ -100,7 +100,7 @@ impl Drop for RequestEnvelope {
 
 /// A finish whose delivery the scheduler handed off (e.g. a P/D prefill role
 /// withholding `Finished` until this step's KV saves are peer-visible). Made
-/// by [`super::RequestLedger::defer_finish`], which closes the request's
+/// by [`super::RequestLedger::defer_finish_with_cause`], which closes the request's
 /// ledger account and folds its already-buffered step record — tokens
 /// included — into this message, so sending it from any thread at any later
 /// time cannot reorder against the step stream: the whole per-request record
