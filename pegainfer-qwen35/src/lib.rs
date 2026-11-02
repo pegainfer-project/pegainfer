@@ -187,22 +187,6 @@ pub fn launch_with_options_policy_and_overlap(
     )
 }
 
-pub fn start_engine_with_capacity(
-    model_path: &Path,
-    options: EngineLoadOptions,
-    max_batch: usize,
-    max_prefill_tokens: usize,
-) -> Result<Engine> {
-    start_engine_with_capacity_and_policy(
-        model_path,
-        options,
-        max_batch,
-        max_prefill_tokens,
-        Qwen35SchedulerPolicy::Off,
-        0,
-    )
-}
-
 pub(crate) fn start_engine_with_capacity_and_policy(
     model_path: &Path,
     options: EngineLoadOptions,
