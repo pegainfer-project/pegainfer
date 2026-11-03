@@ -3665,23 +3665,27 @@ impl LocalQwen3Lane {
         })
     }
 
+    fn ensure_sample_scratch_rows(&mut self, rows: usize) -> Result<()> {
+        if rows > self.sample_scratch.max_rows() {
+            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
+                self.model.device_ctx(),
+                self.model.config().logits_rows,
+                self.model.config().decodable_vocab,
+                rows,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Pick one token per logits column (batched argmax for greedy rows,
-    /// one batched sampler call for non-greedy rows). Grows the sampling
-    /// scratch when a step is wider than the decode bucket it was sized for.
+    /// one batched sampler call for non-greedy rows).
     fn select_step_tokens(
         &mut self,
         logits: &HiddenStates,
         params: &[&SamplingParams],
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
-        if params.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
-                self.model.device_ctx(),
-                self.model.config().logits_rows,
-                self.model.config().decodable_vocab,
-                params.len(),
-            )?;
-        }
+        self.ensure_sample_scratch_rows(params.len())?;
         self.steps_buf.clear();
         self.steps_buf.resize(params.len(), 0);
         pegainfer_sample::select_batch(
@@ -4113,9 +4117,6 @@ impl LocalQwen3Lane {
             })
         })();
         self.verify_bufs = Some(bufs);
-        if let Some(dflash) = self.dflash.as_mut() {
-            dflash.proposal_rows.clear();
-        }
         result
     }
 

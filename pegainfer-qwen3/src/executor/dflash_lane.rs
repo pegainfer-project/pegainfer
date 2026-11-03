@@ -561,7 +561,6 @@ impl LocalQwen3Lane {
     pub(super) fn drop_dflash_request(&mut self, request_id: RequestId) {
         if let Some(dflash) = self.dflash.as_mut() {
             dflash.requests.remove(&request_id);
-            dflash.proposal_rows.remove(&request_id);
         }
     }
 }

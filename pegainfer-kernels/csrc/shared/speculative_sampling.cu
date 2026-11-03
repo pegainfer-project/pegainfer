@@ -49,6 +49,7 @@ __global__ void sparse_verify(float* probs, const int* requests, const uint32_t*
   __shared__ SamplingStorage storage;
   __shared__ int accepted;
   __shared__ float mass;
+  __shared__ float original_target[CANDIDATES];
   int request = blockIdx.x;
   int row_start = requests[request * 3];
   int draft_row = requests[request * 3 + 1];
@@ -69,7 +70,8 @@ __global__ void sparse_verify(float* probs, const int* requests, const uint32_t*
           uniforms[request * block_size + position], proposed_prob);
       if (!(threshold < target[token])) {
         for (int k = 0; k < CANDIDATES; ++k) {
-          target[ids[k]] = fmaxf(target[ids[k]] - proposal[k], 0.0f);
+          original_target[k] = target[ids[k]];
+          target[ids[k]] = fmaxf(original_target[k] - proposal[k], 0.0f);
         }
         break;
       }
@@ -84,6 +86,15 @@ __global__ void sparse_verify(float* probs, const int* requests, const uint32_t*
   for (int token = threadIdx.x; token < vocab; token += THREADS) sum += row[token];
   sum = Reduce(storage.block_prim.reduce).Sum(sum);
   if (threadIdx.x == 0) {
+    if (sum == 0.0f && accepted < length) {
+      // Rounding can reject a draft even when no positive residual remains.
+      // Restore the filtered target; every entry outside the candidates is zero.
+      const uint32_t* ids = candidates + (draft_row * block_size + accepted + 1) * CANDIDATES;
+      for (int k = 0; k < CANDIDATES; ++k) {
+        row[ids[k]] = original_target[k];
+        sum += original_target[k];
+      }
+    }
     mass = sum;
     storage.sampled_id = vocab;
     storage.last_valid_id = -1;

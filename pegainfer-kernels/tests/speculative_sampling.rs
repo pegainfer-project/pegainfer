@@ -63,6 +63,32 @@ fn sparse_verify_accepts_corrects_and_preserves_the_target_distribution() -> Res
             [0.5, 0.5, 0.5, 0.9],
             (1, 3),
         ),
+        // The largest uniform times the rounded-up q rounds back to p. The
+        // second draft is rejected with zero residual; draw token 2 from p.
+        (
+            [0.25; 4],
+            [[0.25; 4], [0.25_f32.next_up(), 0.25, 0.25, 0.25], [0.25; 4]],
+            [1, 0, 0],
+            2,
+            0,
+            1.0,
+            0.0,
+            [0.5, 1.0_f32.next_down(), 0.5, 0.625],
+            (1, 2),
+        ),
+        // Top-p keeps only token 1. A tiny proposal probability can coexist
+        // with q[1] == 1 after rounding; correcting to draft 0 would violate top-p.
+        (
+            [0.25, 0.75, 0.0, 0.0],
+            [[f32::EPSILON / 4.0, 1.0, 0.0, 0.0]; 3],
+            [0, 0, 0],
+            1,
+            0,
+            0.5,
+            0.0,
+            [0.5; 4],
+            (0, 1),
+        ),
         // An anchor-only span emits the target token without checking drafts.
         (
             [0.25; 4],

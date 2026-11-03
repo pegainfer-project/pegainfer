@@ -77,14 +77,7 @@ impl LocalQwen3Lane {
                 .collect()
         };
 
-        if rows.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
-                self.model.device_ctx(),
-                self.model.config().logits_rows,
-                self.model.config().decodable_vocab,
-                rows.len(),
-            )?;
-        }
+        self.ensure_sample_scratch_rows(rows.len())?;
         let dflash = self
             .dflash
             .as_mut()
