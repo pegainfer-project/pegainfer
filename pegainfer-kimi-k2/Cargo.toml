@@ -30,8 +30,7 @@ tokio = { workspace = true }
 
 [features]
 default = []
-kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
-kernel-report = ["kimi-k2", "kernel-call-trace"]
+kernel-report = ["kimi-k2"]
 kimi-k2 = ["pegainfer-kernels/kimi-k2"]
 
 [[test]]

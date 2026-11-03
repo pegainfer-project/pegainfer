@@ -103,17 +103,16 @@ fn mtp_shifted_tokens(batch: &Glm52PrefillBatch, boundary_outputs: &[u32]) -> Re
         let start = range[0] as usize;
         let end = range[1] as usize;
         shifted[start..end - 1].copy_from_slice(&batch.token_ids[start + 1..end]);
-        shifted[end - 1] = match batch.mtp_next_tokens[request] {
-            Some(token) => token,
-            None => {
-                ensure!(
-                    batch.output_rows.get(boundary).copied() == Some((end - 1) as u32),
-                    "GLM5.2 MTP boundary row does not end request range {request}"
-                );
-                let token = boundary_outputs[boundary];
-                boundary += 1;
-                token
-            }
+        shifted[end - 1] = if let Some(token) = batch.mtp_next_tokens[request] {
+            token
+        } else {
+            ensure!(
+                batch.output_rows.get(boundary).copied() == Some((end - 1) as u32),
+                "GLM5.2 MTP boundary row does not end request range {request}"
+            );
+            let token = boundary_outputs[boundary];
+            boundary += 1;
+            token
         };
     }
     ensure!(
@@ -148,11 +147,13 @@ impl Glm52TpPrefillLayout {
     }
 }
 
+type ProfiledSection = (&'static str, usize, Vec<(CudaEvent, CudaEvent)>);
+
 /// Env-gated (`PEGAINFER_GLM52_PREFILL_PROFILE=1`) CUDA-event section
 /// profile: per-section call counts and summed GPU ms per chunk forward.
 struct Glm52PrefillProfiler {
     enabled: bool,
-    sections: Vec<(&'static str, usize, Vec<(CudaEvent, CudaEvent)>)>,
+    sections: Vec<ProfiledSection>,
 }
 
 impl Glm52PrefillProfiler {
@@ -686,7 +687,7 @@ impl Glm52TpPrefillExecutor {
                     .slice_mut(..batch.output_rows.len() * GLM52_HIDDEN),
             )?;
         }
-        let mtp_draft1 = if let Some(mtp) = model.mtp {
+        let mtp_draft1 = if let Some(mut mtp) = model.mtp {
             let mark = self.profiler.start(ctx)?;
             let drafts = self.run_mtp_context(
                 ctx,
@@ -699,7 +700,7 @@ impl Glm52TpPrefillExecutor {
                 model.full_lm_head,
                 model.vocab_start,
                 model.sampling_scratch,
-                mtp,
+                &mut mtp,
                 model.slab,
                 rows,
                 rows4,
@@ -730,7 +731,7 @@ impl Glm52TpPrefillExecutor {
         full_lm_head: &DeviceMatrix,
         vocab_start: usize,
         sampling_scratch: &mut BatchSamplingScratch,
-        mtp: Glm52TpPrefillMtpView<'_>,
+        mtp: &mut Glm52TpPrefillMtpView<'_>,
         slab: &mut Glm52KvSlab,
         rows: usize,
         rows4: usize,
@@ -1432,6 +1433,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::float_cmp)]
     #[test]
     #[ignore = "requires a GPU"]
     fn w_uv_multirow_output_is_token_major() -> Result<()> {

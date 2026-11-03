@@ -2,7 +2,7 @@
 
 > **TL;DR:** vLLM Kimi/DeepSeekV3 decode 和 PegaInfer decode 的最大结构差异已缩小到 MLA cache/metadata 与 collective bridge：PegaInfer 现在同样用 load-time `fused_qkv_a_proj` 合并 `q_a + kv_a`，decode 执行 `gemm_graphsafe(fused_qkv_a)` 后用 `kimi_mla_split_qkv_a` 一次拆出 `q_a/compressed_kv/k_rope`。MoE shared/main 与 routed compute/aux stream overlap、shared gate/up fused GEMM、dense layer0 gate/up fused GEMM、routed scale+residual add fused kernel、routed sum clear 与 Marlin locks clear 清理已通过 H20 correctness/perf gate；真实 fixture output16 steady TPOT p99 `14.26ms`，synthetic output64 steady TPOT avg `14.39ms` / p99 `14.83ms`。vLLM TP-only MoE final all-reduce cadence 已实测 BF16/F32 两版均慢于当前 RS bridge，因此保留 RS bridge。
 >
-> **Last touched:** 2026-05
+> **Last touched:** 2026-11
 
 ## Source Map
 
@@ -131,23 +131,23 @@ Validation:
 cargo fmt --all --check
 PEGAINFER_CUDA_SM=90a cargo check --release -p pegainfer-kimi-k2 --features kernel-report --bins
 PEGAINFER_CUDA_SM=90a cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_kernel_report -- \
-  trace --source static --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
+  trace --batch-size 4 --kv-len 1024 --out $RESULT_ROOT/kimi_decode_trace_fixed_bs4_kv1024.json
 ```
 
 H20 validation for the fused-qkv patch used the same `cargo check` and static trace command under `$PEGAINFER_DIR` with `PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python`; output was `calls=1886`, `gemm_graphsafe=367`, and `kimi_mla_split_qkv_a=61`.
 
-Runtime model-report validation on H20:
+Model-report validation on H20, 2026-05. That run passed `--source runtime`, since removed because it only replayed this same static schedule at the decode arena bucket; the command below is its current form and has not been rerun on H20:
 
 ```bash
 LD_LIBRARY_PATH=$RESULT_ROOT/pegainfer-nccl-lib:${LD_LIBRARY_PATH:-} \
 PEGAINFER_CUDA_SM=90a \
 PEGAINFER_TRITON_PYTHON=$PEGAINFER_DIR/.venv-kimi/bin/python \
 cargo run --release -p pegainfer-kimi-k2 --features kernel-report --bin kimi_model_report -- \
-  decode --source runtime --batch-size 4 --kv-len 28 --iters 1 --format text \
+  decode --batch-size 4 --kv-len 28 --iters 1 --format text \
   --out $RESULT_ROOT/kimi_runtime_model_report_bs4_kv28_fixed_trace_v2.json
 ```
 
-The fused-qkv runtime report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
+The fused-qkv report produced `total_schedule_calls=1886`, `measured_schedule_calls=1642`, `missing_schedule_calls=244`, and measured subset `136.549ms`. Missing providers are explicit:
 
 - `all_reduce`: `123` calls, multi-rank H20 provider needed.
 - `reduce_scatter`: `60` calls, multi-rank H20 provider needed.

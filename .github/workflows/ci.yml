@@ -223,58 +223,134 @@ jobs:
       - name: Run simulated frontend E2E tests
         run: cargo test --release --locked -p pegainfer-sim --test frontend_e2e
 
+  cuda-clippy-rows:
+    name: Select CUDA Clippy rows
+    runs-on: ubuntu-latest
+    outputs:
+      rows: ${{ steps.select.outputs.rows }}
+
+    steps:
+      # A pull request checks out its merge commit, whose first parent is the
+      # base branch, so two commits are enough to list the changed files.
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # One row per model line; adding a model line is one more row. Clippy
+      # lints every target of the packages a row names and the library of each
+      # workspace crate they pull in. pegainfer-cupti is out: building it needs
+      # CUPTI headers the toolkit omits.
+      #
+      # `feature` is empty for the default line, which is the only one that
+      # needs no `--features` flag. That row also names the shared crates, so
+      # their tests are linted once. Each row builds for `cuda_sm`: the Kimi-K2
+      # DeepEP shim needs sm_90 and the GLM5.2 kernels need sm_100.
+      #
+      # A push to main runs every row. A pull request runs the rows its changed
+      # files reach: a model crate reaches its own row; a shared crate, the
+      # workspace manifests, the submodule list, the toolchain or this workflow
+      # reaches every row; any other file reaches the rows of the crates whose
+      # Rust source names it, as `include_str!` does, and a Markdown file
+      # reaches rows only that way. A rename counts at both its old and its
+      # new path.
+      - name: Select rows
+        id: select
+        env:
+          ROWS: |
+            [
+              {"key": "qwen3", "model_name": "Qwen3", "package": "pegainfer-qwen3",
+               "extra_packages": "-p pegainfer-server -p pegainfer-core -p pegainfer-kernels -p pegainfer-kv-cache -p pegainfer-kv-offload -p pegainfer-kv-store -p pegainfer-sample -p pegainfer-bench",
+               "feature": "", "cuda_sm": "80", "needs_triton": false, "triton_python": "", "needs_nccl": false},
+              {"key": "gemma4", "model_name": "Gemma 4", "package": "pegainfer-gemma4",
+               "extra_packages": "", "feature": "gemma4", "cuda_sm": "80",
+               "needs_triton": false, "triton_python": "", "needs_nccl": false},
+              {"key": "qwen35", "model_name": "Qwen3.5", "package": "pegainfer-qwen35",
+               "extra_packages": "", "feature": "qwen35", "cuda_sm": "80",
+               "needs_triton": true, "triton_python": "python", "needs_nccl": false},
+              {"key": "k3", "model_name": "Kimi-K3", "package": "pegainfer-k3",
+               "extra_packages": "-p pegainfer-kernels", "feature": "k3", "cuda_sm": "80",
+               "needs_triton": false, "triton_python": "", "needs_nccl": false},
+              {"key": "glm52", "model_name": "GLM5.2", "package": "pegainfer-glm52",
+               "extra_packages": "-p pegainfer-kernels", "feature": "glm52", "cuda_sm": "100",
+               "needs_triton": false, "triton_python": "", "needs_nccl": true},
+              {"key": "kimi-k2", "model_name": "Kimi-K2", "package": "pegainfer-kimi-k2",
+               "extra_packages": "-p pegainfer-kernels", "feature": "kimi-k2", "cuda_sm": "90",
+               "needs_triton": false, "triton_python": "", "needs_nccl": true},
+              {"key": "deepseek-v2-lite", "model_name": "DeepSeek-V2-Lite", "package": "pegainfer-deepseek-v2-lite",
+               "extra_packages": "-p pegainfer-kernels", "feature": "deepseek-v2-lite", "cuda_sm": "80",
+               "needs_triton": false, "triton_python": "", "needs_nccl": false},
+              {"key": "qwen4", "model_name": "Qwen4", "package": "pegainfer-qwen4",
+               "extra_packages": "-p pegainfer-kernels", "feature": "pegainfer-kernels/qwen4", "cuda_sm": "80",
+               "needs_triton": false, "triton_python": "", "needs_nccl": false}
+            ]
+        run: |
+          set -euo pipefail
+          rows_for_crate() {
+            case "$1" in
+              pegainfer-qwen3 | pegainfer-server | pegainfer-cupti) echo qwen3 ;;
+              pegainfer-gemma4) echo gemma4 ;;
+              pegainfer-qwen35) echo qwen35 ;;
+              pegainfer-k3) echo k3 ;;
+              pegainfer-glm52) echo glm52 ;;
+              pegainfer-kimi-k2) echo kimi-k2 ;;
+              pegainfer-deepseek-v2-lite) echo deepseek-v2-lite ;;
+              pegainfer-qwen4) echo qwen4 ;;
+              pegainfer-sim) ;;
+              *) echo all ;;
+            esac
+          }
+          rows_for_path() {
+            local name=${1##*/}
+            local -a names=(-e "$name")
+            case "$1" in
+              Cargo.toml | Cargo.lock | rust-toolchain.toml | .gitmodules | .github/workflows/ci.yml) echo all ;;
+              *.md)
+                names=(-e "\"$name")
+                if [[ $1 == */* ]]; then
+                  local parent=${1%/*}
+                  names+=(-e "${parent##*/}/$name")
+                fi
+                ;;
+              pegainfer-*/* | kvbm/*) rows_for_crate "${1%%/*}" ;;
+            esac
+            if [[ $1 != *.rs ]]; then
+              { git grep -l -F "${names[@]}" -- '*.rs' || true; } | while read -r file; do
+                rows_for_crate "${file%%/*}"
+              done
+            fi
+          }
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            keys=$(git diff --name-only --no-renames HEAD^1 HEAD | while read -r path; do rows_for_path "$path"; done | sort -u)
+          else
+            keys=all
+          fi
+          selected=$(jq -c --arg keys "$keys" \
+            '($keys | split("\n")) as $k | map(select(($k | index("all")) or (.key as $key | $k | index($key))))' \
+            <<<"$ROWS")
+          echo "rows reached: $(jq -r 'map(.key) | join(" ")' <<<"$selected")"
+          echo "rows=$selected" >> "$GITHUB_OUTPUT"
+
   feature-model-cuda:
-    if: github.event_name == 'push' || github.event.pull_request.draft == false
-    name: ${{ matrix.model_name }} CUDA Clippy (sm_80)
+    needs: cuda-clippy-rows
+    if: >-
+      (github.event_name == 'push' || github.event.pull_request.draft == false)
+      && needs.cuda-clippy-rows.outputs.rows != '[]'
+    name: ${{ matrix.model_name }} CUDA Clippy (sm_${{ matrix.cuda_sm }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       CUDA_PATH: /usr/local/cuda
-      PEGAINFER_CUDA_SM: "80"
+      PEGAINFER_CUDA_SM: ${{ matrix.cuda_sm }}
       PEGAINFER_NVCC_JOBS: "2"
       PEGAINFER_NVCC_LAUNCHER: sccache
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
-      # One row per model line; adding a model line is one more row.
-      # Clippy lints only the packages named here; dependencies are compiled,
-      # not linted. pegainfer-cupti is out: building it needs CUPTI headers the
-      # toolkit above omits.
-      #
-      # `feature` is empty for the default line, which is the only one that
-      # needs no `--features` flag. It is also the line that carries the shared
-      # crates, so every model line stays covered by exactly one row.
       matrix:
-        include:
-          - model_name: Qwen3
-            package: pegainfer-qwen3
-            feature: ""
-            extra_packages: >-
-              -p pegainfer-server -p pegainfer-core -p pegainfer-kernels
-              -p pegainfer-kv-cache -p pegainfer-kv-offload -p pegainfer-sample
-              -p pegainfer-bench
-            needs_triton: false
-            triton_python: ""
-          - model_name: Gemma 4
-            package: pegainfer-gemma4
-            feature: gemma4
-            extra_packages: ""
-            needs_triton: false
-            triton_python: ""
-          - model_name: Qwen3.5
-            package: pegainfer-qwen35
-            feature: qwen35
-            extra_packages: ""
-            needs_triton: true
-            triton_python: python
-          # The line's own feature compiles the crate and the kernels' K3 tests.
-          - model_name: Kimi-K3
-            package: pegainfer-k3
-            feature: k3
-            extra_packages: "-p pegainfer-kernels"
-            needs_triton: false
-            triton_python: ""
+        include: ${{ fromJSON(needs.cuda-clippy-rows.outputs.rows) }}
 
     steps:
       - name: Checkout
@@ -315,6 +391,15 @@ jobs:
       - name: Install Triton
         if: matrix.needs_triton
         run: python -m pip install "triton==3.7.1"
+
+      # The DeepEP shim behind the kernels' `moe` feature links NCCL >= 2.30.4;
+      # build.rs takes the unpacked nvidia-nccl-cu13 wheel as its root.
+      - name: Install NCCL
+        if: matrix.needs_nccl
+        run: |
+          python3 -m pip download "nvidia-nccl-cu13==2.30.7" --no-deps --only-binary=:all: -d "$RUNNER_TEMP/nccl"
+          unzip -q "$RUNNER_TEMP"/nccl/*.whl 'nvidia/nccl/*' -d "$RUNNER_TEMP/nccl"
+          echo "PEGAINFER_NCCL_ROOT=$RUNNER_TEMP/nccl/nvidia/nccl" >> "$GITHUB_ENV"
 
       - name: Run ${{ matrix.model_name }} CUDA Clippy
         run: >-

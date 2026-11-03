@@ -401,24 +401,6 @@ __global__ void scale_bf16_kernel(
 }
 
 // ============================================================================
-// Embedding lookup: out = embed[token_id, :]
-// Reads token_id from token_id[0] (CUDA Graph safe).
-// ============================================================================
-
-__global__ void embedding_decode_kernel(
-    const __nv_bfloat16 *__restrict__ embed,
-    const uint32_t *__restrict__ token_id,
-    __nv_bfloat16 *__restrict__ out,
-    int hidden_size) {
-  uint32_t token_idx = __ldg(&token_id[0]);
-  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-       idx < hidden_size;
-       idx += gridDim.x * blockDim.x) {
-    out[idx] = embed[(size_t)token_idx * hidden_size + idx];
-  }
-}
-
-// ============================================================================
 // Batched embedding lookup: out[:, i] = embed[token_ids[i], :]
 // Column-major output: [hidden_size, seq_len].
 // ============================================================================
@@ -915,15 +897,6 @@ CUresult suppress_logits_bf16_in_place_cuda(
   int grid = total / block + (total % block != 0);
   suppress_logits_bf16_kernel<<<grid, block, 0, stream>>>(
       logits, ids, vocab, id_count, total);
-  return map_cuda_error(cudaGetLastError());
-}
-
-CUresult embedding_decode_cuda(
-    const __nv_bfloat16 *embed, const uint32_t *token_id,
-    __nv_bfloat16 *out, int hidden_size, cudaStream_t stream) {
-  int block = 256;
-  int grid = (hidden_size + block - 1) / block;
-  embedding_decode_kernel<<<grid, block, 0, stream>>>(embed, token_id, out, hidden_size);
   return map_cuda_error(cudaGetLastError());
 }
 

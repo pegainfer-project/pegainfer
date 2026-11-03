@@ -238,8 +238,6 @@ __global__ void qwen4_qsa_block_scores_kernel(
   }
 }
 
-CUresult consume_score_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 extern "C" {
@@ -304,7 +302,7 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
     qwen4_qsa_pool_keys_kernel<<<grid, kThreads, 0, stream>>>(
         fused_qk, k_norm_weight, cos_table, sin_table, pooled_keys, blocks,
         rms_eps);
-    const CUresult pooled_status = consume_score_error();
+    const CUresult pooled_status = consume_last_cuda_error();
     if (pooled_status != CUDA_SUCCESS) {
       return pooled_status;
     }
@@ -313,7 +311,7 @@ CUresult qwen4_qsa_indexer_block_scores_cuda(
   qwen4_qsa_block_scores_kernel<<<score_grid, kThreads, 0, stream>>>(
       fused_qk, q_norm_weight, pooled_keys, cos_table, sin_table, rows,
       visible_len, scores, tokens, score_cols, rms_eps);
-  return consume_score_error();
+  return consume_last_cuda_error();
 }
 
 }  // extern "C"

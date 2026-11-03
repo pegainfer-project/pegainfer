@@ -47,17 +47,14 @@ pub(crate) const GLM52_MTP_DRAFTS: usize = 5;
 /// ceiling — a shorter span just leaves the tail rows unproposed, so P and D
 /// may even disagree on this knob (D truncates to its own length; a longer
 /// D span verifies zero-filled rows that simply fail the prefix match).
-/// Wide-EP throughput deployments pair 2 drafts with 16 decode slots: fewer
-/// sequential proposal forwards per step, same 48-row verify ceiling.
 pub(crate) fn glm52_mtp_draft_len() -> usize {
     static LEN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *LEN.get_or_init(|| {
-        std::env::var("GLM52_MTP_DRAFTS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, GLM52_MTP_DRAFTS))
-            .unwrap_or(GLM52_MTP_DRAFTS)
-    })
+    *LEN.get_or_init(|| glm52_mtp_draft_len_from_env().unwrap_or_else(|err| panic!("{err:#}")))
+}
+
+/// Strict read behind [`glm52_mtp_draft_len`]; launch calls it so a bad value refuses to start.
+pub(crate) fn glm52_mtp_draft_len_from_env() -> Result<usize> {
+    crate::model::env_count("GLM52_MTP_DRAFTS", 1..=GLM52_MTP_DRAFTS, GLM52_MTP_DRAFTS)
 }
 
 /// Context-scaled device memory the native MTP lane ADDS on top of

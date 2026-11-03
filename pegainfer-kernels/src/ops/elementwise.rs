@@ -172,50 +172,6 @@ pub fn add_scaled_bf16_into(
     Ok(())
 }
 
-/// In-place scaled add into a row range of `out`: out[row_offset..] += scale * delta.
-pub fn scaled_add_rows_into(
-    ctx: &DeviceContext,
-    delta: &HiddenStates,
-    scale: f32,
-    out: &mut HiddenStates,
-    row_offset: usize,
-) -> Result<()> {
-    assert!(
-        scale.is_finite(),
-        "scaled_add_rows_into scale must be finite"
-    );
-    assert_eq!(
-        delta.seq_len, out.seq_len,
-        "delta seq_len {} != out seq_len {}",
-        delta.seq_len, out.seq_len
-    );
-    assert!(
-        row_offset + delta.hidden_dim <= out.hidden_dim,
-        "row range [{}..{}) exceeds out hidden_dim {}",
-        row_offset,
-        row_offset + delta.hidden_dim,
-        out.hidden_dim
-    );
-
-    let (delta_ptr, _gd) = delta.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::scaled_add_rows_cuda(
-            delta_ptr as *const ffi::Half,
-            scale,
-            out_ptr as *mut ffi::Half,
-            out.hidden_dim as i32,
-            row_offset as i32,
-            delta.hidden_dim as i32,
-            delta.seq_len as i32,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-
-    Ok(())
-}
-
 /// In-place scaled add into a row range of a contiguous token range in `out`.
 pub fn scaled_add_rows_token_range_into(
     ctx: &DeviceContext,
@@ -560,42 +516,6 @@ pub fn scaled_add_rows_indexed_into(
     Ok(())
 }
 
-/// In-place scaled add for tensors with identical shape.
-pub fn scaled_add_batch_into(
-    ctx: &DeviceContext,
-    delta: &HiddenStates,
-    scale: f32,
-    out: &mut HiddenStates,
-) -> Result<()> {
-    assert_eq!(delta.hidden_dim, out.hidden_dim);
-    scaled_add_rows_into(ctx, delta, scale, out, 0)
-}
-
-pub fn bf16_hidden_to_f32_into(
-    ctx: &DeviceContext,
-    input: &HiddenStates,
-    output: &mut CudaSlice<f32>,
-) -> Result<()> {
-    assert!(
-        output.len() >= input.data.len(),
-        "f32 output len {} < bf16 input len {}",
-        output.len(),
-        input.data.len()
-    );
-    let (input_ptr, _gi) = input.data.device_ptr(&ctx.stream);
-    let (output_ptr, _go) = output.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::bf16_to_f32_cuda(
-            input_ptr as *const ffi::Half,
-            output_ptr as *mut f32,
-            input.data.len() as i32,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
 /// Cast bf16 logits (as raw `CudaSlice<u8>`) to f32.
 /// Used by the indexer forward to convert DeepGEMM's bf16 logits output
 /// before FlashInfer top-k (which expects f32).
@@ -669,53 +589,6 @@ pub fn scale_f32_in_place(
             values_ptr as *mut f32,
             scale,
             len as i32,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-    Ok(())
-}
-
-pub fn accumulate_bf16_token_scaled_to_f32_into(
-    ctx: &DeviceContext,
-    token: &HiddenStates,
-    scale: f32,
-    token_idx: usize,
-    seq_len: usize,
-    out: &mut CudaSlice<f32>,
-) -> Result<()> {
-    assert!(
-        scale.is_finite(),
-        "accumulate_bf16_token_scaled_to_f32_into scale must be finite"
-    );
-    assert_eq!(
-        token.seq_len, 1,
-        "accumulate_bf16_token_scaled_to_f32_into expects one token, got seq_len={}",
-        token.seq_len
-    );
-    assert!(
-        token_idx < seq_len,
-        "accumulate token_idx {} exceeds seq_len {}",
-        token_idx,
-        seq_len
-    );
-    assert!(
-        out.len() >= token.hidden_dim * seq_len,
-        "f32 output len {} < hidden_dim {} * seq_len {}",
-        out.len(),
-        token.hidden_dim,
-        seq_len
-    );
-    let (token_ptr, _gt) = token.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
-    let result = unsafe {
-        ffi::accumulate_bf16_token_scaled_to_f32_cuda(
-            token_ptr as *const ffi::Half,
-            scale,
-            out_ptr as *mut f32,
-            token.hidden_dim as i32,
-            token_idx as i32,
-            seq_len as i32,
             crate::tensor::active_cu_stream(ctx),
         )
     };
@@ -962,16 +835,6 @@ pub fn extract_vec_ref(
     Ok(out)
 }
 
-/// Copy one column from `batch` into a pre-allocated `out`.
-pub fn extract_vec_into(
-    ctx: &DeviceContext,
-    batch: &HiddenStates,
-    token_idx: usize,
-    out: &mut DeviceVec,
-) -> Result<()> {
-    extract_vec_ref_into(ctx, batch.as_ref(), token_idx, out)
-}
-
 /// Copy one column from a borrowed `batch` into a pre-allocated `out`.
 pub fn extract_vec_ref_into(
     ctx: &DeviceContext,
@@ -980,10 +843,10 @@ pub fn extract_vec_ref_into(
     out: &mut DeviceVec,
 ) -> Result<()> {
     let len = batch.hidden_dim;
-    anyhow::ensure!(out.len == len, "extract_vec_into len mismatch");
+    anyhow::ensure!(out.len == len, "extract_vec_ref_into len mismatch");
     anyhow::ensure!(
         token_idx < batch.seq_len,
-        "extract_vec_into token index {token_idx} out of bounds for seq_len {}",
+        "extract_vec_ref_into token index {token_idx} out of bounds for seq_len {}",
         batch.seq_len
     );
     let offset = token_idx * batch.hidden_dim;

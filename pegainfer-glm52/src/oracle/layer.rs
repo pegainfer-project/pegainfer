@@ -9,14 +9,11 @@
 //! assert the outputs land on the probes.
 //!
 //! Layer 0 exercises the dense MLP and full indexer. Layer 6's generated
-//! probes are shared by the EP8 and TP8 topology gates in the sibling modules;
-//! the obsolete EP1 local-MoE implementation is not retained here.
+//! probes feed the EP4 MoE gate in `layer_ep4.rs`.
 //!
-//! Run (H200 + checkpoint + DeepGEMM env):
+//! Run (Blackwell GPU + checkpoint):
 //! ```text
 //! PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-//! PEGAINFER_DEEPGEMM_ROOT=pegainfer-kernels/third_party/DeepGEMM/deep_gemm \
-//! CUDA_HOME=/usr/local/cuda \
 //!   cargo test --release -p pegainfer-glm52 --features glm52 --lib layer_oracle -- --ignored --nocapture
 //! ```
 
@@ -614,7 +611,7 @@ pub(crate) fn checked_hidden(
 }
 
 #[test]
-#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
+#[ignore = "requires a Blackwell GPU + GLM-5.2-FP8 checkpoint"]
 fn layer_dense_oracle_gate() -> Result<()> {
     let hidden_host = checked_hidden(
         DENSE_ORACLE_SEED,
