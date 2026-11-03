@@ -155,7 +155,7 @@ def _axis(values: list, label: str, maximum: int) -> list[int]:
 
 def _decode_model(candidate: dict[str, Any]) -> dict[str, Any]:
     if candidate.get("name") != "decode_2d_surface":
-        raise ProfileError("C6 requires decode_2d_surface; no candidate fallback")
+        raise ProfileError("runtime profile requires decode_2d_surface; no candidate fallback")
     axes = candidate["axes"]
     requests = _axis(axes["requests"], "decode.requests", 2**32 - 1)
     contexts = _axis(axes["kv_tokens"], "decode.kv_tokens", 2**64 - 1)
@@ -166,7 +166,7 @@ def _decode_model(candidate: dict[str, Any]) -> dict[str, Any]:
             "duration_us": [_ms_to_us(value, "decode surface duration") for row in values for value in row]}
 
 
-def _training_inputs(normalized_path: Path, fit_path: Path) -> tuple[dict, dict, dict]:
+def _training_inputs(campaign: dict, normalized_path: Path, fit_path: Path) -> tuple[dict, dict, dict]:
     """Read the two direct materialization inputs without replaying training."""
     from fit import verify_fit
     from normalize import verify_normalized
@@ -175,6 +175,8 @@ def _training_inputs(normalized_path: Path, fit_path: Path) -> tuple[dict, dict,
     if normalized['scope'] != 'train':
         raise ProfileError('profile materialization requires training input')
     verify_fit(fitted)
+    if normalized['campaign_id'] != campaign['campaign_id'] or fitted['campaign_id'] != campaign['campaign_id']:
+        raise ProfileError('training artifacts belong to a different campaign')
     return normalized, fitted, {'normalized': str(normalized_path), 'fit': str(fit_path)}
 
 
@@ -202,15 +204,11 @@ def read_calibration(root: Path, campaign: dict) -> dict:
     return document
 
 
-def verify_calibration(root: Path, campaign: dict) -> dict:
-    return read_calibration(root, campaign)
-
-
 def materialize_calibration(root: Path, *, normalized_artifact: Path, fit_artifact: Path) -> dict:
     """Publish the cached-only endpoint; no runtime curves or replay are required."""
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    normalized, fitted, sources = _training_inputs(normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    normalized, fitted, sources = _training_inputs(campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
     document = _calibration_document(campaign, normalized, fitted, sources)
     write_derived_document(root / CALIBRATION_PATH, document, root)
     return document
@@ -273,7 +271,7 @@ def verify_fitted_bundle(root: Path, campaign: dict) -> dict:
 def materialize_profile(root: Path, *, normalized_artifact: Path, fit_artifact: Path) -> dict:
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    normalized, fitted, sources = _training_inputs(normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    normalized, fitted, sources = _training_inputs(campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
     if normalized['cached_requirements']:
         write_derived_document(root / CALIBRATION_PATH,
                                _calibration_document(campaign, normalized, fitted, sources), root)

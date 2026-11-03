@@ -11,6 +11,9 @@ from pathlib import Path
 MODULE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(MODULE_ROOT))
 from campaign import compile_campaign
+from manifest import ManifestError
+from probe import requires_cache_reset
+from request_plan import build_plan
 
 FIXTURE = Path(__file__).parent / 'fixtures/campaign-compile.json'
 
@@ -56,6 +59,15 @@ class CampaignCompileTests(unittest.TestCase):
             self.assertEqual(cell['seed'], 9)
             self.assertFalse(cell['fit_policy']['train'])
             self.assertEqual(cell['fit_policy']['excluded_metrics'], ['ttft_ms'])
+            plan = build_plan(cell, compiled['client'])
+            self.assertTrue(requires_cache_reset(plan, 'target', compiled['variants']['target']['runtime'], plan['batches'][0]))
+            del matrix['cache_lifecycle']
+            path.write_text(json.dumps(spec))
+            with self.subTest(mode='decode_cache_without_lifecycle'), self.assertRaisesRegex(ManifestError, 'cache lifecycle'):
+                compile_campaign(path, write=False)
+            del plan['cache_lifecycle']
+            with self.assertRaisesRegex(ValueError, 'reset lifecycle'):
+                requires_cache_reset(plan, 'target', compiled['variants']['target']['runtime'], plan['batches'][0])
 
 
 if __name__ == '__main__':

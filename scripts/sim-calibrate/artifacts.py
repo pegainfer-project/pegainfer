@@ -210,7 +210,8 @@ def read_sealed_attempt(root: Path, plan: dict, variant: str, reference: dict) -
     result = {'directory': directory, 'raw_index': raw, 'envelope': envelope, 'workload': workload}
     if plan['workload_kind'] == 'steady_decode':
         result['statistics'] = _read_json(directory / 'decode_statistics.json')
-        from steady_state import requires_qualified_window
+        from steady_state import requires_qualified_window, verify_statistics
+        verify_statistics(plan, envelope, result['statistics'])
         if requires_qualified_window(plan) and not result['statistics']['qualified']:
             raise ArtifactError('sealed decode attempt is not qualified')
     return result

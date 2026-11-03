@@ -33,7 +33,8 @@ def make_bundle(base: Path, *, cached=False, reset_before=None, full_train=False
     path, spec = make_input(base)
     cached_matrix = spec['workload']['matrices']['cached-train']
     matrix = {'kind': 'steady_decode', 'split': 'train', 'concurrency': [2], 'num_ctx': [16],
-              'output_tokens': 8, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'}}
+              'output_tokens': 8, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'},
+              'cache_lifecycle': {'namespace': 'decode', 'reset_before': 'repeat', 'bootstrap_repeats': 0}}
     if reset_before:
         matrix = {'kind': 'cold_prefill', 'split': 'train', 'concurrency': 1, 'input_tokens': [8],
                   'output_tokens': 4, 'warmup_repeats': 1, 'repeats': 2, 'arrival': {'mode': 'fixed_batch'},
@@ -232,7 +233,7 @@ class NormalizeTests(unittest.TestCase):
     def test_explicit_raw_replay_rejects_bad_evidence(self):
         for mode in ('raw', 'workload', 'measurement', 'wire', 'shape', 'sampling', 'command', 'mapping',
                      'overlap', 'events', 'observer', 'unindexed',
-                     'binding_endpoint', 'binding_listener', 'reset_missing', 'reset_false'):
+                     'binding_endpoint', 'binding_listener', 'reset_missing', 'reset_false', 'decode_statistics'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 root, campaign = make_bundle(Path(tmp), reset_before='repeat' if mode.startswith('reset_') else None)
                 collect_fixture(root, campaign)
@@ -249,6 +250,10 @@ class NormalizeTests(unittest.TestCase):
                     envelope = _read_json(directory / 'measurements.json')
                     envelope['measurements'].pop()
                     _write_atomic(directory / 'measurements.json', envelope)
+                elif mode == 'decode_statistics':
+                    statistics = _read_json(directory / 'decode_statistics.json')
+                    statistics['summary']['mean'] += 1
+                    _write_atomic(directory / 'decode_statistics.json', statistics)
                 else:
                     if mode in ('wire', 'shape', 'sampling'):
                         body = _read_json(request / 'request.json')

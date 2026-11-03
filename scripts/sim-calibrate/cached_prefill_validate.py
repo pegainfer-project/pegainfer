@@ -168,12 +168,6 @@ def verify_report(document: dict, *, root: Path | None = None) -> None:
         raise CachedValidationError('cached report differs from selected evidence, scope or statistics')
 
 
-def write_report(path: Path, document: dict) -> None:
-    """Verify an arbitrary report before publication; generated reports can use output=."""
-    verify_report(document)
-    write_derived_document(path, document, Path(document['source']['artifact_root']))
-
-
 async def execute_cached_validation(root: Path, *, sim_binary: Path, model_path: Path,
                                     timeout: float = 120, startup_timeout: float = 60,
                                     output: Path | None = None) -> dict:

@@ -297,7 +297,7 @@ async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
                 if plan['workload_kind'] == 'cached_prefill':
                     from cached_prefill import batch_payload
                     (batch_root / 'custom.jsonl').write_bytes(batch_payload(plan, batch))
-                prefix = f"c2-{campaign['campaign_id'][:12]}-{variant_name}-{attempt}-{uuid.uuid4().hex}-{name}-"
+                prefix = f"calibration-{campaign['campaign_id'][:12]}-{variant_name}-{attempt}-{uuid.uuid4().hex}-{name}-"
                 proxy.register(batch, prefix, batch_root)
                 argv = render_command(plan, batch, binary=Path(client['binary']), endpoint=proxy.url,
                                       model=identity['model'], result_dir=batch_root,

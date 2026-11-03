@@ -24,6 +24,8 @@ use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
+use pegainfer_sim::profile::MixedAdditive;
+use pegainfer_sim::profile::PredictorModel;
 use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
 use pegainfer_sim::start_engine_with_partitions;
@@ -497,6 +499,98 @@ fn functional_profile_prices_pure_work_and_fails_closed() -> Result<()> {
     });
     assert!(out_of_domain.is_err(), "profile coverage must fail closed");
     Ok(())
+}
+
+#[test]
+fn serving_rejects_incomplete_functional_profiles() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("functional-step-gate.json")?;
+    for missing in ["prefill", "decode", "mixed"] {
+        let mut partial = profile.clone();
+        if let PredictorModel::Functional {
+            prefill, decode, ..
+        } = &mut partial.profile.predictor.model
+        {
+            match missing {
+                "prefill" => *prefill = None,
+                "decode" => *decode = None,
+                _ => {}
+            }
+        }
+        let error = SimulatedEngineConfig::default()
+            .with_engine_profile(partial)
+            .expect_err("serving must reject a missing functional component");
+        assert!(
+            error
+                .to_string()
+                .contains("requires prefill, decode, and mixed models"),
+            "missing {missing}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpriced_prefill_and_decode_requests_leave_server_running() -> Result<()> {
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { decode, mixed, .. } = &mut profile.profile.predictor.model {
+        decode
+            .as_mut()
+            .context("fixture decode model missing")?
+            .sum_decode_ctx_tokens = vec![3, 4];
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let model_name = "pegainfer-sim-unpriced-request";
+    let server =
+        SimServer::spawn_with_config(model_dir_with_minimal_metadata()?, 1, model_name, config)
+            .await?;
+    let client = test_client()?;
+
+    for prompt in [vec![1], vec![1, 2]] {
+        let refused = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": prompt,
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let valid = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": [1, 2, 3],
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert_eq!(valid["choices"][0]["finish_reason"], "length");
+        assert_eq!(valid["usage"]["completion_tokens"], 2);
+    }
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:num_requests_running", "0", 0.0),
+            ("vllm:num_requests_waiting", "0", 0.0),
+        ],
+        model_name,
+    )
+    .await?;
+    server.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

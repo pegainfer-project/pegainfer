@@ -16,7 +16,6 @@ from measurement_schema import canonical_json, sha256_json, TIMING_CONTRACT, RET
 CAMPAIGN_SPEC_SCHEMA_VERSION = 10
 COMPILED_CAMPAIGN_SCHEMA_VERSION = 11
 SPLITS = ("train", "threshold_validation", "held_out_mixed", "sealed_test")
-WORKLOAD_KINDS = ("cold_prefill", "steady_decode", "cached_prefill", "mixed")
 
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 
@@ -191,77 +190,6 @@ def canonical_client_identity(client: dict[str, Any], *, tokenizer_config_sha256
             raise ManifestError("client.tokenizer_config_sha256 must be SHA-256")
         identity["tokenizer_config_sha256"] = tokenizer_config_sha256
     return identity
-
-
-def canonical_workload_identity(campaign: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[str]]]:
-    """Normalize workload cells and split assignments for profile identity."""
-
-    workload = campaign.get("workload") if isinstance(campaign, dict) else None
-    cells = workload.get("cells") if isinstance(workload, dict) else None
-    if not isinstance(cells, list) or not cells:
-        raise ManifestError("workload.cells must be a non-empty list")
-    normalized_cells: list[dict[str, Any]] = []
-    warmups: set[int] = set()
-    repeats: set[int] = set()
-    names: set[str] = set()
-    for index, cell in enumerate(cells):
-        if not isinstance(cell, dict):
-            raise ManifestError(f"workload.cells[{index}] must be an object")
-        name = _non_empty(cell.get("name"), f"workload.cells[{index}].name")
-        if name in names:
-            raise ManifestError(f"workload cell name is duplicated: {name}")
-        names.add(name)
-        kind = _non_empty(cell.get("kind"), f"workload.cells[{index}].kind")
-        if kind not in WORKLOAD_KINDS:
-            raise ManifestError(f"workload.cells[{index}].kind is unsupported: {kind}")
-        normalized_cell = {
-            "id": name,
-            "family": kind,
-            "input_tokens": _positive_int(cell.get("input_tokens"), f"workload.cells[{index}].input_tokens"),
-            "output_tokens": _positive_int(cell.get("output_tokens"), f"workload.cells[{index}].output_tokens"),
-            "concurrency": _positive_int(cell.get("concurrency"), f"workload.cells[{index}].concurrency"),
-            "arrival_pattern": _non_empty(
-                cell.get("arrival_pattern", "closed_loop"),
-                f"workload.cells[{index}].arrival_pattern",
-            ),
-            "attribution": "black_box_effective",
-        }
-        normalized_cells.append(normalized_cell)
-        warmups.add(_positive_int(cell.get("warmup_repeats", 0), f"workload.cells[{index}].warmup_repeats", allow_zero=True))
-        repeats.add(_positive_int(cell.get("repeats", 1), f"workload.cells[{index}].repeats"))
-    if not warmups or not repeats:
-        raise ManifestError("profile workload identity requires workload repetition metadata")
-    # Repetition counts describe measurement effort, not the serving workload
-    # shape.  Campaigns may use more repeats for held-out cells than for train
-    # cells; retain one deterministic compatibility scalar for the Rust profile
-    # schema while the concrete cell counts remain in the campaign artifacts.
-    raw_splits = campaign.get("splits")
-    if raw_splits is None:
-        split = {name: [] for name in SPLITS}
-        for cell in cells:
-            split[cell.get("split", "train")].append(cell["name"])
-    elif isinstance(raw_splits, dict):
-        unknown_splits = set(raw_splits) - set(SPLITS)
-        if unknown_splits:
-            raise ManifestError(f"splits contains unsupported names: {sorted(unknown_splits)}")
-        split = {}
-        for name in SPLITS:
-            values = raw_splits.get(name, [])
-            if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
-                raise ManifestError(f"splits.{name} must be a list of strings")
-            split[name] = sorted(values)
-    else:
-        raise ManifestError("splits must be an object when present")
-    if set(name for values in split.values() for name in values) != names:
-        raise ManifestError("workload split identity does not cover exactly the workload cells")
-    return (
-        {
-            "cells": sorted(normalized_cells, key=lambda item: item["id"]),
-            "warmup_repeats": max(warmups),
-            "repeats": max(repeats),
-        },
-        split,
-    )
 
 
 def _non_empty(value: Any, field: str) -> str:
@@ -483,6 +411,8 @@ def compile_manifest(spec: dict[str, Any], assets: dict[str, Any]) -> dict[str, 
             elif matrix["generation"]["prompt_representation"] != "token_ids":
                 raise ManifestError("cold/decode require token-ID prompts")
             lifecycle = matrix.get("cache_lifecycle")
+            if variants["target"]["runtime"]["cache"]["policy"] == "on" and lifecycle is None:
+                raise ManifestError(f"matrix {name} requires an explicit cache lifecycle while target cache is enabled")
             if lifecycle is not None and matrix["kind"] != "cached_prefill" and lifecycle["bootstrap_repeats"]:
                 raise ManifestError("bootstrap is only supported for cached_prefill")
             if matrix.get("kind") == "cached_prefill" and (lifecycle is None or not lifecycle["bootstrap_repeats"]):

@@ -26,6 +26,8 @@ pub mod worker;
 
 use profile::EngineProfile;
 use profile::LoadedEngineProfile;
+use profile::PredictorError;
+use profile::PredictorModel;
 use worker::CancelResult;
 use worker::GeneratedToken;
 use worker::RequestRejection;
@@ -141,6 +143,17 @@ impl SimulatedEngineConfig {
     /// validated for online step timing and scheduling.
     pub fn with_engine_profile(mut self, profile: LoadedEngineProfile) -> Result<Self> {
         profile.validate()?;
+        if let PredictorModel::Functional {
+            prefill,
+            decode,
+            mixed,
+        } = &profile.predictor.model
+        {
+            ensure!(
+                prefill.is_some() && decode.is_some() && mixed.is_some(),
+                "serving a functional profile requires prefill, decode, and mixed models"
+            );
+        }
         self.profile = Some(ProfileConfig { profile });
         Ok(self)
     }
@@ -340,10 +353,37 @@ impl ProfiledRuntime {
         let estimate = match self.profile.estimate_step(shape) {
             Ok(estimate) => estimate,
             Err(error) => {
+                let refused_requests: Vec<_> = plan
+                    .prefill()
+                    .iter()
+                    .map(|work| work.request_id)
+                    .chain(plan.decode().iter().map(|work| work.request_id))
+                    .collect();
                 self.worker
                     .discard_step(step_id)
                     .context("failed to roll back an unpriced worker step")?;
-                return Err(error);
+                if !matches!(
+                    error.downcast_ref::<PredictorError>(),
+                    Some(
+                        PredictorError::OutOfDomain { .. }
+                            | PredictorError::UnsupportedShape { .. }
+                            | PredictorError::ModelCoverageGap { .. }
+                    )
+                ) {
+                    return Err(error);
+                }
+                let message = error.to_string();
+                for request_id in refused_requests {
+                    ensure!(
+                        self.worker.cancel(request_id) == CancelResult::Cancelled,
+                        "unpriced request {request_id} was not cancellable after step rollback"
+                    );
+                    self.requests
+                        .remove(&request_id)
+                        .with_context(|| format!("missing profiled request {request_id}"))?;
+                    ledger.fail(request_id, message.clone());
+                }
+                return Ok(());
             }
         };
         for &request_id in plan.admitted() {

@@ -81,17 +81,17 @@ def requires_cache_reset(plan: dict, variant: str, runtime: dict, batch: dict) -
     if variant != 'target' or runtime.get('cache', {}).get('policy') != 'on':
         return False
     lifecycle = plan.get('cache_lifecycle', {})
-    if plan['workload_kind'] == 'cold_prefill' and not lifecycle:
-        raise ValueError('cold target with cache enabled requires explicit reset lifecycle')
+    if not lifecycle:
+        raise ValueError('target with cache enabled requires explicit reset lifecycle')
     if plan['workload_kind'] == 'cached_prefill':
-        if not lifecycle or batch['phase'] != 'bootstrap':
+        if batch['phase'] != 'bootstrap':
             return False
         if lifecycle['reset_before'] == 'cell':
             return batch == plan['batches'][0]
         group = (batch['before_phase'], batch['before_repeat'])
         return batch == next(b for b in plan['batches'] if b['phase'] == 'bootstrap'
                              and (b['before_phase'], b['before_repeat']) == group)
-    return bool(lifecycle and (lifecycle['reset_before'] == 'repeat' or batch == plan['batches'][0]))
+    return lifecycle['reset_before'] == 'repeat' or batch == plan['batches'][0]
 
 
 def validate_reset_receipt(receipt: dict) -> None:

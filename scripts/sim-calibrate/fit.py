@@ -113,8 +113,8 @@ def _piecewise_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[st
         {"x": x, "y": statistics.median(values), "dispersion": _median_mad(values)}
         for x, values in sorted(by_x.items())
     ]
-    if not knots:
-        raise FitError("no measured samples for cold prefill")
+    if len(knots) < 2:
+        raise FitError("cold prefill requires at least two distinct input token points")
     source = _source_metadata(samples, metric=metric)
     return {
         "name": "cold_prefill_piecewise_linear",
@@ -130,22 +130,6 @@ def _piecewise_fit(samples: Sequence[dict[str, Any]], *, metric: str) -> dict[st
         },
         "source": source,
     }
-
-
-def evaluate_piecewise(candidate: dict[str, Any], input_tokens: float) -> float:
-    x = _finite(input_tokens, "input_tokens")
-    knots = candidate.get("knots")
-    if not isinstance(knots, list) or not knots:
-        raise FitError("piecewise candidate has no knots")
-    if x < knots[0]["x"] or x > knots[-1]["x"]:
-        raise FitError(f"input_tokens={x:g} is outside measured domain")
-    for left, right in zip(knots, knots[1:]):
-        if x <= right["x"]:
-            if right["x"] == left["x"]:
-                return _finite(right["y"], "piecewise prediction")
-            fraction = (x - left["x"]) / (right["x"] - left["x"])
-            return _finite(left["y"] + fraction * (right["y"] - left["y"]), "piecewise prediction")
-    return _finite(knots[-1]["y"], "piecewise prediction")
 
 
 def _aggregate_decode_samples(samples: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -292,18 +276,6 @@ def _bracket(axis: Sequence[float], value: float, name: str) -> tuple[int, int, 
             return index - 1, index, fraction
     last = len(axis) - 1
     return last, last, 0.0
-
-
-def evaluate_surface(candidate: dict[str, Any], requests: float, kv_tokens: float) -> float:
-    axes = candidate["axes"]
-    request_axis = axes["requests"]
-    kv_axis = axes["kv_tokens"]
-    left_request, right_request, request_fraction = _bracket(request_axis, _finite(requests, "requests"), "requests")
-    left_kv, right_kv, kv_fraction = _bracket(kv_axis, _finite(kv_tokens, "kv_tokens"), "kv_tokens")
-    values = candidate["values_ms"]
-    lower = values[left_request][left_kv] + kv_fraction * (values[left_request][right_kv] - values[left_request][left_kv])
-    upper = values[right_request][left_kv] + kv_fraction * (values[right_request][right_kv] - values[right_request][left_kv])
-    return _finite(lower + request_fraction * (upper - lower), "surface prediction")
 
 
 def evaluate_cached_surface(candidate: dict[str, Any], prefix_tokens: float, new_tokens: float) -> float:

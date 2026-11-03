@@ -149,7 +149,12 @@
           1024,
           3072,
           6144
-        ]
+        ],
+        "cache_lifecycle": {
+          "namespace": "decode-train",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 0
+        }
       },
       "cached-train": {
         "kind": "cached_prefill",
@@ -205,7 +210,12 @@
         "num_ctx": [
           1536,
           4096
-        ]
+        ],
+        "cache_lifecycle": {
+          "namespace": "decode-heldout",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 0
+        }
       },
       "decode-heldout-b3": {
         "kind": "steady_decode",
@@ -223,7 +233,12 @@
           1536,
           3072,
           4608
-        ]
+        ],
+        "cache_lifecycle": {
+          "namespace": "decode-heldout-b3",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 0
+        }
       },
       "decode-heldout-short": {
         "kind": "steady_decode",
@@ -240,7 +255,12 @@
         },
         "num_ctx": [
           512
-        ]
+        ],
+        "cache_lifecycle": {
+          "namespace": "decode-heldout-short",
+          "reset_before": "repeat",
+          "bootstrap_repeats": 0
+        }
       }
     }
   },

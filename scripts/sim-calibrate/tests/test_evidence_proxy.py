@@ -95,7 +95,8 @@ def compiled_plan(root: Path):
     spec['workload']['matrices'] = {'decode':{
         'kind':'steady_decode','split':'train','concurrency':[2],'num_ctx':[16],
         'output_tokens':8,
-        'warmup_repeats':0,'repeats':1,'arrival':{'mode':'fixed_batch'}}}
+        'warmup_repeats':0,'repeats':1,'arrival':{'mode':'fixed_batch'},
+        'cache_lifecycle':{'namespace':'decode','reset_before':'repeat','bootstrap_repeats':0}}}
     path.write_text(json.dumps(spec))
     campaign = compile_campaign(path, write=False)
     cell = campaign['workload']['cells'][0]

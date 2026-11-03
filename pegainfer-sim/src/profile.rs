@@ -33,6 +33,15 @@ impl EngineProfile {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).context("failed to parse engine profile JSON")?;
+        if let Some(version) = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+        {
+            ensure!(
+                version == u64::from(ENGINE_PROFILE_SCHEMA_VERSION),
+                "unsupported engine profile schema_version {version}; migrate to schema_version {ENGINE_PROFILE_SCHEMA_VERSION} with a calibration manifest reference and explicit predictor coverage"
+            );
+        }
         if value.get("profile_id").is_some()
             || value.get("provenance").is_some()
             || value.get("timing").is_some()
@@ -1187,6 +1196,11 @@ mod tests {
             "step_duration_us": [10, 80, 70, 140, 210, 280, 270, 340]
         });
         assert!(parse(&grid_payload).is_err());
+
+        grid_payload["schema_version"] = json!(1);
+        let error = parse(&grid_payload).unwrap_err().to_string();
+        assert!(error.contains("schema_version 1"));
+        assert!(error.contains("migrate to schema_version 3"));
     }
 
     #[test]
