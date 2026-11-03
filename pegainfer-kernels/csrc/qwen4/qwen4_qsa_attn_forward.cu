@@ -380,7 +380,7 @@ __global__ void qwen4_qsa_attn_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
+CUresult consume_attention_error() { return map_cuda_error(cudaGetLastError()); }
 
 }  // namespace
 
@@ -455,7 +455,7 @@ CUresult qwen4_qsa_attn_forward_cuda(
                                        kThreads, 0, stream>>>(
       keys, k_norm_weight, positions, cos_table, sin_table, normed_keys, tokens,
       rms_eps);
-  const CUresult key_status = consume_last_cuda_error();
+  const CUresult key_status = consume_attention_error();
   if (key_status != CUDA_SUCCESS) {
     return key_status;
   }
@@ -486,7 +486,7 @@ CUresult qwen4_qsa_attn_forward_cuda(
         cos_table, sin_table, attn_weights, attn_out, query_rows, tokens,
         rms_eps);
   }
-  return consume_last_cuda_error();
+  return consume_attention_error();
 }
 
 }  // extern "C"

@@ -241,7 +241,7 @@ __global__ void qwen4_qsa_select_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
+CUresult consume_select_error() { return map_cuda_error(cudaGetLastError()); }
 
 }  // namespace
 
@@ -293,7 +293,7 @@ CUresult qwen4_qsa_indexer_select_cuda(
   qwen4_qsa_select_kernel<<<query_rows, kThreads,
                             static_cast<size_t>(shared_bytes), stream>>>(
       scores, rows, mask, tokens, score_cols, budget);
-  return consume_last_cuda_error();
+  return consume_select_error();
 }
 
 }  // extern "C"
