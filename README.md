@@ -11,7 +11,7 @@
   <a href="https://pegainfer.org/">
     <img src="https://img.shields.io/badge/Docs%20%26%20Blog-pegainfer.org-2ea44f" alt="Docs and engineering blog">
   </a>
-  <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-41scnc53a-d0McNJDjK2lVqFGoSLUgXA">
+  <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-4fhvbqhup-dBO0rbL0UrVJNDz6RMwMqg">
     <img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join the PegaInfer Slack">
   </a>
   <a href="LICENSE">
