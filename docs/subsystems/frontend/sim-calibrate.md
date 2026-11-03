@@ -29,9 +29,9 @@ Every collection uses `plan_driver → vllm_bench → original vllm-bench → ev
 
 `campaign.py execute` orchestrates the full cold/decode pipeline: the caller normally starts the target beforehand, while the orchestrator starts and stops reference and fitted sim services using their profiles. `run` collects specified roles/cells; externally started reference and sim services require a local PID. For cached campaigns, use `execute --through-fit` to finish training, then `cached_prefill_validate.py collect` for the dedicated held-out collection. `validate` consumes existing measurements, and `verify` explicitly recomputes the report.
 
-Endpoints must support `/v1/completions`, SSE, and output token IDs. Cold/decode requests use token-ID prompts; cached campaigns also require actual prompt IDs and per-request cached-token usage in responses. Cached targets must support cache recovery through HTTP reset or a declared managed restart. An OpenAI-compatible service that only streams text cannot directly provide the evidence this pipeline requires.
+Endpoints must support `/v1/completions`, SSE, and output token IDs. Cold/decode requests use token-ID prompts; cached campaigns also require actual prompt IDs and per-request cached-token usage in responses. Whenever the target cache is on, every cell, including decode, must declare a cache lifecycle. Cold/decode cells use HTTP reset; cached cells can use HTTP reset or a managed restart. This prevents an interrupted attempt from warming prompts reused by a retry. An OpenAI-compatible service that only streams text cannot directly provide the evidence this pipeline requires.
 
-There is currently no cached Rust predictor, separate mixed fit, frozen error tolerance, or publication stage. Inputs of 32k tokens and concurrency 256 are configurable when server capacity permits; the existing main measurement matrix does not cover these limits.
+There is currently no cached Rust predictor, separate mixed fit, frozen error tolerance, or publication stage. Inputs of 32k tokens and concurrency 256 are configurable when server capacity permits; the recorded campaign does not cover these limits.
 
 ## 2. Measurement Rules and Batches
 
@@ -73,7 +73,7 @@ Fitting reads only complete, qualified normalized data with `scope=train`. All C
 
 | Candidate | Inputs and purpose |
 | --- | --- |
-| `cold_prefill_piecewise_linear` | Input tokens and effective TTFT at C=1. Retains sampled knots and uses piecewise-linear interpolation within the domain. |
+| `cold_prefill_piecewise_linear` | Input tokens and effective TTFT at C=1, with at least two distinct input lengths. Retains sampled knots and uses piecewise-linear interpolation within the domain. |
 | `decode_2d_surface` | A complete B × initial total context grid of effective TPOT values, with bilinear interpolation within the domain. The sole decode fit and runtime model. |
 | `cached_prefill_surface` | A complete P×N grid with at least two points per axis, using medians of paired differences and bilinear interpolation within the domain. |
 
@@ -81,7 +81,11 @@ Missing required cells/repeats cause the corresponding fit to fail; remaining sa
 
 ## 5. Profiles, Artifacts, and Readers
 
-Cold/decode uses piecewise prefill and the decode surface, converts millisecond costs to integer microseconds, and generates Rust profile schema 3, manifest schema 2, and selection schema 3. Runtime mixed cost is `prefill + decode` with a zero intercept. Positive workloads must be covered by the actual curves to be evaluated; declaring an outer coverage range does not fill gaps in the curves.
+Cold/decode uses piecewise prefill and the decode surface, converts millisecond costs to integer microseconds, and generates Rust profile schema 3, manifest schema 2, and selection schema 3. Runtime mixed cost is `prefill + decode` with a zero intercept. Export requires both normalized and fit inputs to carry the current campaign ID.
+
+Serving a functional profile requires prefill, decode, and mixed components because request arrivals can produce all three step types. A partial functional model can still be loaded and estimated directly, but `with_engine_profile` rejects it for serving. Old profile schemas receive a migration error before their contents are decoded into the current structure.
+
+Positive workloads must be covered by the actual curves to be evaluated; declaring an outer coverage range does not fill gaps in the curves. A coverage minimum of zero allows a step to have no work of that type; it does not create measured knots at zero or enable extrapolation. If a planned step is outside the domain or otherwise cannot be priced by the predictor's declared model, the sim rolls back that step and fails its requests while continuing to serve subsequent requests. Internal scheduler or engine errors remain fatal.
 
 Cached fitting generates a separate schema-3 calibration artifact containing the P/N axes, cost surface, and direct input paths, with `runtime_enabled=false`. The runtime profile does not enable a cached predictor even when the same campaign also fits cold/decode costs.
 
@@ -99,9 +103,9 @@ reports/{validation.json,cached_validation.json}
 diagnostics/environment.json
 ```
 
-The manifest records the target/model, runtime configuration, client, workload, and source locations. Digests are used only for actual request-content pairing, actual profile/manifest file binding, ID/deterministic-input generation, and the model declaration, tokenizer config, and numerical-source fields required by Rust. The raw index lists paths; it has no whole-bundle or per-file raw SHA. Source code and dependency versions are no longer frozen as execution gates. Environment versions are recorded together in diagnostics.
+The manifest records the target/model, runtime configuration, client, workload, and source locations. Digests are used only for actual request-content pairing, actual profile/manifest file binding, ID/deterministic-input generation, and the model declaration, tokenizer config, and numerical-source fields required by Rust. The raw index lists paths; it has no whole-bundle or per-file raw SHA. Source code and dependency versions are not execution gates. Environment versions are recorded together in diagnostics.
 
-Normal stages read their direct artifacts without recursively opening training files. Resuming sealed work reuses the selected attempt. Failed or interrupted attempts are retained, and explicitly resuming collection creates a new attempt. Report verification and normalized-source recomputation read the fixed selected attempts and reconstruct requests, SSE events, measurements, and values from raw evidence. Other attempts added later are excluded from that recomputation. The new Python contracts are incompatible with older artifact formats.
+Normal stages read their direct artifacts without recursively opening training files. When reading a sealed decode attempt, the reader recomputes its window statistics from the plan and measurement envelope with `verify_statistics` and compares the values with `decode_statistics.json`. Resuming sealed work reuses the selected attempt. Failed or interrupted attempts are retained, and explicitly resuming collection creates a new attempt. Report verification and normalized-source recomputation read the fixed selected attempts and reconstruct requests, SSE events, measurements, and values from raw evidence. Other attempts added later are excluded from that recomputation. The Python contracts are incompatible with older artifact formats.
 
 ## 6. Held-out Reporting Rules
 
@@ -111,11 +115,13 @@ The dedicated cached report covers all declared non-training cached cells and re
 
 For the standard report, succeeded means the required roles, scope, counts, coverage, and statistics are complete. Missing evidence produces results such as partial/replay_required. Neither report type imposes a business accuracy threshold: `accuracy_acceptance=not_assessed`. A complete report can still contain large errors.
 
-The two-model 112-cell main campaign and 28-cell post-consolidation campaign include real held-out reports stored outside the repository. They remain measurement evidence for their respective specs, profiles, and workloads; subsequent SHA/field simplification did not change the baseline, fitting, or error formulas. These files retain their original formats and cannot be loaded directly as new-format artifacts by the current reader.
+The [two-model RTX 3090 campaign](../../benchmarks/sim-calibrate-serving-3090-20261103.md) records 38 cells generated by the current implementation, including the 1-token cold point and the minimum shared decode context of 4. Its two standard and two cached held-out reports succeeded and were recomputed from raw evidence after stopping the targets. The snapshot and companion JSON retain the measured errors; accuracy remains `not_assessed`.
+
+Report results apply to the exact campaign matrix and profile used to produce them. Comparing accuracy across campaigns requires matching their workloads; an overall error from one matrix does not establish an improvement over a different matrix.
 
 ## 7. Script Responsibilities
 
-All files below are under `scripts/sim-calibrate/`. There are currently 20 Python files, seven with CLIs. Responsibilities after consolidation belong to the following owners.
+All files below are under `scripts/sim-calibrate/`.
 
 | File | Entry point | Responsibility |
 | --- | --- | --- |
@@ -140,7 +146,7 @@ All files below are under `scripts/sim-calibrate/`. There are currently 20 Pytho
 | [report.py](../../../scripts/sim-calibrate/report.py) | CLI | Standard held-out raw TTFT, error percentiles, required-scope completeness, and explicit recomputation. |
 | `__init__.py` | Package marker | No execution logic. |
 
-`requirements-evidence-proxy.txt` is the installation requirements file. Names such as `test_acceptance.py`, `test_replay.py`, and `test_target_statistics.py` remain in the test suite; they do not imply that production scripts with those names still exist.
+`requirements-evidence-proxy.txt` is the installation requirements file.
 
 ## 8. Campaign Examples
 
@@ -184,7 +190,7 @@ This is a structurally complete configuration template. Replace the angle-bracke
       "runtime": {
         "backend": "vllm", "parallelism": "1", "quantization": "none",
         "scheduler": {
-          "policy": "vllm_v1", "max_num_seqs": 2,
+          "policy": "vllm_v1", "max_num_seqs": 4,
           "max_num_batched_tokens": 8192, "max_model_len": 8192,
           "prefill": {"mode": "whole"}
         },
@@ -212,13 +218,13 @@ This is a structurally complete configuration template. Replace the angle-bracke
   "workload": {
     "matrices": {
       "prefill-train": {
-        "kind": "cold_prefill", "split": "train", "input_tokens": [128, 2048],
+        "kind": "cold_prefill", "split": "train", "input_tokens": [1, 64, 2048],
         "concurrency": 1, "output_tokens": 1, "warmup_repeats": 1, "repeats": 3,
         "arrival": {"mode": "fixed_batch"}
       },
       "decode-train": {
-        "kind": "steady_decode", "split": "train", "concurrency": [1, 2],
-        "num_ctx": [512, 2048], "output_tokens": 16, "warmup_repeats": 1, "repeats": 3,
+        "kind": "steady_decode", "split": "train", "concurrency": [1, 4],
+        "num_ctx": [4, 256, 2048], "output_tokens": 16, "warmup_repeats": 1, "repeats": 3,
         "arrival": {"mode": "fixed_batch"}
       },
       "prefill-heldout": {
@@ -237,7 +243,7 @@ This is a structurally complete configuration template. Replace the angle-bracke
 }
 ```
 
-This configuration expands to six training cells and three held-out cells. For decode, B=2 with num_ctx=1024 means two requests with 512 input tokens each. Axes also accept `{"values":[...]}` or `{"start":...,"stop":...,"step":...}` with an inclusive stop. Decode output length currently accepts only 8 or 16. The actual bench executable's version is read during compilation.
+This configuration expands to nine training cells and three held-out cells. For decode, B=2 with num_ctx=1024 means two requests with 512 input tokens each. The minimum training total context is 4, which is divisible by both training batch sizes, 1 and 4. B=1 with total context 1–3 remains outside the decode surface. A one-token prompt generating only one output token uses the measured prefill knot and needs no decode step; generating further tokens can fail when the first decode step is below the measured domain. Axes also accept `{"values":[...]}` or `{"start":...,"stop":...,"step":...}` with an inclusive stop. Decode output length currently accepts only 8 or 16. The actual bench executable's version is read during compilation.
 
 Save the spec with placeholders replaced to `/tmp/sim-cali-example/campaign.json`, then check compilation from the repository root:
 

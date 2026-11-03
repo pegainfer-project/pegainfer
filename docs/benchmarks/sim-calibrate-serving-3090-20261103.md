@@ -134,17 +134,4 @@ All measured held-out samples are retained without rounding in the companion JSO
 | 3 / 0 | 116.142213 | 3.481703 | 112.660510 | 113.063127 | 0.402617 | 0.3574% |
 | 4 / 0 | 114.731336 | 3.558908 | 111.172428 | 113.063127 | 1.890699 | 1.7007% |
 
-## Artifact interpretation
-
-The companion [sim-calibrate-serving-3090-20261103.json](sim-calibrate-serving-3090-20261103.json) contains curated native report fields, complete matrix coordinates, execution counts, attempt histories, and all held-out request samples. It is a public excerpt, not an artifact bundle and not a replacement for a native reader input. Process bindings, command paths, and machine-local artifact paths are omitted.
-
-Native reports, profiles, calibration documents, and raw bundles remain outside the repository in `sim-calibration-serving-20261103-evidence.tar.gz`, prepared for attachment to the PR. The following paths are relative to the extracted native artifact bundle:
-
-| Job | Native report |
-| --- | --- |
-| qwen3-joint | `qwen3-joint/artifacts/reports/validation.json` |
-| qwen3-cached | `qwen3-cached/artifacts/reports/cached_validation.json` |
-| qwen35-joint | `qwen35-joint/artifacts/reports/validation.json` |
-| qwen35-cached | `qwen35-cached/artifacts/reports/cached_validation.json` |
-
-The excerpt does not compare accuracy with a different historical matrix. This campaign covers a small set of held-out coordinates, with five repeats per cell; its p95/p99 estimates have limited sample support. Large joint TTFT errors remain visible and no accuracy pass is claimed. Short decode contexts below the sampled surface remain outside the functional domain; a rejected request does not terminate serving.
+See the companion [JSON report](sim-calibrate-serving-3090-20261103.json) for the complete matrix, execution statistics, and per-request errors.
