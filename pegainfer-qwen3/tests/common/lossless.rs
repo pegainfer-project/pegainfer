@@ -1,37 +1,62 @@
 //! Greedy losslessness check shared by the speculative gates.
 //!
-//! The verify path runs the prefill attention kernel over the draft span while a
-//! plain decode runs the decode kernel, and the two differ by about one bf16
-//! ULP, so an exact `spec == baseline` match false-fails on a benign tie flip.
-//! At the first divergence the check re-prefills the shared context and accepts
-//! the speculative pick only when it sits within `MARGIN_TOL` of that prefill
-//! argmax.
+//! A speculative run commits most tokens from a verify forward and the rest
+//! from prefill or batched decode, while the plain-decode baseline produces each
+//! position from its own forward. They run in bf16 with different kernels and
+//! GEMM row counts, so where the model's two best tokens sit within a bf16 step
+//! of each other the two forwards can round to opposite winners, and an exact
+//! `spec == baseline` match false-fails. At the first divergence the check reads
+//! the forward row that committed the speculative token from the executor's
+//! commit trace and accepts the divergence only as such a tie: the speculative
+//! token is that row's argmax, the baseline token is its runner up, and the two
+//! forwards' margins between the two tokens differ by at most [`TIE_STEPS`]
+//! bf16 steps at the logit's magnitude.
 
 // Each integration test crate compiles this module independently and uses a
 // different slice of it.
 #![allow(dead_code)]
 
+use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
 use super::harness::EngineHarness;
 use super::harness::Outcome;
+use super::harness::committed_row;
 use super::harness::request;
 
 /// Top-K logprobs requested from the baseline; wide enough that the speculative
 /// pick is in the set on any real tie (a pick outside the top-K is itself a red
 /// flag the gate should catch).
 pub(crate) const LOGPROBS: usize = 20;
-/// Max acceptable regret: how far below the baseline's argmax (in the baseline's
-/// own logprobs) the speculative pick may sit at the divergence point. ~3 bf16
-/// ULP at typical logit magnitudes — mirrors `hf_golden_gate`'s `MARGIN_TOL`.
-pub(crate) const MARGIN_TOL: f32 = 0.20;
+/// Widest disagreement between the two forwards, in bf16 steps at the logit's
+/// magnitude, that still counts as a tie: the committing forward's lead for
+/// the speculative token plus the decode forward's lead for the baseline's.
+/// Over 3769 agreeing positions from every lever configuration of the DFlash
+/// and EAGLE-3 gates, the two forwards' margins between the same two tokens
+/// differed by at most 5 steps, 99.7% of them by 3 or fewer.
+pub(crate) const TIE_STEPS: f32 = 6.0;
 
 /// One decoded position: the chosen token and (when requested) the top-K
 /// `(token, logprob)` distribution that produced it.
 pub(crate) struct Step {
     pub(crate) id: u32,
     pub(crate) top_logprobs: Vec<(u32, f32)>,
+}
+
+/// One request's decoded steps and the id the engine served it under, which
+/// locates the forward rows behind its committed tokens.
+pub(crate) struct Run {
+    pub(crate) id: RequestId,
+    pub(crate) steps: Vec<Step>,
+}
+
+impl std::ops::Deref for Run {
+    type Target = [Step];
+
+    fn deref(&self) -> &[Step] {
+        &self.steps
+    }
 }
 
 /// Fold a finished request's outcome into decoded steps: tokens paired with
@@ -54,54 +79,49 @@ pub(crate) fn to_steps(outcome: Outcome) -> Vec<Step> {
         .collect()
 }
 
+/// [`to_steps`] keeping the request id.
+pub(crate) fn to_run(outcome: Outcome) -> Run {
+    let id = outcome.id;
+    Run {
+        id,
+        steps: to_steps(outcome),
+    }
+}
+
 /// Submit one greedy request and collect the decoded steps until it finishes.
 pub(crate) fn generate(
     engine: &EngineHarness,
     prompt_tokens: Vec<u32>,
     logprobs: usize,
     max_tokens: usize,
-) -> Vec<Step> {
+) -> Run {
     let mut req = request(prompt_tokens, SamplingParams::default(), max_tokens);
     req.logprobs = (logprobs > 0).then_some(logprobs);
-    to_steps(engine.submit(req).expect_finished())
+    to_run(engine.submit(req).expect_finished())
 }
 
-/// Prefill `context` (prompt scoring) and return the next-token distribution the *prefill*
-/// kernel produces — the kernel the speculative verify path also uses. This is
-/// the reference the spec pick should match (vs the plain-decode baseline, whose
-/// kernel resolves bifurcation ties to the other side). Returns the first
-/// generated token's `(id, top_logprobs)`.
-fn prefill_next(engine: &EngineHarness, context: Vec<u32>, logprobs: usize) -> Step {
-    let mut req = request(context, SamplingParams::default(), 1);
-    req.logprobs = (logprobs > 0).then_some(logprobs);
-    req.prompt_logprobs = Some(logprobs);
-    let mut generated = to_steps(engine.submit(req).expect_finished());
-    assert!(
-        !generated.is_empty(),
-        "prompt-scoring prefill finished without a token"
-    );
-    generated.swap_remove(0)
+/// The bf16 step at `logit`'s magnitude: bf16 keeps eight significant bits.
+fn bf16_ulp(logit: f32) -> f32 {
+    (logit.abs().max(f32::MIN_POSITIVE).log2().floor() - 7.0).exp2()
 }
 
-/// Compare one prompt's speculative `spec` steps against its plain-greedy `base`,
-/// tolerating only the benign prefill-vs-decode kernel-gap tie flip (the spec
-/// pick sits within `MARGIN_TOL` of the prefill kernel's own argmax, measured in
-/// the prefill distribution the verify path actually runs). `Ok(())` ⇒ lossless
-/// or a benign tie; `Err(diagnostic)` ⇒ a real spec bug. `engine` must be the
-/// live speculative engine — at a divergence it re-prefills the shared context
-/// (`prompt_tokens` + the matched prefix) to read that prefill-kernel reference.
+/// Compare one prompt's speculative `spec` run against its plain-greedy `base`,
+/// tolerating only a bf16 tie between the forward that committed the
+/// speculative token and the baseline's decode forward. `Ok(())` ⇒ lossless or
+/// a benign tie; `Err(diagnostic)` ⇒ a real spec bug. The commit trace is read
+/// from the engine the harness started last, so the test must have called
+/// `init_capture_logging` before that engine served the run.
 pub(crate) fn check_lossless(
-    engine: &EngineHarness,
     tokenizer: &DynTokenizer,
     i: usize,
     prompt: &str,
     prompt_tokens: &[u32],
     base: &[Step],
-    spec: &[Step],
+    spec: &Run,
 ) -> Result<(), String> {
     let matched = base
         .iter()
-        .zip(spec)
+        .zip(spec.iter())
         .take_while(|(b, s)| b.id == s.id)
         .count();
 
@@ -122,7 +142,7 @@ pub(crate) fn check_lossless(
     }
 
     let spec_id = spec[matched].id;
-    let decode_argmax = base[matched].top_logprobs[0].0;
+    let base_id = base[matched].id;
 
     // Diagnostic: show the exact branch point.
     {
@@ -151,66 +171,55 @@ pub(crate) fn check_lossless(
         );
     }
 
-    // The verify path runs the prefill kernel, so the right reference for the
-    // spec pick is a plain *prefill* of the same shared context — not the
-    // plain-decode baseline, whose kernel resolves a bifurcation tie to the
-    // other side and amplifies the gap.
-    let mut context = prompt_tokens.to_vec();
-    context.extend(base[..matched].iter().map(|s| s.id));
-    let prefill_ref = prefill_next(engine, context, LOGPROBS);
-
-    if prefill_ref.id == spec_id {
-        // Spec faithfully reproduced the prefill-kernel greedy pick; the
-        // divergence is purely the pre-existing prefill-vs-decode kernel gap.
-        let decode_lp = base[matched]
+    let pos = prompt_tokens.len() + matched;
+    let Some(row) = committed_row(spec.id, pos) else {
+        return Err(format!(
+            "prompt {i}: at token {matched} spec chose {spec_id} and the baseline {base_id}, but \
+             the commit trace has no row for position {pos}; call init_capture_logging before \
+             the speculative engine starts"
+        ));
+    };
+    let [(top_id, top_logit), (second_id, second_logit)] = row.top;
+    if top_id != spec_id {
+        return Err(format!(
+            "prompt {i}: at token {matched} spec committed {spec_id}, but the forward that \
+             committed it ranks {top_id} first ({top_logit}) — the commit does not follow its \
+             forward — real spec bug"
+        ));
+    }
+    if second_id != base_id {
+        return Err(format!(
+            "prompt {i}: at token {matched} the baseline chose {base_id}, which is not the \
+             committing forward's runner up ({second_id} at {second_logit}, after {spec_id} at \
+             {top_logit}) — the two forwards disagree beyond a tie — real spec bug"
+        ));
+    }
+    let ulp = bf16_ulp(top_logit);
+    let commit_gap = (top_logit - second_logit) / ulp;
+    let logprob = |token: u32| {
+        base[matched]
             .top_logprobs
             .iter()
-            .find(|(t, _)| *t == spec_id)
-            .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
-        eprintln!(
-            "prompt {i} ({prompt:?}): kernel-gap flip at token {matched} — verify(prefill)→{spec_id}, \
-             decode→{decode_argmax}; spec matches prefill greedy (decode-margin {:?}). Not a spec bug.",
-            decode_lp
-        );
-        return Ok(());
-    }
-
-    // Spec's greedy pick differs from the prefill-kernel argmax too. The verify
-    // path builds its committed KV incrementally across batched speculative
-    // spans while this reference prefill builds it in one shot; the two differ by
-    // a few bf16 ULP. Within MARGIN_TOL of the prefill argmax ⇒ a benign tie
-    // flip; clearly worse ⇒ the verify/accept/capture logic picked a token the
-    // forward never favored — a real bug.
-    let prefill_regret = prefill_ref
-        .top_logprobs
-        .iter()
-        .find(|(t, _)| *t == spec_id)
-        .map(|(_, lp)| prefill_ref.top_logprobs[0].1 - lp);
-
-    if let Some(regret) = prefill_regret {
-        if regret <= MARGIN_TOL {
+            .find(|(t, _)| *t == token)
+            .map(|(_, lp)| *lp)
+    };
+    let decode_gap = logprob(base_id)
+        .zip(logprob(spec_id))
+        .map(|(base_lp, spec_lp)| (base_lp - spec_lp) / ulp);
+    match decode_gap {
+        Some(decode_gap) if commit_gap + decode_gap <= TIE_STEPS => {
             eprintln!(
-                "prompt {i} ({prompt:?}): tie flip at token {matched} — \
-                 verify(prefill)→{}, spec→{spec_id}, decode→{decode_argmax}; \
-                 spec pick is #2 in the prefill distribution (regret {regret:.3} ≤ {MARGIN_TOL}). \
-                 Not a spec bug.",
-                prefill_ref.id,
+                "prompt {i} ({prompt:?}): tie flip at token {matched} — committing forward→{spec_id} \
+                 by {commit_gap:.1} steps, decode→{base_id} by {decode_gap:.1} steps (one step = \
+                 {ulp} at logit {top_logit}). Not a spec bug."
             );
-            return Ok(());
+            Ok(())
         }
+        _ => Err(format!(
+            "prompt {i}: at token {matched} spec chose {spec_id} by {commit_gap:.1} steps in the \
+             forward that committed it and the baseline chose {base_id} by {decode_gap:?} steps \
+             (one step = {ulp} at logit {top_logit}, tie band {TIE_STEPS} steps in all) — real \
+             spec bug"
+        )),
     }
-
-    // Either the spec pick is outside the prefill top-K entirely, or it sits
-    // clearly below the prefill argmax — neither is a benign tie.
-    let decode_regret = base[matched]
-        .top_logprobs
-        .iter()
-        .find(|(t, _)| *t == spec_id)
-        .map(|(_, lp)| base[matched].top_logprobs[0].1 - lp);
-    Err(format!(
-        "prompt {i}: at token {matched} spec chose {spec_id} but prefill greedy says {} and \
-         decode greedy says {decode_argmax} (spec regret in prefill dist: {prefill_regret:?} > \
-         {MARGIN_TOL}; in decode dist: {decode_regret:?}) — real spec bug",
-        prefill_ref.id,
-    ))
 }

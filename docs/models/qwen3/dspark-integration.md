@@ -20,8 +20,8 @@ cargo test --release -p pegainfer-qwen3 --test dflash_speculative_gate
 #   one into a failure instead of a green skip, so always set it when the run
 #   is meant to be evidence. See the test's own doc for what it does and does
 #   not prove.
-#   The "kernel-gap flip … Not a spec bug" diagnostics are the pre-existing
-#   DFlash prefill/decode numeric gap, unrelated.
+#   The "tie flip … Not a spec bug" diagnostics are bf16 ties between the
+#   committing forward and the baseline's decode, unrelated.
 ```
 
 What was actually built (the new DSpark code lives in its own module `pegainfer-qwen3/src/dspark.rs`):
