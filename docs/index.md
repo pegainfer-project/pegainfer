@@ -238,6 +238,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `benchmarks/sim-calibrate-serving-3090-20261103.md` | Current-code two-model calibration on two RTX 3090s: 38 cells, four verified held-out reports, short-input training points, native error excerpts; accuracy remains not_assessed. |
 | `benchmarks/qwen3-4b-spec-decode-l20.md` | Qwen3-4B speculative-decode gate and draft trim on one L20 (2026-10): spec-off crossover **c32 (DFlash block7) / c64 (DSpark block7)**, the load gate is worth **+46.6 %** at c64 and is a no-op below its threshold, and the trim's sign flips with concurrency — **the optimal verify span shrinks as the batch grows**. |
 | `benchmarks/k3-ep4-decode-profile.md` | K3 EP4 93-layer decode step profile (MegaMoE, GB300, 2026-08): 52% backbone B=1 dense GEMM at ~50% of SOL (cuBLASLt splitK), 20% fused MoE, 5% a mis-tuned router top-k; not launch-bound. Levers: near-SOL dense GEMV (~10 ms) + router fix (~2 ms) project ~50 → ~30 ms/step; FP8 backbone is the structural next step. |
 | `benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` | DeepSeek-V2-Lite EP2 2026-06-28 snapshot: PegaInfer host-staged/NCCL passed correctness, direct diagnostics, HTTP pressure, and trace rows; stock vLLM TP2/TP2+EP2 are retained as FlashInfer SM120/CUDA 12.8 setup failures, with a separate FlashInfer-fixed vLLM validation and no parity claim. |
