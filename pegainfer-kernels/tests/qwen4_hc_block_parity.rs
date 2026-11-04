@@ -63,16 +63,11 @@ use std::fmt::Write as _;
 use anyhow::Result;
 use anyhow::anyhow;
 use half::bf16;
-use pegainfer_kernels::ops::HC_SCATTER_BROADCAST;
-use pegainfer_kernels::ops::HC_SCATTER_PRODUCTION;
-use pegainfer_kernels::ops::HC_SCATTER_SCALE_STREAM;
-use pegainfer_kernels::ops::HC_SCATTER_SINGLE_ROUNDING;
 use pegainfer_kernels::ops::HcMixScratch;
 use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::hc_mix_into;
 use pegainfer_kernels::ops::hc_mul_branch_combine_into;
 use pegainfer_kernels::ops::hc_scatter_add_into;
-use pegainfer_kernels::ops::hc_scatter_add_variant_into;
 use pegainfer_kernels::ops::hc_sigmoid_affine_into;
 use pegainfer_kernels::ops::hc_silu_scaled_into;
 use pegainfer_kernels::ops::rms_norm_batch_into;
@@ -968,25 +963,18 @@ fn negative_plain_weight_norm_fails() {
 
 // ── the scatter half ──────────────────────────────────────────────────────
 
-/// Run one scatter step through the production entry (or a gate variant) and
-/// return the written stream.
+/// Run one scatter step and return the written stream.
 fn scatter_step(
     ctx: &DeviceContext,
     hyper: &HiddenStates,
     sublayer: &[bf16],
     inject: &[bf16],
     rows: usize,
-    variant: i32,
 ) -> Vec<bf16> {
     let x = HiddenStates::from_host(ctx, sublayer, HIDDEN, rows).expect("scatter sublayer");
     let inj = HiddenStates::from_host(ctx, inject, HC_COUNT, rows).expect("scatter inject");
     let mut out = HiddenStates::zeros(ctx, STREAM, rows).expect("scatter output");
-    let launched = if variant == HC_SCATTER_PRODUCTION {
-        hc_scatter_add_into(ctx, &x, &inj, hyper, &mut out)
-    } else {
-        hc_scatter_add_variant_into(ctx, &x, &inj, hyper, &mut out, variant)
-    };
-    launched.expect("scatter launch");
+    hc_scatter_add_into(ctx, &x, &inj, hyper, &mut out).expect("scatter launch");
     ctx.sync().expect("scatter sync");
     ctx.stream.clone_dtoh(&out.data).expect("scatter download")
 }
@@ -1014,7 +1002,6 @@ fn hyper_connection_scatter_matches_golden() {
             &scatter.attn_sublayer,
             &scatter.attn_inject,
             case.rows,
-            HC_SCATTER_PRODUCTION,
         );
         let diffs = count_bit_diffs(&attn, &scatter.attn_out);
         println!(
@@ -1036,7 +1023,6 @@ fn hyper_connection_scatter_matches_golden() {
             &scatter.mlp_sublayer,
             &scatter.mlp_inject,
             case.rows,
-            HC_SCATTER_PRODUCTION,
         );
         let diffs = count_bit_diffs(&mlp, &scatter.mlp_out);
         println!(
@@ -1052,49 +1038,16 @@ fn hyper_connection_scatter_matches_golden() {
     }
 }
 
-/// Every gate variant must move the recorded stream, and so must a caller that
-/// reads the wrong step's injection weights. A control that left the stream
-/// alone would not be testing the rounding or the per-branch mapping.
+/// A caller that reads the wrong step's injection weights must move the
+/// recorded stream: a control that left it alone would not be testing the
+/// per-branch mapping. The floor is the fraction measured on this box (~98% of
+/// elements), set well below it so the control cannot pass on a few stray bits.
 #[test]
 fn scatter_negative_controls_fail() {
     let Some(harness) = harness() else {
         return;
     };
     for (case, scatter) in harness.cases.iter().zip(&harness.scatter) {
-        let hyper = harness.upload_stream(case);
-        // Floors are fractions of the recorded stream, measured on this box:
-        // one rounding moves ~24% of elements, scaling the stream ~99.9%,
-        // broadcasting branch 0 ~70%, and the wrong step's weights ~98%. The
-        // floors sit below those with margin, so a control that stopped
-        // reaching the arithmetic cannot pass on a few stray bits.
-        for (name, variant, floor) in [
-            ("one rounding", HC_SCATTER_SINGLE_ROUNDING, 0.10),
-            ("scale the stream", HC_SCATTER_SCALE_STREAM, 0.90),
-            ("broadcast branch 0", HC_SCATTER_BROADCAST, 0.50),
-        ] {
-            let got = scatter_step(
-                &harness.ctx,
-                &hyper,
-                &scatter.attn_sublayer,
-                &scatter.attn_inject,
-                case.rows,
-                variant,
-            );
-            let diffs = count_bit_diffs(&got, &scatter.attn_out);
-            println!(
-                "case {} {name}: {diffs} of {} elements differ",
-                case.index,
-                got.len()
-            );
-            let fraction = diffs as f64 / got.len() as f64;
-            assert!(
-                fraction >= floor,
-                "case {}: the {name} control moved {diffs} of {} elements, below the {floor} floor",
-                case.index,
-                got.len()
-            );
-        }
-
         // The MLP step reads the MLP head's weights; feeding it the attention
         // head's is a data-level error the kernel cannot detect.
         let base = HiddenStates::from_host(&harness.ctx, &scatter.attn_out, STREAM, case.rows)
@@ -1105,7 +1058,6 @@ fn scatter_negative_controls_fail() {
             &scatter.mlp_sublayer,
             &scatter.attn_inject,
             case.rows,
-            HC_SCATTER_PRODUCTION,
         );
         let diffs = count_bit_diffs(&got, &scatter.mlp_out);
         println!(
@@ -1123,9 +1075,9 @@ fn scatter_negative_controls_fail() {
     }
 }
 
-/// Shape and variant refusals happen before any launch.
+/// Shape refusals happen before any launch.
 #[test]
-fn scatter_refuses_bad_shapes_and_variants() {
+fn scatter_refuses_bad_shapes() {
     let Some(harness) = harness() else {
         return;
     };
@@ -1137,11 +1089,6 @@ fn scatter_refuses_bad_shapes_and_variants() {
     let inject = HiddenStates::from_host(&harness.ctx, &scatter.attn_inject, HC_COUNT, case.rows)
         .expect("inject");
     let mut out = HiddenStates::zeros(&harness.ctx, STREAM, case.rows).expect("output");
-
-    assert!(
-        hc_scatter_add_variant_into(&harness.ctx, &x, &inject, &hyper, &mut out, 4).is_err(),
-        "an unknown variant must be refused"
-    );
 
     let short_rows = case.rows - 1;
     let short = HiddenStates::from_host(
@@ -1227,7 +1174,6 @@ fn hyper_connection_block_chain_matches_golden() {
             &scatter.attn_sublayer,
             &inject_got,
             case.rows,
-            HC_SCATTER_PRODUCTION,
         );
         let d = diff(&f32_of(&out), &f32_of(&scatter.attn_out));
         println!(

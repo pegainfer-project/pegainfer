@@ -110,8 +110,6 @@ unsafe extern "C" {
     /// Scatter a sublayer output back into the `branches * hidden` stream:
     /// `out[s, b*hidden + h] = bf16(hyper[s, b*hidden + h] +
     /// bf16(f32(x[s, h]) * f32(inject[s, b])))`. `out` may alias `hyper`.
-    /// `variant` 0 is production; the other values are the gate's negative
-    /// controls and are refused outside `0..=3`.
     pub fn qwen4_hc_scatter_cuda(
         x: *const Half,
         inject: *const Half,
@@ -120,7 +118,6 @@ unsafe extern "C" {
         rows: i32,
         hidden: i32,
         branches: i32,
-        variant: i32,
         stream: CUstream,
     ) -> CUresult;
 }

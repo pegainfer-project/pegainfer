@@ -235,14 +235,6 @@ pub use norm::rms_norm_rows_into;
 // "hc" is the Qwen4 hyper-connection block (`Qwen4ExpTextGatedResidual`); the
 // three ops are its elementwise tail — see `ops/qwen4.rs`.
 #[cfg(feature = "qwen4")]
-pub use qwen4::HC_SCATTER_BROADCAST;
-#[cfg(feature = "qwen4")]
-pub use qwen4::HC_SCATTER_PRODUCTION;
-#[cfg(feature = "qwen4")]
-pub use qwen4::HC_SCATTER_SCALE_STREAM;
-#[cfg(feature = "qwen4")]
-pub use qwen4::HC_SCATTER_SINGLE_ROUNDING;
-#[cfg(feature = "qwen4")]
 pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_mix_into;
@@ -250,8 +242,6 @@ pub use qwen4::hc_mix_into;
 pub use qwen4::hc_mul_branch_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_scatter_add_into;
-#[cfg(feature = "qwen4")]
-pub use qwen4::hc_scatter_add_variant_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_sigmoid_affine_into;
 #[cfg(feature = "qwen4")]

@@ -515,16 +515,6 @@ pub fn hc_mul_branch_combine_into(
     launch(result, "mul_branch_combine")
 }
 
-/// `HC_SCATTER_*` variants are gate-only mutations of the same launch;
-/// production always passes [`HC_SCATTER_PRODUCTION`].
-pub const HC_SCATTER_PRODUCTION: i32 = 0;
-/// One rounding instead of the reference's two.
-pub const HC_SCATTER_SINGLE_ROUNDING: i32 = 1;
-/// Scale the stream instead of the sublayer output.
-pub const HC_SCATTER_SCALE_STREAM: i32 = 2;
-/// Broadcast branch 0's injection weight to every branch.
-pub const HC_SCATTER_BROADCAST: i32 = 3;
-
 /// Scatter a sublayer output back into the hyper-connection stream:
 ///
 /// ```text
@@ -536,8 +526,6 @@ pub const HC_SCATTER_BROADCAST: i32 = 3;
 /// `[rows, branches * HIDDEN]`. The two bf16 roundings are the reference's two
 /// elementwise ops (`out * inject`, then `hyper_input + ...`). `out` may alias
 /// `hyper`: every element reads its own base before writing it.
-///
-/// This is [`hc_scatter_add_variant_into`] with [`HC_SCATTER_PRODUCTION`].
 pub fn hc_scatter_add_into(
     ctx: &DeviceContext,
     x: &HiddenStates,
@@ -545,26 +533,6 @@ pub fn hc_scatter_add_into(
     hyper: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    hc_scatter_add_variant_into(ctx, x, inject, hyper, out, HC_SCATTER_PRODUCTION)
-}
-
-/// [`hc_scatter_add_into`] with the parity gate's mutation knob.
-///
-/// `variant` is [`HC_SCATTER_PRODUCTION`] in production; the other
-/// `HC_SCATTER_*` values run the same launch with one step wrong and are
-/// refused outside `0..=3`.
-pub fn hc_scatter_add_variant_into(
-    ctx: &DeviceContext,
-    x: &HiddenStates,
-    inject: &HiddenStates,
-    hyper: &HiddenStates,
-    out: &mut HiddenStates,
-    variant: i32,
-) -> Result<()> {
-    ensure!(
-        (0..=HC_SCATTER_BROADCAST).contains(&variant),
-        "hyper-connection scatter variant {variant} is not one of 0..=3"
-    );
     ensure!(
         x.seq_len == inject.seq_len && x.seq_len == hyper.seq_len && x.seq_len == out.seq_len,
         "hyper-connection scatter rows differ: x {}, inject {}, hyper {}, out {}",
@@ -606,7 +574,6 @@ pub fn hc_scatter_add_variant_into(
             rows,
             hidden,
             branches,
-            variant,
             active_cu_stream(ctx),
         )
     };
@@ -699,10 +666,6 @@ pub fn hc_mix_into(
         branches,
         hyper.hidden_dim
     );
-    ensure!(
-        rms_eps.is_finite() && rms_eps > 0.0,
-        "hyper-connection mix: eps {rms_eps} is not positive"
-    );
     // The reference divides by `hc_count` in bf16 on both the mix path and the
     // injection head. Both folds here multiply by `1 / branches` instead; that
     // is the same value only where the division is exact, i.e. for a
@@ -712,6 +675,10 @@ pub fn hc_mix_into(
         branches.is_power_of_two(),
         "hyper-connection mix: {branches} branches is not a power of two, so the folded \
          1/branches scale is not the reference's exact bf16 division"
+    );
+    ensure!(
+        rms_eps.is_finite() && rms_eps > 0.0,
+        "hyper-connection mix: eps {rms_eps} is not positive"
     );
     let hidden = hyper.hidden_dim / branches;
     let rows = hyper.seq_len;
