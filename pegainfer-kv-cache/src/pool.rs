@@ -1,27 +1,15 @@
-use std::sync::Arc;
-
 use dynamo_kv_hashing::compute_salt_hash;
-use kvbm_logical::KvbmSequenceHashProvider;
 use kvbm_logical::SequenceHash;
 use kvbm_logical::blocks::ImmutableBlock;
 use kvbm_logical::blocks::MutableBlock;
-use kvbm_logical::events::EventsManager;
-use kvbm_logical::events::KvCacheEvent;
 use kvbm_logical::integrations::DecodeOutcome;
 use kvbm_logical::integrations::SchedulableSequence;
 use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
-use tokio::sync::broadcast;
 
 use crate::view::KvView;
-
-/// Broadcast capacity for the opt-in KV-event feed. Generous: the scheduler
-/// drains it every step, but a step can register/evict many blocks, and a
-/// dropped event silently desyncs the router's prefix tree. Only allocated on
-/// the [`BlockPool::with_events`] path.
-const KV_EVENT_CHANNEL_CAPACITY: usize = 65_536;
 
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
@@ -36,44 +24,12 @@ pub struct BlockPool {
 
 impl BlockPool {
     pub fn new(block_size: usize, num_blocks: usize) -> anyhow::Result<Self> {
-        Self::build(block_size, num_blocks, BlockRegistry::builder().build())
-    }
-
-    /// Like [`new`](Self::new), but the pool also emits block store/remove
-    /// events for an out-of-band cache-aware router, returned as a raw broadcast
-    /// receiver to drain synchronously. The stream carries `Create` events too
-    /// (the emission policy can't separate them) — the consumer ignores `Create`
-    /// and sources richer store events from the seal site, and maps the lineage
-    /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
-    /// default: plain single-machine serving uses [`new`](Self::new) and pays
-    /// neither the per-block event attachment nor the channel.
-    pub(crate) fn with_events(
-        block_size: usize,
-        num_blocks: usize,
-    ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
-        // Default emission policy is AllEventsPolicy (every block tracked).
-        let events = Arc::new(
-            EventsManager::builder()
-                .channel_capacity(KV_EVENT_CHANNEL_CAPACITY)
-                .build(),
-        );
-        let rx = events.subscribe_receiver();
-        let registry = BlockRegistry::builder().event_manager(events).build();
-        let pool = Self::build(block_size, num_blocks, registry)?;
-        Ok((pool, rx))
-    }
-
-    fn build(
-        block_size: usize,
-        num_blocks: usize,
-        registry: BlockRegistry,
-    ) -> anyhow::Result<Self> {
         anyhow::ensure!(num_blocks >= 2, "need at least 2 blocks (1 for padding)");
 
         let block_manager = BlockManager::builder()
             .block_count(num_blocks)
             .block_size(block_size)
-            .registry(registry)
+            .registry(BlockRegistry::builder().build())
             .duplication_policy(BlockDuplicationPolicy::Allow)
             .with_lru_backend()
             .build()
@@ -180,10 +136,7 @@ impl BlockPool {
             None,
             Some(salt_hash),
         );
-        RequestKv {
-            seq,
-            emitted_blocks: 0,
-        }
+        RequestKv { seq }
     }
 
     // ── KV-offload prefetch (CPU-tier load before prefill) ─────────────
@@ -378,13 +331,6 @@ impl LoadReservation {
 /// loop (`revert_schedule` undoes a reservation whose step failed).
 pub struct RequestKv {
     seq: SchedulableSequence<()>,
-    /// Cursor for [`Self::take_newly_registered_blocks`]: how many of this
-    /// request's sequence blocks have already been surfaced as KV-router store
-    /// events. Starts past the prefix-cache hit (those were stored by whoever
-    /// first sealed them — this assumes GPU-resident reuse, i.e. KV offload off,
-    /// which holds wherever the event feed is enabled). Untouched on the plain
-    /// path where the feed is off.
-    emitted_blocks: usize,
 }
 
 impl RequestKv {
@@ -415,10 +361,6 @@ impl RequestKv {
             .seq
             .match_and_add_prefix_up_to(&pool.block_manager, max_blocks)
             .map_err(|e| anyhow::anyhow!("match_and_add_prefix_up_to: {e}"))?;
-        // Prefix-hit blocks are already in the router's tree (whoever first
-        // sealed them stored them, and a GPU hit means they were never evicted),
-        // so the store-event cursor skips them.
-        self.emitted_blocks = self.seq.assigned_blocks();
         Ok(blocks * self.seq.block_size())
     }
 
@@ -684,52 +626,6 @@ impl RequestKv {
     pub fn prefix_matched_blocks(&self) -> usize {
         self.seq.inner().prefix_matched_blocks()
     }
-
-    /// Blocks this request has registered (made cacheable) since the last call,
-    /// in the u64 hash space a KV-router consumes plus the kvbm lineage hash.
-    ///
-    /// A block becomes reusable by other requests once it is *registered*
-    /// (assigned an `ImmutableBlock`), which lags sealing the token block by a
-    /// step. Diffs the registered count against an internal cursor and returns
-    /// the new run in sequence order; prefix-cache hits are skipped (see
-    /// [`Self::emitted_blocks`]). Empty when nothing new registered this step.
-    pub fn take_newly_registered_blocks(&mut self) -> Vec<RegisteredBlock> {
-        let registered = self.seq.assigned_blocks();
-        if registered <= self.emitted_blocks {
-            return Vec::new();
-        }
-        let blocks = self.seq.inner().sequence().blocks();
-        debug_assert!(
-            registered <= blocks.len(),
-            "registered blocks ({registered}) exceed sealed token blocks ({})",
-            blocks.len()
-        );
-        let new = blocks[self.emitted_blocks..registered]
-            .iter()
-            .map(|b| RegisteredBlock {
-                plh: b.kvbm_sequence_hash().as_u128(),
-                sequence_hash: b.sequence_hash(),
-                tokens_hash: b.block_hash(),
-                parent_sequence_hash: b.parent_sequence_hash(),
-            })
-            .collect();
-        self.emitted_blocks = registered;
-        new
-    }
-}
-
-/// One full KV block a request just registered, ready to become a KV-router
-/// store event. `sequence_hash`/`tokens_hash`/`parent_sequence_hash` are the
-/// router's u64 hashes (`dynamo_tokens::TokenBlock` accessors, identical by
-/// construction to what the router recomputes); `plh` is the engine's 128-bit
-/// lineage hash, kept only to correlate an eviction event (which carries the
-/// lineage hash) back to `sequence_hash`.
-#[derive(Clone, Copy, Debug)]
-pub struct RegisteredBlock {
-    pub plh: u128,
-    pub sequence_hash: u64,
-    pub tokens_hash: u64,
-    pub parent_sequence_hash: Option<u64>,
 }
 
 /// Pack a kvbm [`SequenceHash`] (lineage hash) into the 16-byte content key the

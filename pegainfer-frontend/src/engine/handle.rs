@@ -142,12 +142,6 @@ impl EngineHandle {
         self.kv_capacity
     }
 
-    #[must_use]
-    pub fn with_metrics_watch(mut self, metrics_watch: watch::Receiver<SchedulerMetrics>) -> Self {
-        self.metrics_watches = vec![Some(metrics_watch)];
-        self
-    }
-
     /// Attach one load feed per logical scheduler partition.
     ///
     /// The vector is also the engine's frontend-visible DP topology, so an

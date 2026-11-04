@@ -437,8 +437,8 @@ impl SteppedEngineBridge {
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             // Keep the legacy SamplingParams lowering unchanged for stepped
-            // producers that have not migrated to StopPolicy. Qwen3 uses the
-            // independent policy below for stop classification.
+            // producers that have not migrated to StopPolicy; the others
+            // classify stops with the independent policy below.
             params: convert_sampling(&sampling_params),
             history_tokens,
             history_marks,

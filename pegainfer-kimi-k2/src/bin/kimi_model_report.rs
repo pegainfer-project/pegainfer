@@ -9,7 +9,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
-use clap::ValueEnum;
 use pegainfer_bench::Accum;
 use pegainfer_bench::CallSiteRow;
 use pegainfer_bench::RollupRow;
@@ -24,7 +23,6 @@ use pegainfer_kimi_k2::batch_decode_trace::PHASE_DECODE;
 use pegainfer_kimi_k2::batch_decode_trace::TP_WORLD_SIZE;
 use pegainfer_kimi_k2::batch_decode_trace::normalize_call_site;
 use pegainfer_kimi_k2::batch_decode_trace::trace_decode_kernel_calls;
-use pegainfer_kimi_k2::batch_decode_trace::trace_runtime_decode_kernel_calls;
 use pegainfer_kimi_k2::kernel_report::LatencyStats;
 use pegainfer_kimi_k2::kernel_report::MeasuredCall;
 use pegainfer_kimi_k2::kernel_report::bench_key;
@@ -47,16 +45,6 @@ struct Cli {
     out: Option<PathBuf>,
     #[arg(long, default_value_t = DEFAULT_ITERS)]
     iters: u64,
-    #[arg(long, default_value = "models/Kimi-K2.5")]
-    model_path: String,
-    #[arg(long, value_enum, default_value_t = TraceSource::Runtime)]
-    source: TraceSource,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum TraceSource {
-    Runtime,
-    Static,
 }
 
 #[derive(Serialize)]
@@ -133,16 +121,9 @@ fn main() -> Result<()> {
         bail!("--format must be `text` or `json`");
     }
 
-    let schedule = load_schedule(cli.source, &cli.model_path, cli.batch_size, cli.kv_len)?;
+    let schedule = trace_decode_kernel_calls(cli.batch_size, cli.kv_len)?;
     let catalog = measure_catalog(&schedule, cli.iters)?;
-    let report = compose_report(
-        cli.batch_size,
-        cli.kv_len,
-        cli.iters,
-        cli.source,
-        schedule,
-        &catalog,
-    )?;
+    let report = compose_report(cli.batch_size, cli.kv_len, cli.iters, schedule, &catalog)?;
     let out = cli.out.unwrap_or_else(|| {
         PathBuf::from(format!(
             "target/model_reports/{MODEL}/decode-rank0-bs{}-kv{}.json",
@@ -176,7 +157,6 @@ fn compose_report(
     batch_size: usize,
     kv_len: usize,
     iters: u64,
-    source: TraceSource,
     schedule: Vec<KernelCall>,
     catalog: &HashMap<String, BenchEntry>,
 ) -> Result<ModelReport> {
@@ -270,15 +250,8 @@ fn compose_report(
             ep_world_size: KIMI_K2_EP_WORLD,
             iters,
         },
-        schedule_source: match source {
-            TraceSource::Runtime => {
-                "Kimi runner decode trace via EngineHandle/worker; no HTTP".to_string()
-            }
-            TraceSource::Static => {
-                "Kimi runner worker decode DAG mirror; no HTTP, no prompt/prefill window"
-                    .to_string()
-            }
-        },
+        schedule_source:
+            "Kimi runner worker decode DAG mirror; no HTTP, no prompt/prefill window".to_string(),
         total_schedule_calls: schedule.len(),
         measured_schedule_calls,
         missing_schedule_calls,
@@ -290,18 +263,6 @@ fn compose_report(
         missing_by_op,
         coverage: coverage.into_values().collect(),
     })
-}
-
-fn load_schedule(
-    source: TraceSource,
-    model_path: &str,
-    batch_size: usize,
-    kv_len: usize,
-) -> Result<Vec<KernelCall>> {
-    match source {
-        TraceSource::Runtime => trace_runtime_decode_kernel_calls(model_path, batch_size, kv_len),
-        TraceSource::Static => trace_decode_kernel_calls(model_path, batch_size, kv_len),
-    }
 }
 
 fn write_json_report(path: &Path, report: &ModelReport) -> Result<()> {

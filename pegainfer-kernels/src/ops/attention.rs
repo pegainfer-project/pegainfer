@@ -744,7 +744,7 @@ pub fn prefill_attention_paged_into(
         );
         if result != 0 {
             anyhow::bail!(
-                "batch_prefill_paged_cuda failed for layer {layer} with error {result}{}",
+                "batch_prefill_paged_cuda_with_cta_tile_q failed for layer {layer} with error {result}{}",
                 crate::ops::ffi_exception_message(result)
             );
         }
@@ -1148,70 +1148,6 @@ pub fn single_decode_nhd_into(
     if result != 0 {
         anyhow::bail!(
             "single_decode_nhd_cuda failed with error {result}{}",
-            crate::ops::ffi_exception_message(result)
-        );
-    }
-    Ok(())
-}
-
-/// Causal NHD single-sequence prefill. Used for EAGLE-3's
-/// teacher-forced prefill in a single batched forward.
-#[allow(clippy::too_many_arguments)]
-pub fn single_prefill_nhd_causal_into(
-    ctx: &DeviceContext,
-    q: &HiddenStates,
-    row_offset: usize,
-    q_seq_len: usize,
-    k_cache: &HiddenStates,
-    v_cache: &HiddenStates,
-    output: &mut HiddenStates,
-    num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-    kv_len: usize,
-) -> Result<()> {
-    assert_eq!(q.hidden_dim, num_q_heads * head_dim);
-    assert_eq!(output.hidden_dim, q.hidden_dim);
-    assert_eq!(output.seq_len, q.seq_len);
-    assert_eq!(k_cache.hidden_dim, num_kv_heads * head_dim);
-    assert_eq!(v_cache.hidden_dim, k_cache.hidden_dim);
-    assert_eq!(v_cache.seq_len, k_cache.seq_len);
-    assert!(kv_len <= k_cache.seq_len);
-    assert!(
-        q_seq_len <= kv_len,
-        "causal prefill q_seq_len {q_seq_len} exceeds kv_len {kv_len}"
-    );
-    // Validate the row window with checked arithmetic and every backing
-    // allocation before deriving pointers; `q`/`output` share the row sub-range.
-    let byte_offset = checked_row_offset(q, row_offset, q_seq_len, "single_prefill_causal q")?;
-    output.checked_extent("single_prefill_causal output")?;
-    k_cache.checked_extent("single_prefill_causal k_cache")?;
-    v_cache.checked_extent("single_prefill_causal v_cache")?;
-    let (q_ptr, _gq) = q.data.device_ptr(&ctx.stream);
-    let q_ptr = q_ptr + byte_offset;
-    let (k_ptr, _gk) = k_cache.data.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = v_cache.data.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let out_ptr = out_ptr + byte_offset;
-    let result = unsafe {
-        ffi::single_prefill_nhd_causal_cuda(
-            q_ptr as *const ffi::Half,
-            out_ptr as *mut ffi::Half,
-            k_ptr as *const ffi::Half,
-            v_ptr as *const ffi::Half,
-            num_q_heads as i32,
-            num_kv_heads as i32,
-            head_dim as i32,
-            q_seq_len as i32,
-            kv_len as i32,
-            k_cache.seq_len as i32,
-            1.0f32 / (head_dim as f32).sqrt(),
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    if result != 0 {
-        anyhow::bail!(
-            "single_prefill_nhd_causal_cuda failed with error {result}{}",
             crate::ops::ffi_exception_message(result)
         );
     }

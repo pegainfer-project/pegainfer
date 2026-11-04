@@ -225,6 +225,7 @@ pub(crate) struct Glm52EngineSpec {
 /// One logical DP rank's autonomous engine. Owns its workers — and its
 /// offload engines: they hold the shared pegaflow host, which must outlive
 /// every in-flight save and dies with the engine.
+#[allow(clippy::struct_excessive_bools)] // independent engine flags, not a state machine
 pub(crate) struct Glm52Engine {
     rank: usize,
     submit_rx: mpsc::UnboundedReceiver<SubmittedRequest>,
@@ -285,30 +286,15 @@ pub(crate) struct Glm52Engine {
 }
 
 impl Glm52Engine {
-    /// Spawn the engine's thread. The KV pool is built inside the thread:
-    /// its sizing arithmetic is the one fallible construction step, and a
-    /// failure must still report on `startup_tx` and let the spec's drop
-    /// shut this rank's workers down (each worker's own Drop sends Shutdown
-    /// and joins — the destroy barrier pairs once the launcher tears the
-    /// fleet down on the failed report).
+    /// Spawn the engine's thread.
     pub(crate) fn spawn(spec: Glm52EngineSpec) -> std::io::Result<std::thread::JoinHandle<()>> {
         let rank = spec.rank;
         std::thread::Builder::new()
             .name(format!("glm52-engine-{rank}"))
-            .spawn(move || {
-                let startup_tx = spec.startup_tx.clone();
-                match Glm52Engine::new(spec) {
-                    Ok(engine) => engine.run(),
-                    Err(err) => {
-                        let _ = startup_tx.send(Err(
-                            err.context(format!("GLM5.2 rank {rank} KV pool construction"))
-                        ));
-                    }
-                }
-            })
+            .spawn(move || Glm52Engine::new(spec).run())
     }
 
-    fn new(spec: Glm52EngineSpec) -> anyhow::Result<Self> {
+    fn new(spec: Glm52EngineSpec) -> Self {
         let mirrored = spec.moe_topo.uses_tensor_replicated_moe();
         debug_assert_eq!(
             spec.workers.len(),
@@ -339,7 +325,7 @@ impl Glm52Engine {
         // other three ranks (the H2D lands on one rank's arena) — GPU radix
         // hits have neither problem, so plain prefix matching stays on.
         let (ready_tx, ready_rx) = mpsc::unbounded_channel();
-        Ok(Self {
+        Self {
             rank: spec.rank,
             submit_rx: spec.submit_rx,
             workers: spec.workers,
@@ -374,7 +360,7 @@ impl Glm52Engine {
             deferred_releases: Vec::new(),
             sample_step: 0,
             channel_open: true,
-        })
+        }
     }
 
     fn run(mut self) {
@@ -666,8 +652,8 @@ impl Glm52Engine {
         let salt = (self.prefill_chunk_size.is_some() && self.drafter.is_mtp())
             .then(native_mtp_cache_salt);
         self.runtime.spawn(async move {
-            let resolved = match native {
-                Some(handoff) => match handoff.anchor_token_id {
+            let resolved = if let Some(handoff) = native {
+                match handoff.anchor_token_id {
                     // P consumed EOS: nothing to restore or decode — the
                     // anchored finish happens at admission, no resolve runs.
                     None => offload::Resolved::Native {
@@ -697,32 +683,30 @@ impl Glm52Engine {
                             },
                         }
                     }
-                },
-                None => {
-                    let mut scope = pegainfer_kv_store::CacheScope::default();
-                    if let Some(salt) = salt {
-                        scope = scope.cache_salt(salt);
-                    }
-                    let req_id_owned;
-                    let req_id = match req.request_id.as_deref() {
-                        Some(id) => id,
-                        None => {
-                            req_id_owned = anon_resolve_key("glm52", rank);
-                            &req_id_owned
-                        }
-                    };
-                    let prefix = store
-                        .resolve_prefix(
-                            rank,
-                            req_id,
-                            &req.prompt_tokens,
-                            scope,
-                            pegainfer_kv_store::ResolvePolicy::default(),
-                            &req.token_tx,
-                        )
-                        .await;
-                    offload::Resolved::Plain { req, prefix }
                 }
+            } else {
+                let mut scope = pegainfer_kv_store::CacheScope::default();
+                if let Some(salt) = salt {
+                    scope = scope.cache_salt(salt);
+                }
+                let req_id_owned;
+                let req_id = if let Some(id) = req.request_id.as_deref() {
+                    id
+                } else {
+                    req_id_owned = anon_resolve_key("glm52", rank);
+                    &req_id_owned
+                };
+                let prefix = store
+                    .resolve_prefix(
+                        rank,
+                        req_id,
+                        &req.prompt_tokens,
+                        scope,
+                        pegainfer_kv_store::ResolvePolicy::default(),
+                        &req.token_tx,
+                    )
+                    .await;
+                offload::Resolved::Plain { req, prefix }
             };
             // The engine counts this send via `resolves_inflight`; if the
             // receiver is gone the engine already exited and the request's
@@ -903,7 +887,7 @@ impl Glm52Engine {
         let mut responses = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             responses.push(worker.step_async(
-                inputs,
+                &inputs,
                 *shape,
                 kv.clone(),
                 flags,

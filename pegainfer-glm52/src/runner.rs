@@ -424,7 +424,7 @@ impl Glm52RankWorker {
 
     pub(crate) fn step_async(
         &self,
-        inputs: [(u32, usize); GLM52_MAX_STEP_ROWS],
+        inputs: &[(u32, usize); GLM52_MAX_STEP_ROWS],
         shape: Glm52StepShape,
         kv: Glm52StepKv,
         flags: Glm52StepFlags,
@@ -434,7 +434,7 @@ impl Glm52RankWorker {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::Step {
-                inputs: Box::new(inputs),
+                inputs: Box::new(*inputs),
                 shape,
                 kv: Box::new(kv),
                 flags,
@@ -718,7 +718,7 @@ impl Glm52RankThreadState {
         &mut self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        drafter: crate::Glm52Drafter,
+        drafter: &crate::Glm52Drafter,
         prefill_chunk_size: Option<usize>,
     ) -> Result<u64> {
         let mut weights = self
@@ -734,7 +734,7 @@ impl Glm52RankThreadState {
             moe_topo
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
-            &drafter,
+            drafter,
             prefill_chunk_size,
         )?));
         Ok(self.ctx.free_vram_bytes()? as u64)
@@ -916,7 +916,9 @@ impl Glm52RankThreadState {
                 crate::Glm52MoeTopo::Ep64 => Glm52MoeEpState::Ep64(Box::new(
                     Glm52MoeEpRankState::new(&dev_ctx, unique_id, ranks, rank)?,
                 )),
-                other => anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology"),
+                other @ crate::Glm52MoeTopo::Tp4 => {
+                    anyhow::bail!("GLM5.2 {other:?} is not an expert-bundle topology")
+                }
             });
         }
         if let Some(exchange) = tp_exchange {
@@ -1061,7 +1063,7 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 let _ = resp.send(state.build_fixed(
                     max_model_len,
                     moe_topo,
-                    drafter,
+                    &drafter,
                     prefill_chunk_size,
                 ));
             }

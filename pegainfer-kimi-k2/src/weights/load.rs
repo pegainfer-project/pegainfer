@@ -64,14 +64,6 @@ pub(crate) struct KimiRankSlicedLoadOutput {
     pub loaded_total_bytes: usize,
 }
 
-pub(crate) fn ensure_text_only_model_index(model_path: &Path) -> Result<KimiK2WeightManifest> {
-    let manifest = KimiK2WeightManifest::from_model_dir(model_path)?;
-    if manifest.text_tensor_count == 0 {
-        bail!("Kimi safetensors index contains no language_model tensors");
-    }
-    Ok(manifest)
-}
-
 pub(crate) fn load_rank_sliced_weights_to_gpu(
     ctx: &KimiRankGpuContext,
     model_path: &Path,
@@ -155,13 +147,6 @@ pub(crate) fn load_rank_sliced_weights_to_gpu(
             _ => slowest_shard = Some((shard.shard.clone(), shard_secs)),
         }
     }
-    ensure!(
-        loaded_tensor_count == load_plan.tensor_count,
-        "Kimi rank {} sliced GPU tensor count {} does not match load plan {}",
-        load_plan.rank,
-        loaded_tensor_count,
-        load_plan.tensor_count
-    );
     ensure!(
         expert_layers.len() == KIMI_K2_MOE_LAYERS,
         "Kimi rank {} expected {KIMI_K2_MOE_LAYERS} streamed MoE Marlin weight layers, got {}",

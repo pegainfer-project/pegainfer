@@ -17,8 +17,8 @@
 //! single persistent kernel that pairs the ranks over NVLink itself, so a
 //! step issues no collective at all.
 //!
-//! KV story: dual-pool — paged KV (kv-store `BlockPool`) for the 24 MLA
-//! layers, plus a qwen35-style fixed-size slot pool for KDA recurrent
+//! KV story: dual-pool — paged KV (the free-list page pool in
+//! `executor/paged_kv.rs`) for the 24 MLA layers, plus a qwen35-style fixed-size slot pool for KDA recurrent
 //! state. Prefix caching ships disabled (KDA state is not recomputable
 //! from tokens; see docs/subsystems/kv-cache/design.md, bounded class).
 

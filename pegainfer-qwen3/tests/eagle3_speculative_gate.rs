@@ -1,8 +1,9 @@
 //! EAGLE-3 speculative-decoding gate (greedy, one request per draft round).
 //!
 //! Greedy speculation must be lossless: every committed token is the target's
-//! own pick, so the output matches plain greedy decode up to the benign
-//! prefill-vs-decode tie flips that `common::lossless` tolerates. The tests
+//! own pick, so the output matches plain greedy decode up to the benign bf16
+//! tie flips between verify and decode forwards that `common::lossless`
+//! tolerates. The tests
 //! also read the engine's speculative counters, so a run that should draft
 //! fails when it silently decodes plainly. Losslessness does not check the
 //! draft forward itself: the verifier rejects a wrong draft, which only lowers
@@ -35,6 +36,7 @@ use common::harness::EngineHarness;
 use common::harness::RequestStream;
 use common::harness::request;
 use common::lossless::LOGPROBS;
+use common::lossless::Run;
 use common::lossless::Step;
 use common::lossless::check_lossless;
 use common::lossless::generate;
@@ -110,7 +112,7 @@ fn launch(model_path: &str, draft: Option<&str>) -> EngineHarness {
 
 /// Plain greedy decode (speculation off) with logprobs, one prompt at a time.
 /// Each case is `(prompt_tokens, max_tokens)`.
-fn baseline(model_path: &str, cases: &[(Vec<u32>, usize)]) -> Vec<Vec<Step>> {
+fn baseline(model_path: &str, cases: &[(Vec<u32>, usize)]) -> Vec<Run> {
     let engine = launch(model_path, None);
     let out = cases
         .iter()
@@ -195,7 +197,7 @@ fn eagle3_greedy_matches_plain_greedy() {
 
     let engine = launch(&model_path, Some(&draft_path));
     let before = launch_counters(&engine);
-    let specs: Vec<Vec<Step>> = encoded
+    let specs: Vec<Run> = encoded
         .iter()
         .map(|t| generate(&engine, t.clone(), 0, GENERATED_TOKENS))
         .collect();
@@ -208,16 +210,7 @@ fn eagle3_greedy_matches_plain_greedy() {
         .iter()
         .enumerate()
         .filter_map(|(i, prompt)| {
-            check_lossless(
-                &engine,
-                &tokenizer,
-                i,
-                prompt,
-                &encoded[i],
-                &base[i],
-                &specs[i],
-            )
-            .err()
+            check_lossless(&tokenizer, i, prompt, &encoded[i], &base[i], &specs[i]).err()
         })
         .collect();
     assert!(
@@ -232,6 +225,7 @@ fn eagle3_greedy_matches_plain_greedy() {
 /// token up to the full chain, and the draft rebuild runs on each.
 #[test]
 fn eagle3_output_budget_edges_match_plain_greedy() {
+    common::harness::init_capture_logging();
     let Some((model_path, draft_path)) = paths_or_skip() else {
         return;
     };
@@ -247,14 +241,14 @@ fn eagle3_output_budget_edges_match_plain_greedy() {
 
     let engine = launch(&model_path, Some(&draft_path));
     let before = launch_counters(&engine);
-    let specs: Vec<Vec<Step>> = budgets
+    let specs: Vec<Run> = budgets
         .iter()
         .map(|&b| generate(&engine, tokens.clone(), 0, b))
         .collect();
     let (proposed, _) = report("budget edges", &before, &counters(&engine));
     assert!(proposed > 0, "EAGLE-3 never drafted");
     for (i, (base, spec)) in base.iter().zip(&specs).enumerate() {
-        check_lossless(&engine, &tokenizer, i, prompt, &tokens, base, spec)
+        check_lossless(&tokenizer, i, prompt, &tokens, base, spec)
             .unwrap_or_else(|failure| panic!("budget {}: {failure}", budgets[i]));
     }
 }
@@ -263,6 +257,7 @@ fn eagle3_output_budget_edges_match_plain_greedy() {
 /// request drafts and stays lossless.
 #[test]
 fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
+    common::harness::init_capture_logging();
     let Some((model_path, draft_path)) = paths_or_skip() else {
         return;
     };
@@ -301,16 +296,8 @@ fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
         proposed > 0 && accepted > 0,
         "EAGLE-3 stopped drafting after an abort"
     );
-    check_lossless(
-        &engine,
-        &tokenizer,
-        1,
-        PROMPTS[1],
-        &encoded[1],
-        &base[0],
-        &spec,
-    )
-    .unwrap_or_else(|failure| panic!("after abort: {failure}"));
+    check_lossless(&tokenizer, 1, PROMPTS[1], &encoded[1], &base[0], &spec)
+        .unwrap_or_else(|failure| panic!("after abort: {failure}"));
 }
 
 /// A second request joining a drafting one exceeds the one-request draft
@@ -318,6 +305,7 @@ fn eagle3_abort_mid_speculation_keeps_the_engine_lossless() {
 /// outputs match plain greedy.
 #[test]
 fn eagle3_overlapping_requests_fall_back_and_stay_lossless() {
+    common::harness::init_capture_logging();
     let Some((model_path, draft_path)) = paths_or_skip() else {
         return;
     };
@@ -359,21 +347,23 @@ fn eagle3_overlapping_requests_fall_back_and_stay_lossless() {
         .spec_decode
         .expect("EAGLE-3 engine publishes speculative counters");
 
+    let (first_id, second_id) = (first.id(), second.id());
     first_steps.extend(to_steps(first.expect_finished()));
     second_steps.extend(to_steps(second.expect_finished()));
-    let specs = [first_steps, second_steps];
+    let specs = [
+        Run {
+            id: first_id,
+            steps: first_steps,
+        },
+        Run {
+            id: second_id,
+            steps: second_steps,
+        },
+    ];
     let (proposed, _) = report("after overlap", &overlap, &counters(&engine));
     assert_eq!(proposed, 0, "a request drafted after the overlap");
     for (i, (base, spec)) in base.iter().zip(&specs).enumerate() {
-        check_lossless(
-            &engine,
-            &tokenizer,
-            i,
-            PROMPTS[2 + i],
-            &encoded[i],
-            base,
-            spec,
-        )
-        .unwrap_or_else(|failure| panic!("concurrent: {failure}"));
+        check_lossless(&tokenizer, i, PROMPTS[2 + i], &encoded[i], base, spec)
+            .unwrap_or_else(|failure| panic!("concurrent: {failure}"));
     }
 }

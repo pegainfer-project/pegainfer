@@ -539,17 +539,31 @@ pub(super) fn spec_hedge_auto() -> bool {
 pub(super) struct HedgeGeometry {
     pub(super) cap: usize,
     pub(super) positions: Vec<usize>,
+    /// Most hedge chain spans one verify round can carry.
+    pub(super) chain_spans: usize,
 }
 
 pub(super) fn spec_hedge_effective(block_size: usize) -> HedgeGeometry {
-    let positions = spec_hedge_positions()
+    let positions: Vec<usize> = spec_hedge_positions()
         .iter()
         .copied()
         .filter(|&p| p < block_size)
         .collect();
+    let cap = spec_hedge_cap();
+    let chain_spans = match spec_hedge_knee() {
+        _ if cap == 0 || positions.is_empty() => 0,
+        0 => cap.saturating_mul(positions.len()),
+        knee => knee_chain_spans(
+            block_size,
+            knee,
+            positions.len(),
+            crate::batch_decode_buffers::BATCH_BUCKETS,
+        ),
+    };
     HedgeGeometry {
-        cap: spec_hedge_cap(),
+        cap,
         positions,
+        chain_spans,
     }
 }
 
@@ -566,7 +580,8 @@ pub(super) fn hedge_pages_per_chain(block_size: usize, page_size: usize) -> usiz
 }
 
 /// `PEGAINFER_SPEC_HEDGE=<H>` enables the parallel hedge and caps the number
-/// of hedged requests per verify round at `H`. Each hedged request costs one
+/// of hedged requests per verify round at `H`, unless
+/// `PEGAINFER_SPEC_HEDGE_KNEE` plans the round. Each hedged request costs one
 /// extra verify span and [`hedge_pages_per_chain`] lane scratch KV pages PER
 /// CHAIN, so a request branching at C positions costs C of each.
 /// `0`/unset/unparsable = off. Read once.
@@ -637,6 +652,23 @@ pub(super) fn batch_adaptive_chains(
         }
     }
     best
+}
+
+/// Most hedge chain spans one round can carry under the knee policy, which
+/// hedges the whole batch at the chain count [`batch_adaptive_chains`] picks:
+/// the planner's own `batch * C` maximum over every batch size.
+fn knee_chain_spans(
+    block_size: usize,
+    knee_rows: usize,
+    max_chains: usize,
+    buckets: &[usize],
+) -> usize {
+    (1..=buckets.last().copied().unwrap_or(0))
+        .map(|batch| {
+            batch * batch_adaptive_chains(batch, block_size, knee_rows, max_chains, buckets)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// `PEGAINFER_SPEC_HEDGE_POSITIONS="0,1,2"` — draft positions at which hedge
@@ -750,6 +782,19 @@ mod tests {
         assert_eq!(batch_adaptive_chains(1, BLOCK, 0, 7, bk), 0);
         assert_eq!(batch_adaptive_chains(0, BLOCK, 96, 7, bk), 0);
         assert_eq!(batch_adaptive_chains(1, BLOCK, 96, 0, bk), 0);
+    }
+
+    #[test]
+    fn knee_chain_spans_is_the_planners_maximum() {
+        let bk = crate::batch_decode_buffers::BATCH_BUCKETS;
+        // block 7, knee 96 rows = 12 spans. One position: only batches 1, 2
+        // and 4 land on a bucket with a chain each, so at most 4 chain spans.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 1, bk), 4);
+        // Three positions: batch 2 at 3 chains (8 spans) carries 6.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 3, bk), 6);
+        // Seven positions: batch 1 at 7 chains carries 7.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 7, bk), 7);
+        assert_eq!(knee_chain_spans(BLOCK, 0, 7, bk), 0);
     }
 
     #[test]

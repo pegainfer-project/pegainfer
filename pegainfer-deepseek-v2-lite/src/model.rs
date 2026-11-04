@@ -14,6 +14,7 @@ use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_core::tensor::HiddenStatesRef;
 use pegainfer_core::weight_loader::deserialize_shards;
+use pegainfer_core::weight_loader::find_tensor;
 use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_2d;
@@ -120,10 +121,6 @@ impl DriverRankModel {
                 config.vocab_size,
                 hidden,
             )?;
-            ensure!(
-                !config.tie_word_embeddings,
-                "DeepSeek-V2-Lite first gate expects untied lm_head"
-            );
             let lm_head = load_tensor_2d(
                 &ctx,
                 shards,
@@ -511,24 +508,6 @@ fn load_bf16_tensor_host(
         .iter()
         .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
         .collect())
-}
-
-fn find_tensor<'a>(
-    shards: &'a [safetensors::SafeTensors<'a>],
-    weight_map: &HashMap<String, usize>,
-    name: &str,
-) -> Result<safetensors::tensor::TensorView<'a>> {
-    if let Some(&idx) = weight_map.get(name) {
-        return shards[idx]
-            .tensor(name)
-            .map_err(|err| anyhow::anyhow!("failed to load tensor {name}: {err}"));
-    }
-    for shard in shards {
-        if let Ok(tensor) = shard.tensor(name) {
-            return Ok(tensor);
-        }
-    }
-    bail!("tensor {name} not found in any shard")
 }
 
 fn load_owned_experts(

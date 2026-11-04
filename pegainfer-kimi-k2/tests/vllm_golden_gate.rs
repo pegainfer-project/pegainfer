@@ -1,5 +1,5 @@
-//! vLLM-golden accuracy gate for Kimi-K2 — the first gate for this model line
-//! that a fresh clone can re-run from committed code and fixtures alone (#223).
+//! vLLM-golden accuracy gate for Kimi-K2, which a fresh clone can re-run from
+//! committed code and fixtures alone.
 //!
 //! vLLM is the reference, not HuggingFace: Kimi-K2.6 is INT4
 //! (compressed-tensors), and vLLM executes the same quantized model through

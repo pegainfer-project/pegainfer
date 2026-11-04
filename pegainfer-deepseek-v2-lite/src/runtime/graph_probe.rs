@@ -96,16 +96,16 @@ impl DeepSeekV2LiteEp2Generator {
                 capture_mode: "thread_local",
             });
         }
+        ensure!(
+            matches!(self.backend, EpBackendRuntime::Nccl(_)),
+            "DeepSeek-V2-Lite --full-decode-graph-probe requires PEGAINFER_DSV2_LITE_EP_BACKEND=nccl"
+        );
         let Some(prompt_tokens) = prompt_tokens else {
             bail!("DeepSeek-V2-Lite full decode graph probe requires prompt tokens");
         };
         ensure!(
             output_len >= 2,
             "DeepSeek-V2-Lite full decode graph probe needs at least two output tokens, got {output_len}"
-        );
-        ensure!(
-            matches!(self.backend, EpBackendRuntime::Nccl(_)),
-            "DeepSeek-V2-Lite --full-decode-graph-probe requires PEGAINFER_DSV2_LITE_EP_BACKEND=nccl"
         );
 
         let mut report = FullDecodeGraphProbeReport {

@@ -880,7 +880,7 @@ impl Glm52DsparkModel {
 /// the target distribution given the accepted prefix, and it is committed
 /// whether or not it matches `proposed[k]` — the match only decides whether
 /// the round keeps riding. Every committed token is therefore distributed
-/// exactly as plain sampled decode (measured A/B on jz-38 2026-07-06: the
+/// exactly as plain sampled decode (measured A/B: the
 /// full rejection-sampling variant buys ≤ 1.5% throughput over this rule on
 /// code at temperature 1.0 — not worth its complexity).
 #[must_use]

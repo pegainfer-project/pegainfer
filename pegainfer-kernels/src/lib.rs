@@ -4,6 +4,7 @@
 pub mod ffi;
 pub mod forward_pass;
 pub mod gpu_buffers;
+pub mod green_ctx;
 pub mod ops;
 pub mod paged_kv;
 pub mod tensor;

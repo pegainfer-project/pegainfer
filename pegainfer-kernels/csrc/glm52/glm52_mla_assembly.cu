@@ -257,8 +257,6 @@ __global__ void glm52_mla_ckv_split_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 extern "C" {

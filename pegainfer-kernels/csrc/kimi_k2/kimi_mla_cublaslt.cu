@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "../shared/cublas_status.cuh"
 #include "../shared/ffi_guard.cuh"
 
 namespace {
@@ -33,13 +34,6 @@ struct MlaLtPlan {
 thread_local cublasLtHandle_t g_mla_lt_handle = nullptr;
 thread_local MlaLtPlan g_absorb_q_nope_plans[kMlaLtMaxBatch];
 thread_local MlaLtPlan g_v_up_plans[kMlaLtMaxBatch];
-
-int cublas_status_to_error(cublasStatus_t status) {
-  if (status == CUBLAS_STATUS_SUCCESS) {
-    return static_cast<int>(cudaSuccess);
-  }
-  return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
-}
 
 void destroy_mla_lt_plan(MlaLtPlan& plan) {
   if (plan.d != nullptr) {
