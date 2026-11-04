@@ -676,7 +676,9 @@ impl HcMixScratch {
 /// when `inject_weight` is. The reference rounds to bf16 at each of these
 /// steps, and each composed op lands its rounding where the reference does.
 /// The per-layer modules pass their injection head; the top-level readout
-/// (`use_combine=False`) passes neither.
+/// (`use_combine=False`) passes neither. `branches` is `hc_count`, which must
+/// be a power of two for the folded `1 / branches` scales to be the
+/// reference's exact division.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_mix_into(
     ctx: &DeviceContext,
@@ -700,6 +702,16 @@ pub fn hc_mix_into(
     ensure!(
         rms_eps.is_finite() && rms_eps > 0.0,
         "hyper-connection mix: eps {rms_eps} is not positive"
+    );
+    // The reference divides by `hc_count` in bf16 on both the mix path and the
+    // injection head. Both folds here multiply by `1 / branches` instead; that
+    // is the same value only where the division is exact, i.e. for a
+    // power-of-two count. Anything else would round somewhere the reference
+    // does not, so it is refused rather than served approximately.
+    ensure!(
+        branches.is_power_of_two(),
+        "hyper-connection mix: {branches} branches is not a power of two, so the folded \
+         1/branches scale is not the reference's exact bf16 division"
     );
     let hidden = hyper.hidden_dim / branches;
     let rows = hyper.seq_len;
