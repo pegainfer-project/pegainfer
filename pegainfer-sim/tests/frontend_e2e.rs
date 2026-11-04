@@ -503,28 +503,31 @@ fn functional_profile_prices_pure_work_and_fails_closed() -> Result<()> {
 
 #[test]
 fn serving_rejects_incomplete_functional_profiles() -> Result<()> {
-    let (_fixture_dir, profile) = profile_fixture("functional-step-gate.json")?;
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { mixed, .. } = &mut profile.profile.predictor.model {
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    SimulatedEngineConfig::default().with_engine_profile(profile.clone())?;
     for missing in ["prefill", "decode", "mixed"] {
         let mut partial = profile.clone();
         if let PredictorModel::Functional {
-            prefill, decode, ..
+            prefill,
+            decode,
+            mixed,
         } = &mut partial.profile.predictor.model
         {
             match missing {
                 "prefill" => *prefill = None,
                 "decode" => *decode = None,
-                _ => {}
+                _ => *mixed = None,
             }
         }
-        let error = SimulatedEngineConfig::default()
+        SimulatedEngineConfig::default()
             .with_engine_profile(partial)
-            .expect_err("serving must reject a missing functional component");
-        assert!(
-            error
-                .to_string()
-                .contains("requires prefill, decode, and mixed models"),
-            "missing {missing}: {error}"
-        );
+            .expect_err(&format!("serving must reject a missing {missing} model"));
     }
     Ok(())
 }

@@ -144,9 +144,8 @@ All files below are under `scripts/sim-calibrate/`.
 | [cached_prefill.py](../../../scripts/sim-calibrate/cached_prefill.py) | Internal | Nested text/ID/JSONL generation and validation of actual prompts, usage, exact P, and request attribution. |
 | [cached_prefill_validate.py](../../../scripts/sim-calibrate/cached_prefill_validate.py) | CLI | Cached collect/validate/verify, surface errors, and TTFT reconstruction. |
 | [report.py](../../../scripts/sim-calibrate/report.py) | CLI | Standard held-out raw TTFT, error percentiles, required-scope completeness, and explicit recomputation. |
-| `__init__.py` | Package marker | No execution logic. |
 
-`requirements-evidence-proxy.txt` is the installation requirements file.
+[`requirements-evidence-proxy.txt`](../../../scripts/sim-calibrate/requirements-evidence-proxy.txt) lists the Python dependencies for the evidence proxy and cached workload generation, including `tokenizers`. Collection requires Linux and `/usr/bin/setpriv`, provided by the `util-linux` system package.
 
 ## 8. Campaign Examples
 

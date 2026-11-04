@@ -141,7 +141,6 @@ def validate_cache_recovery_receipt(receipt: dict, plan: dict, batch: dict, *,
 @dataclass(frozen=True)
 class HttpResult:
     status: int
-    headers: dict[str, str]
     body: bytes
     elapsed_ms: float
 
@@ -178,7 +177,6 @@ def _get(
         payload = response.read()
         return HttpResult(
             response.status,
-            {key.lower(): value for key, value in response.getheaders()},
             payload,
             (time.perf_counter() - started) * 1000.0,
         )

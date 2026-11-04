@@ -248,7 +248,7 @@ class TargetProcess:
                 await asyncio.sleep(0.1)
 
 
-async def run_attempt(campaign: dict, cell: dict, plan: dict, variant_name: str,
+async def run_attempt(campaign: dict, plan: dict, variant_name: str,
                       store: ExecutionStore, *, timeout: float, binding: dict) -> dict:
     previous = store.sealed(plan, variant_name, binding)
     if previous:
@@ -366,7 +366,6 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
         raise EvidenceError('select distinct target/zero_cost/sim variants')
     if any(c['kind'] == 'cached_prefill' for c in cells) and 'sim' in variants:
         raise EvidenceError('cached simulator runtime is not implemented; collect target/zero_cost for offline calibration')
-    client = campaign['client']
     results = []
     with ExecutionStore(root, campaign['campaign_id']) as store:
         for variant_name in variants:
@@ -375,13 +374,13 @@ async def run_campaign(root: Path, *, variants: list[str], selectors: list[str] 
                 binding = {'variant_identity': execution_identity(variant['identity'])}
                 configured = variant
                 if variant_name == 'zero_cost':
-                    binding['reference'] = select_reference(root, campaign, cell['cell_id'])
+                    binding['reference'] = select_reference(cell['cell_id'])
                     configured = {**variant, **resolve_reference(root, campaign, binding['reference'], cell['cell_id'])}
                 if variant_name != 'target':
                     binding.update(profile_binding(root, configured, (server_pids or {}).get(variant_name)))
                 plan = _read_json(checked_path(root, cell['plan']['path']))
                 validate_plan(plan)
-                result = await run_attempt(campaign, cell, plan, variant_name, store,
+                result = await run_attempt(campaign, plan, variant_name, store,
                                            timeout=timeout, binding=binding)
                 results.append({'cell_id': cell['cell_id'], 'variant': variant_name, **result})
                 if result['status'] != 'sealed':

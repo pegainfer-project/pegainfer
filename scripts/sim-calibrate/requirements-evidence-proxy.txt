@@ -1,4 +1,4 @@
-# Observer environment: compile records these installed versions and source digests.
+# Python dependencies for the evidence proxy and cached workload generation.
 aiohttp==3.14.3
 aiohappyeyeballs==2.7.1
 aiosignal==1.4.0
@@ -8,3 +8,4 @@ multidict==6.9.1
 propcache==0.5.4
 yarl==1.25.1
 idna==3.20
+tokenizers==0.23.2

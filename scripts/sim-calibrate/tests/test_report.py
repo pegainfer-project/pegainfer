@@ -10,7 +10,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from artifacts import ArtifactError
-from report import require_complete
 from report import _sample, report_campaign, summarize_samples, verify_report
 from test_normalize import collect_fixture, make_bundle
 
@@ -51,7 +50,7 @@ class ReportEvidenceTests(unittest.TestCase):
     def test_complete_report_binds_sources_and_rejects_statistics_or_scope_tampering(self):
         self.assertEqual(self.document['status'], 'succeeded')
         self.assertEqual(self.document['expected_count'], 4)
-        require_complete(self.document)
+        verify_report(self.document)
         for mode in ('percentile', 'scope', 'count', 'profile', 'attestation'):
             document = copy.deepcopy(self.document)
             if mode == 'percentile':

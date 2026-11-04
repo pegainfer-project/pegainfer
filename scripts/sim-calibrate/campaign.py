@@ -169,7 +169,7 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
 
     async def references(cells: list[dict]) -> None:
         for cell in pending(cells, 'zero_cost'):
-            binding = select_reference(root, campaign, cell['cell_id'])
+            binding = select_reference(cell['cell_id'])
             variant = {**campaign['variants']['zero_cost'], **resolve_reference(root, campaign, binding, cell['cell_id'])}
             async with profile_server(root, variant, binary=sim_binary, model_path=model_path,
                                       timeout=startup_timeout) as pid:
@@ -201,7 +201,7 @@ async def execute_campaign(root: Path, *, sim_binary: Path, model_path: Path,
         normalized_path, fit_path = root / 'derived/train.normalized.json', root / 'derived/fit.json'
         if normalized_path.exists():
             normalized = _read_json(normalized_path)
-            verify_normalized(normalized, root=root)
+            verify_normalized(normalized)
         else:
             normalized = normalize_campaign(root, scope='train')
         if normalized['status'] != 'succeeded':

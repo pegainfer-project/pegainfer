@@ -127,7 +127,6 @@ class EvidenceProxy:
         self.model, self.plan, self.root, self.timeout = model, plan, root, timeout
         self.expected: dict[str, dict] = {}
         self.seen: set[str] = set()
-        self.records: dict[str, dict] = {}
         self.errors: list[str] = []
         self.active: set[asyncio.Task] = set()
         self.batch_root: Path | None = None
@@ -193,7 +192,6 @@ class EvidenceProxy:
                       'upstream_attempts': 0, 'http_status': None, 'stream_end_ns': None,
                       'downstream_end_ns': None, 'eof': False, 'done': False, 'finished': False,
                       'error': None, 'directory': str(directory.relative_to(self.root))}
-            self.records[logical['pairing_key']] = record
             raw = await incoming.read()
             self.writer.put(directory / 'request-body.bin', raw)
             body = json.loads(raw)

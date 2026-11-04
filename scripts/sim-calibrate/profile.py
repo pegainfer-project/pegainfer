@@ -180,7 +180,7 @@ def _training_inputs(campaign: dict, normalized_path: Path, fit_path: Path) -> t
     return normalized, fitted, {'normalized': str(normalized_path), 'fit': str(fit_path)}
 
 
-def _calibration_document(campaign: dict, normalized: dict, fitted: dict, sources: dict) -> dict:
+def _calibration_document(campaign: dict, fitted: dict, sources: dict) -> dict:
     surface = _fit_candidate(fitted, 'cached_prefill_surface')
     return {'kind': 'cached_prefill_calibration', 'schema_version': 3,
             'campaign_id': campaign['campaign_id'], 'status': 'fitted',
@@ -190,7 +190,7 @@ def _calibration_document(campaign: dict, normalized: dict, fitted: dict, source
             'runtime_enabled': False, 'validation_status': 'offline_fit_only'}
 
 
-def read_calibration(root: Path, campaign: dict) -> dict:
+def read_calibration(root: Path) -> dict:
     """Read the standalone cached surface; training intermediates are not required."""
     document = _read_json(checked_path(root, CALIBRATION_PATH))
     if (document.get('kind') != 'cached_prefill_calibration' or document.get('schema_version') != 3
@@ -208,8 +208,8 @@ def materialize_calibration(root: Path, *, normalized_artifact: Path, fit_artifa
     """Publish the cached-only endpoint; no runtime curves or replay are required."""
     root = root.expanduser().resolve()
     campaign = load_compiled_bundle(root)
-    normalized, fitted, sources = _training_inputs(campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
-    document = _calibration_document(campaign, normalized, fitted, sources)
+    _, fitted, sources = _training_inputs(campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
+    document = _calibration_document(campaign, fitted, sources)
     write_derived_document(root / CALIBRATION_PATH, document, root)
     return document
 
@@ -274,7 +274,7 @@ def materialize_profile(root: Path, *, normalized_artifact: Path, fit_artifact: 
     normalized, fitted, sources = _training_inputs(campaign, normalized_artifact.expanduser().resolve(), fit_artifact.expanduser().resolve())
     if normalized['cached_requirements']:
         write_derived_document(root / CALIBRATION_PATH,
-                               _calibration_document(campaign, normalized, fitted, sources), root)
+                               _calibration_document(campaign, fitted, sources), root)
     documents = _fitted_documents(root, campaign, normalized, fitted, sources)
     write_fitted_bundle(root, campaign, documents)
     return documents['selection.json']

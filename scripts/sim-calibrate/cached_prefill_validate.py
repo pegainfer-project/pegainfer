@@ -54,7 +54,7 @@ def _selected(root: Path, campaign: dict, cells: list[dict], pinned: list | None
 def _open(root: Path) -> tuple[dict, list[dict], dict]:
     campaign = load_compiled_bundle(root)
     cells = _scope(campaign)
-    calibration = read_calibration(root, campaign)
+    calibration = read_calibration(root)
     for cell in cells:
         prediction = evaluate_cached_surface(calibration['surface'], cell['prefix_tokens'], cell['new_tokens'])
         if not math.isfinite(prediction) or prediction < 0:
@@ -200,7 +200,7 @@ async def execute_cached_validation(root: Path, *, sim_binary: Path, model_path:
 
     await collect(pending('target'), 'target')
     for cell in pending('zero_cost'):
-        binding = select_reference(root, campaign, cell['cell_id'])
+        binding = select_reference(cell['cell_id'])
         variant = {**campaign['variants']['zero_cost'], **resolve_reference(root, campaign, binding, cell['cell_id'])}
         async with profile_server(root, variant, binary=sim_binary, model_path=model_path,
                                   timeout=startup_timeout) as pid:

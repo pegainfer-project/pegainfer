@@ -61,7 +61,7 @@ def collect_target_statistics(root: Path) -> dict:
             'source': {'artifact_root': str(root), 'selected_attempts': selected}}
 
 
-def verify_target_statistics(document: dict, *, root: Path | None = None) -> None:
+def verify_target_statistics(document: dict) -> None:
     """Read the direct target-statistics contract without replaying its attempts."""
     if (document.get('kind') != 'train_target_statistics'
             or document.get('schema_version') != TARGET_STATISTICS_SCHEMA
@@ -69,7 +69,7 @@ def verify_target_statistics(document: dict, *, root: Path | None = None) -> Non
         raise ArtifactError('requires a succeeded current train-target statistics artifact')
 
 
-def read_target_statistics(path: Path, *, root: Path | None = None) -> dict:
+def read_target_statistics(path: Path) -> dict:
     document = _read_json(path)
     verify_target_statistics(document)
     return document
@@ -129,13 +129,6 @@ def _read_reference(root: Path, campaign: dict, cell_id: str, reference: dict) -
     return {**reference, 'interval_us': interval_us, 'encoded_interval_ms': interval_us / 1000}
 
 
-def verify_preparation(root: Path, campaign: dict, document: dict) -> None:
-    if document.get('kind') != KIND or document.get('schema_version') != SCHEMA_VERSION:
-        raise ArtifactError('unsupported reference preparation')
-    for cell_id, reference in document['cells'].items():
-        _read_reference(root, campaign, cell_id, reference)
-
-
 def prepare_references(root: Path) -> dict:
     from pairing import load_role
     root = root.expanduser().resolve()
@@ -165,7 +158,7 @@ def prepare_references(root: Path) -> dict:
     return document
 
 
-def select_reference(root: Path, campaign: dict, cell_id: str) -> dict:
+def select_reference(cell_id: str) -> dict:
     return {'path': PREPARATION_PATH, 'cell_id': cell_id}
 
 

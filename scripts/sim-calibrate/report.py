@@ -133,15 +133,6 @@ def assess_report(document: dict) -> dict:
             'basis': 'evidence_scope_pairing_statistics', 'accuracy_assessed': False}
 
 
-def require_complete(document: dict) -> None:
-    result = assess_report(document)
-    if result['status'] != 'passed':
-        raise ValueError('held-out completeness failed: ' + '; '.join(result['failures']))
-    verify_report(document)
-    if document['status'] != 'succeeded':
-        raise ValueError('held-out report is not complete')
-
-
 def _heldout(root: Path, campaign: dict, cells: list[dict], roles: tuple,
              selected: list[dict] | None, replay_raw: bool = False) -> tuple[list[dict], list[dict]]:
     if selected is None:

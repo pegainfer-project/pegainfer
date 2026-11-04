@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from report import assess_report, require_complete
+from report import assess_report
 from report import summarize_samples
 
 
@@ -48,5 +48,3 @@ class AcceptanceTests(unittest.TestCase):
             mutate(changed)
             with self.subTest(changed=changed):
                 self.assertEqual(assess_report(changed)['status'], 'failed')
-                with self.assertRaises(ValueError):
-                    require_complete(changed)

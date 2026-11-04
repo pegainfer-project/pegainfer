@@ -191,8 +191,6 @@ pub enum StepShapeError {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PredictorError {
-    #[error(transparent)]
-    InvalidShape(#[from] StepShapeError),
     #[error(
         "calibration manifest '{manifest}' (sha256 {manifest_sha256}) does not cover step shape {shape:?}; supported predictor coverage: {coverage:?}"
     )]

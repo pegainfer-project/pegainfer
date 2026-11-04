@@ -135,7 +135,7 @@ def verify_normalized_sources(document: dict, *, root: Path | None = None) -> di
     return _assemble_document(campaign, document['scope'], results, source)
 
 
-def verify_normalized(document: dict, *, root: Path | None = None) -> None:
+def verify_normalized(document: dict) -> None:
     """Check the direct normalized input; training reads do not replay raw evidence."""
     if (document.get('kind') != 'normalized_campaign' or document.get('schema_version') != SCHEMA_VERSION
             or document.get('status') != 'succeeded'):

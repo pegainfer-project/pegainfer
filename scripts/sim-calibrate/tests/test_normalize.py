@@ -85,7 +85,7 @@ def collect_fixture(root: Path, campaign: dict, roles=('target', 'zero_cost'), *
                 if role != 'target':
                     configured = campaign['variants'][role]
                     if role == 'zero_cost':
-                        binding['reference'] = select_reference(root, campaign, cell['cell_id'])
+                        binding['reference'] = select_reference(cell['cell_id'])
                         configured = resolve_reference(root, campaign, binding['reference'], cell['cell_id'])
                     profile = root / configured['profile_path']
                     endpoint = urlsplit(identity['endpoint'])

@@ -39,7 +39,7 @@ class DiagnosticEndpoint:
     async def __aexit__(self, *_):
         await self.runner.cleanup()
 
-    async def get_models(self, request):
+    async def get_models(self, _request):
         self.models += 1
         return web.json_response({'data':[{'id':'test-model'}]})
 
