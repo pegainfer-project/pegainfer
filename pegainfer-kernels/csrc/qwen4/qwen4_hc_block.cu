@@ -48,8 +48,6 @@ namespace {
 
 constexpr int kThreads = 256;
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 __device__ __forceinline__ float sigmoid_f32(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
