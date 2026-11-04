@@ -67,6 +67,7 @@ pub(super) struct DecodeGraphBlocker {
     pub(super) reason: &'static str,
 }
 
+#[allow(clippy::struct_excessive_bools)] // the flags are keys of the serialized report
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct FullDecodeGraphProbeReport {
     pub(super) requested: bool,

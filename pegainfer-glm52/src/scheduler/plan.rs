@@ -119,6 +119,7 @@ pub(super) fn plan_step_shape(wants: &[usize; GLM52_MAX_BATCH_PER_RANK]) -> Glm5
 /// content-addressed block for every later match. Without leases, the joined
 /// D2H is the last thing on the rank stream and admission truly is a quiet
 /// boundary. Costs ~0.7 ms/step, offload deployments only.
+#[allow(clippy::fn_params_excessive_bools)] // independent lease predicates, not a state machine
 pub(super) fn lease_flags(
     consume: bool,
     pending_empty: bool,
@@ -542,7 +543,7 @@ mod tests {
     #[test]
     fn prefill_want_extends_one_slot_into_a_span() {
         // A lone mid-prefill request with plenty of prompt left fills the
-        // whole max bucket with its span — 48 rows since #812.
+        // whole max bucket with its span.
         let mut wants = decode_wants(0);
         wants[2] = 3000;
         assert_eq!(
@@ -641,8 +642,8 @@ mod tests {
 
     #[test]
     fn wide_occupancy_two_draft_spans_fit_the_max_bucket() {
-        // The throughput profile: 16 slots riding a 2-draft span — the
-        // ceiling slot count saturates the same 48-row budget exactly.
+        // The throughput profile: 32 slots riding a 2-draft span — the
+        // ceiling slot count saturates the same 96-row budget exactly.
         let wants = [3usize; GLM52_MAX_BATCH_PER_RANK];
         let shape = plan_step_shape(&wants);
         assert_eq!(shape.bucket, GLM52_MAX_STEP_ROWS);
@@ -657,7 +658,7 @@ mod tests {
     #[test]
     fn over_committed_wants_shrink_round_robin_not_collapse() {
         // A mis-paired (slots, drafts) config (launch() rejects it, but the
-        // planner must still be safe): 16 slots each wanting the 6-row span
+        // planner must still be safe): 32 slots each wanting the 6-row span
         // get round-robined down to 3 rows apiece, never to a bare anchor.
         let wants = [6usize; GLM52_MAX_BATCH_PER_RANK];
         let shape = plan_step_shape(&wants);

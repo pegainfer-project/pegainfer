@@ -23,8 +23,6 @@ constexpr int kHeadDimV = 512;
 constexpr int kPageSize = 64;
 constexpr size_t kCounterBytes = 8192ull * 256 * sizeof(uint32_t);
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 namespace flashinfer::trtllm_cubin_loader {

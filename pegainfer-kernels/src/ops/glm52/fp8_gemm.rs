@@ -130,7 +130,7 @@ pub fn glm52_fp8_groupwise_gemm_sm100_offset_launch(
                 activation_ptr as *const u8,
                 activation_scale_ptr as *const f32,
                 weight_ptr as *const u8,
-                weight_scale_ptr as *const u8 as *const f32,
+                weight_scale_ptr as *const f32,
                 output_ptr as *mut ffi::Half,
                 workspace_ptr as *mut u8,
                 workspace_bytes,
@@ -295,6 +295,7 @@ pub fn glm52_fp8_grouped_gemm_sm100_launch(
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

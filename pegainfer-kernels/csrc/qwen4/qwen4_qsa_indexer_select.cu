@@ -241,8 +241,6 @@ __global__ void qwen4_qsa_select_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 extern "C" {

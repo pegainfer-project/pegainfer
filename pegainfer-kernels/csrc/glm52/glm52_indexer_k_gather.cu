@@ -134,8 +134,6 @@ __global__ void topk_to_slots_lut_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 }  // namespace
 
 extern "C" {

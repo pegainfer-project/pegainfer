@@ -505,49 +505,6 @@ impl Projections {
     }
 }
 
-/// Order `ctx.stream` producers (plan uploads, token-id H2D, buffer
-/// allocations) before the override stream consumes them. No-op without an
-/// override.
-fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
-    use cudarc::driver::sys;
-    if !pegainfer_core::tensor::has_stream_override() {
-        return Ok(());
-    }
-    let override_stream = pegainfer_core::tensor::active_cu_stream(ctx);
-    let producer = ctx.stream.cu_stream();
-    unsafe {
-        let mut event: sys::CUevent = std::ptr::null_mut();
-        let create = sys::cuEventCreate(
-            &raw mut event,
-            sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-        );
-        anyhow::ensure!(
-            create == sys::CUresult::CUDA_SUCCESS,
-            "cuEventCreate (producer fence) failed: {create:?}"
-        );
-        let record = sys::cuEventRecord(event, producer);
-        let wait = if record == sys::CUresult::CUDA_SUCCESS {
-            sys::cuStreamWaitEvent(override_stream, event, 0)
-        } else {
-            record
-        };
-        let destroy = sys::cuEventDestroy_v2(event);
-        anyhow::ensure!(
-            record == sys::CUresult::CUDA_SUCCESS,
-            "cuEventRecord (producer fence) failed: {record:?}"
-        );
-        anyhow::ensure!(
-            wait == sys::CUresult::CUDA_SUCCESS,
-            "cuStreamWaitEvent (producer fence) failed: {wait:?}"
-        );
-        anyhow::ensure!(
-            destroy == sys::CUresult::CUDA_SUCCESS,
-            "cuEventDestroy (producer fence) failed: {destroy:?}"
-        );
-    }
-    Ok(())
-}
-
 /// The tower's whole working set for one step: attention buffers, epilogue
 /// buffers, and the hidden pair the layers alternate between so no layer
 /// writes the buffer it is reading.
@@ -3053,7 +3010,7 @@ impl GemmaServe {
         let mut pass = self.prepare_single(ctx, kv, tokens, "prefill")?;
         let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
         let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, 1)?;
-        fence_producers_before_override(ctx)?;
+        pegainfer_core::tensor::fence_producers_before_override(ctx)?;
         self.run_single_tower(ctx, &mut pass, seq_len)?;
         logits_tail_into(
             ctx,

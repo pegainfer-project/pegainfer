@@ -72,6 +72,7 @@ pub fn glm52_prefill_unpack_pages_launch(
 mod tests {
     use super::*;
 
+    #[allow(clippy::float_cmp)]
     #[test]
     #[ignore = "requires a CUDA device"]
     fn unpack_supported_cache_layouts() -> Result<()> {

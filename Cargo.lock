@@ -3800,7 +3800,6 @@ dependencies = [
  "half",
  "kvbm-logical",
  "pegainfer-kernels",
- "tokio",
 ]
 
 [[package]]

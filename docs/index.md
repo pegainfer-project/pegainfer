@@ -58,7 +58,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `models/qwen35/tp-implementation.md` | Current TP runtime: rank-local state, start-gated mixed execution, ID-aligned results, acknowledged retirement and joint prefix reuse; batched eager decode and Graph replay for compiled GQA groups. Documents lifecycle constraints and validation boundaries. |
 | `models/qwen35/mixed-load-itl-470.md` | Issue #470: full cold `--max-batch 8/bg=4` matrix on RTX 4090 (24/24 valid) + starvation negative control. Qwen3.5 is not immune; chunking bounds max/per-step stall but raises p99 at low QPS (~14→~80–92ms) and pulls p99/max back from the prefill wall to the chunk wall at high load; `qps·prefill_s≳1` is a throughput wall (chunking can't fix it, and ON's +15% TTFT can trip it earlier). The old "p99 immunity" was a slot-starvation artifact. |
 | `models/qwen35/adaptive-scheduler-policy.md` | Issue #727 adaptive scheduler policy record: default `off`, opt-in `auto`, hard `--max-prefill-tokens` cap, TP `auto` rejection, and pre-review whole-prefill benchmark tradeoff retained as non-default evidence. |
-| `models/qwen35/decode-kernel-attribution.md` | nsys kernel attribution of the remaining serving gap vs vLLM 0.27 on A100: GDN decode closed to 1.14x by #1054, decode GEMMs at per-kernel parity with the residual in the projection arrangement (#1073 fuses the linear-attention half), full-attention paged decode the largest block because FlashInfer's grid is fixed at `(batch, kv_heads)`, a split-KV HD256 kernel for decode buckets up to 16 (bs1, c8 and c16 faster), and a clean GEMM alignment audit. |
+| `models/qwen35/decode-kernel-attribution.md` | nsys kernel attribution of the remaining serving gap vs vLLM 0.27 on A100: GDN decode closed to 1.14x by #1054, decode GEMMs at per-kernel parity with the residual in the projection arrangement (#1073 fuses the linear-attention half), full-attention paged decode the largest block because FlashInfer's grid is fixed at `(batch, kv_heads)`, a split-KV HD256 kernel for decode buckets up to 16 on any card and the 32 bucket on sm_80 (bs1, c8 and c16 faster), and a clean GEMM alignment audit. |
 | `models/qwen35/unified-prefill-overlap.md` | Issue #715 implementation record: opt-in single-GPU shared-SM overlap keeps one prefill chunk in flight while active decode continues; default serial policy and unsupported-combination guards remain explicit. |
 
 ## models / qwen4
@@ -160,8 +160,8 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | Path | TL;DR |
 | --- | --- |
 | `subsystems/router/kv-aware-routing.md` | Dynamo KV-aware routing on 8×Qwen3-4B (RTX 5090): cache-affinity routing keeps a multi-turn conversation on its home worker, so follow-up-turn TTFT stays flat ~45ms vs round-robin 160–170ms / random 165–180ms (all-turns p50 3.3–3.8× lower). Router prefix overlap 0.72 under KV, 0 under stateless policies; `kv_hit_rate>0` is the gate that the worker↔router block-hash bridge is actually matching. Includes the per-response `prompt_tokens_details.cached_tokens` signal. |
-| `subsystems/runtime/runtime.md` | Runtime complexity is controlled by a shared `pegainfer-core` that owns the generation contract and orchestration; per-model crates implement `ModelForward` so prefill/decode and hybrid attention stay hidden from the caller. State (`&mut`) is separated from weights (`&self`) for future bs > 1. |
 | `subsystems/runtime/kv-cache-design.md` | Dynamo 式 logical/physical 分层 KV cache：BlockManager 管 block 生命周期和 admission，PhysicalBackend trait 管 GPU 内存和布局（FullAttention / MLA）。支持 TP / DP。基于 vLLM/Dynamo/pegaflow 调研。 |
+| `subsystems/runtime/qwen3-kvbm-integration-spec.md` | Qwen3-4B spec (2026-05) for replacing the hand-written `PagePool` with kvbm-logical's `BlockManager`. It landed: `pegainfer-kv-cache` wraps the block manager today. |
 | `subsystems/runtime/pegaflow-offload-integration.md` | 把 `pegaflow-core` 当进程内 Rust 库做 KV 卸载物理后端（HBM→DRAM/SSD/RDMA），补 kvbm 没写的卸载层。**Qwen3-4B full-attn 首发，端到端已在真实 GPU 跑通并验证**（async SAVE+LOAD 接进 executor/scheduler，纯 CPU-hit 与 GPU+CPU 组合 hit 恢复后 logits 与冷算一致）。pegaflow 经 git rev pin（#331+#333）。默认关，server CLI 已接（#316：`--kv-offload`/`--no-prefix-cache`，plain+LoRA）。linear 排除，sparse 暂缓。 |
 
 ## subsystems / scheduler
@@ -216,7 +216,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 | `playbooks/bench-vs-vllm.md` | pegainfer vs vLLM comparative benchmarking: method, workflow, typical configs, gotchas. |
 | `playbooks/model-optimization-pipeline.md` | Per-model optimization methodology: 2 standard profiles, vLLM baseline, e2e dashboard + append-only optimization log. |
 | `playbooks/profiling-guide.md` | GPU profiling playbook: nsys pitfalls, diagnostic paths, measured kernel comparisons. |
-| `playbooks/accuracy-parity-playbook.md` | Accuracy debugging playbook: truth-source rules, first-diff workflow, bf16 rounding traps, and verified Qwen3.5 parity commands. |
+| `playbooks/accuracy-parity-playbook.md` | Accuracy debugging playbook: truth-source rules, first-diff workflow, bf16 rounding traps, and where the HF golden tools live. |
 | `playbooks/hawk-visibility-audit.md` | hawk workspace 可见性审计：必须 all-features（单 profile 的 dead_public 61% 假阳性），三个必需环境变量，kvbm fork 边界。 |
 
 ## lessons
@@ -237,7 +237,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | **Deleted** — superseded by `models/qwen3/serving-performance.md`. |
 | `benchmarks/qwen3-4b-spec-decode-l20.md` | Qwen3-4B speculative-decode gate and draft trim on one L20 (2026-10): spec-off crossover **c32 (DFlash block7) / c64 (DSpark block7)**, the load gate is worth **+46.6 %** at c64 and is a no-op below its threshold, and the trim's sign flips with concurrency — **the optimal verify span shrinks as the batch grows**. |
 | `benchmarks/k3-ep4-decode-profile.md` | K3 EP4 93-layer decode step profile (MegaMoE, GB300, 2026-08): 52% backbone B=1 dense GEMM at ~50% of SOL (cuBLASLt splitK), 20% fused MoE, 5% a mis-tuned router top-k; not launch-bound. Levers: near-SOL dense GEMV (~10 ms) + router fix (~2 ms) project ~50 → ~30 ms/step; FP8 backbone is the structural next step. |
 | `benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` | DeepSeek-V2-Lite EP2 2026-06-28 snapshot: PegaInfer host-staged/NCCL passed correctness, direct diagnostics, HTTP pressure, and trace rows; stock vLLM TP2/TP2+EP2 are retained as FlashInfer SM120/CUDA 12.8 setup failures, with a separate FlashInfer-fixed vLLM validation and no parity claim. |

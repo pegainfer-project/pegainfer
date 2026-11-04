@@ -142,6 +142,8 @@ fn run_request(
 #[ignore = "requires 4 GPUs + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4"]
 fn freerun_padding_byte_constancy_gate() -> Result<()> {
     const MIN_PADDING_STEPS: usize = 64;
+    type PaddingRoutesByBucket<'a> =
+        std::collections::BTreeMap<usize, Vec<(&'a Vec<i32>, &'a Vec<u32>)>>;
     let engine = launch_ep4(crate::Glm52Drafter::None)?;
     freerun_probe::set_enabled(true);
     let completion = run_request(&engine, 0, PATHOLOGICAL_PROMPT.len(), 96, true)?;
@@ -154,8 +156,7 @@ fn freerun_padding_byte_constancy_gate() -> Result<()> {
         // Idle ranks run only padding steps; group by bucket (prefill spans
         // on rank 0 no longer lift idle ranks' buckets, but the pre-capture
         // and any transient shapes may differ — the claim is per shape).
-        let mut per_bucket: std::collections::BTreeMap<usize, Vec<(&Vec<i32>, &Vec<u32>)>> =
-            std::collections::BTreeMap::new();
+        let mut per_bucket: PaddingRoutesByBucket<'_> = std::collections::BTreeMap::new();
         for record in records.iter().filter(|record| record.rank == rank) {
             assert_eq!(
                 record.active_rows, 0,
