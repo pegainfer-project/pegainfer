@@ -175,6 +175,7 @@ __global__ void qwen4_moe_route_kernel(const __nv_bfloat16* __restrict__ logits,
   __shared__ int b_i;
   __shared__ float s_sum[kWarps];
   __shared__ float b_sum;
+  __shared__ float s_probs[kExperts];
 
   const __nv_bfloat16* row_logits = logits + static_cast<size_t>(row) * kExperts;
   float held[kPerThread];
@@ -242,66 +243,89 @@ __global__ void qwen4_moe_route_kernel(const __nv_bfloat16* __restrict__ logits,
     }
   }
 
-  // Top-k by K masked block-argmax passes: pass k takes the k-th canonical
-  // pick, so the picks come out in the canonical order and the running
-  // selected sum accumulates in that same descending order — the order the
-  // device-free replay's renormalization sums in.
-  float selected_sum = 0.0f;
-  int win_slot[kPerThread];
-  int win_expert[kPerThread];
-  float win_prob[kPerThread];
-  int win_count = 0;
-  for (int k = 0; k < kTopK; ++k) {
-    float value = held[0];
-    int expert = tid;
+  // Top-k by K masked argmax passes, all of them inside one warp: the row's
+  // 512 probabilities cross to shared memory once, lane l takes the contiguous
+  // slice [16l, 16l+16) into registers, and each pass is a 16-deep lane scan
+  // plus a shuffle tree. Pass k takes the k-th canonical pick, so the picks
+  // come out in the canonical order and the running selected sum accumulates in
+  // that same descending order — the order the device-free replay's
+  // renormalization sums in.
+  //
+  // The picks and the weights are bit-identical to a block-wide reduction per
+  // pass: (value desc, expert asc) is a total order, the passes take the same
+  // sequence of winners, and `selected_sum` accumulates in that same order.
+  // What changes is the price of the serial structure — a block-wide reduction
+  // costs two `__syncthreads` per pass where this costs none, because the
+  // winner is masked in the owning lane's registers (the pass broadcasts
+  // `win_at`, so the sweep is over compile-time indices and no lane needs a
+  // shared-memory write to hide a pick). Measured on an RTX 5060 at 1.2 GHz,
+  // one token: 12.9 us per launch against 16.4 us for the block-wide form, and
+  // 36.5 vs 52.4 us at 512 tokens, with a 3.2-4.2 us empty-kernel floor.
 #pragma unroll
-    for (int slot = 1; slot < kPerThread; ++slot) {
-      const int e = tid + slot * kThreads;
-      if (route_better(held[slot], e, value, expert)) {
-        value = held[slot];
+  for (int slot = 0; slot < kPerThread; ++slot) {
+    s_probs[tid + slot * kThreads] = held[slot];
+  }
+  __syncthreads();
+
+  if (tid >= WARP_SIZE) return;
+  const int lane = tid;
+  constexpr int kLane = kExperts / WARP_SIZE;
+  float vals[kLane];
+#pragma unroll
+  for (int i = 0; i < kLane; ++i) {
+    vals[i] = s_probs[lane * kLane + i];
+  }
+  int win_expert[kTopK];
+  float win_prob[kTopK];
+  float selected_sum = 0.0f;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    float value = vals[0];
+    int expert = lane * kLane;
+#pragma unroll
+    for (int i = 1; i < kLane; ++i) {
+      const int e = lane * kLane + i;
+      if (route_better(vals[i], e, value, expert)) {
+        value = vals[i];
         expert = e;
       }
     }
-    float win_value;
-    int win_at;
-    block_reduce_best(value, expert, s_v, s_i, b_v, b_i, win_value, win_at);
-    if (win_at >= kExperts) {
-      // Unreachable now that a non-finite row returns above: the sentinel is
-      // the reduction's own padding lane, and beating it needs every one of
-      // the 512 probabilities at or below -FLT_MAX, while they are `expf`
-      // outputs and so >= 0. Kept as the same fail-closed write rather than a
-      // silent out-of-range expert id.
-      fail_row_closed(weights, ids, row, tid);
-      return;
-    }
-    selected_sum += win_value;
-    if (win_at % kThreads == tid) {
-      // Provably unreachable guard, kept so the bound can never degrade into a
-      // silent out-of-bounds write: this thread owns exactly `kPerThread`
-      // experts, and each pass masks the winner it took with -INFINITY, so it
-      // can win at most `kPerThread` of the `kTopK` passes. `win_count`
-      // therefore only ever reaches `kPerThread` on the increment that fills
-      // the last slot, never past it — dropping the check would be safe today
-      // and quietly unsafe the moment `kTopK` or the ownership split changes.
-      if (win_count < kPerThread) {
-        win_slot[win_count] = k;
-        win_expert[win_count] = win_at;
-        win_prob[win_count] = win_value;
-        ++win_count;
+#pragma unroll
+    for (int width = WARP_SIZE / 2; width > 0; width >>= 1) {
+      const float other_v = __shfl_down_sync(0xffffffffu, value, width);
+      const int other_i = __shfl_down_sync(0xffffffffu, expert, width);
+      if (route_better(other_v, other_i, value, expert)) {
+        value = other_v;
+        expert = other_i;
       }
-      // Mask the winner so no later pass can take it again. Only the owner
-      // thread holds this expert's probability, and it reads its own registers
-      // only, so no barrier is needed before the next pass.
-      held[win_at / kThreads] = -INFINITY;
+    }
+    // kExperts == WARP_SIZE * kLane, so every lane scans a full slice and the
+    // tree's winner is a real expert: the block-wide path's out-of-range
+    // sentinel (a padding lane winning the row) has no counterpart here. Every
+    // probability is finite — a non-finite row returned above.
+    const float win_value = __shfl_sync(0xffffffffu, value, 0);
+    const int win_at = __shfl_sync(0xffffffffu, expert, 0);
+    selected_sum += win_value;
+    if (lane == 0) {
+      win_prob[k] = win_value;
+      win_expert[k] = win_at;
+    }
+    // Mask the winner so no later pass can take it again. The owner is known to
+    // every lane (`win_at`), and the sweep is over compile-time indices, so the
+    // mask stays in registers and the next pass needs no barrier.
+#pragma unroll
+    for (int i = 0; i < kLane; ++i) {
+      if (lane * kLane + i == win_at) vals[i] = -INFINITY;
     }
   }
-
-  for (int w = 0; w < win_count; ++w) {
-    float value = win_prob[w];
+  if (lane != 0) return;
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) {
+    float value = win_prob[k];
     if (renorm != 0) value = value / selected_sum;
-    const size_t at = static_cast<size_t>(row) * kTopK + win_slot[w];
+    const size_t at = static_cast<size_t>(row) * kTopK + k;
     weights[at] = __float2bfloat16(value);
-    ids[at] = win_expert[w];
+    ids[at] = win_expert[k];
   }
 }
 
@@ -352,6 +376,7 @@ CUresult qwen4_moe_route_cuda(const __nv_bfloat16* logits,
       logits, weights, ids, rows, renorm, probs_bf16);
   return map_cuda_error(cudaGetLastError());
 }
+
 
 // `gate_logit` is `[tokens]` bf16 (the `[1, 2560]` gate linear's output);
 // `expert_out`, `shared_out` and `out` are `[tokens, hidden]` bf16.
