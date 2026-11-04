@@ -19,7 +19,7 @@
 > ~17s 超时 → fatal ERROR log → 进程退出。** 取代 `cross-node-scaling.md` 的
 > Event plane 与 SMR 方向(该文档的 NVL72 实测数据仍有效)。
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-10
 
 ## 1. 问题:DP 只切了状态,没切控制
 
@@ -204,7 +204,8 @@ gate 1–3 全部 GO。** 前三个 gate 实现于 `pegainfer-glm52/src/oracle/f
 ```bash
 for g in freerun_hetero_traffic_gate freerun_hetero_graph_gate freerun_bound_tax_probe; do
   PEGAINFER_TEST_MODEL_PATH=/mnt/shared/weights/GLM-5.2-FP8 EP_DISABLE_GIN=1 \
-    cargo test --release -p pegainfer-glm52 --lib "$g" -- --ignored --nocapture
+    cargo test --release -p pegainfer-glm52 --features glm52 --lib "$g" \
+      -- --ignored --nocapture
 done
 ```
 

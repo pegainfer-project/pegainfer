@@ -705,6 +705,7 @@ impl Scheduler for Qwen35Scheduler {
                 as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
+            prefix_cache: None,
         }
     }
 }

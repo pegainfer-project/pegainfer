@@ -347,6 +347,30 @@ fn start_with_knobs(
     options: &EngineLoadOptions,
     lookup: &dyn Fn(&str) -> Result<Option<String>>,
 ) -> Result<Engine> {
+    let state = load_with_knobs(model_path, options, lookup)?;
+    // Publishing the real ceiling is what lets the frontend refuse an
+    // over-length request with its own message instead of forwarding one the
+    // engine can only fail mid-stream.
+    // The ceiling domain keeps the value inside i32, so this API-boundary
+    // conversion cannot fail.
+    let servable =
+        u32::try_from(state.max_context).expect("ceiling domain holds servable inside u32");
+    let scheduler = Gemma4Scheduler::new(state);
+    Ok(Engine {
+        schedulers: vec![spawn_scheduler("gemma4-engine", scheduler)],
+        info: EngineInfo {
+            kv_capacity: None,
+            servable_len: Some(servable),
+        },
+        lora: None,
+    })
+}
+
+fn load_with_knobs(
+    model_path: &Path,
+    options: &EngineLoadOptions,
+    lookup: &dyn Fn(&str) -> Result<Option<String>>,
+) -> Result<EngineState> {
     let dir = model_path
         .to_str()
         .context("model path is not valid UTF-8")?
@@ -441,7 +465,7 @@ fn start_with_knobs(
         }
     }
 
-    let state = EngineState::load(
+    EngineState::load(
         &dir,
         &config,
         knobs,
@@ -449,23 +473,7 @@ fn start_with_knobs(
         policy,
         base_seed,
         graph_enabled,
-    )?;
-    let servable = state.max_context;
-    // Publishing the real ceiling is what lets the frontend refuse an
-    // over-length request with its own message instead of forwarding one the
-    // engine can only fail mid-stream.
-    // The ceiling domain keeps the value inside i32, so this API-boundary
-    // conversion cannot fail.
-    let servable = u32::try_from(servable).expect("ceiling domain holds servable inside u32");
-    let scheduler = Gemma4Scheduler::new(state);
-    Ok(Engine {
-        schedulers: vec![spawn_scheduler("gemma4-engine", scheduler)],
-        info: EngineInfo {
-            kv_capacity: None,
-            servable_len: Some(servable),
-        },
-        lora: None,
-    })
+    )
 }
 
 struct GenerationPolicy {
@@ -490,12 +498,6 @@ fn generation_policy(dir: &str, vocab: usize) -> Result<GenerationPolicy> {
 }
 
 impl GenerationPolicy {
-    /// Whether this pick retires its row instead of being emitted. Every path
-    /// that can stop a request asks here, so the rule cannot drift.
-    fn stops(&self, id: u32, ignore_eos: bool) -> bool {
-        !ignore_eos && self.eos.contains(&id)
-    }
-
     /// The suppressed ids index the vocabulary, so they are checked against
     /// it once the head is loaded: an out-of-range one would fail the first
     /// request. The EOS set was checked when it was resolved.
@@ -703,14 +705,9 @@ const MIX_MAX_PROMPTS: usize = 4;
 /// records, not here.
 const MIX_GATHER_ROWS: usize = 512;
 
-/// The prompt rows a tensor-parallel mixed step may absorb — the
-/// `PEGAINFER_TP_MAX_PROMPT` default that went with the stall it guarded. The
-/// mixed step is the one TP path no gate covers (`serve::oracle::
-/// mixed_step_matches_serial` is single-rank), and the deleted ceiling was also
-/// what kept a gathered prompt's rows small here, so the bound stays for this
-/// step alone until a gate covers it: a prompt that does not fit beside the
-/// live batch is prefilled on its own instead, exactly as an over-ceiling
-/// prompt was before. At one rank the step is unbounded, as it always was.
+/// The prompt rows a tensor-parallel mixed step may absorb, kept small because no gate covers
+/// that step yet (`serve::oracle::mixed_step_matches_serial` is single-rank). A prompt that
+/// does not fit beside the live batch is prefilled on its own; one rank is unbounded.
 const TP_MIX_PROMPT_ROWS: usize = 64;
 
 fn parse_mix_max_prompts(raw: &str, slots: usize) -> Result<usize> {
@@ -910,7 +907,6 @@ struct SampleRow<'a> {
     params: &'a pegainfer_frontend::sampler::SamplingParams,
     step: u64,
     logprobs: Option<usize>,
-    ignore_eos: bool,
 }
 
 impl<'a> SampleRow<'a> {
@@ -920,16 +916,13 @@ impl<'a> SampleRow<'a> {
             params: &request.params,
             step,
             logprobs: request.logprobs,
-            ignore_eos: request.params.ignore_eos,
         }
     }
 
-    /// A mid-walk segment's row, sampled and discarded: it never stops and is
-    /// never scored.
+    /// A mid-walk segment's row, sampled and discarded without scoring.
     fn discarded(request: &'a Request) -> Self {
         Self {
             logprobs: None,
-            ignore_eos: true,
             ..Self::of(request, 0)
         }
     }
@@ -955,7 +948,6 @@ impl SampleSeed {
 struct SampledRows {
     picked: Vec<u32>,
     logprobs: Vec<Option<TokenLogprob>>,
-    stops: Vec<bool>,
 }
 
 impl SampledRows {
@@ -963,7 +955,6 @@ impl SampledRows {
         SampledToken {
             id: self.picked[row],
             logprob: self.logprobs[row].take(),
-            stop: self.stops[row],
         }
     }
 }
@@ -971,11 +962,9 @@ impl SampledRows {
 /// Suppress, sample and score one step's logits, with the failed stage on the
 /// error's context chain. Nothing here sends an event or moves request state:
 /// what a pick means for its row is the only thing the callers disagree about.
-#[allow(clippy::too_many_arguments)]
 fn sample_logits_rows(
     ctx: &DeviceContext,
     suppress_ids: &ops::SuppressIds,
-    policy: &GenerationPolicy,
     scratch: &mut SampleScratch,
     seed: &mut SampleSeed,
     rows: &[SampleRow<'_>],
@@ -990,22 +979,15 @@ fn sample_logits_rows(
         pegainfer_sample::select_batch(ctx, logits, &params, &steps, call_seed, scratch)
             .context("sampling")?
     };
-    let stops: Vec<bool> = rows
-        .iter()
-        .zip(&picked)
-        .map(|(row, &id)| policy.stops(id, row.ignore_eos))
-        .collect();
     let requests: Vec<LogprobRequest> = rows
         .iter()
         .enumerate()
         .filter_map(|(row, spec)| {
-            spec.logprobs
-                .filter(|_| !stops[row])
-                .map(|top_k| LogprobRequest {
-                    row,
-                    picked: picked[row],
-                    top_k,
-                })
+            spec.logprobs.map(|top_k| LogprobRequest {
+                row,
+                picked: picked[row],
+                top_k,
+            })
         })
         .collect();
     let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; rows.len()];
@@ -1016,11 +998,7 @@ fn sample_logits_rows(
             logprobs[request.row] = Some(logprob);
         }
     }
-    Ok(SampledRows {
-        picked,
-        logprobs,
-        stops,
-    })
+    Ok(SampledRows { picked, logprobs })
 }
 
 /// Capture this prompt's tail into the prefix cache when one is configured and
@@ -1093,7 +1071,7 @@ fn mixed_head_flow(
             .copied()
             .chain(active.iter().map(|entry| entry.sample_row(ledger)))
             .collect();
-        sample_logits_rows(ctx, suppress_ids, policy, scratch, seed, &rows, logits)
+        sample_logits_rows(ctx, suppress_ids, scratch, seed, &rows, logits)
     };
     let mut sampled = match sampled {
         Ok(sampled) => sampled,
@@ -1103,7 +1081,7 @@ fn mixed_head_flow(
         }
     };
     // Active rows: the decode-round event flow, `k` logits rows up.
-    emit_decode_rows(active, &mut sampled, k, ledger);
+    emit_decode_rows(active, &mut sampled, k, policy, ledger);
     Ok(sampled)
 }
 
@@ -1126,20 +1104,17 @@ impl Active {
         )
     }
 
-    /// A staged greedy pick never went through [`sample_logits_rows`], so its
-    /// stop is decided here, by the same rule.
     fn settle_staged(&mut self, policy: &GenerationPolicy, token: u32, ledger: &mut RequestLedger) {
         if self.stopping {
             return;
         }
-        let stop = policy.stops(token, self.request.request.params.ignore_eos);
         self.stopping = settle_token(
             self,
             SampledToken {
                 id: token,
                 logprob: None,
-                stop,
             },
+            policy,
             ledger,
         );
     }
@@ -1305,7 +1280,7 @@ struct EngineState {
 /// Rank 0's graphs are released here, on its own device, before the fields (and
 /// with them the communicator) drop: NCCL's abort waits for a graph that
 /// references the communicator to be destroyed. Only the single-rank path
-/// captures anything (`start_with_knobs` turns them off under TP, "Decode graphs
+/// captures anything (`load_with_knobs` turns them off under TP, "Decode graphs
 /// are off under TP"), so there is no peer arena holding a captured collective
 /// to release.
 impl Drop for EngineState {
@@ -1439,7 +1414,6 @@ impl EngineState {
                     // leave a handle pair's device memory behind.
                     let outcome = (|| -> Result<()> {
                         let _handles = bind_engine_thread(&state.ctx)?;
-                        activate_rank(&state.ctx)?;
                         extra(state, item)
                             .with_context(|| format!("tensor-parallel rank {rank} segment"))?;
                         state
@@ -1598,16 +1572,7 @@ impl EngineState {
 /// ends: the scheduler holds its guard for its lifetime, and each step's
 /// extra-rank thread holds one for the step's.
 fn bind_engine_thread(ctx: &DeviceContext) -> Result<CublasThreadGuard> {
-    let err = unsafe { pegainfer_core::ffi::cuda_set_device(ctx.device_ordinal as i32) };
-    anyhow::ensure!(
-        err == 0,
-        "cudaSetDevice({}) on the scheduler thread failed: cudaError={err}",
-        ctx.device_ordinal
-    );
-    ctx.ctx
-        .bind_to_thread()
-        .map_err(|e| anyhow::anyhow!("bind the CUDA context to the scheduler thread: {e}"))?;
-    unsafe { pegainfer_core::ffi::cublas_init() };
+    activate_rank(ctx)?;
     Ok(CublasThreadGuard)
 }
 
@@ -2371,7 +2336,6 @@ impl EngineState {
         let sampled = sample_logits_rows(
             &self.ctx,
             &self.suppress_ids,
-            &self.policy,
             &mut self.scratch,
             &mut self.seed,
             &[SampleRow::of(&request.request, 0)],
@@ -2385,7 +2349,7 @@ impl EngineState {
                 return Admitted::Done;
             }
         };
-        match settle_first_token(request, kv, sampled.token(0), echo, ledger) {
+        match settle_first_token(request, kv, sampled.token(0), echo, &self.policy, ledger) {
             Some(entry) => Admitted::Active(Box::new(entry)),
             None => Admitted::Done,
         }
@@ -2752,7 +2716,7 @@ impl EngineState {
             &request.request.prompt_tokens,
             resumed,
         );
-        if let Some(entry) = settle_first_token(request, kv, token, None, ledger) {
+        if let Some(entry) = settle_first_token(request, kv, token, None, &self.policy, ledger) {
             active.push(entry);
         }
     }
@@ -2792,7 +2756,9 @@ impl EngineState {
     }
 
     fn pipeline_eligible(&self, active: &[Active], ledger: &RequestLedger) -> bool {
-        !active.is_empty()
+        // Only one rank can feed the next step from device-resident sampled IDs.
+        self.more.is_empty()
+            && !active.is_empty()
             && active.len() <= self.scratch.max_rows()
             && active.iter().all(|entry| {
                 !entry.stopping
@@ -2812,18 +2778,12 @@ impl EngineState {
 
     /// Reserve the next token without retiring or reordering a row.
     ///
-    /// `Ok(false)` is rank 0's own shortfall, which the caller answers by
-    /// falling back to [`Self::ready_decode_rows`] — that path fails the row and
-    /// drops it, so its pages come back. `Err` is only reachable with extra
-    /// ranks: a rank that cannot reserve what rank 0 just reserved has lost the
-    /// page-id race, and nothing here drops the row, so the divergence would
-    /// ride into the step and read one rank's KV at another's frontier. By
-    /// `admit_extra_ranks`' own contract nothing after that can repair it, so
-    /// the engine stops instead.
-    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> Result<bool> {
+    /// A shortfall falls back to [`Self::ready_decode_rows`] after the pipeline
+    /// drains, so no pages are released while a staged step still uses them.
+    fn ready_rows_pinned(&self, active: &mut [Active], ledger: &RequestLedger) -> bool {
         for entry in active.iter_mut() {
             if ledger.is_aborted(entry.request.id) {
-                return Ok(false);
+                return false;
             }
             if admit_tokens(
                 &self.serve.local_pool,
@@ -2833,11 +2793,10 @@ impl EngineState {
             )
             .is_err()
             {
-                return Ok(false);
+                return false;
             }
-            self.admit_extra_ranks(&mut entry.kv, 1)?;
         }
-        Ok(true)
+        true
     }
 
     fn fence(&self) -> Result<()> {
@@ -2857,43 +2816,25 @@ impl EngineState {
         resident: bool,
         slot: usize,
     ) -> Result<usize> {
+        anyhow::ensure!(self.more.is_empty(), "staged decode requires a single rank");
         let rows = active.len();
-        // The staged pipeline hands rank 1 no ids of its own (it has no
-        // sampler), so under tensor parallelism every rank takes the
-        // explicit-token path.
-        let resident = resident && self.more.is_empty();
         let tokens = (!resident).then(|| active.iter().map(|entry| entry.next).collect::<Vec<_>>());
         {
-            let payload = rank_payloads(active);
-            if let Some(tokens) = tokens.as_deref() {
-                // Every rank carries the same tokens and page ids; only rank 0
-                // samples, so the extras' logits are discarded.
-                self.drive_ranks(
-                    payload,
-                    |ctx, serve, arena, mut kvs| {
-                        serve
-                            .decode_batch_step(ctx, arena, &mut kvs, tokens)
-                            .map(|_| ())
-                    },
-                    |state, mut kvs| {
-                        state
-                            .serve
-                            .decode_batch_step(&state.ctx, &mut state.arena, &mut kvs, tokens)
-                            .map(|_| ())
-                    },
-                )?;
+            activate_rank(&self.ctx)?;
+            let mut kvs: Vec<_> = active
+                .iter_mut()
+                .map(|entry| entry.kv.core_mut(0))
+                .collect();
+            let stepped = if let Some(tokens) = tokens.as_deref() {
+                self.serve
+                    .decode_batch_step(&self.ctx, &mut self.arena, &mut kvs, tokens)
+                    .map(|_| ())
             } else {
-                // World size 1: the resident path, with no extra rank to drive.
-                self.drive_ranks(
-                    payload,
-                    |ctx, serve, arena, mut kvs| {
-                        serve
-                            .decode_batch_step_resident(ctx, arena, &mut kvs)
-                            .map(|_| ())
-                    },
-                    |_state, _kvs| Ok(()),
-                )?;
-            }
+                self.serve
+                    .decode_batch_step_resident(&self.ctx, &mut self.arena, &mut kvs)
+                    .map(|_| ())
+            };
+            stepped?;
         }
         let graph_slot = crate::serve::decode_bucket_slot(rows);
         if let Some(graph) = self.sampler_graphs.get_mut(graph_slot) {
@@ -3071,7 +3012,9 @@ impl EngineState {
 
         // The newcomers: their first tokens are logits rows `0..k`.
         for (j, (request, kv, _)) in newcomers.into_iter().enumerate() {
-            if let Some(entry) = settle_first_token(request, kv, sampled.token(j), None, ledger) {
+            if let Some(entry) =
+                settle_first_token(request, kv, sampled.token(j), None, &self.policy, ledger)
+            {
                 active.push(entry);
             }
         }
@@ -3113,7 +3056,6 @@ impl EngineState {
             sample_logits_rows(
                 &self.ctx,
                 &self.suppress_ids,
-                &self.policy,
                 &mut self.scratch,
                 &mut self.seed,
                 &rows,
@@ -3121,7 +3063,7 @@ impl EngineState {
             )
         };
         match sampled {
-            Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0, ledger),
+            Ok(mut sampled) => emit_decode_rows(active, &mut sampled, 0, &self.policy, ledger),
             Err(err) => {
                 self.fence()?;
                 fail_active_batch(active, "batched decode", &err, ledger);
@@ -3135,7 +3077,7 @@ impl EngineState {
     /// successor in flight and drain before any row-order change.
     fn decode_round(&mut self, active: &mut Vec<Active>, ledger: &mut RequestLedger) -> Result<()> {
         if let Some(pending) = self.pipeline.take() {
-            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger)? {
+            if self.pipeline_eligible(active, ledger) && self.ready_rows_pinned(active, ledger) {
                 let next_slot = (pending.slot + 1) % DECODE_PIPELINE_DEPTH;
                 match self.launch_staged(active, true, next_slot) {
                     Ok(rows) => {
@@ -3218,7 +3160,6 @@ impl Scheduler for Gemma4Scheduler {
             // down on this thread. Each other rank's handles are created the
             // first time `activate_rank` reaches it.
             self.cublas = Some(bind_engine_thread(&self.state.ctx)?);
-            activate_rank(&self.state.ctx)?;
         }
         if self.walk.is_some() {
             return self.advance_walk(ledger);
@@ -3275,34 +3216,41 @@ impl Scheduler for Gemma4Scheduler {
             num_running_reqs: (self.active.len() + walkers + lane_inflight) as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
+            prefix_cache: None,
         }
     }
 }
 
-/// One sampled pick, with the stop the sampler decided for it.
+/// One sampled pick and its requested logprob.
 struct SampledToken {
     id: u32,
     logprob: Option<TokenLogprob>,
-    stop: bool,
 }
 
 /// Settle one pick for its request, first token or later: an aborted request
-/// retires with no event, and a stop token retires it without being emitted
-/// (the frontend appends its own sentinel for a terminal Stop and drops the
-/// last id, so an engine that emits EOS costs the client its final visible
-/// token). Any other token is emitted and finishes the request at
-/// `max_tokens`. Returns whether the request is done.
-fn settle_token(entry: &mut Active, token: SampledToken, ledger: &mut RequestLedger) -> bool {
+/// retires with no event; every generated token is recorded before its stop
+/// or length verdict. Returns whether the request is done.
+fn settle_token(
+    entry: &mut Active,
+    token: SampledToken,
+    policy: &GenerationPolicy,
+    ledger: &mut RequestLedger,
+) -> bool {
     let id = entry.request.id;
     if ledger.is_aborted(id) {
         ledger.retire(id);
         return true;
     }
-    if token.stop {
-        ledger.finish(id, FinishReason::Stop);
+    let cause = entry
+        .request
+        .request
+        .stop_policy
+        .classify(token.id, |id| policy.eos.contains(&id));
+    ledger.push_tokens(id, &[token.id], &[token.logprob]);
+    if let Some(cause) = cause {
+        ledger.finish_with_cause(id, FinishReason::Stop, Some(cause));
         return true;
     }
-    ledger.push_tokens(id, &[token.id], &[token.logprob]);
     if ledger.completion_tokens(id) >= entry.request.request.max_tokens {
         ledger.finish(id, FinishReason::Length);
         return true;
@@ -3319,11 +3267,12 @@ fn emit_decode_rows(
     active: &mut Vec<Active>,
     sampled: &mut SampledRows,
     row_base: usize,
+    policy: &GenerationPolicy,
     ledger: &mut RequestLedger,
 ) {
     let mut retire: Vec<usize> = Vec::new();
     for (row, entry) in active.iter_mut().enumerate() {
-        if settle_token(entry, sampled.token(row + row_base), ledger) {
+        if settle_token(entry, sampled.token(row + row_base), policy, ledger) {
             retire.push(row);
         }
     }
@@ -3339,6 +3288,7 @@ fn settle_first_token(
     kv: GemmaKv,
     token: SampledToken,
     echo: Option<PromptEcho>,
+    policy: &GenerationPolicy,
     ledger: &mut RequestLedger,
 ) -> Option<Active> {
     if let Some(echo) = echo.filter(|_| !ledger.is_aborted(request.id)) {
@@ -3350,7 +3300,7 @@ fn settle_first_token(
         next: token.id,
         stopping: false,
     };
-    (!settle_token(&mut entry, token, ledger)).then_some(entry)
+    (!settle_token(&mut entry, token, policy, ledger)).then_some(entry)
 }
 
 #[cfg(test)]

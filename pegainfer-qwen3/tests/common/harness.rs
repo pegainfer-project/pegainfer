@@ -26,6 +26,7 @@ use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::SchedulerHandle;
+use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -51,6 +52,7 @@ pub(crate) fn request(
         prompt_tokens,
         params,
         history_tokens: None,
+        history_marks: Vec::new(),
         stop_policy,
         max_tokens,
         lora_adapter: None,
@@ -88,6 +90,9 @@ impl EngineHarness {
             1,
             "test harness drives single-scheduler engines"
         );
+        // Request ids restart with every engine, so an older engine's commit
+        // trace would answer for this one's requests.
+        COMMITTED_ROWS.lock().unwrap().clear();
         let mut scheduler = engine.schedulers.remove(0);
         let mut steps = scheduler
             .handle
@@ -138,6 +143,13 @@ impl EngineHarness {
             control,
             inbox: Arc::clone(&self.inbox),
         }
+    }
+
+    pub(crate) fn metrics(&self) -> SchedulerMetrics {
+        self.handle
+            .as_ref()
+            .expect("harness handle lives until drop")
+            .metrics()
     }
 
     /// The engine's LoRA client; panics when the engine serves no adapter
@@ -209,6 +221,7 @@ impl RequestStream {
     /// vanished stream is a test failure, not an outcome.
     pub(crate) fn outcome(mut self) -> Outcome {
         let mut outcome = Outcome {
+            id: self.id,
             tokens: Vec::new(),
             logprobs: Vec::new(),
             cached_tokens: None,
@@ -256,6 +269,7 @@ impl RequestStream {
 /// A finished request, folded: everything the old per-request event stream
 /// delivered incrementally.
 pub(crate) struct Outcome {
+    pub(crate) id: RequestId,
     pub(crate) tokens: Vec<u32>,
     pub(crate) logprobs: Vec<Option<TokenLogprob>>,
     pub(crate) cached_tokens: Option<usize>,
@@ -263,19 +277,32 @@ pub(crate) struct Outcome {
     pub(crate) terminal: Terminal,
 }
 
-/// Minimal stderr logger for gate children (`PEGAINFER_TEST_LOG=1`): the
-/// hedged execution gate counts the executor's per-round hedge trace lines,
-/// and cargo test binaries install no logger of their own. Forwarding only
-/// this crate's records keeps child stderr parseable.
+/// Test logger, installed by [`init_capture_logging`]. It keeps the
+/// executor's commit trace in memory for [`committed_row`], and with
+/// `PEGAINFER_TEST_LOG=1` it also forwards this crate's debug records to
+/// stderr: the hedged execution gate counts the per-round hedge trace lines in
+/// child stderr, and cargo test binaries install no logger of their own.
 struct TestLogger;
+
+fn forwards_to_stderr() -> bool {
+    std::env::var_os("PEGAINFER_TEST_LOG").is_some()
+}
 
 impl log::Log for TestLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.target().starts_with("pegainfer_qwen3")
+        metadata.target() == pegainfer_qwen3::COMMIT_TRACE_TARGET
+            || (metadata.level() <= log::Level::Debug
+                && metadata.target().starts_with("pegainfer_qwen3")
+                && forwards_to_stderr())
     }
 
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if record.target() == pegainfer_qwen3::COMMIT_TRACE_TARGET {
+            record_committed_row(&record.args().to_string());
+        } else {
             eprintln!("[{}] {}", record.level(), record.args());
         }
     }
@@ -285,9 +312,62 @@ impl log::Log for TestLogger {
 
 static TEST_LOGGER: TestLogger = TestLogger;
 
+/// Install [`TestLogger`]. Every test that runs a lossless check calls this
+/// first, since the check reads the commit trace the logger keeps; once
+/// installed the executor pays one row copy per committed token.
 pub(crate) fn init_capture_logging() {
-    if std::env::var("PEGAINFER_TEST_LOG").is_ok() {
-        let _ = log::set_logger(&TEST_LOGGER);
-        log::set_max_level(log::LevelFilter::Debug);
-    }
+    let _ = log::set_logger(&TEST_LOGGER);
+    log::set_max_level(log::LevelFilter::Trace);
+}
+
+/// The forward row behind one committed token: the request, the sequence
+/// position it commits, and the row's top two decodable `(token, logit)`.
+#[derive(Clone, Debug)]
+pub(crate) struct CommittedRow {
+    request: String,
+    pos: usize,
+    pub(crate) top: [(u32, f32); 2],
+}
+
+static COMMITTED_ROWS: Mutex<Vec<CommittedRow>> = Mutex::new(Vec::new());
+
+fn record_committed_row(line: &str) {
+    let field = |key: &str| {
+        line.split(' ')
+            .find_map(|part| part.strip_prefix(key))
+            .unwrap_or_else(|| panic!("commit trace without {key}: {line}"))
+    };
+    let pair = |text: &str| {
+        let (token, logit) = text
+            .split_once(':')
+            .unwrap_or_else(|| panic!("commit trace top entry {text:?}: {line}"));
+        (
+            token.parse().expect("commit trace token"),
+            logit.parse().expect("commit trace logit"),
+        )
+    };
+    let (_, top) = line
+        .split_once("top=")
+        .unwrap_or_else(|| panic!("commit trace without top: {line}"));
+    let (first, second) = top
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("commit trace top needs two entries: {line}"));
+    COMMITTED_ROWS.lock().unwrap().push(CommittedRow {
+        request: field("request=").to_string(),
+        pos: field("pos=").parse().expect("commit trace position"),
+        top: [pair(first), pair(second)],
+    });
+}
+
+/// The forward row that committed `request`'s token at sequence position
+/// `pos`, from the engine the harness started last.
+pub(crate) fn committed_row(request: RequestId, pos: usize) -> Option<CommittedRow> {
+    let request = request.to_string();
+    COMMITTED_ROWS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|row| row.request == request && row.pos == pos)
+        .cloned()
 }

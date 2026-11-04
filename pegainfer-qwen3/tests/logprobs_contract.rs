@@ -55,6 +55,7 @@ fn engine(path: &str) -> EngineHarness {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: None,
+        eagle3_draft_model_path: None,
     };
     EngineHarness::new(
         pegainfer_qwen3::launch(Path::new(path), options).expect("launch real engine"),

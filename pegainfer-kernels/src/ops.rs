@@ -5,6 +5,8 @@ mod attention;
 mod deepep;
 #[cfg(feature = "deepseek-v2-lite")]
 mod deepseek_v2_lite;
+mod dflash2;
+mod dflash2_conv;
 #[cfg(feature = "deepseek-v2-lite")]
 mod dsv2_routed_moe;
 #[cfg(feature = "deepseek-v2-lite")]
@@ -35,6 +37,7 @@ mod k3;
 mod k3_tilelang;
 #[cfg(feature = "kimi-k2")]
 mod kimi_k2;
+mod kimi_k2_geometry;
 mod linear;
 mod lora;
 #[cfg(any(feature = "gemma4", feature = "kimi-k2"))]
@@ -55,8 +58,8 @@ pub use attention::paged_attention_batch_decode_split_kv_into;
 pub use attention::prefill_attention_paged_into;
 pub use attention::qk_norm_rope_batch_decode_into;
 pub use attention::single_decode_nhd_into;
-pub use attention::single_prefill_nhd_causal_into;
 pub use attention::single_prefill_nhd_noncausal_into;
+pub use attention::single_prefill_nhd_noncausal_range_into;
 #[cfg(feature = "moe")]
 pub use deepep::DeepEp;
 #[cfg(feature = "moe")]
@@ -89,21 +92,22 @@ pub use deepep::glm52_deepep_info;
 pub use deepep::glm52_ep_deepep_unique_id;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use deepseek_v2_lite::*;
+pub use dflash2::DFLASH2_CANDIDATE_K;
+pub use dflash2::DFlash2Scratch;
+pub use dflash2::dflash2_select_into;
+pub use dflash2_conv::dflash2_grouped_conv_into;
 pub use elementwise::SuppressIds;
-pub use elementwise::accumulate_bf16_token_scaled_to_f32_into;
 pub use elementwise::add_batch;
 pub use elementwise::add_batch_into;
 pub use elementwise::add_into;
 pub use elementwise::add_scaled_bf16_into;
 pub use elementwise::advance_decode_metadata;
 pub use elementwise::bf16_bytes_to_f32_into;
-pub use elementwise::bf16_hidden_to_f32_into;
 pub use elementwise::copy_hidden_rows_into;
 pub use elementwise::copy_hidden_rows_raw_into;
 pub use elementwise::copy_hidden_token_range_into;
 pub use elementwise::extract_hidden_rows_raw_into;
 pub use elementwise::extract_vec;
-pub use elementwise::extract_vec_into;
 pub use elementwise::extract_vec_ref;
 pub use elementwise::extract_vec_ref_into;
 pub use elementwise::f32_to_bf16_hidden_into;
@@ -113,9 +117,7 @@ pub use elementwise::mask_position_zero_rows_into;
 pub use elementwise::repeat_f32_for_reduce_scatter_into;
 pub use elementwise::scale_bf16_in_place;
 pub use elementwise::scale_f32_in_place;
-pub use elementwise::scaled_add_batch_into;
 pub use elementwise::scaled_add_rows_indexed_into;
-pub use elementwise::scaled_add_rows_into;
 pub use elementwise::scaled_add_rows_token_range_into;
 pub use elementwise::silu_mul_batch;
 pub use elementwise::silu_mul_batch_into;
@@ -126,7 +128,6 @@ pub use elementwise::suppress_logits_bf16_in_place;
 pub use elementwise::write_vec_into;
 pub use embedding::embedding_batch;
 pub use embedding::embedding_batch_vocab_shard;
-pub use embedding::embedding_decode_into;
 pub use embedding::embedding_rows_into;
 #[cfg(feature = "gemma4")]
 pub use gemma4::*;
@@ -180,6 +181,7 @@ pub use k3::*;
 pub use k3_tilelang::*;
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
+pub use kimi_k2_geometry::*;
 pub use linear::GEMM_LT_MAX_N;
 pub use linear::NumericPolicy;
 pub use linear::PinAlgoConfig;
@@ -208,6 +210,7 @@ pub use linear::numeric_policy;
 pub use linear::per_token_served;
 pub use linear::pin_served;
 pub use linear::reset_numeric_policy_counters;
+pub use linear::set_n1_matvec;
 pub use linear::set_numeric_policy;
 pub use lora::LoraDecodeGroupedProjection;
 pub use lora::lora_decode_fused_delta_group3_into;
@@ -216,7 +219,6 @@ pub use lora::pack_lora_b_rows_into;
 pub use norm::GatedNormActivation;
 pub use norm::dual_rms_norm_add_batch_into;
 pub use norm::fused_add_rms_norm_batch_into;
-pub use norm::fused_add_rms_norm_into;
 pub use norm::fused_add_rms_norm_round_batch_into;
 pub use norm::fused_add_rms_norm_round_into;
 pub use norm::layer_norm_into;
@@ -232,6 +234,10 @@ pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qsa_indexer_select_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::rms_norm_grouped_offset_batch_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::GDN_AOT_KEY_HEAD_DIM;
 #[cfg(feature = "qwen35")]

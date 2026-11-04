@@ -59,8 +59,8 @@ impl Qwen3Executor {
                 req.request_id
             );
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative verification requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative verification requested before draft state is ready for {:?}",
                 req.request_id
             );
             anyhow::ensure!(
@@ -100,6 +100,7 @@ impl Qwen3Executor {
             kv_views,
             sample_seed: plan.sample_seed,
             verify_round,
+            gated: plan.gated,
         };
         let outcome = match self.run_step(&step) {
             Ok(outcome) => outcome,
@@ -179,7 +180,7 @@ impl Qwen3Executor {
             }
             if std::env::var_os("PEGAINFER_TEST_LOG").is_some() {
                 log::debug!(
-                    "Qwen3 DFlash commit round={} request={} accepted_len={}",
+                    "Qwen3 speculative commit round={} request={} accepted_len={}",
                     verify_round,
                     req_result.request_id,
                     req_result.accepted_tokens.len(),
@@ -194,7 +195,12 @@ impl Qwen3Executor {
         if let Some(counters) = self.spec_decode_counters.as_mut() {
             for (req, req_result) in plan.requests.iter().zip(&result.requests) {
                 let num_draft_tokens = req.as_slice().len().saturating_sub(1);
-                counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+                // A load-gated round verifies a one-token span and proposes no
+                // draft; booking it as one would inflate the published draft
+                // count and dilute the acceptance rate.
+                if num_draft_tokens > 0 {
+                    counters.observe_draft(num_draft_tokens, req_result.matched_draft_tokens);
+                }
             }
         }
 
@@ -211,8 +217,8 @@ impl Qwen3Executor {
         );
         for req in plan.requests {
             anyhow::ensure!(
-                self.dflash_ready_requests.contains(&req.request_id),
-                "speculative draft requested before DFlash state is ready for {:?}",
+                self.draft_ready_requests.contains(&req.request_id),
+                "speculative draft requested before draft state is ready for {:?}",
                 req.request_id
             );
         }

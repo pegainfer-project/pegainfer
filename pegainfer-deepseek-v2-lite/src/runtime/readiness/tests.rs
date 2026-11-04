@@ -1,65 +1,7 @@
 use super::DecodeGraphBlocker;
 use super::EpBackendKind;
-use super::FullDecodeGraphProbeReport;
-use super::decode_graph_blockers;
 use super::decode_graph_readiness_status;
-use super::full_decode_graph_probe_report;
-
-#[test]
-fn nccl_readiness_has_no_static_blockers_after_probe_wiring() {
-    let blockers = decode_graph_blockers(EpBackendKind::Nccl);
-    let ids: Vec<_> = blockers.iter().map(|blocker| blocker.id).collect();
-
-    assert!(ids.is_empty(), "unexpected NCCL blockers: {ids:?}");
-}
-
-#[test]
-fn full_decode_probe_is_not_requested_by_default() {
-    let report = full_decode_graph_probe_report(EpBackendKind::Nccl, false, &[]).unwrap();
-
-    assert!(!report.requested);
-    assert!(!report.ready());
-    assert_eq!(report.coverage_status(), "not_requested");
-    assert_eq!(report.failure_stage, "not_requested");
-    assert!(report.failure_summary.is_none());
-    assert!(report.blockers.is_empty());
-}
-
-#[test]
-fn full_decode_probe_preflight_blockers_fail_closed_and_serialize() {
-    let blockers = vec![synthetic_blocker("synthetic_probe_blocker")];
-    let report = full_decode_graph_probe_report(EpBackendKind::Nccl, true, &blockers).unwrap();
-    let json = serde_json::to_value(&report).unwrap();
-
-    assert_requested_but_not_captured(&report);
-    assert_eq!(report.failure_stage, "preflight_blocked");
-    assert_eq!(report.coverage_status(), "blocked_preflight");
-    assert_eq!(report.blockers.len(), 1);
-    assert!(
-        report
-            .failure_summary
-            .as_deref()
-            .is_some_and(|summary| summary.contains("synthetic_probe_blocker"))
-    );
-    assert_eq!(json["requested"], true);
-    assert_eq!(json["replay_count"], 0);
-    assert_eq!(json["verified_replay_count"], 0);
-    assert_eq!(json["failure_stage"], "preflight_blocked");
-    assert_eq!(json["capture_mode"], "thread_local");
-    assert_eq!(json["blockers"][0]["id"], "synthetic_probe_blocker");
-}
-
-#[test]
-fn full_decode_probe_rejects_host_staged_backend() {
-    let blockers = decode_graph_blockers(EpBackendKind::HostStaged);
-    let err =
-        full_decode_graph_probe_report(EpBackendKind::HostStaged, true, &blockers).unwrap_err();
-
-    assert!(
-        err.to_string()
-            .contains("--full-decode-graph-probe requires")
-    );
-}
+use crate::runtime::types::FullDecodeGraphProbeReport;
 
 #[test]
 fn readiness_status_tracks_request_and_success() {
@@ -154,14 +96,6 @@ fn complete_probe_report() -> FullDecodeGraphProbeReport {
         failure_summary: None,
         blockers: Vec::new(),
         capture_mode: "thread_local",
-    }
-}
-
-fn synthetic_blocker(id: &'static str) -> DecodeGraphBlocker {
-    DecodeGraphBlocker {
-        id,
-        source: "runtime/readiness/tests.rs",
-        reason: "test-only blocker",
     }
 }
 

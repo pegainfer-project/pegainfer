@@ -705,99 +705,38 @@ fn collect_files_recursively(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn is_deepseek_v2_lite_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "deepseek_v2_lite"),
-        Err(_) => false,
+/// Flags for kernels AOT-instantiated from the vendored DeepGEMM device
+/// headers: torch-free via DG_NO_TORCH, no runtime JIT, C++20, with the
+/// DeepGEMM csrc headers and its nested CUTLASS and fmt.
+fn deepgemm_aot_args(root: &Path) -> Vec<String> {
+    let deepgemm_root = root.join("third_party/DeepGEMM");
+    let mut args: Vec<String> = [
+        "--std=c++20",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+        "-DDG_NO_TORCH",
+    ]
+    .map(str::to_string)
+    .into();
+    for include in [
+        "csrc",
+        "deep_gemm/include",
+        "third-party/cutlass/include",
+        "third-party/cutlass/tools/util/include",
+        "third-party/fmt/include",
+    ] {
+        args.push("-I".to_string());
+        args.push(deepgemm_root.join(include).to_string_lossy().to_string());
     }
+    args
 }
 
-fn is_kimi_k2_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "kimi_k2"),
-        Err(_) => false,
-    }
+/// Whether `path` sits under a directory named `dir` below `csrc_dir`, which
+/// is how each model line's CUDA is kept out of builds without its feature.
+fn is_source_in(csrc_dir: &Path, path: &Path, dir: &str) -> bool {
+    path.strip_prefix(csrc_dir)
+        .is_ok_and(|relative| relative.components().any(|part| part.as_os_str() == dir))
 }
-
-/// DeepEP elastic shim (csrc/deepep/): shared MoE EP all-to-all substrate.
-/// Compiled only with the `moe` feature; needs NCCL >= 2.30.4 headers/lib.
-fn is_deepep_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "deepep"),
-        Err(_) => false,
-    }
-}
-
-/// The Marlin substrate (csrc/marlin/): shared by every four-bit weight, so it
-/// rides whichever of its consumers is enabled rather than a feature of its own.
-fn is_marlin_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "marlin"),
-        Err(_) => false,
-    }
-}
-
-/// Gemma 4 model-local CUDA. The NVFP4 conversion intrinsics arrived in CUDA
-/// 12.8, so keeping this out of the default build keeps the toolkit floor
-/// where the other model lines put it.
-fn is_gemma4_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "gemma4"),
-        Err(_) => false,
-    }
-}
-
-/// Qwen3.5 model-local CUDA: the linear-attention recurrence and the
-/// head_dim 256 full-attention path.
-fn is_qwen35_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "qwen35"),
-        Err(_) => false,
-    }
-}
-
-/// Qwen4 line (Qwen3.8-Flash-Next) model-local CUDA: the QSA token indexer.
-/// Named after the model line, like qwen35 and glm52.
-fn is_qwen4_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "qwen4"),
-        Err(_) => false,
-    }
-}
-
-/// GLM5.2 model-local CUDA shims over DeepGEMM/FlashMLA contracts.
-fn is_glm52_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative
-            .components()
-            .any(|part| part.as_os_str() == "glm52"),
-        Err(_) => false,
-    }
-}
-
-// --- k3 -------------------------------------------------------------------
-/// Kimi-K3 model-local CUDA shims (FP8xFP4 masked grouped GEMM over DeepGEMM).
-fn is_k3_source(csrc_dir: &Path, path: &Path) -> bool {
-    match path.strip_prefix(csrc_dir) {
-        Ok(relative) => relative.components().any(|part| part.as_os_str() == "k3"),
-        Err(_) => false,
-    }
-}
-// --- end k3 ---------------------------------------------------------------
 
 fn require_submodule_file(root: &Path, feature: &str, label: &str, relative: &str) {
     let path = root.join(relative);
@@ -998,9 +937,10 @@ fn cuda_object_name(csrc_dir: &Path, cu_file: &Path) -> String {
     format!("{}_cuda.o", parts.join("_"))
 }
 
-fn probe_triton_python(candidate: &str) -> Result<String, String> {
+/// `candidate` when that interpreter can import `module`.
+fn probe_python(candidate: &str, module: &str) -> Result<String, String> {
     let output = Command::new(candidate)
-        .args(["-c", "import triton"])
+        .args(["-c", &format!("import {module}")])
         .output()
         .map_err(|err| format!("{candidate}: {err}"))?;
 
@@ -1022,7 +962,7 @@ fn find_triton_python() -> Result<String, String> {
                 "PEGAINFER_TRITON_PYTHON is set but empty. See pegainfer-kernels/tools/triton/README.md.".to_string(),
             );
         }
-        return probe_triton_python(candidate).map_err(|message| {
+        return probe_python(candidate, "triton").map_err(|message| {
             format!(
                 "PEGAINFER_TRITON_PYTHON=`{candidate}` could not import Triton. {message}. See pegainfer-kernels/tools/triton/README.md."
             )
@@ -1038,7 +978,7 @@ fn find_triton_python() -> Result<String, String> {
     candidates.extend(["python3".to_string(), "python".to_string()]);
 
     for candidate in candidates {
-        match probe_triton_python(&candidate) {
+        match probe_python(&candidate, "triton") {
             Ok(path) => return Ok(path),
             Err(message) => diagnostics.push(message),
         }
@@ -1730,22 +1670,6 @@ const K3_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     ),
 ];
 
-fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
-    let output = Command::new(candidate)
-        .args(["-c", "import tilelang"])
-        .output()
-        .map_err(|err| format!("{candidate}: {err}"))?;
-
-    if output.status.success() {
-        Ok(candidate.to_string())
-    } else {
-        Err(format!(
-            "{candidate}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
 fn find_tilelang_python(family: &TileLangFamily) -> Result<String, String> {
     for var in [
         format!("PEGAINFER_{}_TILELANG_PYTHON", family.label),
@@ -1758,7 +1682,7 @@ fn find_tilelang_python(family: &TileLangFamily) -> Result<String, String> {
         if candidate.is_empty() {
             return Err(format!("{var} is set but empty."));
         }
-        return probe_tilelang_python(&candidate).map_err(|message| {
+        return probe_python(&candidate, "tilelang").map_err(|message| {
             format!("{var}=`{candidate}` could not import TileLang: {message}")
         });
     }
@@ -1776,7 +1700,7 @@ fn find_tilelang_python(family: &TileLangFamily) -> Result<String, String> {
     candidates.extend(["python3".to_string(), "python".to_string()]);
 
     for candidate in candidates {
-        match probe_tilelang_python(&candidate) {
+        match probe_python(&candidate, "tilelang") {
             Ok(path) => return Ok(path),
             Err(message) => diagnostics.push(message),
         }
@@ -2245,9 +2169,6 @@ fn main() {
             .join(",")
     );
 
-    let replaced_cuda_files =
-        BTreeSet::from(["activation.cu", "embedding.cu", "fused_attention.cu"]);
-
     let root = crate_root();
     if moe_enabled {
         require_moe_submodules(&root);
@@ -2267,10 +2188,12 @@ fn main() {
         .iter()
         .filter_map(|path| {
             let file_name = path.file_name()?.to_str()?;
-            if !deepseek_v2_lite_enabled && is_deepseek_v2_lite_source(&csrc_dir, path) {
+            if !deepseek_v2_lite_enabled && is_source_in(&csrc_dir, path, "deepseek_v2_lite") {
                 return None;
             }
-            if !moe_enabled && is_deepep_source(&csrc_dir, path) {
+            // The DeepEP elastic shim, the MoE EP all-to-all substrate, needs
+            // NCCL >= 2.30.4 headers and libraries.
+            if !moe_enabled && is_source_in(&csrc_dir, path, "deepep") {
                 return None;
             }
             // The GLM5.2 shim instantiations (EP4..EP64) ride the deepep
@@ -2278,32 +2201,35 @@ fn main() {
             if !glm52_enabled && file_name.starts_with("deepep_shim_glm52") {
                 return None;
             }
-            if !gemma4_enabled && is_gemma4_source(&csrc_dir, path) {
+            // The NVFP4 conversion intrinsics arrived in CUDA 12.8, so keeping
+            // Gemma 4 out of the default build keeps the toolkit floor where
+            // the other model lines put it.
+            if !gemma4_enabled && is_source_in(&csrc_dir, path, "gemma4") {
                 return None;
             }
-            if !gemma4_enabled && !kimi_k2_enabled && is_marlin_source(&csrc_dir, path) {
+            // Marlin serves every four-bit weight, so it rides whichever of its
+            // consumers is enabled rather than a feature of its own.
+            if !gemma4_enabled && !kimi_k2_enabled && is_source_in(&csrc_dir, path, "marlin") {
                 return None;
             }
-            if !glm52_enabled && is_glm52_source(&csrc_dir, path) {
+            if !glm52_enabled && is_source_in(&csrc_dir, path, "glm52") {
                 return None;
             }
-            if !kimi_k2_enabled && is_kimi_k2_source(&csrc_dir, path) {
+            if !kimi_k2_enabled && is_source_in(&csrc_dir, path, "kimi_k2") {
                 return None;
             }
-            if !qwen35_enabled && is_qwen35_source(&csrc_dir, path) {
+            if !qwen35_enabled && is_source_in(&csrc_dir, path, "qwen35") {
                 return None;
             }
-            if !qwen4_enabled && is_qwen4_source(&csrc_dir, path) {
+            if !qwen4_enabled && is_source_in(&csrc_dir, path, "qwen4") {
                 return None;
             }
             // --- k3 ---
-            if !k3_enabled && is_k3_source(&csrc_dir, path) {
+            if !k3_enabled && is_source_in(&csrc_dir, path, "k3") {
                 return None;
             }
             // --- end k3 ---
-            if path.extension().and_then(|e| e.to_str()) == Some("cu")
-                && !replaced_cuda_files.contains(file_name)
-            {
+            if path.extension().and_then(|e| e.to_str()) == Some("cu") {
                 Some(path.clone())
             } else {
                 None
@@ -2319,15 +2245,6 @@ fn main() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
     }
-
-    println!(
-        "cargo:warning=Legacy CUDA translation units retired from the runtime build: {}",
-        replaced_cuda_files
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
 
     let nvcc_jobs = nvcc_job_count();
     println!("cargo:warning=Compiling CUDA translation units with {nvcc_jobs} nvcc job(s)");
@@ -2497,9 +2414,11 @@ fn main() {
             || stem == "paged_attention_window_hd256"
             || stem == "flashinfer_norm"
             || stem == "flashinfer_sampling"
+            || stem == "dflash2_selector"
             || stem == "flashinfer_top1"
             || stem == "glm52_topk"
             || stem == "local_kv_fp8"
+            || stem == "qwen4_grouped_rmsnorm"
         {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
@@ -2527,7 +2446,7 @@ fn main() {
 
         // DeepEP elastic shim: mirrors the upstream JIT compile flags
         // (DeepEP csrc/jit/compiler.hpp) minus the cubin plumbing.
-        if is_deepep_source(&csrc_dir, cu_file) {
+        if is_source_in(&csrc_dir, cu_file, "deepep") {
             let nccl_root = deepep_nccl
                 .as_ref()
                 .expect("deepep sources are collected only with the moe feature");
@@ -2652,61 +2571,14 @@ fn main() {
                 flashinfer.spdlog.to_string_lossy().to_string(),
             ]);
         } else if stem == "glm52_deepgemm_mqa" || stem == "glm52_deepgemm_grouped_sm100" {
-            // DeepGEMM MQA + masked grouped GEMM kernels,
-            // AOT-instantiated from the vendored device headers (torch-free
-            // via DG_NO_TORCH, no runtime JIT). Needs DeepGEMM csrc headers +
-            // CUTLASS + fmt, C++20.
-            let deepgemm_root = root.join("third_party/DeepGEMM");
-            let deepgemm_csrc = deepgemm_root.join("csrc");
-            let deepgemm_include = deepgemm_root.join("deep_gemm/include");
-            let cutlass_include = deepgemm_root.join("third-party/cutlass/include");
-            let cutlass_util = deepgemm_root.join("third-party/cutlass/tools/util/include");
-            let fmt_include = deepgemm_root.join("third-party/fmt/include");
-            nvcc_args.extend([
-                "--std=c++20".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-                "--expt-extended-lambda".to_string(),
-                "-DDG_NO_TORCH".to_string(),
-                "-I".to_string(),
-                deepgemm_csrc.to_string_lossy().to_string(),
-                "-I".to_string(),
-                deepgemm_include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                cutlass_include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                cutlass_util.to_string_lossy().to_string(),
-                "-I".to_string(),
-                fmt_include.to_string_lossy().to_string(),
-            ]);
+            // DeepGEMM MQA + masked grouped GEMM kernels.
+            nvcc_args.extend(deepgemm_aot_args(&root));
         } else if stem.starts_with("glm52_") {
             nvcc_args.extend(["--std=c++17".to_string()]);
         // --- k3 ---
-        } else if is_k3_source(&csrc_dir, cu_file) {
-            // K3 FP8xFP4 masked grouped GEMM, AOT-instantiated from the
-            // vendored DeepGEMM device headers (torch-free via DG_NO_TORCH, no
-            // runtime JIT). Same flags/includes as the GLM5.2 DeepGEMM stems.
-            let deepgemm_root = root.join("third_party/DeepGEMM");
-            let deepgemm_csrc = deepgemm_root.join("csrc");
-            let deepgemm_include = deepgemm_root.join("deep_gemm/include");
-            let cutlass_include = deepgemm_root.join("third-party/cutlass/include");
-            let cutlass_util = deepgemm_root.join("third-party/cutlass/tools/util/include");
-            let fmt_include = deepgemm_root.join("third-party/fmt/include");
-            nvcc_args.extend([
-                "--std=c++20".to_string(),
-                "--expt-relaxed-constexpr".to_string(),
-                "--expt-extended-lambda".to_string(),
-                "-DDG_NO_TORCH".to_string(),
-                "-I".to_string(),
-                deepgemm_csrc.to_string_lossy().to_string(),
-                "-I".to_string(),
-                deepgemm_include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                cutlass_include.to_string_lossy().to_string(),
-                "-I".to_string(),
-                cutlass_util.to_string_lossy().to_string(),
-                "-I".to_string(),
-                fmt_include.to_string_lossy().to_string(),
-            ]);
+        } else if is_source_in(&csrc_dir, cu_file, "k3") {
+            // K3 FP8xFP4 masked grouped GEMM.
+            nvcc_args.extend(deepgemm_aot_args(&root));
             // --- end k3 ---
         }
 
@@ -2734,7 +2606,7 @@ fn main() {
     }
     if !qwen4_enabled {
         println!(
-            "cargo:warning=Qwen4 QSA indexer kernels disabled; enable the pegainfer-kernels `qwen4` feature to build them"
+            "cargo:warning=Qwen4 kernels disabled; enable the pegainfer-kernels `qwen4` feature to build them"
         );
     }
 

@@ -198,7 +198,6 @@ impl Eagle3DraftModel {
             norm,
             lm_head,
             d2t,
-            t2d,
             cos_cache,
             sin_cache,
         })

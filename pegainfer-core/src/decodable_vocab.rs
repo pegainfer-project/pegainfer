@@ -12,15 +12,15 @@ use anyhow::Result;
 use log::warn;
 use serde::Deserialize;
 
-/// One `added_tokens_decoder` entry in `tokenizer_config.json`.
+/// One added-token entry: `added_tokens` in `tokenizer.json` or
+/// `added_tokens_decoder` in `tokenizer_config.json`.
 ///
 /// An explicitly-owned frontend compatibility contract. The frontend's decoder
-/// schema is bool-heavy, and we parse it with these typed fields purely to make
-/// the whole-file typed parse fail-closed on a malformed entry (e.g. a `special`
+/// schema is bool-heavy, and we parse it with these typed fields to make the
+/// whole-file typed parse fail-closed on a malformed entry (e.g. a `special`
 /// that is not a bool): then every decoder token is dropped, mirroring the
-/// frontend. None of the fields are read by [`decodable_vocab_width`] — the
-/// contract's entire job is the fail-closed type-check, so this schema is
-/// intentionally dead in the code path and its fields exist to shape the parse.
+/// frontend. [`decodable_vocab_width`] reads only `id`, from `tokenizer.json`;
+/// the other fields exist to shape the parse.
 #[allow(clippy::struct_excessive_bools)]
 #[allow(dead_code)]
 #[derive(Deserialize)]

@@ -64,6 +64,12 @@ cargo run --release --features glm52 -- --model-path models/GLM5.2
 # Unit tests (~9s)
 cargo test --release --workspace --lib
 
+# Lines gated on their own kernel feature need it named to run their unit tests.
+# The K3 command also names the kernels crate, whose K3 tests ride the same
+# feature:
+cargo test --release -p pegainfer-k3 -p pegainfer-kernels --features k3 --lib
+cargo test --release -p pegainfer-glm52 --features glm52 --lib
+
 # Accuracy and integration tests — require GPU + model weights
 cargo test --release -p pegainfer-qwen3 --test hf_golden_gate
 PEGAINFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate

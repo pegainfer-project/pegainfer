@@ -19,6 +19,7 @@ Last touched: 2026-10
 | Device-resident NCCL dense exchange | Available | Issue #276 reuses backend-owned bf16 dense-exchange scratch, clears rank1 zero-send every exchange, removes dense-exchange stream sync from the backend call, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. |
 | NCCL route-plan replay | Available | Issue #277 builds a token-major host route plan once after top-k routing, replays that plan for NCCL expert launches and device contribution accumulation, keeps route counters visible, and preserves HF / host-staged / NCCL exactness on 2x RTX 5090. This remains the eager NCCL oracle path. |
 | Device-routed NCCL small-row MoE | Available for rows 1..8 | Decode and short prefill keep routing and routed-expert execution on GPU through fixed route slots and pointer-batched GEMMs; the eager route-plan path remains the rollback oracle. Correctness and performance evidence lives in `device-routed-moe.md`. |
+| Device decode attention and KV | Available for NCCL steady decode | Steady decode keeps attention, KV, and RMSNorm on GPU through per-request slots of a fixed bf16 pool, so rows at different positions share one decode step; prefill stays on the host, host-staged remains the correctness oracle, and `PEGAINFER_DSV2_LITE_DECODE_ATTENTION=host` is the rollback switch. Correctness and performance evidence lives in `device-attention.md`. |
 | NCCL CUDA Graph readiness | Covered-shape diagnostic | Schema-2 `cuda_graph_readiness` now includes a fail-closed `full_decode_graph_probe`. The 2026-06-20 run reports capture, instantiate, replay, and verification success with `8/8` verified replays for the retained batch-1 NCCL decode step. |
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
@@ -107,7 +108,7 @@ Backend attribution found two costs: repeated outer expert replay for routes sha
 
 The retained A/B rows completed with zero failures, timeouts, or missing traces, and each paired baseline/optimized cell preserved its request output hash set. Direct `Hello`/16 attribution also preserved the exact retained token and text hashes.
 
-The remaining profiler direction is attention/KV host-side work. Moving attention and KV state fully device-side changes cache ownership, long-context capacity, request retirement, and CUDA Graph semantics, so it remains a separate change with its own artifact contract.
+The remaining profiler direction was attention/KV host-side work. Issue #635 moved NCCL steady decode attention and KV to the device; see `device-attention.md`.
 
 These results cover direct `Hello`/16 and short fixed-shape HTTP traffic only. They do not prove mixed or long-prompt scaling, soak/SLO behavior, production readiness, multi-node EP, or vLLM parity.
 
@@ -268,7 +269,7 @@ Scenario summaries:
 - the #280 HTTP trace proves active request sets and subgroup decode batches, but throughput still scales only weakly on NCCL EP2 and long prompts have high TTFT;
 - the #464 trace refresh closes the phase/decode-step observability gap: batching forms, while decode mean/total grows with active rows, so scheduler admission is not the final throughput blocker;
 - the #464 host-staged and NCCL route grouping reduces repeated expert replay; the NCCL device logits router also removes the CPU gate GEMM and full-hidden D2H copy;
-- NCCL collectives are not the dominant measured limiter for the retained short shape; attention/KV host-side work requires a separate cache/ownership design;
+- NCCL collectives are not the dominant measured limiter for the retained short shape; #635 moved NCCL decode attention/KV to the device;
 - the #453 runner and trace fields make failure isolation auditable; host-staged and NCCL live HTTP artifacts now prove cancel/disconnect/reject/overload/mixed-failure cleanup and clean follow-up recovery on the retained 2-GPU validation contract;
 - the 2026-06-28 clean matrix keeps stock vLLM startup failures visible because they are part of the reproducibility record;
 - the supplemental vLLM validation shows the HTTP contract can run after the FlashInfer SM120/CUDA 12.8 path is fixed, but it should stay separate from stock-package rows;

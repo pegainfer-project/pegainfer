@@ -18,7 +18,7 @@ It also **requires `--no-prefix-cache` and rejects `--kv-offload`**. A prefix hi
   - `docs/subsystems/kernels/pegainfer-kernels-boundary.md` - records the per-model engine direction and says root should be reusable frontend/control-plane infrastructure, not a universal model abstraction.
   - `src/main.rs`, `src/lib.rs`, `src/server_engine.rs`, `src/scheduler.rs`, `src/model_executor.rs`, `src/model/qwen3/*`, `src/bin/bench_serving.rs`, and Qwen3 tests - mapped what root currently knows about Qwen3.
 - **Relevant history**:
-  - The earlier shared-runtime work (now consolidated into `docs/subsystems/runtime/runtime.md`) was a useful simplification, but the next boundary should not make `ModelForward` the long-term universal engine API.
+  - The earlier shared-runtime work around the `ModelForward` trait (since removed) was a useful simplification, but the next boundary should not make that trait the long-term universal engine API.
 - **Plan**:
   1. Define the model crate/root interface before moving code.
   2. Move the generic text-generation handle/request/event types into `pegainfer-core` so root and model crates can communicate without model crates depending on root.

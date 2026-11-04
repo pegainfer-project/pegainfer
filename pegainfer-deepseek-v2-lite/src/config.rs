@@ -58,7 +58,7 @@ pub struct Config {
     pub(crate) rope_theta: f32,
     pub(crate) rope_scaling: Option<RopeScaling>,
     max_position_embeddings: usize,
-    pub(crate) tie_word_embeddings: bool,
+    tie_word_embeddings: bool,
 }
 
 impl Config {
@@ -140,6 +140,10 @@ impl Config {
             self.moe_layer_freq == 1,
             "DeepSeek-V2-Lite expects moe_layer_freq=1, got {}",
             self.moe_layer_freq
+        );
+        ensure!(
+            !self.tie_word_embeddings,
+            "DeepSeek-V2-Lite expects an untied lm_head, got tie_word_embeddings=true"
         );
         ensure!(
             self.intermediate_size > 0 && self.moe_intermediate_size > 0,

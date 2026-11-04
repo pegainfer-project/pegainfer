@@ -26,6 +26,13 @@ pub(crate) enum ExecutionPlan {
     Decode,
     /// Draft + verify the whole active batch (all requests are draft-ready).
     SpeculativeDecode,
+    /// Verify the whole active batch over a one-token span — the load gate
+    /// turned speculation off for this step. No draft is proposed, so the
+    /// target commits one token per request, but the DFlash capture and the
+    /// draft-ready state survive: the next round under the threshold
+    /// speculates again. A plain decode would drop the capture, which only a
+    /// fresh prefill rebuilds.
+    GatedSpeculativeDecode,
     Unified {
         pending: Vec<PendingRequest>,
     },
@@ -62,7 +69,7 @@ pub(crate) fn build_next_plan(
     // dedicated prefill step instead of degrading silently.
     let needs_prompt_logprobs = pending.iter().any(|req| req.prompt_logprobs.is_some());
     // Deliberately a loose superset of the real capture eligibility
-    // (`dflash_prefill_supported`, which also needs `cached_tokens == 0 && no
+    // (`prefill_capture_supported`, which also needs `cached_tokens == 0 && no
     // prompt logprobs`): over-routing an ineligible request to a dedicated
     // prefill only costs one fusion, but under-routing a capture-eligible one
     // into Unified would silently break its readiness. Never tighten this into
@@ -122,6 +129,17 @@ pub(crate) fn execute_plan(
             let mut verify = executor.execute_speculative_verify(VerifyPlan {
                 requests: &verify_requests,
                 sample_seed: rand::RngExt::random(rng),
+                gated: false,
+            })?;
+            verify.requests.sort_by_key(|result| result.request_id);
+            Ok(ExecutionArtifacts::SpeculativeDecode { verify })
+        }
+        ExecutionPlan::GatedSpeculativeDecode => {
+            let verify_requests = build_gated_verify_items(active);
+            let mut verify = executor.execute_speculative_verify(VerifyPlan {
+                requests: &verify_requests,
+                sample_seed: rand::RngExt::random(rng),
+                gated: true,
             })?;
             verify.requests.sort_by_key(|result| result.request_id);
             Ok(ExecutionArtifacts::SpeculativeDecode { verify })
@@ -143,23 +161,61 @@ pub(crate) fn execute_plan(
     }
 }
 
+/// `PEGAINFER_SPEC_MAX_BATCH=<n>` turns on the load-aware speculation gate: once
+/// the active batch reaches `<n>` requests, the engine stops proposing drafts
+/// for that step. `0`/unset = off. Read once; a malformed value refuses to
+/// start (see [`crate::spec_env`]).
+pub(crate) fn spec_max_batch() -> usize {
+    static MAX_BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_BATCH.get_or_init(|| crate::spec_env::read(crate::spec_env::MAX_BATCH))
+}
+
+/// What the engine does with the active batch this step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SpeculationDecision {
+    /// Every request is draft-ready and the batch is under the load gate:
+    /// draft + verify.
+    Speculate,
+    /// Every request is draft-ready but the batch reached the load gate.
+    Gated,
+    /// Some request is not draft-ready, the batch is wider than the drafter
+    /// serves, or no drafter is loaded: plain decode.
+    NotReady,
+}
+
 /// All-or-nothing: speculate the whole active batch only when every request is
 /// draft-ready (no LoRA, no logprobs). A single non-ready request falls the
 /// batch back to plain decode rather than running a mixed step. Sampling
 /// params are NOT a gate: sampled-verify (#512) runs the regular sampler over
 /// the verify rows, so the full surface — temperature/top_k/top_p/min_p/seed —
 /// rides the speculative path.
-pub(crate) fn should_speculative_decode(
+pub(crate) fn speculation_decision_at(
     executor: &impl ModelExecutor,
     active: &[ActiveRequestState],
-) -> bool {
-    executor.speculative_enabled()
-        && !active.is_empty()
-        && active.iter().all(|req| {
-            executor.speculative_request_ready(req.request_id)
-                && req.lora_adapter.is_none()
-                && req.logprobs.is_none()
-        })
+    max_batch: usize,
+) -> SpeculationDecision {
+    if !executor.speculative_enabled() || active.is_empty() {
+        return SpeculationDecision::NotReady;
+    }
+    if executor
+        .max_draft_batch()
+        .is_some_and(|limit| active.len() > limit)
+    {
+        return SpeculationDecision::NotReady;
+    }
+    let all_ready = active.iter().all(|req| {
+        executor.speculative_request_ready(req.request_id)
+            && req.lora_adapter.is_none()
+            && req.logprobs.is_none()
+    });
+    if !all_ready {
+        return SpeculationDecision::NotReady;
+    }
+    if max_batch > 0 && active.len() >= max_batch {
+        SpeculationDecision::Gated
+    } else {
+        SpeculationDecision::Speculate
+    }
 }
 
 fn build_speculative_draft_items(active: &[ActiveRequestState]) -> Vec<DraftStepItem> {
@@ -209,6 +265,22 @@ fn build_speculative_verify_items(
     requests
 }
 
+/// One-token verify spans for a gated round: each request's confirmed last
+/// token and nothing else.
+fn build_gated_verify_items(active: &[ActiveRequestState]) -> Vec<VerifyStepItem> {
+    active
+        .iter()
+        .map(|req| {
+            VerifyStepItem::new(
+                req.request_id,
+                vec![req.last_token],
+                req.params,
+                req.stop_policy.clone(),
+            )
+        })
+        .collect()
+}
+
 fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<PrefillStepItem> {
     indices
         .iter()
@@ -222,7 +294,10 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 logprobs: r.logprobs,
                 prompt_logprobs: r.prompt_logprobs,
                 lora_adapter: r.lora_adapter.clone(),
-                cached_tokens: r.cached_tokens,
+                // No lookup has run yet for this chunk; the executor fills it
+                // in (`None` stays `None` when it never runs one).
+                cached_tokens: None,
+                external_hit_tokens: None,
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,
@@ -257,11 +332,15 @@ fn sort_decode_results(results: &mut [crate::executor::DecodeRequestResult]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use pegainfer_frontend::engine::StopPolicy;
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
     use crate::executor::RequestId;
+    use crate::scheduler::test_support::FakeExecutor;
 
     fn pending() -> PendingRequest {
         PendingRequest {
@@ -276,7 +355,6 @@ mod tests {
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 3,
-            cached_tokens: 0,
         }
     }
 
@@ -304,6 +382,51 @@ mod tests {
         assert_eq!(items[0].hedge_budget, 1);
         assert_eq!(items[1].hedge_budget, 32);
         assert_eq!(items[2].hedge_budget, 0);
+    }
+
+    fn speculative_batch(count: usize) -> Vec<ActiveRequestState> {
+        (0..count)
+            .map(|i| ActiveRequestState {
+                request_id: RequestId::new(i as u64 + 1),
+                lora_adapter: None,
+                last_token: 42,
+                generated_count: 0,
+                max_tokens: 32,
+                prompt_len: 10,
+                params: SamplingParams::default(),
+                stop_policy: StopPolicy::default(),
+                logprobs: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_request_without_draft_context_is_never_gated() {
+        // A request that never captured its context cannot run a verify round,
+        // so the batch decodes plainly; the gate must not paper over that.
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())))
+            .with_speculative()
+            .with_request_not_ready(RequestId::new(3));
+        let batch = speculative_batch(8);
+        assert_eq!(
+            speculation_decision_at(&exec, &batch, 4),
+            SpeculationDecision::NotReady
+        );
+    }
+
+    #[test]
+    fn a_batch_wider_than_the_drafter_serves_decodes_plainly() {
+        let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())))
+            .with_speculative()
+            .with_max_draft_batch(1);
+        assert_eq!(
+            speculation_decision_at(&exec, &speculative_batch(1), 0),
+            SpeculationDecision::Speculate
+        );
+        assert_eq!(
+            speculation_decision_at(&exec, &speculative_batch(2), 0),
+            SpeculationDecision::NotReady
+        );
     }
 
     #[test]

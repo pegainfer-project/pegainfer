@@ -214,6 +214,7 @@ mod tests {
 
     /// Route metadata invariants + fp8 gather + deterministic combine on a
     /// small hand-checkable case.
+    #[allow(clippy::float_cmp)]
     #[test]
     #[ignore = "requires a GPU"]
     fn route_gather_combine_roundtrip() -> Result<()> {
@@ -317,7 +318,7 @@ mod tests {
         // Combine: w2_out[slot] rows encode their source row; expected
         // output is shared + sum over the row's routes in fixed j order.
         let w2_host: Vec<bf16> = (0..routes * HIDDEN)
-            .map(|i| bf16::from_f32((gather[i / HIDDEN] as f32 + 1.0) * 0.5))
+            .map(|i| bf16::from_f32(f32::midpoint(gather[i / HIDDEN] as f32, 1.0)))
             .collect();
         let shared_host: Vec<bf16> = (0..ROWS * HIDDEN)
             .map(|i| bf16::from_f32((i / HIDDEN) as f32 * 0.25))

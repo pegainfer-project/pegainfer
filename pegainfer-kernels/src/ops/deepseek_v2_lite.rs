@@ -187,18 +187,7 @@ pub struct Dsv2LiteAttentionConfig {
     pub kv_lora_rank: usize,
     pub max_seq_len: usize,
     pub rms_norm_eps: f32,
-    pub rope_theta: f32,
-    pub rope_scaling: Option<Dsv2LiteRopeScalingConfig>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Dsv2LiteRopeScalingConfig {
-    pub factor: f32,
-    pub mscale: f32,
-    pub mscale_all_dim: f32,
-    pub beta_fast: f32,
-    pub beta_slow: f32,
-    pub original_max_position_embeddings: usize,
+    pub softmax_scale: f32,
 }
 
 pub fn dsv2_lite_router_softmax_topk_into(
@@ -407,9 +396,12 @@ pub fn dsv2_lite_decode_attention_into(
     q: &HiddenStates,
     kv_a: &HiddenStates,
     kv_b: &HiddenStates,
-    position: usize,
-    key_cache: &mut CudaSlice<f32>,
-    value_cache: &mut CudaSlice<f32>,
+    slot_ids: &CudaSlice<i32>,
+    positions: &CudaSlice<i32>,
+    num_slots: usize,
+    rope_cos_sin: &CudaSlice<bf16>,
+    key_cache: &mut CudaSlice<bf16>,
+    value_cache: &mut CudaSlice<bf16>,
     out: &mut HiddenStates,
 ) -> Result<()> {
     let query_head_dim = cfg
@@ -436,43 +428,45 @@ pub fn dsv2_lite_decode_attention_into(
         .num_heads
         .checked_mul(cfg.v_head_dim)
         .ok_or_else(|| anyhow!("DSV2-Lite attention out dim overflow"))?;
+    let batch = q.seq_len;
+    ensure!(batch > 0, "DSV2-Lite attention batch must be positive");
     ensure!(
-        q.hidden_dim == expected_q_dim && q.seq_len == 1,
-        "DSV2-Lite attention q shape mismatch: got [{} x {}], expected [{} x 1]",
+        q.hidden_dim == expected_q_dim,
+        "DSV2-Lite attention q shape mismatch: got [{} x {}], expected [{} x {batch}]",
         q.hidden_dim,
         q.seq_len,
         expected_q_dim
     );
     ensure!(
-        kv_a.hidden_dim == expected_kv_a_dim && kv_a.seq_len == 1,
+        kv_a.hidden_dim == expected_kv_a_dim && kv_a.seq_len == batch,
         "DSV2-Lite attention kv_a shape mismatch: got [{} x {}]",
         kv_a.hidden_dim,
         kv_a.seq_len
     );
     ensure!(
-        kv_b.hidden_dim == expected_kv_b_dim && kv_b.seq_len == 1,
+        kv_b.hidden_dim == expected_kv_b_dim && kv_b.seq_len == batch,
         "DSV2-Lite attention kv_b shape mismatch: got [{} x {}]",
         kv_b.hidden_dim,
         kv_b.seq_len
     );
     ensure!(
-        out.hidden_dim == expected_out_dim && out.seq_len == 1,
+        out.hidden_dim == expected_out_dim && out.seq_len == batch,
         "DSV2-Lite attention out shape mismatch: got [{} x {}]",
         out.hidden_dim,
         out.seq_len
     );
     ensure!(
-        position < cfg.max_seq_len,
-        "DSV2-Lite attention position {position} exceeds max_seq_len {}",
-        cfg.max_seq_len
+        slot_ids.len() >= batch && positions.len() >= batch,
+        "DSV2-Lite attention metadata too small: slot_ids={}, positions={}, batch={batch}",
+        slot_ids.len(),
+        positions.len()
     );
-    let key_cache_rows = checked_len("attention key cache rows", cfg.max_seq_len, cfg.num_heads)?;
-    let key_elems = checked_len("attention key cache", key_cache_rows, query_head_dim)?;
-    as_i32("attention key cache", key_elems)?;
-    let value_cache_rows =
-        checked_len("attention value cache rows", cfg.max_seq_len, cfg.num_heads)?;
-    let value_elems = checked_len("attention value cache", value_cache_rows, cfg.v_head_dim)?;
-    as_i32("attention value cache", value_elems)?;
+    ensure!(num_slots > 0, "DSV2-Lite attention needs at least one slot");
+    let slot_tokens = checked_len("attention slot tokens", num_slots, cfg.max_seq_len)?;
+    let key_rows = checked_len("attention key cache rows", slot_tokens, cfg.num_heads)?;
+    let key_elems = checked_len("attention key cache", key_rows, query_head_dim)?;
+    let value_rows = checked_len("attention value cache rows", slot_tokens, cfg.num_heads)?;
+    let value_elems = checked_len("attention value cache", value_rows, cfg.v_head_dim)?;
     ensure!(
         key_cache.len() >= key_elems,
         "DSV2-Lite attention key cache too small: have {}, need {key_elems}",
@@ -482,6 +476,16 @@ pub fn dsv2_lite_decode_attention_into(
         value_cache.len() >= value_elems,
         "DSV2-Lite attention value cache too small: have {}, need {value_elems}",
         value_cache.len()
+    );
+    let rope_elems = checked_len(
+        "attention rope table",
+        cfg.max_seq_len,
+        cfg.qk_rope_head_dim,
+    )?;
+    ensure!(
+        rope_cos_sin.len() >= rope_elems,
+        "DSV2-Lite attention rope table too small: have {}, need {rope_elems}",
+        rope_cos_sin.len()
     );
     ensure_hidden_backing_len("attention q", q.data.len(), q.hidden_dim, q.seq_len)?;
     ensure_hidden_backing_len(
@@ -498,28 +502,7 @@ pub fn dsv2_lite_decode_attention_into(
     )?;
     ensure_hidden_backing_len("attention out", out.data.len(), out.hidden_dim, out.seq_len)?;
 
-    let (
-        rope_factor,
-        rope_mscale,
-        rope_mscale_all_dim,
-        rope_beta_fast,
-        rope_beta_slow,
-        rope_original,
-        has_rope_scaling,
-    ) = cfg
-        .rope_scaling
-        .map_or((1.0, 1.0, 1.0, 1.0, 1.0, cfg.max_seq_len, 0), |rope| {
-            (
-                rope.factor,
-                rope.mscale,
-                rope.mscale_all_dim,
-                rope.beta_fast,
-                rope.beta_slow,
-                rope.original_max_position_embeddings,
-                1,
-            )
-        });
-    let position = as_i32("attention position", position)?;
+    let batch = as_i32("attention batch", batch)?;
     let num_heads = as_i32("attention num_heads", cfg.num_heads)?;
     let qk_nope_head_dim = as_i32("attention qk_nope_head_dim", cfg.qk_nope_head_dim)?;
     let qk_rope_head_dim = as_i32("attention qk_rope_head_dim", cfg.qk_rope_head_dim)?;
@@ -527,27 +510,29 @@ pub fn dsv2_lite_decode_attention_into(
     let kv_lora_rank = as_i32("attention kv_lora_rank", cfg.kv_lora_rank)?;
     let kv_a_rows = as_i32("attention kv_a rows", kv_a.hidden_dim)?;
     let kv_b_rows = as_i32("attention kv_b rows", kv_b.hidden_dim)?;
+    let num_slots = as_i32("attention num_slots", num_slots)?;
     let max_seq_len = as_i32("attention max_seq_len", cfg.max_seq_len)?;
-    let rope_original = as_i32(
-        "attention rope original max position embeddings",
-        rope_original,
-    )?;
 
     let (q_ptr, _q_guard) = q.data.device_ptr(&ctx.stream);
     let (kv_a_ptr, _kv_a_guard) = kv_a.data.device_ptr(&ctx.stream);
     let (kv_b_ptr, _kv_b_guard) = kv_b.data.device_ptr(&ctx.stream);
+    let (rope_ptr, _rope_guard) = rope_cos_sin.device_ptr(&ctx.stream);
     let (key_cache_ptr, _key_cache_guard) = key_cache.device_ptr_mut(&ctx.stream);
     let (value_cache_ptr, _value_cache_guard) = value_cache.device_ptr_mut(&ctx.stream);
+    let (slot_ids_ptr, _slot_ids_guard) = slot_ids.device_ptr(&ctx.stream);
+    let (positions_ptr, _positions_guard) = positions.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::dsv2_lite_decode_attention_cuda(
             q_ptr as *const ffi::Half,
             kv_a_ptr as *const ffi::Half,
             kv_b_ptr as *const ffi::Half,
-            key_cache_ptr as *mut f32,
-            value_cache_ptr as *mut f32,
+            key_cache_ptr as *mut ffi::Half,
+            value_cache_ptr as *mut ffi::Half,
+            slot_ids_ptr as *const i32,
+            positions_ptr as *const i32,
             out_ptr as *mut ffi::Half,
-            position,
+            batch,
             num_heads,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -555,15 +540,10 @@ pub fn dsv2_lite_decode_attention_into(
             kv_lora_rank,
             kv_a_rows,
             kv_b_rows,
+            num_slots,
             max_seq_len,
-            cfg.rope_theta,
-            rope_factor,
-            rope_mscale,
-            rope_mscale_all_dim,
-            rope_beta_fast,
-            rope_beta_slow,
-            rope_original,
-            has_rope_scaling,
+            cfg.softmax_scale,
+            rope_ptr as *const ffi::Half,
             ctx.stream.cu_stream(),
         )
     };

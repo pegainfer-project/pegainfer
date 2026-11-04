@@ -6,10 +6,12 @@ use pegainfer_core::tensor::HiddenStates;
 
 use crate::Config;
 use crate::device::activate;
+use crate::device_kv::DeviceKvSlot;
 
 #[derive(Default)]
 pub(crate) struct DecodeCache {
     pub(crate) layers: Vec<LayerCache>,
+    pub(crate) device: Option<DeviceKvSlot>,
 }
 
 #[derive(Default)]
@@ -49,10 +51,14 @@ impl DecodeCache {
             layers: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
+            device: None,
         }
     }
 
     pub(crate) fn position(&self, config: &Config) -> Result<usize> {
+        if let Some(slot) = &self.device {
+            return Ok(slot.len());
+        }
         ensure!(
             self.layers.len() == config.num_hidden_layers,
             "decode cache layer count mismatch: cache={}, expected={}",
@@ -75,12 +81,14 @@ impl DecodeCache {
 
     pub(crate) fn clone_for_graph_probe(&self) -> Self {
         // Keep this explicit so serving hot paths do not get blanket cache cloning.
+        debug_assert!(self.device.is_none(), "graph probe clones host caches only");
         Self {
             layers: self
                 .layers
                 .iter()
                 .map(LayerCache::clone_for_graph_probe)
                 .collect(),
+            device: None,
         }
     }
 }
@@ -237,9 +245,7 @@ fn apply_deepseek_v2_rope(
     assert_eq!(inv_freq.len(), half);
     assert_eq!(dim % 2, 0);
     for pair in 0..half {
-        let angle = pos as f32 * inv_freq[pair];
-        let cos = bf16::from_f32(angle.cos() * mscale).to_f32();
-        let sin = bf16::from_f32(angle.sin() * mscale).to_f32();
+        let (cos, sin) = rope_cos_sin(pos, inv_freq[pair], mscale);
         let x0 = input[2 * pair];
         let x1 = input[2 * pair + 1];
         let x0_cos = bf16::from_f32(x0 * cos).to_f32();
@@ -250,6 +256,32 @@ fn apply_deepseek_v2_rope(
         out[pair + half] = bf16::from_f32(x1_cos + x0_sin).to_f32();
     }
     out
+}
+
+fn rope_cos_sin(pos: usize, inv_freq: f32, mscale: f32) -> (f32, f32) {
+    let angle = pos as f32 * inv_freq;
+    (
+        bf16::from_f32(angle.cos() * mscale).to_f32(),
+        bf16::from_f32(angle.sin() * mscale).to_f32(),
+    )
+}
+
+// Layout [position][pair][cos, sin]; the device kernel computes none of this itself because
+// CUDA math differs from glibc in the last bit, which large angles amplify.
+pub(crate) fn rope_cos_sin_table(config: &Config, max_seq_len: usize) -> Vec<bf16> {
+    let inv_freq: Vec<_> = (0..config.qk_rope_head_dim / 2)
+        .map(|pair| rope_inv_freq(config, pair))
+        .collect();
+    let mscale = rope_cache_mscale(config);
+    let mut table = Vec::with_capacity(max_seq_len * config.qk_rope_head_dim);
+    for pos in 0..max_seq_len {
+        for &inv_freq in &inv_freq {
+            let (cos, sin) = rope_cos_sin(pos, inv_freq, mscale);
+            table.push(bf16::from_f32(cos));
+            table.push(bf16::from_f32(sin));
+        }
+    }
+    table
 }
 
 fn rope_cache_mscale(config: &Config) -> f32 {
@@ -374,7 +406,7 @@ pub(crate) fn compute_attention_host_decode_batch(
     out
 }
 
-fn attention_softmax_scale(config: &Config) -> f32 {
+pub(crate) fn attention_softmax_scale(config: &Config) -> f32 {
     let mut scale = (config.query_head_dim() as f32).sqrt().recip();
     if let Some(rope_scaling) = &config.rope_scaling
         && rope_scaling.mscale_all_dim > 0.0
@@ -522,6 +554,7 @@ mod tests {
                 keys: vec![1.0, 2.0],
                 values: vec![3.0, 4.0],
             }],
+            device: None,
         };
 
         let cloned = cache.clone_for_graph_probe();

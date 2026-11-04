@@ -8,9 +8,18 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_EXPERT_INTERMEDIATE;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_HIDDEN;
+use pegainfer_kernels::ops::KIMI_K2_KV_LORA_RANK;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_Q_LORA_RANK;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_QK_NOPE_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_QK_ROPE_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_ROUTED_EXPERTS;
+use pegainfer_kernels::ops::KIMI_K2_ROUTED_SCALING_FACTOR;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_TOPK;
+pub(crate) use pegainfer_kernels::ops::KIMI_K2_V_HEAD_DIM;
 use serde_json::Value;
 
-pub(crate) const KIMI_K2_HIDDEN: usize = 7168;
 pub(crate) const KIMI_K2_VOCAB: usize = 163_840;
 pub const KIMI_K2_LAYERS: usize = 61;
 pub(crate) const KIMI_K2_DENSE_LAYERS: usize = 1;
@@ -18,26 +27,16 @@ pub(crate) const KIMI_K2_MOE_LAYERS: usize = 60;
 const KIMI_K2_MAX_CONTEXT: usize = 262_144;
 
 pub(crate) const KIMI_K2_HEADS: usize = 64;
-pub(crate) const KIMI_K2_Q_LORA_RANK: usize = 1536;
-const KIMI_K2_KV_LORA_RANK: usize = 512;
-pub(crate) const KIMI_K2_QK_NOPE_HEAD_DIM: usize = 128;
-pub(crate) const KIMI_K2_QK_ROPE_HEAD_DIM: usize = 64;
 pub(crate) const KIMI_K2_Q_HEAD_DIM: usize = KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_QK_ROPE_HEAD_DIM;
-pub(crate) const KIMI_K2_V_HEAD_DIM: usize = 128;
 
 pub(crate) const KIMI_K2_DENSE_INTERMEDIATE: usize = 18_432;
-pub(crate) const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
-pub(crate) const KIMI_K2_ROUTED_EXPERTS: usize = 384;
-pub(crate) const KIMI_K2_TOPK: usize = 8;
 const KIMI_K2_SHARED_EXPERTS: usize = 1;
-pub(crate) const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
 pub(crate) const KIMI_K2_ROPE_THETA: f32 = 50_000.0;
 pub(crate) const KIMI_K2_YARN_FACTOR: f32 = 64.0;
 pub(crate) const KIMI_K2_YARN_ORIGINAL_MAX_POS: usize = 4096;
 pub(crate) const KIMI_K2_YARN_BETA_FAST: f32 = 32.0;
 pub(crate) const KIMI_K2_YARN_BETA_SLOW: f32 = 1.0;
-const KIMI_K2_ROUTED_SCALING_FACTOR: f32 = 2.827;
 pub(crate) const KIMI_K2_RMS_NORM_EPS: f32 = 1.0e-5;
 
 /// Validate that `json` is a Kimi-K2.6 text config and that every dimension

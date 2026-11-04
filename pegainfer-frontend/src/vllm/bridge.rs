@@ -35,7 +35,10 @@ use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
+use vllm_engine_core_client::protocol::stats::BaseCacheStats;
+use vllm_engine_core_client::protocol::stats::CachedTokensBySource;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -53,6 +56,7 @@ use zeromq::util::PeerIdentity;
 use crate::engine::EngineHandle;
 use crate::engine::FinishReason;
 use crate::engine::GenerateRequest;
+use crate::engine::PrefixCacheCounters;
 use crate::engine::RequestAbortReason;
 use crate::engine::RequestTag;
 use crate::engine::SchedulerMetrics;
@@ -630,23 +634,96 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
     }
 }
 
-#[derive(Default)]
-pub(crate) struct SpecDecodeTracker {
-    last: SpecDecodeCounters,
+/// Per-interval prefix-cache deltas from two cumulative snapshots, in the wire
+/// shape the frontend increments its prefix-cache counters by. The frontend
+/// credits every local hit to `source="device"` and reads a tier split only off
+/// the connector stats, so connector-restored hits travel there, the way vLLM's
+/// own offload connector reports them: local stats carry the remaining hits
+/// into `vllm:prefix_cache_*` and `source="device"`, connector stats carry the
+/// connector lookups and hits into `vllm:external_prefix_cache_*`, with hits
+/// labeled `source="host"` when the engine knows they came from host memory
+/// and `source="external_unspecified"` when it cannot say which tier.
+/// The connector side is `None` for an interval without host activity. A total
+/// below its baseline means the engine restarted, so the interval diffs from
+/// zero rather than going negative or dropping the new counts.
+fn prefix_cache_delta(
+    last: &PrefixCacheCounters,
+    cur: &PrefixCacheCounters,
+) -> (PrefixCacheStats, Option<PrefixCacheStats>) {
+    let restarted = cur.queries < last.queries
+        || cur.hits < last.hits
+        || cur.host_queries < last.host_queries
+        || cur.host_hits < last.host_hits
+        || cur.external_unspecified_hits < last.external_unspecified_hits;
+    let base = if restarted {
+        PrefixCacheCounters::default()
+    } else {
+        *last
+    };
+    let hits = cur.hits - base.hits;
+    let host_queries = cur.host_queries - base.host_queries;
+    let host_hits = cur.host_hits - base.host_hits;
+    let unspecified_hits = cur.external_unspecified_hits - base.external_unspecified_hits;
+    let external_hits = host_hits + unspecified_hits;
+    let local = PrefixCacheStats {
+        base: BaseCacheStats {
+            queries: cur.queries - base.queries,
+            hits: hits.saturating_sub(external_hits),
+            ..BaseCacheStats::default()
+        },
+        ..PrefixCacheStats::default()
+    };
+    let connector = (host_queries > 0 || external_hits > 0).then(|| PrefixCacheStats {
+        base: BaseCacheStats {
+            queries: host_queries,
+            hits: external_hits,
+            ..BaseCacheStats::default()
+        },
+        hits_by_source: CachedTokensBySource {
+            host: host_hits,
+            external_unspecified: unspecified_hits,
+            ..CachedTokensBySource::default()
+        },
+        ..PrefixCacheStats::default()
+    });
+    (local, connector)
 }
 
-impl SpecDecodeTracker {
-    /// The delta to stamp on the next outgoing batch, or `None` when nothing
-    /// drafted. Advances the baseline, so a caller that declines to send after
-    /// calling this drops only a no-op interval.
-    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> Option<SpecDecodingStats> {
+/// Turns the scheduler's cumulative counters into the per-interval deltas
+/// stamped on each outgoing batch.
+#[derive(Default)]
+pub(crate) struct StatsTracker {
+    spec_decode: SpecDecodeCounters,
+    prefix_cache: PrefixCacheCounters,
+}
+
+impl StatsTracker {
+    /// Stats for the next outgoing batch. Advances the baselines, so a caller
+    /// that declines to send after calling this drops only that interval's
+    /// counter deltas.
+    pub(crate) fn stats(&mut self, snapshot: &SchedulerMetrics) -> SchedulerStats {
+        let mut stats = scheduler_stats_from(snapshot);
+        stats.spec_decoding_stats = self.spec_decode_interval(snapshot);
+        if let Some(cur) = &snapshot.prefix_cache {
+            (stats.prefix_cache_stats, stats.connector_prefix_cache_stats) =
+                prefix_cache_delta(&self.prefix_cache, cur);
+            self.prefix_cache = *cur;
+        } else {
+            // Reset so a prefix cache that shows up later diffs from zero.
+            self.prefix_cache = PrefixCacheCounters::default();
+        }
+        stats
+    }
+
+    /// The spec-decode delta, or `None` when nothing drafted.
+    fn spec_decode_interval(&mut self, snapshot: &SchedulerMetrics) -> Option<SpecDecodingStats> {
         let Some(cur) = &snapshot.spec_decode else {
             // Reset so a drafter loaded later diffs from zero.
-            self.last = SpecDecodeCounters::default();
+            self.spec_decode = SpecDecodeCounters::default();
             return None;
         };
-        let delta = spec_decode_delta(&self.last, cur);
-        self.last = *cur;
+        let delta = spec_decode_delta(&self.spec_decode, cur);
+        self.spec_decode = *cur;
         // A zero-draft interval would divide by zero in the frontend's
         // acceptance-rate log, and every counter moves only inside
         // `observe_draft`, so dropping it loses nothing.
@@ -666,11 +743,10 @@ async fn publish_scheduler_stats(
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let mut spec = SpecDecodeTracker::default();
+    let mut tracker = StatsTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
+        let stats = tracker.stats(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),

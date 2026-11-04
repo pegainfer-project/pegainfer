@@ -72,7 +72,7 @@ async fn spawn_ready_server(
 ) -> Result<Qwen35Tp2Server> {
     let device_ordinals = common::tp2_device_ordinals();
     let handle = tokio::task::spawn_blocking(move || {
-        pegainfer_qwen35::start_engine_with_capacity(
+        pegainfer_qwen35::start_engine(
             &engine_model_path,
             EngineLoadOptions {
                 enable_cuda_graph: true,

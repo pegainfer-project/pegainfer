@@ -9,3 +9,4 @@ mod scheduler;
 mod worker;
 
 pub(crate) use bringup::start_engine;
+pub(crate) use worker::decode_batch_bucket;

@@ -76,6 +76,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::bail;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::sys::CUdevice_attribute;
@@ -142,8 +143,7 @@ const K3_MASKED_CAP: usize = K3_MAX_BATCH;
 const K3_LAYERS_ENV: &str = "PEGAINFER_K3_LAYERS";
 /// Set to `0` to run every step eagerly instead of through a captured graph.
 const K3_CUDA_GRAPH_ENV: &str = "PEGAINFER_K3_CUDA_GRAPH";
-/// Concurrent slots per rank; rounded up to a compiled bucket, capped at the
-/// widest one.
+/// Concurrent slots per rank, at most the widest compiled bucket; rounded up to a bucket.
 const K3_MAX_BATCH_ENV: &str = "PEGAINFER_K3_MAX_BATCH";
 /// Context ceiling per slot (tokens); the paged pool is sized from it when
 /// `kv_pages` is not set explicitly.
@@ -257,32 +257,46 @@ impl Default for K3ExecutorConfig {
     }
 }
 
+/// An optional count override: unset is `None`, anything else must parse into `range`.
+fn env_count(name: &str, range: std::ops::RangeInclusive<usize>) -> Result<Option<usize>> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy();
+    match raw.trim().parse::<usize>() {
+        Ok(value) if range.contains(&value) => Ok(Some(value)),
+        _ => bail!(
+            "{name}={raw:?} not recognized (N, {} <= N <= {})",
+            range.start(),
+            range.end()
+        ),
+    }
+}
+
 impl K3ExecutorConfig {
-    /// Apply the bring-up environment overrides.
-    #[must_use]
-    pub fn from_env(mut self) -> Self {
-        if let Ok(raw) = std::env::var(K3_LAYERS_ENV)
-            && let Ok(layers) = raw.parse::<usize>()
-            && (1..=K3_LAYERS).contains(&layers)
+    /// Apply the bring-up environment overrides. A value outside its range refuses to start.
+    pub fn from_env(mut self) -> Result<Self> {
+        if let Some(layers) = env_count(K3_LAYERS_ENV, 0..=K3_LAYERS)?
+            && layers > 0
         {
             self.num_layers = layers;
         }
-        if std::env::var(K3_CUDA_GRAPH_ENV).as_deref() == Ok("0") {
-            self.cuda_graph = false;
+        match std::env::var_os(K3_CUDA_GRAPH_ENV) {
+            None => {}
+            Some(raw) if raw == "1" => {}
+            Some(raw) if raw == "0" => self.cuda_graph = false,
+            Some(raw) => bail!(
+                "{K3_CUDA_GRAPH_ENV}={:?} not recognized (0 or 1)",
+                raw.to_string_lossy()
+            ),
         }
-        if let Ok(raw) = std::env::var(K3_MAX_BATCH_ENV)
-            && let Ok(slots) = raw.parse::<usize>()
-            && (1..=K3_MAX_BATCH).contains(&slots)
-        {
+        if let Some(slots) = env_count(K3_MAX_BATCH_ENV, 1..=K3_MAX_BATCH)? {
             self.max_batch = slots;
         }
-        if let Ok(raw) = std::env::var(K3_MAX_CTX_ENV)
-            && let Ok(tokens) = raw.parse::<usize>()
-            && (1..=crate::config::K3_MAX_CONTEXT).contains(&tokens)
-        {
+        if let Some(tokens) = env_count(K3_MAX_CTX_ENV, 1..=crate::config::K3_MAX_CONTEXT)? {
             self.max_ctx = tokens;
         }
-        self
+        Ok(self)
     }
 
     /// Apply what an EP width decides on its own: a narrower default slot count

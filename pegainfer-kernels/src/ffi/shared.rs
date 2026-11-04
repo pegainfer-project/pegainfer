@@ -5,6 +5,20 @@ use super::Half;
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
+    pub fn dflash2_grouped_conv_cuda(
+        input: *const Half,
+        dynamic: *const Half,
+        base: *const Half,
+        output: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group_size: i32,
+        taps: i32,
+        side: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,
@@ -143,16 +157,6 @@ unsafe extern "C" {
         dst_seq_len: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    pub fn fused_add_rms_norm_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
 
     pub fn layer_norm_cuda(
         x: *const Half,
@@ -320,6 +324,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// `y[rows] = W[rows, cols] * x[cols]`, bf16 in and out with fp32 accumulation.
+    pub fn gemv_bf16_cuda(
+        w: *const Half,
+        x: *const Half,
+        y: *mut Half,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> i32;
+
     /// cuBLAS `cublasGemmStridedBatchedEx` (bf16, workspace-free, graph-safe).
     pub fn gemm_strided_batched_bf16_cuda(
         op_a: i32,
@@ -420,15 +434,6 @@ unsafe extern "C" {
         K: i32,
         stream: CUstream,
     ) -> i32;
-
-    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
-    pub fn embedding_decode_cuda(
-        embed: *const Half,
-        token_id: *const u32,
-        out: *mut Half,
-        hidden_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
 
     pub fn silu_mul_fused_cuda(
         gate_up: *const Half,
@@ -592,13 +597,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the number of Q tiles for batch prefill (needed to size plan arrays).
-    pub fn batch_prefill_paged_num_tiles(
-        seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
         seq_len: i32,
         num_qo_heads: i32,
@@ -608,13 +606,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the CTA tile size for batch prefill planning.
-    pub fn batch_prefill_cta_tile_q(
-        total_seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_cta_tile_q_with_override(
         total_seq_len: i32,
         num_qo_heads: i32,
@@ -624,33 +615,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
-    pub fn batch_prefill_paged_cuda(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn batch_prefill_paged_cuda_with_cta_tile_q(
         q: *const Half,
         output: *mut Half,
@@ -711,22 +675,6 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn single_prefill_nhd_noncausal_cuda_hd64(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Causal NHD single-sequence prefill (same layout, causal mask).
-    pub fn single_prefill_nhd_causal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,
@@ -1011,4 +959,39 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
+}
+
+// Native DFlash2 candidate selection. All entries guard C++ exceptions;
+// nonfinite selected candidates and computed scores use the error flag.
+unsafe extern "C" {
+    pub fn dflash2_prepare_cuda(
+        logits: *const Half,
+        hidden: *const Half,
+        predecessor: *const Half,
+        successor: *const Half,
+        anchors: *const u32,
+        ids: *mut u32,
+        unary: *mut f32,
+        gated: *mut f32,
+        successors: *mut f32,
+        error: *mut u32,
+        topk_values: *mut Half,
+        row_states: *mut u8,
+        batch: i32,
+        block_size: i32,
+        vocab: i32,
+        rank: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_finish_cuda(
+        edges: *mut f32,
+        unary: *const f32,
+        ids: *const u32,
+        selected: *mut u32,
+        error: *mut u32,
+        batch: i32,
+        length: i32,
+        stream: CUstream,
+    ) -> i32;
 }

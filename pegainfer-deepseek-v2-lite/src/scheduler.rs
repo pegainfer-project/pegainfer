@@ -36,7 +36,7 @@ use crate::host_ops::DecodeCache;
 use crate::runtime::DeepSeekV2LiteEp2Generator;
 use crate::runtime::GenerationStats;
 
-const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
+pub(crate) const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 8;
 
 pub(crate) struct MixedRequestScheduler {
     generator: DeepSeekV2LiteEp2Generator,
@@ -226,12 +226,18 @@ impl MixedRequestScheduler {
         let mut cache = DecodeCache::new(self.generator.config());
         let mut stats = self.generator.new_generation_stats(prompt_len);
         let mut attribution = DecodeAttributionProfile::disabled();
-        let next = match self.generator.prefill_next_token(
-            &pending.prompt_tokens,
-            &mut cache,
-            &mut stats,
-            &mut attribution,
-        ) {
+        let next = match self
+            .generator
+            .prefill_next_token(
+                &pending.prompt_tokens,
+                &mut cache,
+                &mut stats,
+                &mut attribution,
+            )
+            .and_then(|token| {
+                self.generator.attach_device_kv(&mut cache)?;
+                Ok(token)
+            }) {
             Ok(token) => token,
             Err(err) => {
                 let message = err.to_string();
@@ -305,14 +311,14 @@ impl MixedRequestScheduler {
             return;
         }
 
-        if let Some(position) = common_decode_position(&self.active) {
+        // Device attention gives every row its own position, so all active rows
+        // share one step. Host attention needs one position per batch.
+        if self.generator.device_decode_enabled() || common_decode_position(&self.active).is_some()
+        {
             let rows: Vec<_> = self.active.drain(..).enumerate().collect();
             let mut active_remaining = active_set_size;
-            self.active = restore_surviving_rows(self.decode_batch_group(
-                position,
-                rows,
-                &mut active_remaining,
-            ));
+            self.active =
+                restore_surviving_rows(self.decode_batch_group(rows, &mut active_remaining));
             return;
         }
 
@@ -321,11 +327,7 @@ impl MixedRequestScheduler {
         let mut active_remaining = active_set_size;
         for group in groups {
             if group.rows.len() > 1 {
-                survivors.extend(self.decode_batch_group(
-                    group.position,
-                    group.rows,
-                    &mut active_remaining,
-                ));
+                survivors.extend(self.decode_batch_group(group.rows, &mut active_remaining));
             } else {
                 let mut rows = group.rows;
                 if let Some(row) = rows.pop() {
@@ -363,13 +365,16 @@ impl MixedRequestScheduler {
 
     fn decode_batch_group(
         &mut self,
-        position: usize,
         rows: Vec<(usize, ActiveRequestState)>,
         active_remaining: &mut usize,
     ) -> Vec<(usize, ActiveRequestState)> {
         let group_size = rows.len();
         let (indices, mut states): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
         let tokens: Vec<_> = states.iter().map(|state| state.last_token).collect();
+        let positions: Vec<_> = states
+            .iter()
+            .map(ActiveRequestState::next_decode_position)
+            .collect();
         let token_index = states
             .iter()
             .map(|state| state.generated)
@@ -385,7 +390,7 @@ impl MixedRequestScheduler {
         let decode_start = Instant::now();
         let result = self.generator.decode_next_tokens_batch(
             &tokens,
-            position,
+            &positions,
             &mut caches,
             &mut stats,
             &mut attribution,

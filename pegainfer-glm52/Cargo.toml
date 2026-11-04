@@ -18,7 +18,7 @@ log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-frontend = { workspace = true }
-pegainfer-kernels = { workspace = true, features = ["glm52"] }
+pegainfer-kernels = { workspace = true }
 pegainfer-kv-store = { workspace = true }
 pegainfer-sample = { workspace = true }
 rayon = { workspace = true }
@@ -27,6 +27,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+glm52 = ["pegainfer-kernels/glm52"]
 
 [lints]
 workspace = true

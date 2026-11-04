@@ -18,6 +18,7 @@ use pegainfer_frontend::engine::UnloadLoraAdapterRequest;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use super::blocks_needed;
+use crate::executor::ConnectorLookupCounters;
 use crate::executor::DecodePlan;
 use crate::executor::DecodeRequestResult;
 use crate::executor::ModelExecutor;
@@ -45,6 +46,7 @@ pub(crate) struct AsyncPrefillGate {
     pub(crate) polls: AtomicUsize,
 }
 
+#[allow(clippy::struct_excessive_bools)] // test double: independent knobs, not a state machine
 pub(crate) struct FakeExecutor {
     pub(crate) block_size: usize,
     max_request_blocks: usize,
@@ -63,8 +65,26 @@ pub(crate) struct FakeExecutor {
     pub(crate) prefetch_offers: Arc<Mutex<Vec<u64>>>,
     stop_token: Option<u32>,
     emit_logprobs: bool,
+    /// Whether a draft model is loaded (the fake reports every request as
+    /// draft-ready unless it is listed in `not_ready`).
+    speculative: bool,
+    /// Requests the fake reports as NOT having captured draft context.
+    not_ready: HashSet<RequestId>,
+    max_draft_batch: Option<usize>,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
+    // `cached_tokens` the first prefill chunk of every request reports (a
+    // simulated prefix-cache lookup). Drives the prefix-cache query/hit
+    // counters without a real GPU KV cache. `None` models a real executor with
+    // prefix caching switched off, which never calls `match_and_add_prefix`
+    // and must therefore report no queries.
+    prefix_hit_tokens: Option<usize>,
+    // Tokens of the simulated hit attributed to the external side (CPU offload
+    // / P2P) rather than found in local KV. `None` models an engine that
+    // consulted no connector for this request, so the external family stays
+    // unreported; `Some(0)` is a probe that restored nothing.
+    prefix_external_hit_tokens: Option<usize>,
+    connector_lookups: ConnectorLookupCounters,
 }
 
 impl FakeExecutor {
@@ -85,8 +105,14 @@ impl FakeExecutor {
             prefetch_offers: Arc::new(Mutex::new(Vec::new())),
             stop_token: None,
             emit_logprobs: false,
+            speculative: false,
+            not_ready: HashSet::new(),
+            max_draft_batch: None,
             async_prefill: None,
             parked_prefill: None,
+            prefix_hit_tokens: Some(0),
+            prefix_external_hit_tokens: None,
+            connector_lookups: ConnectorLookupCounters::default(),
         }
     }
 
@@ -97,6 +123,27 @@ impl FakeExecutor {
 
     pub(crate) fn with_async_prefill(mut self, gate: Arc<AsyncPrefillGate>) -> Self {
         self.async_prefill = Some(gate);
+        self
+    }
+
+    /// Simulate a prefix-cache hit on every request's first prefill chunk by
+    /// reporting `tokens` cached tokens.
+    pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_hit_tokens = Some(tokens);
+        self
+    }
+
+    /// Model an executor that never consults a prefix cache (caching switched
+    /// off): no `match_and_add_prefix` happens, so no query may be counted.
+    pub(crate) fn without_prefix_cache(mut self) -> Self {
+        self.prefix_hit_tokens = None;
+        self
+    }
+
+    /// Simulate a connector that was consulted for every request and restored
+    /// `tokens` externally. Without this the external family reports nothing.
+    pub(crate) fn with_external_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_external_hit_tokens = Some(tokens);
         self
     }
 
@@ -131,6 +178,24 @@ impl FakeExecutor {
         self
     }
 
+    /// Pretend a draft model is loaded: every request reports captured draft
+    /// context unless it is named in [`Self::with_request_not_ready`].
+    pub(crate) fn with_speculative(mut self) -> Self {
+        self.speculative = true;
+        self
+    }
+
+    /// Report one request as NOT draft-ready (no captured draft context).
+    pub(crate) fn with_request_not_ready(mut self, request_id: RequestId) -> Self {
+        self.not_ready.insert(request_id);
+        self
+    }
+
+    pub(crate) fn with_max_draft_batch(mut self, limit: usize) -> Self {
+        self.max_draft_batch = Some(limit);
+        self
+    }
+
     /// Advance a request's prompt by one chunk, mirroring the real
     /// executor: clamp the scheduler's budget to the tokens remaining
     /// and report the new authoritative position.
@@ -148,6 +213,20 @@ impl FakeExecutor {
         } else {
             self.prefill_positions.insert(req.request_id, prefill_pos);
         }
+        // The external family is only reported for a request whose connector
+        // was consulted; later chunks contribute nothing.
+        let external_hit_tokens = if start == 0 && self.prefix_hit_tokens.is_some() {
+            self.prefix_external_hit_tokens
+        } else {
+            None
+        };
+        // Mirror the real executor's settle point: the connector is asked
+        // about whatever was not already local, once per request.
+        if let Some((hit, external)) = self.prefix_hit_tokens.zip(external_hit_tokens) {
+            self.connector_lookups.queries +=
+                (req.prompt_tokens.len() - hit.saturating_sub(external)) as u64;
+            self.connector_lookups.hits += external as u64;
+        }
         PrefillRequestResult {
             request_id: req.request_id,
             first_token: 100 + req.request_id.raw() as u32,
@@ -160,7 +239,16 @@ impl FakeExecutor {
                 }
             }),
             prompt_logprobs: None,
-            cached_tokens: 0,
+            // A simulated lookup is reported only on the request's first chunk
+            // (start == 0); later chunks carry no cached prefix. `None` models
+            // a cache that never ran a lookup (switched off, or prompt
+            // scoring).
+            cached_tokens: if start == 0 {
+                self.prefix_hit_tokens
+            } else {
+                None
+            },
+            external_hit_tokens,
             completed,
             prefill_pos,
         }
@@ -217,6 +305,22 @@ impl ModelExecutor for FakeExecutor {
 
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.stop_token == Some(token_id)
+    }
+
+    fn speculative_enabled(&self) -> bool {
+        self.speculative
+    }
+
+    fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+        self.speculative && !self.not_ready.contains(&request_id)
+    }
+
+    fn max_draft_batch(&self) -> Option<usize> {
+        self.max_draft_batch
+    }
+
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        self.connector_lookups
     }
 
     fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
@@ -279,7 +383,7 @@ impl ModelExecutor for FakeExecutor {
                 .iter()
                 .map(|req| self.fake_prefill_result(req))
                 .collect(),
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
@@ -347,7 +451,7 @@ impl ModelExecutor for FakeExecutor {
         if let Some(gate) = &self.async_prefill {
             self.parked_prefill = Some(PrefillResult {
                 requests: std::mem::take(&mut prefill_requests),
-                dflash_context_captured_requests: Vec::new(),
+                draft_context_captured_requests: Vec::new(),
             });
             gate.launches.fetch_add(1, Ordering::SeqCst);
         }
@@ -387,6 +491,7 @@ pub(crate) fn request(prompt_len: usize, max_tokens: usize) -> Request {
         prompt_tokens: vec![1; prompt_len],
         params: SamplingParams::default(),
         history_tokens: None,
+        history_marks: Vec::new(),
         stop_policy: StopPolicy::default(),
         max_tokens,
         lora_adapter: None,

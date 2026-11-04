@@ -49,6 +49,7 @@ pub(crate) fn assert_traps(row: i32, visible: i32) {
         &rows,
         &visible_len,
         TOKENS,
+        crate::common::sm_count(ctx),
         &mut scores,
         SCORE_COLS,
         &mut pooled,

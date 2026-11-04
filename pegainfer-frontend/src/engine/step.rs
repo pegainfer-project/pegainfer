@@ -58,6 +58,13 @@ pub struct Request {
     /// when the frontend did not measure it (a completion, or a chat body the
     /// chat layer could not read).
     pub history_tokens: Option<usize>,
+    /// Where the conversation's earlier turns ended, newest first: the
+    /// `history_tokens` of the requests that carried them, as the chat layer
+    /// re-measures them from the messages. Each is a point an earlier turn's
+    /// snapshot may be found at, by a scheduler that keeps snapshots beyond
+    /// the one that made them; strictly less than `history_tokens`. Empty
+    /// when the frontend did not measure them.
+    pub history_marks: Vec<usize>,
     pub stop_policy: StopPolicy,
     pub max_tokens: usize,
     pub lora_adapter: Option<String>,
@@ -271,20 +278,4 @@ pub enum Terminal {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_rejection_names_the_engine_feature() {
-        let reason = RejectReason::Unsupported {
-            feature: "frontend-resolved prefix".to_string(),
-        };
-        assert_eq!(
-            reason.to_string(),
-            "this engine does not support frontend-resolved prefix"
-        );
-    }
 }

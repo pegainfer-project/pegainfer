@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::sync::LazyLock;
 
 use anyhow::Context;
@@ -22,6 +21,8 @@ use pegainfer_kernels::ops::dsv2_lite_router_softmax_topk_ref_into;
 use super::DeepSeekV2LiteEp2Generator;
 use super::backend::EpBackendKind;
 use super::backend::EpBackendRuntime;
+use super::load_rollback_value;
+use super::rollback_enabled;
 use super::routing::MoeRouteEntry;
 use super::routing::MoeRoutePlan;
 use crate::attribution::DecodeAttributionProfile;
@@ -41,41 +42,6 @@ use crate::model::dense_mlp_forward_preallocated_into;
 use crate::model::dense_mlp_forward_preallocated_ref_into;
 use crate::model::routed_expert_projections;
 use crate::nccl_backend::NaiveNcclEp2Backend;
-
-fn parse_rollback_value(
-    name: &str,
-    raw: Option<&str>,
-    optimized: &str,
-    rollback: &str,
-) -> std::result::Result<bool, String> {
-    match raw.map(str::trim) {
-        None | Some("") => Ok(false),
-        Some(value) if value == optimized => Ok(false),
-        Some(value) if value == rollback => Ok(true),
-        Some(value) => Err(format!(
-            "{name} must be `{optimized}` or `{rollback}`, got `{value}`"
-        )),
-    }
-}
-
-fn load_rollback_value(
-    name: &str,
-    optimized: &str,
-    rollback: &str,
-) -> std::result::Result<bool, String> {
-    match env::var(name) {
-        Ok(value) => parse_rollback_value(name, Some(&value), optimized, rollback),
-        Err(env::VarError::NotPresent) => Ok(false),
-        Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must contain valid Unicode text")),
-    }
-}
-
-fn rollback_enabled(value: &std::result::Result<bool, String>) -> Result<bool> {
-    value
-        .as_ref()
-        .copied()
-        .map_err(|message| anyhow::anyhow!("{message}"))
-}
 
 static HOST_STAGED_SERIAL: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
     load_rollback_value(

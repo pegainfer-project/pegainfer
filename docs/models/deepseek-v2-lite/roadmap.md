@@ -27,7 +27,7 @@ The first three can be green while the fourth is only a retained baseline. A pas
 | HTTP SLO report | Retained for #466 | `benchmarking.md`, `bench_dsv2lite_http_slo.py` | Fixed host-staged/NCCL HTTP contracts retained; no soak or production claim |
 | Sustained soak | Retained baseline for #465 | `benchmarking.md`, `bench_dsv2lite_http_soak.py` | Fixed short-shape host-staged/NCCL soak retained; runtime/provenance gates are hard, drift is reported, not a ratified production budget |
 | Long-prefill scheduling | Open | issue #452 | Current long smoke records the boundary; it does not close latency work |
-| Device attention and KV | Open | issue #635 | Required for bounded device lifetime and stronger scaling |
+| Device attention and KV | Done for NCCL decode | issue #635, `device-attention.md` | Prefill stays on the host |
 
 ## Issue #466 Position
 
@@ -63,7 +63,7 @@ Primary issue: #465.
 
 ### 3. Move Decode State To The Device
 
-Primary issue: #635.
+Primary issue: #635. Done for NCCL steady decode; see `device-attention.md`.
 
 - Give each request explicit device KV ownership, capacity, retirement, and slot-reuse semantics.
 - Move steady decode attention and compressed KV off the host path.

@@ -12,7 +12,7 @@
   - `docs/playbooks/model-optimization-pipeline.md` - defined per-model optimization docs, DAG expansion, and profiling-driven optimization.
   - Local source in `src/model_executor.rs`, `src/scheduler_qwen35.rs`, `src/model/qwen35/`, the DSV3 worktree, `vllm_frontend.rs`, and `../pegaflow` - confirmed that model execution, KV/state layout, communication, and kernel needs diverge materially by model family.
 - **Relevant history**:
-  - Earlier shared-runtime work (consolidated in `docs/subsystems/runtime/runtime.md`) pursued shared model execution boundaries.
+  - Earlier shared-runtime work around the `ModelForward` trait (since removed) pursued shared model execution boundaries.
   - `docs/models/qwen3/tp-design.md` moved Qwen3 toward a controller/worker executor model.
   - The DSV3 branch demonstrates that FP8, MLA compressed KV, MoE, DeepEP, and EP scheduling form a different model engine shape from dense full attention.
 - **Plan**:

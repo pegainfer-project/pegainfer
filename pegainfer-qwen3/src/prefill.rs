@@ -152,7 +152,7 @@ impl Qwen3Model {
             .map_err(|e| anyhow::anyhow!("H2D copy failed: {}", e))?;
 
         let mut out = HiddenStates::zeros(&self.ctx, hidden_dim, seq_len)?;
-        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        pegainfer_kernels::tensor::fence_producers_before_override(&self.ctx)?;
         let launched =
             ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, &mut out);
         park(token_ids_gpu);
@@ -451,7 +451,7 @@ impl Qwen3Model {
         let mut gathered = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
         let mut normed = HiddenStates::zeros(&self.ctx, hidden.hidden_dim, n)?;
         let mut logits = HiddenStates::zeros(&self.ctx, self.config.logits_rows, n)?;
-        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        pegainfer_kernels::tensor::fence_producers_before_override(&self.ctx)?;
 
         let gather =
             ops::gather_hidden_tokens_into(&self.ctx, hidden, &indices_d, n, &mut gathered);
@@ -621,7 +621,7 @@ impl Qwen3Model {
             total_tokens,
         )?;
 
-        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        pegainfer_kernels::tensor::fence_producers_before_override(&self.ctx)?;
 
         let run = (|| -> Result<()> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {

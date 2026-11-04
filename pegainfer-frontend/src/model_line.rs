@@ -120,9 +120,10 @@ pub struct SharedArgs {
     pub tool_call_parser: ParserSelection,
 
     /// Enable CUDA Graph capture/replay on decode path (`--cuda-graph=false` to
-    /// disable). Rejected for GLM5.2; forced off in Qwen3 LoRA mode; Qwen3.5
-    /// always captures and rejects `false`; dense Gemma 4 captures per batch
-    /// bucket while routed checkpoints warn and serve eagerly.
+    /// disable). Rejected for GLM5.2 and Kimi-K3; forced off in Qwen3 LoRA
+    /// mode; Qwen3.5 always captures and rejects `false`; dense Gemma 4
+    /// captures per batch bucket while routed checkpoints warn and serve
+    /// eagerly.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub cuda_graph: bool,
 
@@ -134,7 +135,7 @@ pub struct SharedArgs {
     #[arg(long)]
     pub dump_graph_png: Option<PathBuf>,
 
-    /// CUDA device ordinal for single-GPU Qwen3/Qwen3.5 loads
+    /// CUDA device ordinal for single-GPU loads
     #[arg(long, default_value_t = 0)]
     pub device_ordinal: usize,
 
@@ -376,7 +377,7 @@ pub trait ModelLine: Send + Sync {
     }
 
     /// Start the engine: spawn scheduler threads, build the handle with its
-    /// metadata (`with_kv_capacity`, `with_metrics_watch`, ...), return it.
+    /// metadata (`with_kv_capacity`, `with_metrics_watches`, ...), return it.
     /// Failures here are deep context chains (CUDA, weights, topology), not
     /// something callers branch on — hence `anyhow`.
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine>;

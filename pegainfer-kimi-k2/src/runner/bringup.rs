@@ -35,9 +35,9 @@ use crate::runner::worker::KIMI_KV_PAGE_SIZE;
 use crate::runner::worker::KimiRankWeightLoadReport;
 use crate::runner::worker::KimiRankWorker;
 use crate::runner::worker::build_placements;
+use crate::weights::KimiK2WeightManifest;
 use crate::weights::KimiRankGpuContext;
 use crate::weights::KimiRankSlicedLoadPlan;
-use crate::weights::ensure_text_only_model_index;
 
 /// TP8 replicates the KV pool on every rank: 8192 pages × 16 tokens ×
 /// (576 ckv + 64 kpe) bf16 ≈ 9.2 GiB per rank — the same footprint as the
@@ -93,8 +93,8 @@ fn build_runner_config(
 ) -> Result<KimiK2RunnerConfig> {
     let started = Instant::now();
     info!("start build runner config");
-    let mut weight_manifest = ensure_text_only_model_index(model_path)?;
-    weight_manifest = weight_manifest.with_parallel_shape(shape)?;
+    let weight_manifest =
+        KimiK2WeightManifest::from_model_dir(model_path)?.with_parallel_shape(shape)?;
     let placements = build_placements(&options.device_ordinals)?;
     let thread_placement = crate::runner::affinity::KimiRankThreadPlacementPlan::for_devices(
         &options.device_ordinals,

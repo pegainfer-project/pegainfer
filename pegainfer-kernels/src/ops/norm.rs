@@ -136,36 +136,6 @@ pub fn layer_norm_into(
         .map_err(|err| anyhow::anyhow!("GLM5.2 LayerNorm launch failed: {err}"))
 }
 
-/// Fused add + RMSNorm: hidden += residual; out = rms_norm(hidden, weight)
-/// Saves one global read of hidden compared to separate add + rms_norm.
-pub fn fused_add_rms_norm_into(
-    ctx: &DeviceContext,
-    hidden: &mut DeviceVec,
-    residual: &DeviceVec,
-    weight: &DeviceVec,
-    eps: f32,
-    out: &mut DeviceVec,
-) -> Result<()> {
-    assert_eq!(hidden.len, residual.len);
-    assert_eq!(hidden.len, out.len);
-    let (h_ptr, _gh) = hidden.data.device_ptr_mut(&ctx.stream);
-    let (r_ptr, _gr) = residual.data.device_ptr(&ctx.stream);
-    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::fused_add_rms_norm_cuda(
-            h_ptr as *mut ffi::Half,
-            r_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            o_ptr as *mut ffi::Half,
-            hidden.len as i32,
-            eps,
-            crate::tensor::active_cu_stream(ctx),
-        );
-    }
-    Ok(())
-}
-
 /// Two RMSNorms of the same input in one launch: `out_a = rms(x) * weight_a *
 /// scale_a` and `out_b = rms(x) * weight_b`, each bitwise what its standalone
 /// operations produce. The norms share one reduction, and the input is read

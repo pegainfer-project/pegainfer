@@ -35,15 +35,15 @@ tikv-jemallocator = "0.6"
 # Qwen3-4B is the default model line: pure Rust + CUDA, no Python at build time.
 default = ["qwen3"]
 qwen3 = ["dep:pegainfer-qwen3"]
-# Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
 deepseek-v2-lite = [
   "dep:pegainfer-deepseek-v2-lite",
   "pegainfer-deepseek-v2-lite/deepseek-v2-lite",
 ]
 gemma4 = ["dep:pegainfer-gemma4", "pegainfer-gemma4/gemma4"]
-glm52 = ["dep:pegainfer-glm52"]
-k3 = ["dep:pegainfer-k3"]
+glm52 = ["dep:pegainfer-glm52", "pegainfer-glm52/glm52"]
+k3 = ["dep:pegainfer-k3", "pegainfer-k3/k3"]
 kimi-k2 = ["dep:pegainfer-kimi-k2", "pegainfer-kimi-k2/kimi-k2"]
+# Qwen3.5 pulls in the Triton AOT kernels (Python + Triton at build time).
 qwen35 = ["dep:pegainfer-qwen35", "pegainfer-qwen35/qwen35"]
 qwen4 = ["dep:pegainfer-qwen4"]
 

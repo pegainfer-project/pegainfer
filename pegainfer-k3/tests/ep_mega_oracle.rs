@@ -33,7 +33,7 @@
 //!
 //! ```text
 //! PEGAINFER_K3_LAYERS=4 PEGAINFER_K3_MAX_BATCH=16 \
-//!   cargo test --release -p pegainfer-k3 --test ep_mega_oracle \
+//!   cargo test --release -p pegainfer-k3 --features k3 --test ep_mega_oracle \
 //!   ep4_mega_matches_ep1_mega -- --ignored --nocapture
 //! ```
 

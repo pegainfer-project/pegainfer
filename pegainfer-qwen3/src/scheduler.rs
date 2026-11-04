@@ -64,9 +64,6 @@ pub(crate) struct PendingRequest {
     /// Prompt tokens to forward in the upcoming step. Set by
     /// `take_prefill_chunks` when the request is packed into a step.
     pub(crate) step_chunk: usize,
-    /// Prefix-cache hits reported by the first chunk, carried across later
-    /// chunks so the final result still reports them truthfully.
-    pub(crate) cached_tokens: usize,
 }
 
 impl PendingRequest {
@@ -83,7 +80,6 @@ impl PendingRequest {
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 0,
-            cached_tokens: 0,
         }
     }
 
@@ -522,14 +518,36 @@ pub(crate) fn runtime_plan(
     active: &[ActiveRequestState],
     pending: Vec<PendingRequest>,
 ) -> Option<plan::ExecutionPlan> {
-    if plan::should_speculative_decode(executor, active) {
-        if pending.is_empty() {
-            Some(plan::ExecutionPlan::SpeculativeDecode)
-        } else {
-            Some(plan::ExecutionPlan::Prefill { pending })
+    runtime_plan_at(executor, active, pending, plan::spec_max_batch())
+}
+
+/// [`runtime_plan`] with the load gate's threshold passed in, so the gate is
+/// testable without mutating process-wide env state.
+fn runtime_plan_at(
+    executor: &impl ModelExecutor,
+    active: &[ActiveRequestState],
+    pending: Vec<PendingRequest>,
+    max_batch: usize,
+) -> Option<plan::ExecutionPlan> {
+    use plan::SpeculationDecision;
+    match plan::speculation_decision_at(executor, active, max_batch) {
+        SpeculationDecision::Speculate => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::SpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
         }
-    } else {
-        plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        SpeculationDecision::Gated => {
+            if pending.is_empty() {
+                Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+            } else {
+                Some(plan::ExecutionPlan::Prefill { pending })
+            }
+        }
+        SpeculationDecision::NotReady => {
+            plan::build_next_plan(!active.is_empty(), pending, executor.speculative_enabled())
+        }
     }
 }
 
@@ -544,7 +562,9 @@ pub(crate) fn failure_target_ids(
         plan::ExecutionPlan::Prefill { pending } => {
             targets.extend(pending.iter().map(|req| req.request_id));
         }
-        plan::ExecutionPlan::Decode | plan::ExecutionPlan::SpeculativeDecode => {
+        plan::ExecutionPlan::Decode
+        | plan::ExecutionPlan::SpeculativeDecode
+        | plan::ExecutionPlan::GatedSpeculativeDecode => {
             targets.extend(active.iter().map(|req| req.request_id));
         }
         plan::ExecutionPlan::Unified { pending } => {

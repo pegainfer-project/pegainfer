@@ -2,11 +2,11 @@
 
 > **TL;DR:** `pegainfer.json` is a Grafana 10.4-validated dashboard for the live PegaInfer `/metrics` surface: HTTP traffic, request outcomes, scheduler/KV state, token throughput, and request latency.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-10
 
 Import `pegainfer.json` in Grafana and select the Prometheus data source whose scrape target is the PegaInfer server address (port 8000 by default, metrics path `/metrics`).
 
-The dashboard intentionally omits prefix-cache query/hit, speculative-decode, residency, FLOP/byte, and CUDA Graph panels because PegaInfer currently sends zero/default scheduler values for those families. Request-derived cached/computed prompt-token counters remain available at `/metrics`, but are not presented as a cache hit-rate panel.
+The dashboard intentionally omits speculative-decode, residency, FLOP/byte, and CUDA Graph panels because PegaInfer sends zero/default scheduler values for those families. Prefix-cache query/hit counters are now real for Qwen3 (token-granular, split local vs connector), so the missing prefix-cache panel is a dashboard gap rather than a data gap — `pegainfer.json` has not been regenerated with it yet. Request-derived cached/computed prompt-token counters remain available at `/metrics`, but are not presented as a cache hit-rate panel.
 
 ## Execution Log
 
