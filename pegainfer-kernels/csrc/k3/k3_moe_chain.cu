@@ -341,8 +341,6 @@ __global__ void moe_weighted_combine_kernel(
   out[(size_t)token * hidden + col] = __float2bfloat16_rn(acc);
 }
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 int entry_grid(int entries) {
   return entries < kMaxEntryBlocks ? entries : kMaxEntryBlocks;
 }

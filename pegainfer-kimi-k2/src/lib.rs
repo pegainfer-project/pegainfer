@@ -1,7 +1,4 @@
 //! Text-only Kimi-K2.6 model crate.
-//!
-//! The current crate stage owns the compile-checked operator API surface and
-//! text-only config probing. CUDA/runtime bodies land behind these headers.
 
 #![allow(incomplete_features)]
 // `use super::*` is the flat-module-layout idiom for these tightly-coupled

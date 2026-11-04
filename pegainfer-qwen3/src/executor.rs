@@ -83,6 +83,14 @@ use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
 
+/// Log target of the commit trace: the top two decodable tokens and logits of
+/// the forward row behind every token a prefill, decode, unified or verify
+/// step commits, which the lossless gates read to judge each token against the
+/// forward that committed it. The split-concurrent overlap steps never run with
+/// a drafter and are not traced. Trace level, so a debug run of the server
+/// never pays the device copy.
+pub const COMMIT_TRACE_TARGET: &str = "pegainfer_qwen3::committed_rows";
+
 #[derive(Clone)]
 pub struct PrefillStepItem {
     pub(crate) request_id: RequestId,
@@ -315,6 +323,15 @@ fn execute_step_on_lane(
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let rows: Vec<_> = requests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, req)| req.is_final_chunk())
+                        .map(|(i, req)| (req.request_id, i, req.chunk_start + req.chunk_tokens))
+                        .collect();
+                    lane.trace_committed_rows(&logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
                         lane.model.device_ctx(),
@@ -349,8 +366,18 @@ fn execute_step_on_lane(
                 .collect();
             lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
+                let results = build_batch_decode_request_results(lane, requests, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let rows: Vec<_> = requests
+                        .iter()
+                        .zip(kv_views)
+                        .enumerate()
+                        .map(|(i, (req, view))| (req.request_id, i, view.seq_len()))
+                        .collect();
+                    lane.trace_committed_rows(&lane.bufs.logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Decode(DecodeResult {
-                    requests: build_batch_decode_request_results(lane, requests, *sample_seed)?,
+                    requests: results,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -392,6 +419,20 @@ fn execute_step_on_lane(
                     .chain(decode_requests.iter().map(|r| &r.params))
                     .collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let prefill = prefill_requests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, req)| req.is_final_chunk())
+                        .map(|(i, req)| (req.request_id, i, req.chunk_start + req.chunk_tokens));
+                    let decode = decode_requests.iter().zip(decode_kv_views).enumerate().map(
+                        |(i, (req, view))| {
+                            (req.request_id, prefill_requests.len() + i, view.seq_len())
+                        },
+                    );
+                    let rows: Vec<_> = prefill.chain(decode).collect();
+                    lane.trace_committed_rows(&logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
                         lane.model.device_ctx(),
@@ -1366,10 +1407,11 @@ impl Qwen3Executor {
                     // Hedge-chain scratch KV pages (PEGAINFER_SPEC_HEDGE)
                     // live in the KV buffer but outside the pool; bill them
                     // via the margin so the profiled block budget shrinks to
-                    // fit instead of OOMing. Two bounds: the effective
-                    // geometry (worst-case span pages per chain) and the
-                    // expanded verify batch, which holds at most
-                    // `max_verify_batch - 1` hedge spans at once.
+                    // fit instead of OOMing. Each chain span touches at most
+                    // `pages_per_chain` pages, and two bounds cap the spans:
+                    // the effective geometry and the expanded verify batch,
+                    // which holds at most `max_verify_batch - 1` hedge spans
+                    // at once.
                     let geometry = dflash_lane::spec_hedge_effective(reservation.block_size);
                     let pages_per_chain = dflash_lane::hedge_pages_per_chain(
                         reservation.block_size,
@@ -1377,10 +1419,9 @@ impl Qwen3Executor {
                     );
                     let pages = if reservation.uses_markov_head {
                         geometry
-                            .cap
+                            .chain_spans
+                            .min(max_verify_batch - 1)
                             .saturating_mul(pages_per_chain)
-                            .saturating_mul(geometry.positions.len())
-                            .min(pages_per_chain.saturating_mul(max_verify_batch - 1))
                     } else {
                         // A plain DFlash drafter can never hedge; a nonzero
                         // hedge env must not reserve scratch it cannot use.
@@ -3693,6 +3734,46 @@ impl LocalQwen3Lane {
         )
     }
 
+    /// Trace committed rows under [`COMMIT_TRACE_TARGET`]. Each entry is
+    /// `(request, logits row, sequence position the row commits)`; the row
+    /// logs its top two decodable tokens and their logits, the lower id first
+    /// on an exact tie as the argmax resolves it.
+    fn trace_committed_rows(
+        &self,
+        logits: &HiddenStates,
+        rows: &[(RequestId, usize, usize)],
+    ) -> Result<()> {
+        let stride = logits.hidden_dim;
+        let vocab = self.model.config().decodable_vocab;
+        for &(request_id, row, pos) in rows {
+            let host = self
+                .model
+                .device_ctx()
+                .stream
+                .clone_dtoh(&logits.data.slice(row * stride..row * stride + vocab))?;
+            let mut best = (0usize, f32::NEG_INFINITY);
+            let mut second = (0usize, f32::NEG_INFINITY);
+            for (token, value) in host.iter().enumerate() {
+                let value = value.to_f32();
+                if value > best.1 {
+                    second = best;
+                    best = (token, value);
+                } else if value > second.1 {
+                    second = (token, value);
+                }
+            }
+            log::trace!(
+                target: COMMIT_TRACE_TARGET,
+                "committed row request={request_id} pos={pos} top={}:{} {}:{}",
+                best.0,
+                best.1,
+                second.0,
+                second.1,
+            );
+        }
+        Ok(())
+    }
+
     fn execute_prefill(
         &mut self,
         prompts: &[&[u32]],
@@ -3760,11 +3841,10 @@ impl LocalQwen3Lane {
             let drafts_start = usize::from(!dflash.model.anchor_first());
             let pages_per_chain =
                 dflash_lane::hedge_pages_per_chain(dflash.model.block_size(), page_size);
-            let mut hedged_requests = 0usize;
+            // The draft round already chose the hedged requests: it built
+            // `hedge_blocks` for exactly those, so this pass only checks the
+            // verify batch and the scratch pages.
             for (idx, req) in requests.iter().enumerate() {
-                if hedged_requests == cap {
-                    break;
-                }
                 if !req.params.is_greedy() || req.token_ids.len() < 2 {
                     continue;
                 }
@@ -3817,9 +3897,6 @@ impl LocalQwen3Lane {
                     views.push(KvView::new(pages, v.seq_len(), page_size));
                     hedge_spans.push((idx, replaced));
                     added.push(ids);
-                }
-                if !added.is_empty() {
-                    hedged_requests += 1;
                 }
             }
         }
@@ -3883,6 +3960,16 @@ impl LocalQwen3Lane {
         };
         let mut b_wins = 0usize;
         let mut b_row_offset = a_total_rows;
+        // First logits row of each request's committed chain, for the verify
+        // trace: chain A's offset until a hedge chain wins.
+        let mut winner_rows: Vec<usize> = requests
+            .iter()
+            .scan(0, |row, req| {
+                let first = *row;
+                *row += req.token_ids.len();
+                Some(first)
+            })
+            .collect();
         for (slot, (idx, replaced)) in hedge_spans.iter().enumerate() {
             let span_len = requests[*idx].token_ids.len();
             let res_b = &results_b[slot];
@@ -3906,6 +3993,7 @@ impl LocalQwen3Lane {
                 }
                 .map_err(|e| anyhow::anyhow!("hedge hidden compaction failed: {e}"))?;
                 b_wins += 1;
+                winner_rows[*idx] = b_row_offset;
                 if let Some(selected) = selected_is_b.as_mut() {
                     selected[*idx] = true;
                 }
@@ -3923,6 +4011,22 @@ impl LocalQwen3Lane {
             "Qwen3 DFlash hedge: {} chain span(s), {b_wins} win event(s), +{b_extra} committed token(s)",
             hedge_spans.len()
         );
+        if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+            let mut rows = Vec::new();
+            for (((req, view), &first_row), result) in requests
+                .iter()
+                .zip(kv_views)
+                .zip(&winner_rows)
+                .zip(&final_results)
+            {
+                let first_pos = view.seq_len() - req.token_ids.len() + 1;
+                rows.extend(
+                    (0..result.accepted_tokens.len())
+                        .map(|j| (req.request_id, first_row + j, first_pos + j)),
+                );
+            }
+            self.trace_committed_rows(bufs.all_logits(), &rows)?;
+        }
 
         // The expanded forward left seq_len at A+B rows; the winner layout is
         // exactly the N chain-A offsets.
@@ -4088,6 +4192,20 @@ impl LocalQwen3Lane {
                     &req.stop_policy,
                     &self.model.config().stop_token_ids,
                 );
+            }
+            if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                let mut first_row = 0;
+                let mut rows = Vec::new();
+                for ((req, view), result) in requests.iter().zip(kv_views).zip(&request_results) {
+                    let span = req.token_ids.len();
+                    let first_pos = view.seq_len() - span + 1;
+                    rows.extend(
+                        (0..result.accepted_tokens.len())
+                            .map(|j| (req.request_id, first_row + j, first_pos + j)),
+                    );
+                    first_row += span;
+                }
+                self.trace_committed_rows(bufs.all_logits(), &rows)?;
             }
             if self.eagle3.is_some() {
                 self.record_verify_eagle3_context(

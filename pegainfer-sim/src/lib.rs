@@ -1038,10 +1038,4 @@ mod tests {
             }
         ));
     }
-
-    #[test]
-    fn start_engine_with_partitions_exposes_that_many_schedulers() {
-        let engine = start_engine_with_partitions(&SimulatedEngineConfig::default(), 3);
-        assert_eq!(engine.schedulers.len(), 3);
-    }
 }

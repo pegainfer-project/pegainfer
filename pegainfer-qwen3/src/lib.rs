@@ -29,6 +29,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 pub(crate) use config::probe_config_json;
+pub use executor::COMMIT_TRACE_TARGET;
 use log::info;
 use log::warn;
 use pegainfer_frontend::engine::Engine;

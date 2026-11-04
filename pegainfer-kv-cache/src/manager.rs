@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use cudarc::driver::CudaStream;
-use kvbm_logical::events::KvCacheEvent;
-use tokio::sync::broadcast;
 
 use crate::buffer::KvBuffer;
 use crate::pool::BlockPool;
@@ -78,28 +76,6 @@ impl KvCacheManager {
         );
         let pool = BlockPool::new(buffer.layout().page_size, num_blocks)?;
         Ok(Self { pool, buffer })
-    }
-
-    /// Like [`new`](Self::new) but the pool emits KV block events; returns the
-    /// receiver to drain. See [`BlockPool::with_events`].
-    pub fn new_with_events(
-        stream: &Arc<CudaStream>,
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        block_size: usize,
-        num_blocks: usize,
-    ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
-        let buffer = KvBuffer::new(
-            stream,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-            block_size,
-            num_blocks,
-        )?;
-        let (pool, events) = BlockPool::with_events(block_size, num_blocks)?;
-        Ok((Self { pool, buffer }, events))
     }
 
     pub fn pool(&self) -> &BlockPool {

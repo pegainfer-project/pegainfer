@@ -143,7 +143,7 @@ impl Qwen35Model {
             eps,
         );
 
-        if bs <= super::decode_buffers::SPLIT_DECODE_MAX_BATCH
+        if bs <= bufs.split_decode_max_batch
             && num_attention_heads
                 == num_key_value_heads * super::decode_buffers::SPLIT_DECODE_GQA_GROUP
         {

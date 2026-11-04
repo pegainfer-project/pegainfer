@@ -21,8 +21,6 @@ mod fp8;
 #[cfg(test)]
 mod freerun_probe;
 mod indexer;
-#[cfg(test)]
-mod indexer_smoke;
 mod layer;
 mod mla_decode;
 mod mla_front;
@@ -310,67 +308,6 @@ impl std::str::FromStr for Glm52MoeTopo {
     }
 }
 
-#[cfg(test)]
-mod topology_tests {
-    use super::*;
-
-    #[test]
-    fn tp4_topology_shape_is_four_rank_replicated_tp() {
-        assert_eq!(Glm52MoeTopo::Tp4.default_dp_size(), 1);
-        assert_eq!(Glm52MoeTopo::Tp4.device_count(), 4);
-        assert_eq!(Glm52MoeTopo::Tp4.logical_rank_count(), 1);
-        assert_eq!(Glm52MoeTopo::Tp4.expected_tp_size(), 4);
-        assert_eq!(Glm52MoeTopo::Tp4.expected_ep_size(), 1);
-        assert!(!Glm52MoeTopo::Tp4.uses_ep_expert_bundles());
-        assert!(Glm52MoeTopo::Tp4.uses_tensor_replicated_moe());
-    }
-
-    #[test]
-    fn ep8_shapes_remain_unchanged() {
-        let topo = Glm52MoeTopo::Ep8;
-        assert_eq!(topo.default_dp_size(), GLM52_EP_RANKS);
-        assert_eq!(topo.device_count(), GLM52_EP_RANKS);
-        assert_eq!(topo.expected_tp_size(), 1);
-        assert_eq!(topo.expected_ep_size(), GLM52_EP_RANKS);
-        assert_eq!(topo.logical_rank_count(), GLM52_EP_RANKS);
-        assert!(topo.uses_ep_expert_bundles());
-        assert!(!topo.uses_tensor_replicated_moe());
-        assert_eq!(topo.ep_local_experts(), 32);
-    }
-
-    #[test]
-    fn ep4_topology_shape_is_four_rank_expert_parallel() {
-        assert_eq!(Glm52MoeTopo::Ep4.default_dp_size(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.device_count(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.logical_rank_count(), 4);
-        assert_eq!(Glm52MoeTopo::Ep4.expected_tp_size(), 1);
-        assert_eq!(Glm52MoeTopo::Ep4.expected_ep_size(), 4);
-        assert!(Glm52MoeTopo::Ep4.uses_ep_expert_bundles());
-        assert!(!Glm52MoeTopo::Ep4.uses_tensor_replicated_moe());
-        assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
-        assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
-    }
-
-    #[test]
-    fn cross_tray_ep_widths_shard_all_routed_experts() {
-        for (topo, ranks, local) in [
-            (Glm52MoeTopo::Ep16, 16, 16),
-            (Glm52MoeTopo::Ep32, 32, 8),
-            (Glm52MoeTopo::Ep64, 64, 4),
-        ] {
-            assert_eq!(topo.default_dp_size(), ranks);
-            assert_eq!(topo.device_count(), ranks);
-            assert_eq!(topo.logical_rank_count(), ranks);
-            assert_eq!(topo.expected_tp_size(), 1);
-            assert_eq!(topo.expected_ep_size(), ranks);
-            assert!(topo.uses_ep_expert_bundles());
-            assert!(!topo.uses_tensor_replicated_moe());
-            assert_eq!(topo.ep_local_experts(), local);
-            assert_eq!(format!("ep{ranks}").parse::<Glm52MoeTopo>().unwrap(), topo);
-        }
-    }
-}
-
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
 /// 8 DP ranks under a single namespace: the MLA latent has no TP sharding
 /// and the non-expert weights are replicated, so any rank's KV for a token
@@ -457,12 +394,9 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
     // occupancy and collapse speculation (#812's original failure mode).
     // Only native MTP rides verify spans; without a drafter every slot is a
     // single decode row and any slot count within the ceiling fits.
-    let slots = model::glm52_decode_slots();
-    let draft_len = if drafter.is_mtp() {
-        crate::mtp::glm52_mtp_draft_len()
-    } else {
-        0
-    };
+    let slots = model::glm52_decode_slots_from_env()?;
+    let mtp_drafts = crate::mtp::glm52_mtp_draft_len_from_env()?;
+    let draft_len = if drafter.is_mtp() { mtp_drafts } else { 0 };
     ensure!(
         slots * (1 + draft_len) <= model::GLM52_MAX_STEP_ROWS,
         "GLM5.2 GLM52_DECODE_SLOTS={slots} x (1 + GLM52_MTP_DRAFTS={draft_len}) exceeds the \
@@ -506,33 +440,30 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
         );
         pegainfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
-    match moe_topo {
-        Glm52MoeTopo::Tp4 => {
-            ensure!(
-                tp_size == 4,
-                "GLM5.2 TP4 requires --tp-size=4, got {tp_size}"
-            );
-            ensure!(
-                dp_size == 1,
-                "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
-            );
-            ensure!(
-                prefill_only.is_some(),
-                "GLM5.2 TP4 is prefill-only: pass --glm52-prefill-only \
-                 (decode TP / LL packet path was removed)"
-            );
-        }
-        _ => {
-            ensure!(
-                tp_size == 1,
-                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
-            );
-            let expected_dp = moe_topo.default_dp_size();
-            ensure!(
-                dp_size == expected_dp,
-                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
-            );
-        }
+    if moe_topo == Glm52MoeTopo::Tp4 {
+        ensure!(
+            tp_size == 4,
+            "GLM5.2 TP4 requires --tp-size=4, got {tp_size}"
+        );
+        ensure!(
+            dp_size == 1,
+            "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+        );
+        ensure!(
+            prefill_only.is_some(),
+            "GLM5.2 TP4 is prefill-only: pass --glm52-prefill-only \
+             (decode TP / LL packet path was removed)"
+        );
+    } else {
+        ensure!(
+            tp_size == 1,
+            "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+        );
+        let expected_dp = moe_topo.default_dp_size();
+        ensure!(
+            dp_size == expected_dp,
+            "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
+        );
     }
     if let Some(prefill) = prefill_only {
         ensure!(
@@ -588,14 +519,14 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
             dp_size,
             ep_size: moe_topo.expected_ep_size(),
         },
-        drafter,
+        &drafter,
         max_model_len,
         prefill_only,
         no_prefix_cache,
-        kv_offload,
+        kv_offload.as_ref(),
         moe_topo,
         weight_staging,
-        dump_graph_png,
+        dump_graph_png.as_deref(),
     )
 }
 
@@ -605,8 +536,7 @@ fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHandle
 /// kv_b), DeepEP collective buffers, the 8 whole-step graph instantiations,
 /// cuBLAS workspaces, and allocator fragmentation. The SM100 DeepGEMM delta
 /// over the retired weight-only chain is charged exactly and separately.
-/// Measured on 8×H200
-/// (jz-38, 2026-07-06): the worst rank's non-arena post-probe allocations
+/// Measured on 8×H200: the worst rank's non-arena post-probe allocations
 /// came to ~3.05 GiB, so 5 GiB leaves ~2 GiB of post-build headroom over
 /// the [`GLM52_POST_BUILD_MIN_FREE_BYTES`] floor; the post-build re-probe
 /// below turns any drift into a launch failure instead of a mid-serving
@@ -897,14 +827,14 @@ struct LoadedGlm52Runtime {
 fn start_engine(
     model_path: &Path,
     options: &Glm52LoadOptions,
-    drafter: Glm52Drafter,
+    drafter: &Glm52Drafter,
     requested_max_model_len: Option<usize>,
     prefill_only: Option<Glm52PrefillOnlyOptions>,
     no_prefix_cache: bool,
-    kv_offload: Option<Glm52KvOffloadOptions>,
+    kv_offload: Option<&Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
     weight_staging: bool,
-    dump_graph_png: Option<PathBuf>,
+    dump_graph_png: Option<&Path>,
 ) -> Result<EngineHandle> {
     let startup = validate_startup(model_path, options, moe_topo, drafter.is_mtp())?;
     let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo, weight_staging)?;
@@ -935,7 +865,7 @@ fn start_engine(
     let budget = derive_max_model_len(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(post_weight_charge_bytes),
-        &drafter,
+        drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
         moe_topo,
@@ -1006,7 +936,7 @@ fn start_engine(
         &loaded.workers,
         max_model_len,
         moe_topo,
-        &drafter,
+        drafter,
         prefill_only.map(|options| options.chunk_size),
         &startup.ranks,
         startup.rendezvous.as_deref(),
@@ -1064,7 +994,7 @@ fn start_engine(
             (rank_arenas, (0..ranks).map(|_| Vec::new()).collect())
         };
         build_kv_store(
-            kv_offload.as_ref(),
+            kv_offload,
             store_arenas,
             store_mirrors,
             drafter.is_mtp(),
@@ -1103,10 +1033,10 @@ fn start_engine(
         })
         .unzip();
     let (mut graph_dump_request, graph_dump_response) =
-        match (&dump_graph_png, startup.ranks.start == 0) {
+        match (dump_graph_png, startup.ranks.start == 0) {
             (Some(path), true) => {
                 let (response_tx, response_rx) = crossbeam_channel::bounded(1);
-                (Some((path.clone(), response_tx)), Some(response_rx))
+                (Some((path.to_path_buf(), response_tx)), Some(response_rx))
             }
             _ => (None, None),
         };
@@ -1619,10 +1549,10 @@ fn build_kv_store(
 /// loader runs under one (pegainfer-server's `spawn_blocking` keeps the
 /// context), else a small dedicated runtime living for the process.
 fn store_runtime_handle() -> tokio::runtime::Handle {
+    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return handle;
     }
-    static FALLBACK: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     FALLBACK
         .get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()

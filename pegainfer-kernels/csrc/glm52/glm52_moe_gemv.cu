@@ -41,8 +41,6 @@ constexpr int kRowsPlainShortKHopper = 4;  // k <= 2048, measured on SM90
 constexpr int kRowsPlainBlackwell    = 1;  // all K, measured on SM103
 constexpr int kRowsPlainLongK        = 1;  // k > 2048 on every architecture
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 // The activation is read with 16-byte float4/uint4 loads straight from global (no shared
 // staging absorbs misalignment any more), so its base must be 16-byte aligned. CudaSlice
 // allocation bases are 256B-aligned and satisfy this; guard here so a future misaligned
@@ -276,7 +274,7 @@ glm52_fp8_weight_only_gemv_batched_kernel(
 // in fixed order (deterministic) and converts to bf16. KSPLIT is the
 // occupancy lever the bit-parity kernels could never use.
 //
-// Measured (jz-38 H200 microbench, batch 8, us): o_proj 66.5 -> 45.8,
+// Measured (H200 microbench, batch 8, us): o_proj 66.5 -> 45.8,
 // dense_gu 99.4 -> 58.6, dense_dn 50.9 -> 33.0, q_b 26.2 -> 16.9,
 // q_a 16.4 -> 10.7, kv_a 13.2 -> 7.7, shared_gu 19.3 -> 13.6,
 // shared_dn 11.5 -> 9.3, idx_wq_b 8.8 -> 7.8, idx_wk 12.5 -> 7.5

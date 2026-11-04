@@ -56,7 +56,7 @@ impl SamplingScratch {
 
 fn decode_top1_packets(host: &[u8], vocab_size: usize) -> Result<Vec<(u32, f32)>> {
     let mut rows = Vec::with_capacity(host.len() / TOP1_PACKET_BYTES);
-    for (row, packet) in host.chunks_exact(TOP1_PACKET_BYTES).enumerate() {
+    for (row, packet) in host.as_chunks::<TOP1_PACKET_BYTES>().0.iter().enumerate() {
         let (id_bytes, value_bytes) = packet.split_at(size_of::<i32>());
         let top_id = i32::from_le_bytes(id_bytes.try_into()?);
         let value_bits = u16::from_le_bytes(value_bytes[..size_of::<u16>()].try_into()?);

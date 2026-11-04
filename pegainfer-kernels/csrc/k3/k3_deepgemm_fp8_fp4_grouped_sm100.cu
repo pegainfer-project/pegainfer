@@ -101,8 +101,6 @@ constexpr int kFp4SfGroupK = 32;
 constexpr int kFp4SfPerWord = 4;
 constexpr int kFp4SfWordK = kFp4SfGroupK * kFp4SfPerWord;  // 128
 
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
-
 // Checkpoint MXFP4 weight scales -> the runtime SFB tensor.
 //
 // in : [groups, n, k / 32]  u8, one UE8M0 exponent byte per (row, K-group),

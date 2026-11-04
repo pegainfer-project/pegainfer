@@ -2,6 +2,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include "cublas_status.cuh"
 #include "ffi_guard.cuh"
 
 #include <fcntl.h>
@@ -17,13 +18,6 @@
 #include <string>
 #include <map>
 #include <mutex>
-
-static int cublas_status_to_error(cublasStatus_t status) {
-  if (status == CUBLAS_STATUS_SUCCESS) {
-    return static_cast<int>(cudaSuccess);
-  }
-  return PEGAINFER_CUBLAS_STATUS_BASE + static_cast<int>(status);
-}
 
 // cuBLAS handle management.
 // Make handles thread-local so each TP rank thread can bind a handle to its own

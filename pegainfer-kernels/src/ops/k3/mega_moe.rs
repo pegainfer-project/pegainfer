@@ -657,14 +657,15 @@ impl K3MegaShape {
 mod tests {
     use super::*;
 
-    /// The protocol maximum must satisfy the upstream token alignment, and the
-    /// symmetric-buffer layout must be computable at exactly that value for
-    /// every instantiated world size. Host arithmetic only — prints the slab
-    /// sizes so a protocol bump shows its memory cost. Skips on builds where
-    /// the sm100 TU is stubbed out.
+    /// The protocol maximum must equal the Rust chunk ceiling, satisfy the
+    /// upstream token alignment, and admit a symmetric-buffer layout at
+    /// exactly that value for every instantiated world size. Host arithmetic
+    /// only — prints the slab sizes so a protocol bump shows its memory cost.
+    /// Skips the layouts on builds where the sm100 TU is stubbed out.
     #[test]
     fn protocol_max_layouts() {
         let max_tokens = k3_mega_max_tokens_per_rank();
+        assert_eq!(max_tokens, crate::ops::K3_MAX_CHUNK);
         let alignment = k3_mega_token_alignment();
         assert_eq!(
             max_tokens % alignment,

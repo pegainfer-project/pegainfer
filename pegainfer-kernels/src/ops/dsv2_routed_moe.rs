@@ -320,7 +320,7 @@ pub fn dsv2_lite_route_logits_into(
         "invalid routed MoE batch"
     );
     ensure!(
-        summary.len() > 3 && layer_idx < summary.len() - 3 && layer_idx <= i32::MAX as usize,
+        summary.len() > 3 && layer_idx < summary.len() - 3 && i32::try_from(layer_idx).is_ok(),
         "routed MoE layer exceeds summary capacity"
     );
     ensure!(

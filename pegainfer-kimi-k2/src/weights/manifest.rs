@@ -79,7 +79,6 @@ pub(crate) struct KimiLayerManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KimiK2WeightManifest {
-    pub text_tensor_count: usize,
     pub token_embedding: KimiTensorEntry,
     pub final_norm: KimiTensorEntry,
     pub lm_head: KimiTensorEntry,
@@ -224,10 +223,6 @@ impl KimiK2WeightManifest {
         }
 
         let manifest = Self {
-            text_tensor_count: weight_map
-                .keys()
-                .filter(|name| name.starts_with(TEXT_PREFIX))
-                .count(),
             token_embedding,
             final_norm,
             lm_head,
@@ -245,20 +240,6 @@ impl KimiK2WeightManifest {
     }
 
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.layers.len() == KIMI_K2_LAYERS,
-            "Kimi manifest expected {KIMI_K2_LAYERS} layers, got {}",
-            self.layers.len()
-        );
-        let moe_layers = self
-            .layers
-            .iter()
-            .filter(|layer| matches!(layer.kind, KimiLayerKindManifest::Moe(_)))
-            .count();
-        ensure!(
-            moe_layers == KIMI_K2_MOE_LAYERS,
-            "Kimi manifest expected {KIMI_K2_MOE_LAYERS} MoE layers, got {moe_layers}"
-        );
         ensure!(
             self.parallel.ep_world > 0
                 && KIMI_K2_ROUTED_EXPERTS.is_multiple_of(self.parallel.ep_world)

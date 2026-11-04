@@ -130,6 +130,8 @@ inline CUresult map_cuda_error(cudaError_t err) {
   }
 }
 
+inline CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
+
 // Entering a guard clears the previous message so a -1 seen by Rust never
 // reads a stale what() from an earlier call on the same thread.
 #define PEGAINFER_FFI_GUARD_BEGIN \

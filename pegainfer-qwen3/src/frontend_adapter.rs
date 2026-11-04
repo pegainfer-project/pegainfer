@@ -18,7 +18,7 @@
 //! decoding or has a prefill in flight — the scheduler mechanics never see
 //! aborts. Finishes ride the committed step unless the executor withholds
 //! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
-//! them as [`RequestLedger::defer_finish`] tokens and delivers each request's
+//! them as [`RequestLedger::defer_finish_with_cause`] tokens and delivers each request's
 //! final record once its KV saves are peer-visible.
 
 #[cfg(test)]

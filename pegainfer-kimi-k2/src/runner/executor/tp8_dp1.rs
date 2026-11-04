@@ -40,8 +40,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         if self.workers.is_empty() {
             bail!("Kimi TP8 executor has no rank workers");
         }
-        ensure_no_logprobs_tp8(row.logprobs.is_some())?;
-        ensure_greedy_tp8(&row.sampling)?;
+        ensure_tp8_row(&row)?;
         // Every rank replicates the KV pool with identical geometry, so the
         // same page assignment is broadcast to all eight workers.
         let responses = self
@@ -108,9 +107,8 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                 slots.len()
             );
         }
-        ensure_no_logprobs_tp8(rows.iter().any(|r| r.logprobs.is_some()))?;
         for row in rows {
-            ensure_greedy_tp8(&row.sampling)?;
+            ensure_tp8_row(row)?;
         }
         let responses = self
             .workers
@@ -209,24 +207,23 @@ impl Drop for Tp8Dp1ForwardExecutor {
     }
 }
 
-fn ensure_no_logprobs_tp8(requested: bool) -> Result<()> {
-    ensure!(
-        !requested,
-        "Kimi TP8 path does not support logprobs yet: each rank holds a vocab \
-         shard and a shard-local logsumexp is not the global one — needs a \
-         cross-rank merge (#236)"
-    );
-    Ok(())
+/// Why the TP8 path cannot serve `row`, if it cannot. Each rank holds a vocab shard, so it can
+/// neither sample the global distribution nor compute a global logprob.
+pub(in crate::runner) fn tp8_row_refusal(row: &KimiRowOptions) -> Option<&'static str> {
+    if !row.sampling.is_greedy() {
+        Some("Kimi TP8 path does not support sampling yet; use TP1/DP8 or temperature=0")
+    } else if row.logprobs.is_some() {
+        Some("Kimi TP8 path does not support logprobs yet; use TP1/DP8")
+    } else {
+        None
+    }
 }
 
-fn ensure_greedy_tp8(sampling: &pegainfer_frontend::sampler::SamplingParams) -> Result<()> {
-    ensure!(
-        sampling.is_greedy(),
-        "Kimi TP8 path does not support sampling yet: each rank holds a vocab \
-         shard and cannot sample the global distribution — use TP1/DP8 or \
-         temperature=0 (#237, #226)"
-    );
-    Ok(())
+fn ensure_tp8_row(row: &KimiRowOptions) -> Result<()> {
+    match tp8_row_refusal(row) {
+        Some(message) => bail!(message),
+        None => Ok(()),
+    }
 }
 
 fn validate_one_token_report(

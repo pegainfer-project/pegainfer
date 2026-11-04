@@ -28,6 +28,7 @@ use half::bf16;
 use log::debug;
 use memmap2::Mmap;
 use pegainfer_kernels::ffi;
+use pegainfer_kernels::ops::KIMI_K2_INT4_GROUP_SIZE;
 use pegainfer_kernels::ops::KimiInt4ExpertRole;
 use pegainfer_kernels::ops::KimiInt4NibbleOrder;
 use pegainfer_kernels::ops::KimiInt4WeightManifest;
@@ -49,7 +50,6 @@ use crate::config::KIMI_K2_DENSE_INTERMEDIATE;
 use crate::config::KIMI_K2_DENSE_LAYERS;
 use crate::config::KIMI_K2_EXPERT_INTERMEDIATE;
 use crate::config::KIMI_K2_HIDDEN;
-use crate::config::KIMI_K2_INT4_GROUP_SIZE;
 use crate::config::KIMI_K2_LAYERS;
 use crate::config::KIMI_K2_MOE_LAYERS;
 use crate::config::KIMI_K2_Q_HEAD_DIM;
@@ -59,7 +59,6 @@ use crate::config::KIMI_K2_V_HEAD_DIM;
 use crate::config::KimiK2ParallelShape;
 
 const KIMI_K2_WEIGHT_INDEX: &str = "model.safetensors.index.json";
-const TEXT_PREFIX: &str = "language_model.";
 
 mod context;
 mod load;
@@ -70,7 +69,6 @@ mod tests;
 
 pub(crate) use context::KimiRankGpuContext;
 pub(crate) use load::KimiRankSlicedLoadPlan;
-pub(crate) use load::ensure_text_only_model_index;
 pub(crate) use load::load_rank_sliced_weights_to_gpu;
 pub(crate) use manifest::KimiK2WeightManifest;
 pub(crate) use manifest::KimiLayerWeightKindNames;

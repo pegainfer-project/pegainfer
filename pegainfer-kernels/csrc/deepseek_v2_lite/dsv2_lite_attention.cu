@@ -254,11 +254,6 @@ __global__ void decode_attention_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() {
-  cudaError_t err = cudaGetLastError();
-  return map_cuda_error(err);
-}
-
 }  // namespace
 
 extern "C" {

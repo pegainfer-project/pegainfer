@@ -79,11 +79,6 @@ __global__ void router_scores_topk_normalize_kernel(
   }
 }
 
-CUresult consume_last_cuda_error() {
-  cudaError_t err = cudaGetLastError();
-  return map_cuda_error(err);
-}
-
 CUresult glm52_router_logits_gemm(const __nv_bfloat16* hidden,
                                   const __nv_bfloat16* gate_weight,
                                   float* logits, int padded_tokens,
