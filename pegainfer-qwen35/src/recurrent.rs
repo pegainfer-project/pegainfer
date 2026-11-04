@@ -453,6 +453,14 @@ pub fn gated_delta_rule_prefill_chunkwise_from_gates_into(
     let expected_chunk_ai_len = expected_chunk_a_len;
     let expected_chunk_state_len =
         GdrChunkwiseScratch35::num_chunks(seq_len) * num_value_heads * val_dim * key_dim;
+    // The head dims are compiled into every chunk kernel (the Triton AOT
+    // specializations bake 128/128); the checks above only tie them to the
+    // caller's own scratch layout, so pin them against the compiled pair, and
+    // the recurrent state — which this function carries across chunks — against
+    // the one state slot a chunk fills.
+    assert_eq!(key_dim, GDN_AOT_KEY_HEAD_DIM);
+    assert_eq!(val_dim, GDN_AOT_VALUE_HEAD_DIM);
+    assert_eq!(state.len(), num_value_heads * val_dim * key_dim);
     assert_eq!(scratch.g_cumsum.len(), expected_gate_len);
     assert_eq!(scratch.beta.len(), expected_gate_len);
     assert_eq!(scratch.a_tril.len(), expected_chunk_a_len);

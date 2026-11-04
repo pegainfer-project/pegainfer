@@ -41,8 +41,6 @@
 //!   ./docker/dev.sh run cargo test --release --locked -p pegainfer-qwen35 \
 //!     --features qwen35 --test qwen38fn_gdn_prefill_parity -- --nocapture
 
-#![cfg(feature = "qwen35")]
-
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;

@@ -93,7 +93,20 @@ The 36 `linear_attention` layers will run Qwen3.5's Gated DeltaNet decode kernel
 
 The three kernel limits (`GDN_AOT_KEY_HEAD_DIM`, `GDN_AOT_VALUE_HEAD_DIM`, `LINEAR_CONV_MAX_KERNEL_DIM`) are defined next to the wrappers. This line's `src/config.rs` keeps a CPU-only mirror of them, so its config tests need no device, until slice B adds the device dependency.
 
-Still to verify is the reuse on this line's activations. The tensor contract derives every GDN shape from the frozen config and validates all 1658 headers, but nothing has run this line's GDN block against a reference yet. That is slice B's M0 exit (#1127), against the `transformers` recurrence, and it has to cover several decode steps from a nonzero state (so `(v - k·s)` is live), finite checks before any reduction, and the gated norm plus `out_proj` that complete the block (the norm's sigmoid entry point is #1129's).
+Still to verify is the **decode** half of that reuse on this line's activations. The tensor contract derives every GDN shape from the frozen config and validates all 1658 headers, and the prefill half is now gated (next section), but no decode step has run against the `transformers` recurrence. That is slice B's M0 exit (#1127), and it has to cover several decode steps from a nonzero state (so `(v - k·s)` is live), finite checks before any reduction, and `out_proj`, which completes the block.
+
+## GDN prefill gate
+
+The prefill half runs against a committed component golden. `test_data/qwen38fn-gdn-golden.safetensors` (written by `tools/accuracy/dump_qwen38fn_gdn_golden.py`, a pure recorder of `Qwen4ExpTextGatedDeltaNet` under transformers 5.16.1 at the frozen geometry) stores, per case S=16/64/80/128, the pre-conv `mixed_qkv`, the reference's post-conv pre-repeat `query`/`key`/`value`, the output gate `z`, the derived pair `g`/`beta`, and the reference's gated-norm output `out` — plus the two weights a GDN kernel applies to them (`conv1d.weight`, `norm.weight`). S=80/128 cross the reference's 64-token chunk boundary, so the carried recurrent state is covered.
+
+`pegainfer-qwen35/tests/qwen38fn_gdn_prefill_parity.rs` replays those activations through the in-tree stack — `conv1d_prefill_batch_into` → the Triton AOT chunk-wise delta rule → the shared gated RMSNorm with the **sigmoid** activation this checkpoint's `output_gate_type` selects — and compares `out`. The conv leg is bit-exact (max abs 0.0 over 2.95M elements); the gated-norm output lands within 6.25e-2 (two bf16 ulps of values up to ~7, 30% of the tolerance budget) on every case, multi-chunk included, so the carried state adds no drift of its own. Three negative controls keep the gate from passing vacuously: silu instead of sigmoid (88–130x past the bound, 24.8–25.8% of elements out), a skipped conv leg (29–34x, 52.7–53.3%), and S=128 replayed as two single-chunk runs (the first half still matches, the tail misses by 15.4x). The fixture stores the gate pair *after* derivation, so the `a`/`b` → `g`/`beta` path, `out_proj`, decode, and real checkpoint weights are **not** covered here.
+
+```
+cargo test --release --locked -p pegainfer-qwen35 --features qwen35 \
+  --test qwen38fn_gdn_prefill_parity -- --nocapture
+```
+
+The gate replays recorded activations, so it needs no checkpoint. Like every `qwen35` gate it is not executed in CI — there is no GPU runner; the Qwen3.5 Clippy row compiles it only. To let it drive the chunk stages with a recorded gate pair, the Qwen3.5 chunk-wise prefill entry point is split into a prepare stage and a `from_gates` stage; production still runs prepare → the chunk stages in the same order over the same kernels.
 
 ## Traps
 
@@ -110,7 +123,7 @@ Still to verify is the reuse on this line's activations. The tensor contract der
 | Criterion | Blocked on |
 | --- | --- |
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
-| GDN decode reuse, executed | slice B: the wrappers are shared in `pegainfer-kernels::ops` and the contract pins their geometry and tensor names, but nothing has run this line's GDN block against the reference. The model-graph fixture that does so is slice B's M0 exit (#1127); the GDN prefill path and the gated norm composition land with it. |
+| GDN decode reuse, executed | slice B: the wrappers are shared in `pegainfer-kernels::ops` and the contract pins their geometry and tensor names; the prefill half (conv → chunk delta rule → sigmoid gated norm) is gated above. Decode steps from a nonzero state, `out_proj`, and the model-graph fixture are slice B's M0 exit (#1127). |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |
