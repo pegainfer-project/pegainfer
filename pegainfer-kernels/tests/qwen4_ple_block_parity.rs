@@ -1,7 +1,7 @@
 //! Qwen3.8-Flash-Next PLE block against the frozen reference golden.
 //!
 //! `test_data/qwen38fn-ple-golden.safetensors` was dumped from transformers
-//! 5.16.1 `qwen4_exp` by `tools/accuracy/dump_qwen4_ple_golden.py`. Each case
+//! 5.16.1 `qwen4_exp` by `tools/accuracy/dump_qwen38fn_ple_golden.py`. Each case
 //! carries the block's inputs *after* the two projections the 95 GiB n-gram
 //! table feeds — `hidden`, `key` and `value` — plus the reference's own block
 //! output `out`, so this gate replays those inputs through the ops layer and
@@ -88,8 +88,8 @@ const CASES: usize = 2;
 /// covering a semantics gap. It covers the three places the device path cannot
 /// be the host path, all of them the same size:
 ///
-/// 1. **`rsqrt.approx.ftz.f32`.** The three grouped norms are the existing
-///    batched `(1 + w)` RMSNorm, whose reciprocal comes from the PTX
+/// 1. **`rsqrt.approx.ftz.f32`.** The three grouped norms are the grouped
+///    `(1 + w)` RMSNorm entry point, whose reciprocal comes from the PTX
 ///    approximation instruction, where the reference and the host replay both use
 ///    a correctly rounded `1 / sqrt`. Its ~1.4e-7 relative error against a bf16
 ///    step of ~3.9e-3 flips the bf16 rounding of roughly one normed element in
@@ -576,7 +576,6 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
     use pegainfer_kernels::ffi::Half;
     use pegainfer_kernels::ffi::qwen4_ple_conv_residual_cuda as conv;
     use pegainfer_kernels::ffi::qwen4_ple_gate_cuda as gate;
-    use pegainfer_kernels::ffi::qwen4_ple_split_branches_cuda as split;
 
     // Dangling and well-aligned, never dereferenced: every call below leaves
     // through a guard or through the zero-extent early return, and a launch is
@@ -590,11 +589,6 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
     let null_stream = CUstream::default();
 
     // Positive controls: the compiled geometry with no rows to do.
-    assert_eq!(
-        (unsafe { split(half, half.cast_mut(), 0, 10240, 2560, 4, null_stream) }) as i32,
-        success,
-        "the compiled split geometry must pass the guards"
-    );
     assert_eq!(
         (unsafe {
             gate(
@@ -635,20 +629,39 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
 
     for (what, result) in [
         (
-            "a split over a stream that is not the compiled 10240 wide",
-            (unsafe { split(half, half.cast_mut(), 0, 10239, 2560, 4, null_stream) }) as i32,
+            "a negative conv row count",
+            (unsafe {
+                conv(
+                    half,
+                    half,
+                    half,
+                    half.cast_mut(),
+                    -1,
+                    2560,
+                    4,
+                    4,
+                    3,
+                    null_stream,
+                )
+            }) as i32,
         ),
         (
-            "a split over a group that is not the compiled 2560 wide",
-            (unsafe { split(half, half.cast_mut(), 0, 10240, 1280, 4, null_stream) }) as i32,
-        ),
-        (
-            "a split over a branch count that is not the compiled 4",
-            (unsafe { split(half, half.cast_mut(), 0, 10240, 2560, 2, null_stream) }) as i32,
-        ),
-        (
-            "a negative row count",
-            (unsafe { split(half, half.cast_mut(), -1, 10240, 2560, 4, null_stream) }) as i32,
+            "a negative gate row count",
+            (unsafe {
+                gate(
+                    half,
+                    half,
+                    half,
+                    half.cast_mut(),
+                    -1,
+                    2560,
+                    4,
+                    2560,
+                    sqrt_hidden,
+                    1,
+                    null_stream,
+                )
+            }) as i32,
         ),
         (
             "a gate over a group that is not the compiled 2560 wide",
@@ -854,22 +867,40 @@ fn the_entry_points_refuse_a_geometry_they_were_not_compiled_for() {
     // pointers and not only the extents.
     for (what, result) in [
         (
-            "a null split source",
+            "a null gate key",
             (unsafe {
-                split(
+                gate(
                     std::ptr::null(),
+                    half,
+                    half,
                     half.cast_mut(),
                     0,
-                    10240,
                     2560,
                     4,
+                    2560,
+                    sqrt_hidden,
+                    1,
                     null_stream,
                 )
             }) as i32,
         ),
         (
-            "a null split destination",
-            (unsafe { split(half, std::ptr::null_mut(), 0, 10240, 2560, 4, null_stream) }) as i32,
+            "a null gate query",
+            (unsafe {
+                gate(
+                    half,
+                    std::ptr::null(),
+                    half,
+                    half.cast_mut(),
+                    0,
+                    2560,
+                    4,
+                    2560,
+                    sqrt_hidden,
+                    1,
+                    null_stream,
+                )
+            }) as i32,
         ),
         (
             "a null gate value",

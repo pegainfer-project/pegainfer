@@ -17,7 +17,7 @@
 //! The PLE block below is the device half of the n-gram golden's consumer:
 //! the per-layer-embedding block one decoder layer injects, starting at the
 //! two recorded projections. Its three grouped `(1 + w)` RMSNorms are calls
-//! to the existing batched entry point rather than new kernels. Frozen
+//! to the grouped entry point above, on the stream in place. Frozen
 //! semantics: `csrc/qwen4/qwen4_ple_block.cu`.
 
 use anyhow::Result;
@@ -398,12 +398,12 @@ impl PleBlockGeometry {
 
     /// Scratch [`ple_block_into`] needs for `seq_len` rows, in bf16 elements.
     ///
-    /// Six regions of `seq_len * width()`, one per intermediate: the two
-    /// branch-major splits, the two grouped norms over them, the gated stream
-    /// and the conv's normed input. Every region is a whole stream, because each
-    /// is written by one launch and read by the next.
+    /// Four regions of `seq_len * width()`, one per intermediate: the two
+    /// grouped norms over the two input streams, the gated stream and the
+    /// conv's normed input. Every region is a whole stream, because each is
+    /// written by one launch and read by the next.
     pub fn workspace_len(&self, seq_len: usize) -> usize {
-        6 * seq_len * self.width()
+        4 * seq_len * self.width()
     }
 
     /// Refuse a geometry the kernels were not compiled for. Called by
@@ -623,55 +623,36 @@ pub fn ple_block_variant_into(
     // Workspace regions, one whole stream each, addressed in bytes.
     let element_bytes = size_of::<bf16>() as u64;
     let region = stream_elements as u64 * element_bytes;
-    let query_split = workspace_ptr;
-    let key_split = workspace_ptr + region;
-    let query_normed = workspace_ptr + 2 * region;
-    let key_normed = workspace_ptr + 3 * region;
-    let gated = workspace_ptr + 4 * region;
-    let conv_in = workspace_ptr + 5 * region;
+    let query_normed = workspace_ptr;
+    let key_normed = workspace_ptr + region;
+    let gated = workspace_ptr + 2 * region;
+    let conv_in = workspace_ptr + 3 * region;
 
-    // 1. Row-major stream -> branch-major, so the grouped norms see contiguous
-    //    groups of `hidden`.
-    split_branches(
+    // 1. The two input norms, one launch each. A row of the stream is one
+    //    branch-major group after another, which is the grouped entry point's
+    //    own layout, so the norms read the caller's streams in place.
+    grouped_norm(
         hidden_ptr,
-        query_split,
-        rows,
+        norm_query_ptr,
+        query_normed,
         width_i,
         group_i,
-        branches_i,
+        rows,
+        geometry.rms_eps,
         stream,
-        "query",
     )?;
-    split_branches(
-        key_ptr, key_split, rows, width_i, group_i, branches_i, stream, "key",
+    grouped_norm(
+        key_ptr,
+        norm_key_ptr,
+        key_normed,
+        width_i,
+        group_i,
+        rows,
+        geometry.rms_eps,
+        stream,
     )?;
 
-    // 2. The two input norms, one launch per branch. The weight for branch `b`
-    //    is that branch's slice of the stream-wide vector.
-    let branch_stride = (seq_len * group) as u64 * element_bytes;
-    let weight_stride = group as u64 * element_bytes;
-    for branch in 0..geometry.hc_count as u64 {
-        grouped_norm(
-            key_split + branch * branch_stride,
-            norm_key_ptr + branch * weight_stride,
-            key_normed + branch * branch_stride,
-            group_i,
-            rows,
-            geometry.rms_eps,
-            stream,
-        );
-        grouped_norm(
-            query_split + branch * branch_stride,
-            norm_query_ptr + branch * weight_stride,
-            query_normed + branch * branch_stride,
-            group_i,
-            rows,
-            geometry.rms_eps,
-            stream,
-        );
-    }
-
-    // 3. Per-branch gate dot, signed sqrt, sigmoid, and the value broadcast.
+    // 2. Per-branch gate dot, signed sqrt, sigmoid, and the value broadcast.
     let status = unsafe {
         ffi::qwen4_ple_gate_cuda(
             key_normed as *const ffi::Half,
@@ -691,21 +672,20 @@ pub fn ple_block_variant_into(
         .result()
         .map_err(|err| anyhow!("PLE block gate launch failed: {err}"))?;
 
-    // 4. The conv's own grouped norm over the gated stream.
-    for branch in 0..geometry.hc_count as u64 {
-        grouped_norm(
-            gated + branch * branch_stride,
-            norm_conv_ptr + branch * weight_stride,
-            conv_in + branch * branch_stride,
-            group_i,
-            rows,
-            geometry.rms_eps,
-            stream,
-        );
-    }
+    // 3. The conv's own grouped norm over the gated stream.
+    grouped_norm(
+        gated,
+        norm_conv_ptr,
+        conv_in,
+        width_i,
+        group_i,
+        rows,
+        geometry.rms_eps,
+        stream,
+    )?;
 
-    // 5. Dilated causal depthwise conv, silu, and the residual add back onto the
-    //    gated stream, landing row-major in the caller's output.
+    // 4. Dilated causal depthwise conv, silu, and the residual add back onto the
+    //    gated stream, landing in the caller's output.
     let status = unsafe {
         ffi::qwen4_ple_conv_residual_cuda(
             conv_in as *const ffi::Half,
@@ -726,58 +706,40 @@ pub fn ple_block_variant_into(
     Ok(())
 }
 
-fn split_branches(
-    row_major: u64,
-    branch_major: u64,
-    rows: i32,
-    width: i32,
-    group: i32,
-    branches: i32,
-    stream: CUstream,
-    what: &str,
-) -> Result<()> {
-    let status = unsafe {
-        ffi::qwen4_ple_split_branches_cuda(
-            row_major as *const ffi::Half,
-            branch_major as *mut ffi::Half,
-            rows,
-            width,
-            group,
-            branches,
-            stream,
-        )
-    };
-    status
-        .result()
-        .map_err(|err| anyhow!("PLE block {what} branch split failed: {err}"))
-}
-
-/// One branch of a grouped `(1 + w)` RMSNorm, through the same entry point
-/// `ops::norm::rms_norm_batch_offset_into` wraps.
+/// One `(1 + w)` grouped RMSNorm over a whole row-major stream, through the same
+/// entry point [`rms_norm_grouped_offset_batch_into`] wraps.
 ///
-/// That wrapper returns no status because the C++ side is `void`, and this call
-/// inherits that: a failure here surfaces as the next launch's sticky error,
-/// which is why every launch in this module checks its own result.
+/// Addressed by raw pointer rather than through `HiddenStates` because the
+/// block's intermediates are workspace regions, not slices the caller owns. The
+/// entry point returns a status — unlike the batched one it replaces here — so a
+/// shape it was not compiled for surfaces at this launch instead of as the next
+/// one's sticky error.
+#[allow(clippy::too_many_arguments)]
 fn grouped_norm(
     x: u64,
     weight: u64,
     out: u64,
     hidden_dim: i32,
+    group_size: i32,
     seq_len: i32,
     eps: f32,
     stream: CUstream,
-) {
-    unsafe {
-        ffi::rms_norm_batched_offset_cuda(
+) -> Result<()> {
+    let status = unsafe {
+        ffi::rms_norm_grouped_offset_cuda(
             x as *const ffi::Half,
             weight as *const ffi::Half,
             out as *mut ffi::Half,
             hidden_dim,
+            group_size,
             seq_len,
             eps,
             stream,
-        );
-    }
+        )
+    };
+    status
+        .result()
+        .map_err(|err| anyhow!("PLE block grouped norm launch failed: {err}"))
 }
 
 #[cfg(test)]
@@ -814,7 +776,7 @@ mod tests {
             compiled.sqrt_hidden().to_bits(),
             ((2560f64).sqrt() as f32).to_bits()
         );
-        assert_eq!(compiled.workspace_len(2), 6 * 2 * 10_240);
+        assert_eq!(compiled.workspace_len(2), 4 * 2 * 10_240);
         for (field, mutated) in [
             (
                 "hidden",

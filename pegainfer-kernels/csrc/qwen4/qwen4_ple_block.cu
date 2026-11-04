@@ -33,13 +33,13 @@
 //   * The dot is per BRANCH (2560), not per stream (10240). One gate per
 //     branch, and all four branches then scale the SAME `value` row.
 //
-// All three grouped norms are the existing batched `(1 + w)` RMSNorm entry point,
-// `rms_norm_batched_offset_cuda`, called once per branch from the Rust ops layer:
-// it normalizes `seq_len` contiguous rows of `hidden_dim`, and this stream's
-// branches are interleaved row-major, so the ops layer splits into branch-major
-// scratch first (kernel 1) and the norms then run on contiguous rows. That split
-// is what the first kernel below is for, and it is why the block's three grouped
-// norms cost twelve launches rather than three.
+// All three grouped norms are the grouped `(1 + w)` RMSNorm entry point,
+// `rms_norm_grouped_offset_cuda`, called once per norm from the Rust ops layer.
+// A row of this stream is one branch-major group after another, which is exactly
+// that entry point's layout: it reduces each `hidden_size`-wide group on its own
+// and indexes the weight by the row's global column, so the stream is read in
+// place and nothing is transposed. The block's two element-wise passes therefore
+// work in the stream's own row-major layout rather than a branch-major copy.
 //
 // Target: the sm_89-first portable subset — no TMA, no cluster, no wgmma. All
 // three kernels are SIMT: two are element-wise copies/maps and the third is a
@@ -112,28 +112,10 @@ __device__ __forceinline__ float block_all_sum(float value, float* shared) {
   return total;
 }
 
-// Row-major `[seq_len, kWidth]` -> branch-major `[kHc][seq_len][kHidden]`.
-// The grouped norms run on contiguous `kHidden` rows, and the block's branches
-// are interleaved in the stream, so this is a transpose of the two middle axes.
-__global__ void qwen4_ple_split_branches_kernel(
-    const __nv_bfloat16* __restrict__ row_major,
-    __nv_bfloat16* __restrict__ branch_major, int seq_len) {
-  const int64_t total = static_cast<int64_t>(seq_len) * kWidth;
-  const int64_t index =
-      static_cast<int64_t>(blockIdx.x) * kMapThreads + threadIdx.x;
-  if (index >= total) {
-    return;
-  }
-  const int64_t row = index / kWidth;
-  const int64_t channel = index - row * kWidth;
-  const int64_t branch = channel / kHidden;
-  const int64_t within = channel - branch * kHidden;
-  branch_major[(branch * seq_len + row) * kHidden + within] = row_major[index];
-}
-
 // One gate scalar per (row, branch), then `sigmoid(gate) * value` over that
-// branch's channels. Inputs are branch-major `[kHc][seq_len][kHidden]`; `value`
-// is `[seq_len, kHidden]` and is broadcast over the branches that share it.
+// branch's channels. Every buffer is the block's row-major `[seq_len, kWidth]`
+// stream, except `value`, which is `[seq_len, kHidden]` and is broadcast over
+// the branches that share it.
 //
 // `gate_span` is `kHidden` for the reference's per-branch dot and `kWidth` for
 // the full-stream control, which folds all four branches into one dot — every
@@ -149,20 +131,20 @@ __global__ void qwen4_ple_gate_kernel(
   const int block = blockIdx.x;
   const int branch = block % kHc;
   const int row = block / kHc;
-  const int branches = (gate_span == kWidth) ? kHc : 1;
-  const int first = (gate_span == kWidth) ? 0 : branch;
+  // The branch's group is a contiguous `kHidden` window of the row; the
+  // full-stream control starts at the row instead and runs the whole width.
+  const int64_t row_base = static_cast<int64_t>(row) * kWidth;
+  const int64_t first =
+      (gate_span == kWidth) ? 0 : static_cast<int64_t>(branch) * kHidden;
 
   // Each product rounds to bf16 before it is summed, as the reference's does:
   // the multiply happens inside the submodule that produces it.
   float partial = 0.0f;
-  for (int j = threadIdx.x; j < kHidden; j += kGateThreads) {
-    for (int b = 0; b < branches; ++b) {
-      const int64_t at =
-          (static_cast<int64_t>(first + b) * seq_len + row) * kHidden + j;
-      const float k = __bfloat162float(key_normed[at]);
-      const float q = __bfloat162float(query_normed[at]);
-      partial += bf16_round(k * q);
-    }
+  for (int j = threadIdx.x; j < gate_span; j += kGateThreads) {
+    const int64_t at = row_base + first + j;
+    const float k = __bfloat162float(key_normed[at]);
+    const float q = __bfloat162float(query_normed[at]);
+    partial += bf16_round(k * q);
   }
   const float dot = block_all_sum(partial, shared);
 
@@ -178,7 +160,7 @@ __global__ void qwen4_ple_gate_kernel(
   const __nv_bfloat16* value_row =
       value + static_cast<int64_t>(row) * kHidden;
   __nv_bfloat16* gated_row =
-      gated + (static_cast<int64_t>(branch) * seq_len + row) * kHidden;
+      gated + row_base + static_cast<int64_t>(branch) * kHidden;
   for (int j = threadIdx.x; j < kHidden; j += kGateThreads) {
     gated_row[j] = __float2bfloat16(weight * __bfloat162float(value_row[j]));
   }
@@ -186,8 +168,7 @@ __global__ void qwen4_ple_gate_kernel(
 
 // `out = gated + silu(bf16(dilated causal depthwise conv(conv_in)))`.
 //
-// `conv_in` and `gated` are branch-major `[kHc][seq_len][kHidden]`; `out` is
-// row-major `[seq_len, kWidth]`, which is the stream the block injects into.
+// `conv_in`, `gated` and `out` are row-major `[seq_len, kWidth]`;
 // `conv_weight` is `[kWidth, 1, kConvKernel]` flattened. The zero initial state
 // of `(kConvKernel - 1) * dilation` rows is the `source >= 0` bound, not a
 // buffer: a tap that reaches before the sequence contributes nothing.
@@ -208,8 +189,6 @@ __global__ void qwen4_ple_conv_residual_kernel(
   }
   const int64_t row = index / kWidth;
   const int64_t channel = index - row * kWidth;
-  const int64_t branch = channel / kHidden;
-  const int64_t within = channel - branch * kHidden;
 
   float taps[kConvKernel];
 #pragma unroll
@@ -217,31 +196,20 @@ __global__ void qwen4_ple_conv_residual_kernel(
     taps[t] = __bfloat162float(conv_weight[channel * kConvKernel + t]);
   }
 
-  // Branch-major base for this channel's column: `(branch * seq_len) * kHidden
-  // + within`, then walked by `source * kHidden`. Branch 0 is the only one where
-  // dropping the group factor would still land on the right element, which is
-  // exactly why the parity gate compares every branch rather than the first.
-  const int64_t column = branch * seq_len * kHidden + within;
-  const __nv_bfloat16* conv_column = conv_in + column;
-  const __nv_bfloat16* gated_column = gated + column;
-
   float acc = 0.0f;
 #pragma unroll
   for (int t = 0; t < kConvKernel; ++t) {
     const int64_t source =
         row - static_cast<int64_t>(kConvKernel - 1 - t) * dilation;
     if (source >= 0) {
-      acc += __bfloat162float(conv_column[source * kHidden]) * taps[t];
+      acc += __bfloat162float(conv_in[source * kWidth + channel]) * taps[t];
     }
   }
   const float convolved = bf16_round(acc);
   const float activated =
       bf16_round(convolved / (1.0f + expf(-convolved)));
-  out[index] = __float2bfloat16(
-      __bfloat162float(gated_column[row * kHidden]) + activated);
+  out[index] = __float2bfloat16(__bfloat162float(gated[index]) + activated);
 }
-
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 // Grid for the element-wise passes, one thread per stream element, or -1 if it
 // does not fit an `int`. Formed in 64 bits: `seq_len * kWidth` overflows an
@@ -257,42 +225,9 @@ int map_grid(int seq_len) {
 
 extern "C" {
 
-// Row-major `[seq_len, width]` -> branch-major `[hc_count][seq_len][hidden]`,
-// for each of the two streams the grouped norms read.
-//
-// `width` is the caller's row stride, checked here: the body splits with the
-// width and the group size it was compiled for, so a caller whose rows are
-// strided differently would be read out of bounds rather than computed wrongly.
-CUresult qwen4_ple_split_branches_cuda(const __nv_bfloat16* row_major,
-                                          __nv_bfloat16* branch_major,
-                                          int seq_len, int width,
-                                          int hidden, int hc_count,
-                                          cudaStream_t stream) {
-  if (row_major == nullptr || branch_major == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (seq_len < 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (width != kWidth || hidden != kHidden || hc_count != kHc) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (seq_len == 0) {
-    return CUDA_SUCCESS;
-  }
-  const int grid = map_grid(seq_len);
-  if (grid < 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  qwen4_ple_split_branches_kernel<<<grid, kMapThreads, 0, stream>>>(
-      row_major, branch_major, seq_len);
-  return consume_last_cuda_error();
-}
-
 // One gate scalar per (row, branch) and `sigmoid(gate) * value` over that
-// branch's channels. All four buffers are branch-major `[hc_count][seq_len]
-// [hidden]`, except `value`, which is `[seq_len, hidden]` and shared by the
-// branches.
+// branch's channels. Every buffer is the row-major `[seq_len, width]` stream,
+// except `value`, which is `[seq_len, hidden]` and shared by the branches.
 //
 // `sqrt_hidden` is `sqrt(hidden_size)` in the f32 the reference divides by; it
 // is an argument because a divide and a reciprocal multiply round differently.
@@ -343,8 +278,8 @@ CUresult qwen4_ple_gate_cuda(const __nv_bfloat16* key_normed,
 }
 
 // The dilated causal depthwise conv, its silu, and the residual add back onto
-// the gated value. `conv_in` and `gated` are branch-major, `out` is row-major
-// `[seq_len, hc_count * hidden]`.
+// the gated value. `conv_in`, `gated` and `out` are the row-major
+// `[seq_len, hc_count * hidden]` stream.
 //
 // `dilation` is `ngram_size`; the state it implies is `(conv_kernel - 1) *
 // dilation` rows and is zero by the `source >= 0` bound rather than by a

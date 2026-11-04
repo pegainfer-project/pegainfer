@@ -22,8 +22,8 @@
 //!    oracle, deliberately kept test-local: it is bit-identical to the stored
 //!    `out`, which is what makes it the cross-check for the device kernels that
 //!    compute the same block in
-//!    `pegainfer-kernels/csrc/qwen38fn/qwen38fn_ple_block.cu` (gated by
-//!    `pegainfer-kernels/tests/qwen38fn_ple_block_parity.rs`, behind that
+//!    `pegainfer-kernels/csrc/qwen4/qwen4_ple_block.cu` (gated by
+//!    `pegainfer-kernels/tests/qwen4_ple_block_parity.rs`, behind that
 //!    crate's `qwen4` feature).
 //!
 //! Provenance is checked on every load, never skipped: the `qwen4_ple_golden`

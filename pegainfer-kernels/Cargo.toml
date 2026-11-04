@@ -39,7 +39,8 @@ deepseek-v2-lite = []
 gemma4 = []
 qwen35 = []
 # Qwen4 line (Qwen3.8-Flash-Next): the QSA token-indexer block-scoring and
-# block-selection kernels and the grouped (1+weight) RMSNorm.
+# block-selection kernels, the grouped (1+weight) RMSNorm, and the PLE block's
+# gate and dilated-conv kernels.
 qwen4 = []
 # Shared MoE/MLA third-party substrate: DeepEP, DeepGEMM, and FlashMLA.
 glm52 = ["moe"]

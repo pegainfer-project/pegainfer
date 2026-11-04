@@ -37,25 +37,6 @@ The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the 
 - **Config** (`src/config.rs`) — every other rule, behind one typed parse (`RawConfig` → `Config`), so detection and loading cannot disagree. The line's `ModelLine::probe` builds the whole `Config`, so `detect` refuses an unservable `qwen4_exp` config before the frontend starts. It follows the Gemma 4 pattern of pinning *structure rather than widths*. Pinned because an alternative would need a kernel or serving path this line does not have: the GDN head dims (they are the Triton AOT specialization keys), `head_dim` 256, the conv kernel ceiling, `rope_type: default` (no YaRN path), an even rotary width (the reference rotates in pairs, so an odd one would rotate one more dim than computed), `output_gate_type: sigmoid`, `mamba_ssm_dtype: float32`, `dtype: bfloat16` with no `quantization_config`, and untied embeddings. The official FP8 sibling and nvidia's NVFP4 keep `dtype: bfloat16` and differ from this checkpoint only by `quantization_config`, so that block is what refuses them; the dtype alone would not. The GDN and attention limits come from the kernels' shared wrappers (`pegainfer_kernels::ops`, behind the kernels' `qwen35` feature): this line's 36 `linear_attention` layers will reuse the Qwen3.5 decode kernels through them once slice B gives the line a device path, and `src/config.rs` mirrors the three GDN constants because the config layer must still test with no device. Deliberately *not* pinned: expert count, hidden size, layer count, head counts, `hc_count` — so a smaller `qwen4_exp` checkpoint passes the same rules, which is what the L20 small-model deployment case needs (`smaller_widths_still_pass`). `mrope_interleaved` and `mrope_section` are accepted rather than refused: a text-only sequence is their degenerate case in the reference itself, which expands one position per token across all three axes before interleaving. The decision is tracked in #1105. Beyond the pins, the config mirrors the rules the reference's own `validate_architecture` enforces — `hc_count > 1`, QSA's `indexer_kv_heads == 1` with the budget a whole multiple of the compress ratio, the rotary width fitting the index head, `rope_theta` present, and PLE confined to a **single** `linear_attention` layer — plus the two head-group integrality rules Qwen3.5's config enforces (`AttentionHeadDivisibility`, `LinearHeadDivisibility`). Multi-layer PLE is refused for now: the reference offsets each layer's prime run by its position in `ple_layer_ids` (`global_head_idx = L * ngram_heads + i`), and this crate derives one table. `norm_topk_prob` is **absent from `config.json`** and comes from the upstream default (`true`, and it decides whether the router renormalizes its top-k), so it is modelled with that default: a port that reads only `config.json` silently drops the router renormalization — this is #1068's mirror image. The other absent field, `seed`, only matters if the n-gram hash multipliers are recomputed instead of read from the checkpoint, so it is not modelled.
 - **Manifest** (`src/manifest/`, test only until slice B's loader calls it) — the tensor contract, ported from `pegainfer-gemma4/src/manifest/`: `schema.rs` derives it from `Config` and `validate.rs` classifies headers against it. It derives **exactly** the frozen text set, 1658 keys − 333 `model.visual.*` − 31 `mtp.*` = **1294 tensors**, with `lm_head.weight` the only one outside `model.language_model.`. Beyond the untied head, it differs from Gemma 4's in rank-3 shapes (the depthwise conv and two fused expert stacks per layer, which carry no `.weight` suffix) and in a mandatory skip set, because all 333 vision tensors share shard 1 with 16 text tensors. `tests/frozen_tensors.json` (148 KB, written by `tools/accuracy/dump_qwen4_frozen_tensors.py`) holds every shard header of the frozen revision, and `the_contract_is_the_frozen_checkpoint` checks all 1658 tensors against the contract.
 - **Registration** — the server binary hand-mirrors every line's probe identities in a hint table that cannot be derived away. With the feature off, `feature_gate_hint` names `--features qwen4` for both `qwen4_exp` and `qwen4_exp_text`; with it on, the hint stays silent. A test under the feature binds that row to this crate's `MODEL_TYPE` / `TEXT_MODEL_TYPE`, so the mirror cannot drift from the probe. The hint is **identity-only** — it cannot run a compiled-out probe — so it also fires for the quantized siblings and the tied/YaRN variants of `qwen4_exp`, which the config refuses once the feature is on; the hint names the feature to rebuild with, not a promise of service. `pegainfer-server/tests/detect_gate.rs` then drives the shipped binary against a model directory holding this crate's frozen `config.json`, both ways: the stock build must name the feature, the enabled build must detect the line and refuse to serve. That is the only coverage of `main`'s CLI → registry → hint → `launch` wiring, and neither outcome reaches CUDA — `launch` bails before the engine is built.
-- **PLE n-gram golden and its host reader** (`test_data/qwen38fn-ple-golden.safetensors`
-  recorded by `tools/accuracy/dump_qwen38fn_ple_golden.py`, read by
-  `tests/ple_ngram_replay.rs`) — the per-layer-embedding block captured from the
-  reference at this config's real geometry (hidden 2560, `hc_count` 4 → a 10240-wide
-  stream, 16 heads × 160, conv kernel 4 dilated by 3), plus a **device-free** gate that
-  replays it: the mul-xor n-gram hash under i64 equality, zero tolerance (128/128 and
-  192/192 ids exact on the S=8 and S=12 cases, the latter carrying a mid-sequence EOS so
-  the window reset has a boundary on both sides), and the block itself from the recorded
-  `key`/`value` projections — bit-identical on all 81920 + 122880 stored bf16 outputs,
-  with the tolerance sized from a perturbation study of the chain's only libm-dependent
-  op rather than guessed. Four negative controls (drop the EOS window reset, dilation 1,
-  unsigned sqrt, swapped bigram/trigram head order) are each asserted to fail. Two
-  boundaries the fixture cannot carry: the n-gram table (102.4 GB at BF16) is not stored,
-  so the gate starts at the block's post-projection inputs, and the recording is
-  whole-sequence, so the decode-side states (the 2-token id window, the 9-slot dilated
-  conv state) stay ungated. The hash reads `layer_multipliers` from the fixture instead of
-  recomputing them from `seed`, which is what keeps `seed` unmodelled above. The device
-  side — the table gather and the dilated conv kernel — is #1106. The crate's tests and
-  clippy now run in CI's CPU jobs, which is what keeps the no-device property honest.
 - **PLE n-gram golden and its two readers** (`test_data/qwen38fn-ple-golden.safetensors`
   recorded by `tools/accuracy/dump_qwen38fn_ple_golden.py`) — the per-layer-embedding
   block captured from the reference at this config's real geometry (hidden 2560,
@@ -73,16 +54,18 @@ The committed `config.json` (`pegainfer-qwen4/tests/frozen_config.json`) is the 
     NgramHasher` — the gate calls it, and its two controls compose the same primitives
     with one knob each, so a control cannot drift onto a private copy of the hash.
   - **Device** (`pegainfer-kernels/tests/qwen4_ple_block_parity.rs`, behind that
-    crate's `qwen4` feature) — the block's three kernels in
-    `csrc/qwen4/qwen4_ple_block.cu` (branch-major split, per-branch gate,
-    dilated conv + residual), driven through `ops::ple_block_into`, with the three
-    grouped norms delegated to the existing batched `(1+w)` entry point. Measured on
-    sm_120 / CUDA 12.9.1: **204799 of the 204800 stored outputs come back bit-for-bit**
-    and the remaining one is a single bf16 ulp (1.221e-4 at 0.0244), against a bound of
-    1.6e-2 — the host gate's own number, so both halves of the consumer read against one
-    scale. Three device-side controls (unsigned sqrt 3.32e-1, a full-stream gate dot
-    2.75e-1, dilation 1 7.89e-1) are each asserted to leave that bound, at 21x, 17x and
-    49x outside it.
+    crate's `qwen4` feature) — the block's two kernels in
+    `csrc/qwen4/qwen4_ple_block.cu` (per-branch gate, dilated conv + residual), driven
+    through `ops::ple_block_into`, with the three grouped norms delegated to the grouped
+    `(1+w)` entry point in the stream's own row-major layout — nothing is transposed and
+    the block costs five launches. Measured on sm_120 / CUDA 12.9.1: **204799 of the
+    204800 stored outputs come back bit-for-bit** and the remaining one is a single bf16
+    ulp (1.221e-4 at 0.0244), against a bound of 1.6e-2 — the host gate's own number, so
+    both halves of the consumer read against one scale. Three device-side controls
+    (unsigned sqrt 3.32e-1, a full-stream gate dot 2.75e-1, dilation 1 7.89e-1) are each
+    asserted to leave that bound, at 21x, 17x and 49x outside it. Every launch is checked
+    from Rust: the grouped entry point returns a status, unlike the batched one it
+    replaces here.
   Two boundaries the fixture cannot carry: the n-gram table (102.4 GB at BF16) is not
   stored, so both gates start at the block's post-projection inputs, and the recording
   is whole-sequence, so the decode-side states (the 2-token id window, the 9-slot
@@ -162,15 +145,17 @@ Still to verify is the reuse on this line's activations. The tensor contract der
 - **Two RMSNorm conventions in one layer.** `(1+w)` for `q_norm`/`k_norm`, the indexer
   layernorms, `hc_norm` and the PLE norms; plain `w` only for the GDN gated norm. The
   four 10240-wide ones are additionally **grouped by 2560**, and the grouping is not a
-  free reshape: `rms_norm_batched_offset_cuda` takes its row stride *from* its
-  `hidden_dim`, so it can only normalize contiguous 2560 rows, while this stream's four
-  groups are interleaved row-major. Serving one grouped norm therefore costs a
-  branch-major transpose plus four calls, and the PLE block's three of them cost twelve.
-  #1158's single-launch grouped entry point removes both halves; until it lands, the
-  transpose is the price. The PLE block's device gate measures the cost of reusing that
-  kernel rather than writing an exact one: its `rsqrt.approx.ftz.f32` reciprocal flips
-  the bf16 rounding of a couple of normed elements in 10^5, and one of them reaches the
-  block output as a single ulp.
+  free reshape of the batched kernel: `rms_norm_batched_offset_cuda` takes its row stride
+  *from* its `hidden_dim`, so it can only normalize contiguous 2560 rows, while this
+  stream's four groups are interleaved row-major — serving one grouped norm through it
+  costs a branch-major transpose plus four calls. Use the grouped entry point
+  (`rms_norm_grouped_offset_cuda`, #1158) instead: it reduces each group on its own and
+  indexes the weight by the row's global column, so a grouped norm is one launch on the
+  stream in place. The PLE block's three of them are three launches, not twelve plus two
+  transposes. Its arithmetic is the same vendor `RMSNormKernel` body, so the block's
+  device gate is bit-identical either way; what the reuse does cost is the
+  `rsqrt.approx.ftz.f32` reciprocal, which flips the bf16 rounding of a couple of normed
+  elements in 10^5, and one of them reaches the block output as a single ulp.
 - **The PLE conv is dilated** (kernel 4, dilation `ngram_size` = 3, state length 9) even
   though its weight tensor `[10240, 1, 4]` is shaped exactly like the GDN conv's. The
   in-tree `conv1d.cu` is non-dilated and caps its state at four taps, so it cannot serve
