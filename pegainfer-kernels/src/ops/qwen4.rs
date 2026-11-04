@@ -588,6 +588,9 @@ pub fn qwen4_moe_shared_branch_into(
     // kernels as an out-of-range stride.
     hidden.checked_extent("MoE shared branch hidden")?;
     shared_out.checked_extent("MoE shared branch shared_out")?;
+    if tokens == 0 {
+        return Ok(());
+    }
 
     gemm_into_checked(ctx, gate_proj, hidden, &mut scratch.gate)?;
     gemm_into_checked(ctx, up_proj, hidden, &mut scratch.up)?;

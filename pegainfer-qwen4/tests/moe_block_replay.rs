@@ -1012,8 +1012,10 @@ fn assert_selection(case: &Case, probs: &[Vec<f32>], canonical: &[Vec<usize>]) -
         // rounding moves a value by at most half a spacing (2^-9 relative), so
         // ten of them move the sum by at most 2^-9 ≈ 0.002 — measured worst
         // 0.0017. The gate sits at 0.01, five times the derivation so a re-dump
-        // keeps its room, and the un-renormalized sum lands 0.34-0.47 away, i.e.
-        // 34x outside it.
+        // keeps its room. The un-renormalized sum lands 0.34-0.47 away on token
+        // 0 of the three cases and as little as 0.1425 on the tightest of the
+        // 21 tokens — 14x outside the gate, which is the margin the device
+        // gate's `WEIGHT_SUM_TOL` quotes.
         let weight_sum: f64 = (0..top_k)
             .map(|slot| f64::from(case.routing_weights.at(t, slot)))
             .sum();

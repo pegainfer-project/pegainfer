@@ -1467,15 +1467,16 @@ fn router_gemm_matches_the_golden() {
         );
         report.assert_clean();
         println!(
-            "  |logit| max {:.4}; {} of {} logits bitwise, worst {} ULP, worst abs {:.6} \
-             (floor {LOGIT_ATOL}) — the reference keeps the router in bf16 (only its softmax \
-             upcasts), so the ULP is the golden's own output rounding and the residual is \
-             cuBLAS accumulation order",
+            "  |logit| max {:.4}; {} of {} logits bitwise, worst abs {:.6} at {:.4} of the \
+             bound (floor {LOGIT_ATOL}; a ULP count is meaningless here — near-zero logits \
+             carry 2^-5 abs = thousands of their own ULP) — the reference keeps the router in \
+             bf16 (only its softmax upcasts), so 1 ULP bounds the golden's own output rounding \
+             and the residual is cuBLAS accumulation order",
             case.router_logits.max_abs(),
             report.exact,
             report.total,
-            report.worst_ulp,
-            report.worst_abs
+            report.worst_abs,
+            report.worst_slack
         );
     }
 }
