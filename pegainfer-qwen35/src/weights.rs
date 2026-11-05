@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
 use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
@@ -80,6 +82,10 @@ pub struct Qwen35Model {
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
     tp_comm: Option<Comm>,
+    /// Alternate streams that let independent requests in one prefill chunk
+    /// overlap; created on first use by [`Qwen35Model::batch_prefill_logits`].
+    /// Empty (the TP path and single-request steps) means the serial pass.
+    pub(super) prefill_streams: Vec<Arc<CudaStream>>,
     /// -inf suppression for the tile-alignment pad rows, applied by
     /// [`Qwen35Model::output_logits_into`] (absent when the selection width
     /// needs no padding).
@@ -366,6 +372,7 @@ impl Qwen35Model {
             reserved_decode_slots: max_batch,
             decode_admission_batch,
             tp_comm: None,
+            prefill_streams: Vec::new(),
             pad_logit_suppress,
         })
     }
@@ -431,6 +438,12 @@ impl Qwen35Model {
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
         self.tp_comm = Some(comm);
+    }
+
+    /// Whether tensor-parallel collectives are installed. TP prefills stay on
+    /// one stream: NCCL calls assume a single stream.
+    pub(crate) fn is_tp(&self) -> bool {
+        self.tp_comm.is_some()
     }
 
     /// Force NCCL connect before any CUDA Graph capture records a collective
