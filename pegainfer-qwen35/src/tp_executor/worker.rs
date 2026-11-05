@@ -721,11 +721,12 @@ impl TpWorkerState {
                     .as_mut()
                     .expect("prefill-phase TP request owns its recurrent state"),
             ];
+            let kv_buffer = self.model.kv_buffer().clone();
             let logits = self.model.batch_prefill_logits(
                 &prompt,
                 std::slice::from_ref(&kv_views[row_idx]),
                 &mut recurrent_refs,
-                self.model.kv_buffer(),
+                &kv_buffer,
             )?;
 
             if chunk.finish_prefill {

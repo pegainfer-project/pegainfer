@@ -5,6 +5,7 @@
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 
 mod backend;
+pub(crate) use backend::fatal_cuda_lifecycle;
 #[cfg(test)]
 mod chunked_prefill_tests;
 #[cfg(test)]
