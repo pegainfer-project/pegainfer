@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from campaign import compile_campaign
-from request_plan import build_plan
+from request_plan import PlanError, build_plan, validate_plan
 from test_campaign import make_input
 
 
@@ -22,6 +22,14 @@ class RequestPlanTests(unittest.TestCase):
             spec['workload']['matrices']['cached-train']['warmup_repeats'] = 1
             path.write_text(json.dumps(spec))
             compiled = compile_campaign(path, write=False)
+            for kind in ('cold_prefill', 'steady_decode'):
+                cell = next(cell for cell in compiled['workload']['cells'] if cell['kind'] == kind)
+                plan = build_plan(cell, compiled['client'])
+                plan['cache_lifecycle']['recovery'] = 'restart'
+                with self.subTest(kind=kind), self.assertRaisesRegex(PlanError, 'restart.*cached_prefill'):
+                    validate_plan(plan)
+                plan['cache_lifecycle']['recovery'] = 'reset'
+                validate_plan(plan)
             plans = [build_plan(cell, compiled['client']) for cell in compiled['workload']['cells']
                      if cell['kind'] == 'cached_prefill']
             validate_workload_collection(plans)
@@ -29,6 +37,7 @@ class RequestPlanTests(unittest.TestCase):
             self.assertEqual(len({p['cached_workload']['prefix_seed'] for p in plans}), 1)
             prefixes = {}
             for plan in plans:
+                validate_plan(plan)
                 prefix = plan['cached_workload']['prefix_token_ids']
                 prefixes.setdefault(len(prefix), prefix)
                 self.assertEqual(prefixes[len(prefix)], prefix)
@@ -46,6 +55,15 @@ class RequestPlanTests(unittest.TestCase):
                     self.assertEqual(imported[0]['output_tokens'], 1 if batch['phase'] == 'bootstrap' else 8)
             short, long = (prefixes[p] for p in sorted(prefixes))
             self.assertEqual(short, long[:len(short)])
+            spec['variants']['target']['launch'] = {'argv': [sys.executable]}
+            spec['workload']['matrices']['cached-train']['cache_lifecycle']['recovery'] = 'restart'
+            path.write_text(json.dumps(spec))
+            compiled = compile_campaign(path, write=False)
+            for cell in compiled['workload']['cells']:
+                if cell['kind'] == 'cached_prefill':
+                    plan = build_plan(cell, compiled['client'])
+                    self.assertEqual(plan['cache_lifecycle']['recovery'], 'restart')
+                    validate_plan(plan)
 
 
 if __name__ == '__main__':

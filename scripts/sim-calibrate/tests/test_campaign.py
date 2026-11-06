@@ -61,6 +61,13 @@ class CampaignCompileTests(unittest.TestCase):
             self.assertEqual(cell['fit_policy']['excluded_metrics'], ['ttft_ms'])
             plan = build_plan(cell, compiled['client'])
             self.assertTrue(requires_cache_reset(plan, 'target', compiled['variants']['target']['runtime'], plan['batches'][0]))
+            for matrix_name in ('prefill-train', 'decode-train'):
+                lifecycle = spec['workload']['matrices'][matrix_name]['cache_lifecycle']
+                lifecycle['recovery'] = 'restart'
+                path.write_text(json.dumps(spec))
+                with self.subTest(matrix=matrix_name), self.assertRaisesRegex(ManifestError, 'restart.*cached_prefill'):
+                    compile_campaign(path, write=False)
+                del lifecycle['recovery']
             del matrix['cache_lifecycle']
             path.write_text(json.dumps(spec))
             with self.subTest(mode='decode_cache_without_lifecycle'), self.assertRaisesRegex(ManifestError, 'cache lifecycle'):

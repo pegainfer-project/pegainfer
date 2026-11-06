@@ -292,6 +292,8 @@ def _matrix_configuration(name: str, matrix: Any, defaults: dict[str, Any]) -> d
         integer(lifecycle.get("bootstrap_repeats"), "bootstrap_repeats", maximum=2**32-1)
         if lifecycle.get("recovery", "reset") not in ("reset", "restart"):
             raise ManifestError("cache_lifecycle.recovery must be reset or restart")
+        if matrix["kind"] != "cached_prefill" and lifecycle.get("recovery") == "restart":
+            raise ManifestError("restart recovery is only supported for cached_prefill")
     return {**matrix, **execution}
 
 

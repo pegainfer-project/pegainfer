@@ -47,8 +47,7 @@ def _plan_fields(value: Any, allowed: set[str], field: str) -> dict[str, Any]:
     return value
 
 
-def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
-               frozen_workload: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_plan(cell: dict[str, Any], client: dict[str, Any]) -> dict[str, Any]:
     try:
         digest(cell.get("cell_id"), "cell_id")
         concurrency = integer(cell.get("concurrency"), "concurrency", positive=True)
@@ -118,23 +117,7 @@ def build_plan(cell: dict[str, Any], client: dict[str, Any], *,
                                            'output_tokens': cell['bootstrap_output_tokens'] if phase == 'bootstrap' else cell['output_tokens']}
                                     for phase in ('bootstrap', 'warmup', 'measured')}
             from cached_prefill import prepare_plan_workload
-            if frozen_workload is None:
-                prepare_plan_workload(plan, client)
-            else:
-                frozen_rows = frozen_workload.get('logical_requests')
-                if not isinstance(frozen_rows, list) or any(not isinstance(row, dict) for row in frozen_rows):
-                    raise PlanError('frozen cached workload must contain logical requests')
-                indexed = {row.get('pairing_key'): row for row in frozen_rows}
-                if len(indexed) != len(frozen_rows) or set(indexed) != {row['pairing_key'] for row in requests}:
-                    raise PlanError('frozen cached workload keys differ from the compiled cell')
-                for row in requests:
-                    frozen = indexed[row['pairing_key']]
-                    for field in ('prompt', 'token_ids', 'suffix_seed'):
-                        if field in frozen:
-                            row[field] = copy.deepcopy(frozen[field])
-                plan['cached_workload'] = copy.deepcopy(frozen_workload.get('cached_workload'))
-        elif frozen_workload is not None:
-            raise PlanError('frozen custom workload is only supported for cached-prefill')
+            prepare_plan_workload(plan, client)
         return plan
     except (MeasurementError, KeyError, TypeError, ValueError) as exc:
         raise PlanError(str(exc)) from exc
@@ -184,6 +167,8 @@ def validate_plan(plan: dict[str, Any]) -> None:
             boots = integer(lifecycle.get("bootstrap_repeats"), "cache_lifecycle.bootstrap_repeats", maximum=2**32 - 1)
             if lifecycle.get('recovery', 'reset') not in ('reset', 'restart'):
                 raise PlanError('cache_lifecycle.recovery must be reset or restart')
+            if workload != 'cached_prefill' and lifecycle.get('recovery') == 'restart':
+                raise PlanError('restart recovery is only supported for cached_prefill')
         prefix_seed = None
         if workload == "cached_prefill":
             if c != 1 or generation["dataset"] != "custom" or generation["prompt_representation"] != "text" or not boots:

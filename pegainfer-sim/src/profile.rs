@@ -231,28 +231,6 @@ pub enum WorkloadFamily {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ManifestSchedulerIdentity {
-    pub policy: SchedulerPolicy,
-    pub max_num_seqs: u32,
-    pub max_num_batched_tokens: u32,
-    pub max_model_len: u32,
-    pub prefill: PrefillPolicy,
-}
-
-impl From<&SchedulerProfile> for ManifestSchedulerIdentity {
-    fn from(scheduler: &SchedulerProfile) -> Self {
-        Self {
-            policy: scheduler.policy,
-            max_num_seqs: scheduler.max_num_seqs,
-            max_num_batched_tokens: scheduler.max_num_batched_tokens,
-            max_model_len: scheduler.max_model_len,
-            prefill: scheduler.prefill,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct CacheIdentity {
     pub enabled: bool,
     pub policy: String,
@@ -337,7 +315,7 @@ pub struct CalibrationManifest {
     #[serde(default)]
     pub quantization: Option<String>,
     #[serde(default)]
-    pub scheduler: Option<ManifestSchedulerIdentity>,
+    pub scheduler: Option<SchedulerProfile>,
     #[serde(default)]
     pub cache: Option<CacheIdentity>,
     #[serde(default)]
@@ -384,14 +362,7 @@ impl CalibrationManifest {
             }
         }
         if let Some(scheduler) = &self.scheduler {
-            SchedulerProfile {
-                policy: scheduler.policy,
-                max_num_seqs: scheduler.max_num_seqs,
-                max_num_batched_tokens: scheduler.max_num_batched_tokens,
-                max_model_len: scheduler.max_model_len,
-                prefill: scheduler.prefill,
-            }
-            .validate()?;
+            scheduler.validate()?;
         }
         if let Some(cache) = &self.cache {
             ensure_nonempty("manifest.cache.policy", &cache.policy)?;
@@ -464,7 +435,7 @@ impl CalibrationManifest {
         self.validate()?;
         if let Some(scheduler) = &self.scheduler {
             ensure!(
-                scheduler == &ManifestSchedulerIdentity::from(&profile.scheduler),
+                scheduler == &profile.scheduler,
                 ProfileContractError::SchedulerIdentityMismatch
             );
         }
@@ -754,12 +725,11 @@ impl PredictorModel {
                 if let Some(decode) = decode {
                     decode.validate()?;
                 }
-                if let Some(mixed) = mixed {
+                if mixed.is_some() {
                     ensure!(
                         prefill.is_some() && decode.is_some(),
                         "functional mixed predictor requires both prefill and decode models"
                     );
-                    mixed.validate()?;
                 }
                 Ok(())
             }
@@ -933,18 +903,6 @@ pub struct MixedAdditive {
 #[serde(rename_all = "snake_case")]
 pub enum MixedAdditiveKind {
     CompositionAdditive,
-}
-
-impl MixedAdditive {
-    fn validate(&self) -> Result<()> {
-        if let Some(kind) = self.kind {
-            ensure!(
-                kind == MixedAdditiveKind::CompositionAdditive,
-                "unsupported mixed predictor kind {kind:?}"
-            );
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
