@@ -1260,10 +1260,12 @@ fn dflash_warm_prefix_keeps_drafting() {
     );
     // The restored rows are the same target hidden states the cold prefill
     // captured, so the warm accept rate should track the cold rate; a
-    // mis-shifted/truncated restore collapses it far below this floor.
+    // mis-shifted/truncated restore collapses it far below this floor. The
+    // measured L20 run was identical (4 rounds / 27 accepted both sides); 90%
+    // leaves room for a bf16 tie without admitting a shifted context.
     assert!(
-        warm_rate >= cold_rate * 0.5,
-        "warm accept rate {warm_rate:.3} is far below the cold rate {cold_rate:.3} \
+        warm_rate >= cold_rate * 0.9,
+        "warm accept rate {warm_rate:.3} is below the cold rate {cold_rate:.3} \
          (cold {cold_drafts}/{cold_accepted}, warm {warm_drafts}/{warm_accepted})"
     );
 }
