@@ -109,6 +109,7 @@ pub(crate) fn start_qwen3(
         draft,
         memory_options,
         decode_overlap,
+        !no_prefix_cache,
     )?;
     if let Some(path) = dump_graph_png {
         let summary = executor.dump_decode_graph_png(path)?;

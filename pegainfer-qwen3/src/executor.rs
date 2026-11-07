@@ -1325,6 +1325,7 @@ impl Qwen3Executor {
             dflash_draft_path.map(DraftModel::DFlash),
             memory_options,
             crate::DecodeOverlap::Off,
+            true,
         )
     }
 
@@ -1343,6 +1344,7 @@ impl Qwen3Executor {
         draft: Option<DraftModel<'_>>,
         memory_options: Qwen3MemoryOptions,
         decode_overlap: crate::DecodeOverlap,
+        capture_cache_enabled: bool,
     ) -> Result<Self> {
         let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
@@ -1402,12 +1404,26 @@ impl Qwen3Executor {
             // config: fixed bytes (weights + block scratch) via the margin, and
             // pool-scaling per-token bytes folded into the block budget.
             let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
+            // `--no-prefix-cache` must not reserve (or later allocate) the
+            // drafter capture cache: the prefix match that would consume it is
+            // off. The lane re-derives the same decision from
+            // `prefix_cache_requested` before it loads.
+            let (capture_cache_bytes, capture_prefix_block_size) = if capture_cache_enabled {
+                (
+                    crate::spec_env::capture_cache_bytes(),
+                    memory_options.page_size,
+                )
+            } else {
+                (0, 0)
+            };
             let (draft_kv_bytes_per_token, hedge_scratch_pages) = match draft {
                 Some(DraftModel::DFlash(path)) => {
                     let reservation = crate::dflash::DFlashMemoryReservation::from_path(
                         path,
                         model.config().logits_rows,
                         max_verify_batch,
+                        capture_cache_bytes,
+                        capture_prefix_block_size,
                     )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
@@ -1859,7 +1875,9 @@ impl Qwen3Executor {
         );
         let meta = match draft {
             DraftModel::DFlash(path) => {
-                let meta = self.primary.load_dflash(path.to_string())?;
+                let meta = self
+                    .primary
+                    .load_dflash(path.to_string(), self.prefix_cache_requested)?;
                 log::info!(
                     "Qwen3 DFlash speculative decoding enabled: draft block size {}",
                     meta.block_size
@@ -3662,7 +3680,7 @@ impl LocalQwen3Lane {
     /// Load the DFlash draft model into this lane (primary rank only). The draft
     /// model is built here on the worker thread because it reads the co-located
     /// target model's embeddings and head.
-    fn load_dflash(&mut self, draft_path: &str) -> Result<DraftMeta> {
+    fn load_dflash(&mut self, draft_path: &str, capture_cache: bool) -> Result<DraftMeta> {
         let model = DFlashDraftModel::from_safetensors_for_target(
             self.model.device_ctx(),
             draft_path,
@@ -3677,11 +3695,20 @@ impl LocalQwen3Lane {
             capture_cache: false,
         };
         let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
+        let (prefix_block_size, capture_cache_bytes) = if capture_cache {
+            (
+                self.layout.page_size,
+                crate::spec_env::capture_cache_bytes(),
+            )
+        } else {
+            (0, 0)
+        };
         let lane = DFlashLaneState::new(
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
-            self.layout.page_size,
+            prefix_block_size,
+            capture_cache_bytes,
         )?;
         meta.capture_cache = lane.capture_cache_enabled();
         self.dflash = Some(lane);
@@ -4427,6 +4454,8 @@ enum WorkerCommand {
     /// thread because it reads the co-located target model).
     LoadDflash {
         draft_path: String,
+        /// Allocate the prefix capture cache. False with `--no-prefix-cache`.
+        capture_cache: bool,
         resp: channel::Sender<Result<DraftMeta>>,
     },
     /// Load the EAGLE-3 draft model into the primary lane, for the same reason.
@@ -4577,8 +4606,12 @@ impl RankWorker {
                                     let result = lane.resolve_inflight_prefill();
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::LoadDflash { draft_path, resp } => {
-                                    let result = lane.load_dflash(&draft_path);
+                                WorkerCommand::LoadDflash {
+                                    draft_path,
+                                    capture_cache,
+                                    resp,
+                                } => {
+                                    let result = lane.load_dflash(&draft_path, capture_cache);
                                     let _ = resp.send(result);
                                 }
                                 WorkerCommand::LoadEagle3 { draft_path, resp } => {
@@ -4675,11 +4708,12 @@ impl RankWorker {
 
     /// Load the DFlash draft model into this worker's lane and return its
     /// metadata. Blocks until the worker finishes loading.
-    fn load_dflash(&self, draft_path: String) -> Result<DraftMeta> {
+    fn load_dflash(&self, draft_path: String, capture_cache: bool) -> Result<DraftMeta> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::LoadDflash {
                 draft_path,
+                capture_cache,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on load_dflash"))?;
