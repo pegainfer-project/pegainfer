@@ -777,6 +777,35 @@ pub fn load_tensor_2d(
     DeviceMatrix::from_safetensors(ctx, tensor.data(), rows, cols)
 }
 
+/// Load one layer of a contiguous `[layers, rows, cols]` tensor as a flat 2D
+/// `[rows, cols]` matrix. The repo has no 3D device type; callers address one
+/// layer's rows at a time (e.g. `early_read_weights [L-1, C, H]`).
+#[allow(clippy::too_many_arguments)]
+pub fn load_tensor_3d_layer(
+    ctx: &DeviceContext,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+    layers: usize,
+    rows: usize,
+    cols: usize,
+    layer: usize,
+) -> Result<DeviceMatrix> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    let shape = tensor.shape();
+    anyhow::ensure!(
+        shape.len() == 3 && shape[0] == layers && shape[1] == rows && shape[2] == cols,
+        "Tensor '{name}' has shape {shape:?}, expected [{layers}, {rows}, {cols}]"
+    );
+    anyhow::ensure!(
+        layer < layers,
+        "Tensor '{name}' layer {layer} out of range 0..{layers}"
+    );
+    let data = tensor_bf16_bytes(&tensor, name)?;
+    let stride = rows * cols * std::mem::size_of::<bf16>();
+    DeviceMatrix::from_safetensors(ctx, &data[layer * stride..(layer + 1) * stride], rows, cols)
+}
+
 fn tensor_2d_dims(
     tensor: &safetensors::tensor::TensorView<'_>,
     name: &str,
@@ -999,9 +1028,9 @@ pub fn load_tensor_i64_host(
             tensor.dtype()
         ));
     }
-    if tensor.shape().len() != 1 {
+    if tensor.shape().len() > 1 {
         return Err(anyhow::anyhow!(
-            "I64 tensor '{}': expected 1D, got shape {:?}",
+            "I64 tensor '{}': expected a scalar or 1D, got shape {:?}",
             name,
             tensor.shape()
         ));
