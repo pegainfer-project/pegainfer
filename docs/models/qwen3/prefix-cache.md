@@ -26,7 +26,9 @@ A prefix hit skips the forward that produces the drafter's target hidden rows, s
 - **Scope:** DFlash/DSpark only. EAGLE-3 has no capture cache yet and keeps the old `spec-on ⇒ APC off` behavior.
 - **Accounting:** the capture budget, the per-request partial-block seal, and the lane shift buffer are charged up front. The draft's own KV is still billed per pool block; with shared prefixes that is not a per-request bound yet (tracked in #1238).
 
-The warm-hit gate is `dflash_warm_prefix_keeps_drafting` in `tests/dflash_speculative_gate.rs`: cold fill, plain baseline, then a warm request that must hit the prefix, stay lossless up to bf16 ties, and increase the draft/accept counters.
+The warm-hit gate is `dflash_warm_prefix_keeps_drafting` in `tests/dflash_speculative_gate.rs`: cold fill, plain baseline, then a warm request that must hit the prefix, stay lossless up to bf16 ties, and keep the cold accept rate.
+
+**L20 run record** (2026-11, Qwen3-4B, `deepseek-ai/dflash_qwen3_4b_block7`, release): the warm gate reports **4 draft rounds / 27 accepted on both the cold and warm requests**; the 1 MiB capture-cache gate reports **400 cached tokens and 4 → 4 drafts** (a miss falls back to plain decode); the lever gate (`MAX_BATCH=1`, `MAX_DRAFTS=4/2`, `MAX_BATCH=3`) passes with the gated and trimmed rows. Run on one L20.
 
 ## Numbers (RTX 5090, 2026-06, drained-stream measurement)
 
