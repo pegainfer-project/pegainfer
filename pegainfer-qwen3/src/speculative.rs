@@ -48,6 +48,10 @@ pub(crate) struct VerifyStepItem {
     pub(crate) token_ids: Vec<u32>,
     pub(crate) params: SamplingParams,
     pub(crate) stop_policy: StopPolicy,
+    /// Assigned KV-block hashes in order; the worker publishes captures for
+    /// the blocks the previous step committed.
+    pub(crate) capture_hashes: Vec<[u8; 16]>,
+    pub(crate) sealed_tokens: usize,
 }
 
 impl VerifyStepItem {
@@ -62,6 +66,8 @@ impl VerifyStepItem {
             token_ids,
             params,
             stop_policy,
+            capture_hashes: Vec::new(),
+            sealed_tokens: 0,
         }
     }
 
@@ -116,6 +122,10 @@ pub(crate) struct DraftStepItem {
     /// when some branch position fits inside `remaining - 1` kept drafts,
     /// and a request that cannot show its chain must not burn a hedge slot.
     pub(crate) hedge_budget: usize,
+    /// Assigned KV-block hashes in order; the worker publishes captures for
+    /// the blocks the previous step committed.
+    pub(crate) capture_hashes: Vec<[u8; 16]>,
+    pub(crate) sealed_tokens: usize,
 }
 
 impl DraftStepItem {
@@ -132,6 +142,8 @@ impl DraftStepItem {
             params,
             sample_seed,
             hedge_budget,
+            capture_hashes: Vec::new(),
+            sealed_tokens: 0,
         }
     }
 }

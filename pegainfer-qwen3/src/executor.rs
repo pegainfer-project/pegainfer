@@ -126,6 +126,9 @@ pub struct PrefillStepItem {
     pub(crate) chunk_start: usize,
     /// Prompt tokens forwarded this step. Set by the executor.
     pub(crate) chunk_tokens: usize,
+    /// Lineage hashes of the blocks the prefix cache matched, in order. The
+    /// worker restores the drafter's captured hidden rows from them.
+    pub(crate) capture_prefix_hashes: Vec<[u8; 16]>,
 }
 
 impl PrefillStepItem {
@@ -151,6 +154,7 @@ impl PrefillStepItem {
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
+            capture_prefix_hashes: Vec::new(),
         }
     }
 
@@ -292,6 +296,10 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
+            // A prefix hit carries the target's captured hidden rows in the
+            // capture cache; seed the drafter before deciding eligibility so a
+            // warm request captures (and drafts) exactly like a cold one.
+            lane.restore_dflash_prefix_captures(requests)?;
             // When a drafter is loaded, capture target hidden states for eligible
             // requests so they can seed the draft model after prefill finishes.
             let capture_requested = lane.should_capture_dflash_prefill_context(requests)
@@ -1741,13 +1749,19 @@ impl Qwen3Executor {
         self.finish_retention_transition(retained_before);
     }
 
-    /// Whether prefix reuse is actually in effect. A loaded drafter forces it
-    /// off: speculative capture needs uncached hidden states, and the KV budget
-    /// charges the draft's out-of-pool cache per POOL block, which only holds
-    /// while blocks are not shared between requests. `load_draft_model`
-    /// also clears the requested flag; this makes the override structural.
+    /// Whether prefix reuse is actually in effect. A loaded drafter keeps it on
+    /// when its capture cache can restore the matched hidden rows (DFlash /
+    /// DSpark with a non-zero `PEGAINFER_SPEC_CAPTURE_CACHE_MB`); EAGLE-3 and a
+    /// zero-budget drafter still force it off. The capture cache is a fixed
+    /// term in the draft reservation; the draft's own KV is still billed per
+    /// pool block, which is not a per-request bound once blocks are shared
+    /// (TODO #1238).
     fn prefix_cache_enabled(&self) -> bool {
-        self.prefix_cache_requested && self.speculative.is_none()
+        self.prefix_cache_requested
+            && self
+                .speculative
+                .as_ref()
+                .is_none_or(|meta| meta.capture_cache)
     }
 
     /// Whether a completed request should leave its registered GPU blocks in
@@ -1829,9 +1843,10 @@ impl Qwen3Executor {
     /// lane.
     ///
     /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
-    /// is incompatible with KV offload. Disables the prefix cache: speculative
-    /// capture needs clean, uncached target hidden states for every prompt
-    /// token, and a prefix-cache hit skips the forward that would produce them.
+    /// is incompatible with KV offload. DFlash keeps the prefix cache on when
+    /// its capture cache is enabled (the hit restores the captured rows);
+    /// EAGLE-3 and a zero capture-cache budget disable it, because a hit skips
+    /// the forward that would produce the drafter's hidden state.
     pub(crate) fn load_draft_model(&mut self, draft: DraftModel<'_>) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
@@ -1862,7 +1877,9 @@ impl Qwen3Executor {
             }
         };
         let counters = SpecDecodeCounters::new(meta.num_spec_tokens)?;
-        self.set_prefix_cache_enabled(false);
+        if !meta.capture_cache {
+            self.set_prefix_cache_enabled(false);
+        }
         self.spec_decode_counters = Some(counters);
         self.speculative = Some(meta);
         Ok(())
@@ -1981,6 +1998,12 @@ impl Qwen3Executor {
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
                 let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
                 req.cached_tokens = Some(matched);
+                req.capture_prefix_hashes = rkv
+                    .assigned_block_hashes()
+                    .into_iter()
+                    .take(matched / self.metadata.block_size)
+                    .map(|(_, hash)| hash)
+                    .collect();
                 // What the connector restored is not a local hit. Only the
                 // blocks a load committed onto the probe (held past its GPU
                 // hit) crossed the connector; anything else in the match was
@@ -3427,6 +3450,10 @@ struct DraftMeta {
     max_position_embeddings: usize,
     /// See [`ModelExecutor::max_draft_batch`].
     max_draft_batch: Option<usize>,
+    /// Whether the drafter's capture cache makes prefix reuse safe. Only
+    /// DFlash/DSpark have one; EAGLE-3 and a zero cache budget keep the
+    /// prefix cache off.
+    capture_cache: bool,
 }
 
 struct LocalQwen3Lane {
@@ -3642,18 +3669,22 @@ impl LocalQwen3Lane {
             &self.model,
         )?;
         model.tune_gemm_algos(&self.model)?;
-        let meta = DraftMeta {
+        let mut meta = DraftMeta {
             block_size: model.block_size(),
             num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
             max_draft_batch: None,
+            capture_cache: false,
         };
         let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
-        self.dflash = Some(DFlashLaneState::new(
+        let lane = DFlashLaneState::new(
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
-        )?);
+            self.layout.page_size,
+        )?;
+        meta.capture_cache = lane.capture_cache_enabled();
+        self.dflash = Some(lane);
         Ok(meta)
     }
 
@@ -4094,6 +4125,9 @@ impl LocalQwen3Lane {
         verify_round: u64,
         gated: bool,
     ) -> Result<VerifyResult> {
+        // Publish the blocks the previous step committed before this verify
+        // consumes the capture history.
+        self.publish_dflash_captures(requests)?;
         // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
         // for DSpark (anchor-first), shortened by a `PEGAINFER_SPEC_MAX_DRAFTS`
         // trim; the EAGLE-3 chain plus its anchor. The graph buffers + replay
@@ -4115,15 +4149,20 @@ impl LocalQwen3Lane {
         };
 
         if self.verify_bufs.is_none() {
-            // Each hedged request repeats its full prefix page list once per
-            // chain, so the plan's page-index capacity must budget the
-            // duplicates on top of the pool-wide worst case.
-            // Base page lists are disjoint pool pages (sum <= total_blocks):
-            // loading a drafter force-disables the prefix cache (see
-            // `load_draft_model`), so no two active requests share
-            // pages on any path that can hedge. Each chain layer duplicates at
-            // most one pool-wide list, so the multiplier is the chain count
-            // alone, bounded by the expanded verify batch.
+            // Page lists are authored by reference: with the prefix cache on,
+            // several active requests can list the same shared pages, so the
+            // batch's total is bounded by `max_batch * pages-per-context`, not
+            // by the physical pool size. A hedged request repeats its list
+            // once per chain, bounded by the expanded verify batch.
+            let per_request_pages = self
+                .model
+                .config()
+                .max_position_embeddings
+                .div_ceil(self.layout.page_size)
+                .saturating_add(2);
+            let base_pages = self
+                .total_blocks
+                .max(max_batch.saturating_mul(per_request_pages));
             let hedge_dup = self.dflash.as_ref().map_or(0, |dflash| {
                 if dflash.hedge_cap() == 0 {
                     0
@@ -4136,8 +4175,7 @@ impl LocalQwen3Lane {
                 max_batch,
                 verify_span,
                 capture_layer_ids.len(),
-                self.total_blocks
-                    .saturating_mul(hedge_dup.saturating_add(1)),
+                base_pages.saturating_mul(hedge_dup.saturating_add(1)),
             )?);
         }
 
