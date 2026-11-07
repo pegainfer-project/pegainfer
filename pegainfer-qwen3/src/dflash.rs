@@ -619,15 +619,27 @@ impl DFlashDraftModel {
         token_offset: usize,
         token_count: usize,
     ) -> Result<()> {
-        if token_count == 0 {
+        if token_count == 0 || state.seal.seq_len == 0 {
             return Ok(());
         }
+        anyhow::ensure!(
+            captured_hidden.seq_len >= token_offset + token_count,
+            "DFlash seal source range [{}, {}) exceeds captured rows {}",
+            token_offset,
+            token_offset + token_count,
+            captured_hidden.seq_len
+        );
         anyhow::ensure!(
             state.seal_len + token_count <= state.seal.seq_len,
             "DFlash seal buffer overflow: {} + {} > {}",
             state.seal_len,
             token_count,
             state.seal.seq_len
+        );
+        debug_assert_eq!(
+            state.seal_len,
+            state.captured_len - state.published_blocks * (state.seal.seq_len / 2),
+            "DFlash capture seal/ledger drift"
         );
         ops::copy_hidden_token_range_into(
             ctx,
@@ -1219,9 +1231,10 @@ mod tests {
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
-        let reservation =
-            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256, 0)
-                .expect("reservation sizing");
+        let reservation = super::DFlashMemoryReservation::from_config(
+            &dflash, /*max_decode_batch*/ 256, 0, 0,
+        )
+        .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
@@ -1229,19 +1242,23 @@ mod tests {
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1, 0)
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1, 0, 0)
             .expect("reservation sizing")
             .fixed_bytes;
         // The capture cache is a fixed term; the budget passes through unshaped
-        // so a knob typo cannot silently under-reserve it.
+        // so a knob typo cannot silently under-reserve it. Enabling it also
+        // allocates one partial-block seal per request plus the lane's shift
+        // buffer, both of which must be reserved.
         let with_capture =
-            super::DFlashMemoryReservation::from_config(&dflash, 1, 128 * 1024 * 1024)
+            super::DFlashMemoryReservation::from_config(&dflash, 1, 128 * 1024 * 1024, 16)
                 .expect("reservation sizing")
                 .fixed_bytes;
+        let capture_dim = dflash.hidden_size * dflash.target_layer_ids.len();
+        let seal_bytes = capture_dim * 2 * 16 * 2; // two KV blocks of bf16 rows
         assert_eq!(
             with_capture - fixed_batch1,
-            128 * 1024 * 1024,
-            "capture cache budget must be reserved verbatim"
+            128 * 1024 * 1024 + 2 * seal_bytes,
+            "capture cache + per-request seal + lane shift must be reserved"
         );
         assert!(
             (1_150_000_000..1_220_000_000).contains(&fixed_batch1),

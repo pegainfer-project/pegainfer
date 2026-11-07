@@ -17,13 +17,14 @@ Last touched: 2026-11
 
 ## With speculative decoding (DFlash / DSpark)
 
-A prefix hit skips the forward that produces the drafter's target hidden rows, so the target KV alone is not enough to speculate. The engine keeps a **drafter capture cache** alongside the KV cache: each sealed 16-token KV block stores its aux hidden rows (`5 × 2560` bf16 = 25.6 KB/token on Qwen3-4B), keyed by the same `SequenceHash` lineage, under the same LRU.
+A prefix hit skips the forward that produces the drafter's target hidden rows, so the target KV alone is not enough to speculate. The engine keeps a **drafter capture cache**: each sealed 16-token KV block stores its aux hidden rows (`5 × 2560` bf16 = 25.6 KB/token on Qwen3-4B), keyed by the same `SequenceHash` lineage.
 
-- **Budget:** `PEGAINFER_SPEC_CAPTURE_CACHE_MB` (default 128 MiB; explicit `0` disables it). The budget is a fixed term in `DFlashMemoryReservation`, so the KV pool shrinks to fit. 128 MiB holds ~327 blocks (~5k tokens).
+- **Lifetime:** the capture cache is a lane-owned side cache with its own LRU and budget, not part of the KV block's refcount. A capture entry can be evicted while its KV block survives; the hit then falls back (below). Moving the payload into the KV block state so both share one lifetime is the follow-up tracked in #1238.
+- **Budget:** `PEGAINFER_SPEC_CAPTURE_CACHE_MB` (default 128 MiB; explicit `0` disables it, as does `--no-prefix-cache`). The budget is a fixed term in `DFlashMemoryReservation`, so the KV pool shrinks to fit. 128 MiB holds ~327 blocks (~5k tokens).
 - **Restore:** a prefix match hands the matched block hashes to the worker, which copies the rows into the draft's `pending_context`: the suffix prefill appends the rest and the first draft round rebuilds the draft KV from the restored rows. `draft_ready` still comes from the capture set + completed flag.
 - **Miss:** if any matched block has no capture entry (LRU eviction, or blocks sealed before the cache), the request keeps the target KV hit but is not draft-ready; the all-or-nothing gate falls back to plain decode. Correctness is unchanged; the request just does not speculate.
-- **Scope:** DFlash/DSpark only. EAGLE-3 has no capture cache yet and a zero budget keeps the old `spec-on ⇒ APC off` behavior.
-- **Accounting:** the capture budget is charged up front; the draft's own KV is still billed per pool block (a per-request bound once blocks are shared is tracked in #1238).
+- **Scope:** DFlash/DSpark only. EAGLE-3 has no capture cache yet and keeps the old `spec-on ⇒ APC off` behavior.
+- **Accounting:** the capture budget, the per-request partial-block seal, and the lane shift buffer are charged up front. The draft's own KV is still billed per pool block; with shared prefixes that is not a per-request bound yet (tracked in #1238).
 
 The warm-hit gate is `dflash_warm_prefix_keeps_drafting` in `tests/dflash_speculative_gate.rs`: cold fill, plain baseline, then a warm request that must hit the prefix, stay lossless up to bf16 ties, and increase the draft/accept counters.
 

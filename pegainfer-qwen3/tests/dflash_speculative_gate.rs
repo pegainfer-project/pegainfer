@@ -158,6 +158,35 @@ fn generate_concurrent(engine: &EngineHarness, requests: Vec<(Vec<u32>, usize)>)
         .collect()
 }
 
+/// Re-exec this test binary for one gate that needs its own process-wide env
+/// (knobs are read once at engine start). Returns the child's stderr.
+fn run_child_gate(child_test: &str, envs: &[(&str, &str)]) -> String {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = Command::new(&exe);
+    command
+        .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+        .env("PEGAINFER_TEST_LOG", "1")
+        .env_remove("PEGAINFER_SPEC_MAX_BATCH")
+        .env_remove("PEGAINFER_SPEC_MAX_DRAFTS")
+        .env_remove("PEGAINFER_SPEC_HEDGE")
+        .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
+        .env_remove("PEGAINFER_SPEC_HEDGE_POSITIONS")
+        .env_remove("PEGAINFER_SPEC_HEDGE_KNEE");
+    for &(key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .output()
+        .unwrap_or_else(|e| panic!("spawn child gate '{child_test}': {e}"));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "child gate '{child_test}' failed with {envs:?}:\n{}\n{stderr}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+    stderr
+}
+
 #[test]
 fn dflash_speculative_greedy_matches_plain_greedy() {
     common::harness::init_capture_logging();
@@ -1061,36 +1090,9 @@ fn dflash_spec_levers_keep_losslessness() {
     let _gpu = GPU
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = std::env::current_exe().expect("test binary path");
-
-    let run_child = |child_test: &str, envs: &[(&str, &str)]| -> String {
-        let mut command = Command::new(&exe);
-        command
-            .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
-            .env("PEGAINFER_TEST_LOG", "1")
-            .env_remove("PEGAINFER_SPEC_MAX_BATCH")
-            .env_remove("PEGAINFER_SPEC_MAX_DRAFTS")
-            .env_remove("PEGAINFER_SPEC_HEDGE")
-            .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
-            .env_remove("PEGAINFER_SPEC_HEDGE_POSITIONS")
-            .env_remove("PEGAINFER_SPEC_HEDGE_KNEE");
-        for &(key, value) in envs {
-            command.env(key, value);
-        }
-        let output = command
-            .output()
-            .unwrap_or_else(|e| panic!("spawn child gate '{child_test}': {e}"));
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        assert!(
-            output.status.success(),
-            "child gate '{child_test}' failed with {envs:?}:\n{}\n{stderr}",
-            String::from_utf8_lossy(&output.stdout),
-        );
-        stderr
-    };
 
     // Every step gated: the one-token round must reproduce plain greedy.
-    let trace = run_child(GREEDY, &[("PEGAINFER_SPEC_MAX_BATCH", "1")]);
+    let trace = run_child_gate(GREEDY, &[("PEGAINFER_SPEC_MAX_BATCH", "1")]);
     let trace_rows = levers_trace_rows(&trace);
     let gated = trace_rows.iter().filter(|row| row.2).count();
     let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
@@ -1111,7 +1113,7 @@ fn dflash_spec_levers_keep_losslessness() {
     for cap in ["4", "2"] {
         let cap_len: usize = cap.parse().expect("numeric draft cap");
         for child_test in [GREEDY, CONCURRENT] {
-            let trace = run_child(child_test, &[("PEGAINFER_SPEC_MAX_DRAFTS", cap)]);
+            let trace = run_child_gate(child_test, &[("PEGAINFER_SPEC_MAX_DRAFTS", cap)]);
             let trace_rows = levers_trace_rows(&trace);
             let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
             let max_drafts = trace_rows.iter().map(|row| row.3).max().unwrap_or(0);
@@ -1132,7 +1134,7 @@ fn dflash_spec_levers_keep_losslessness() {
     }
 
     // Resume, checked per request: aggregate counts cannot show it.
-    let trace = run_child(CONCURRENT, &[("PEGAINFER_SPEC_MAX_BATCH", "3")]);
+    let trace = run_child_gate(CONCURRENT, &[("PEGAINFER_SPEC_MAX_BATCH", "3")]);
     let trace_rows = levers_trace_rows(&trace);
     let gated = trace_rows.iter().filter(|row| row.2).count();
     let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
@@ -1194,6 +1196,10 @@ fn dflash_warm_prefix_keeps_drafting() {
     );
 
     // Cold run: fills both the KV prefix cache and the drafter capture cache.
+    let cold_base = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
     let cold_outcome = engine
         .submit(request(
             prompt_tokens.clone(),
@@ -1204,10 +1210,12 @@ fn dflash_warm_prefix_keeps_drafting() {
     let cold_cached = cold_outcome.cached_tokens.unwrap_or(0);
     let _cold = to_run(cold_outcome);
     assert_eq!(cold_cached, 0, "the first (cache-filling) run must be cold");
-    let before = engine
+    let cold = engine
         .metrics()
         .spec_decode
         .expect("drafter must be loaded");
+    let cold_drafts = cold.num_drafts - cold_base.num_drafts;
+    let cold_accepted = cold.num_accepted_tokens - cold_base.num_accepted_tokens;
 
     // Plain baseline with logprobs: it skips drafting and leaves the commit
     // trace the lossless check needs.
@@ -1235,16 +1243,125 @@ fn dflash_warm_prefix_keeps_drafting() {
         .metrics()
         .spec_decode
         .expect("drafter must be loaded");
+    let warm_drafts = after.num_drafts - cold.num_drafts;
+    let warm_accepted = after.num_accepted_tokens - cold.num_accepted_tokens;
     assert!(
-        after.num_drafts > before.num_drafts,
-        "the warm request did not draft (drafts {} -> {})",
-        before.num_drafts,
-        after.num_drafts
+        cold_drafts > 0 && warm_drafts > 0,
+        "the cold or warm request did not draft (cold {cold_drafts}, warm {warm_drafts})"
+    );
+    let cold_rate = cold_accepted as f64 / cold_drafts as f64;
+    let warm_rate = warm_accepted as f64 / warm_drafts as f64;
+    eprintln!(
+        "warm prefix: cold {cold_drafts} rounds / {cold_accepted} accepted ({cold_rate:.3}); \
+         warm {warm_drafts} rounds / {warm_accepted} accepted ({warm_rate:.3})"
     );
     assert!(
-        after.num_accepted_tokens > before.num_accepted_tokens,
-        "the warm request drafted but accepted nothing (accepted {} -> {})",
-        before.num_accepted_tokens,
-        after.num_accepted_tokens
+        warm_accepted > 0,
+        "the warm request drafted but accepted nothing ({warm_drafts} rounds)"
+    );
+    // The restored rows are the same target hidden states the cold prefill
+    // captured, so the warm accept rate should track the cold rate; a
+    // mis-shifted/truncated restore collapses it far below this floor.
+    assert!(
+        warm_rate >= cold_rate * 0.5,
+        "warm accept rate {warm_rate:.3} is far below the cold rate {cold_rate:.3} \
+         (cold {cold_drafts}/{cold_accepted}, warm {warm_drafts}/{warm_accepted})"
+    );
+}
+
+/// A capture-cache miss must fall back to plain decode, not fail or seed a
+/// shifted draft context. Run in a child so the 1 MiB budget (two blocks, far
+/// less than the prompt) is read at engine start.
+#[test]
+fn dflash_capture_cache_miss_falls_back_to_plain_decode() {
+    const CHILD: &str = "dflash_capture_cache_miss_falls_back_to_plain_decode";
+    const MARKER: &str = "PEGAINFER_CAPTURE_MISS_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        if target_path_or_skip().is_none() || draft_path_or_skip().is_none() {
+            return;
+        }
+        // Hold the in-process GPU lock while the child runs so another test in
+        // this binary cannot load a second engine concurrently.
+        let _gpu = GPU
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stderr = run_child_gate(
+            CHILD,
+            &[("PEGAINFER_SPEC_CAPTURE_CACHE_MB", "1"), (MARKER, "1")],
+        );
+        eprintln!("{stderr}");
+        return;
+    }
+
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let prompt_tokens = tokenizer.encode(&prompt, false).expect("encode failed");
+    assert!(
+        prompt_tokens.len() > 4 * 16,
+        "the prompt must span several 16-token blocks, got {} tokens",
+        prompt_tokens.len()
+    );
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    // 1 MiB holds two 16-token blocks, far less than this prompt's ~22. The
+    // cold run's publishes evict the early blocks, so the warm restore's
+    // all-or-nothing lookup misses.
+    let cold = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams::default(),
+            32,
+        ))
+        .expect_finished();
+    assert_eq!(
+        cold.cached_tokens.unwrap_or(0),
+        0,
+        "the first (cache-filling) run must be cold"
+    );
+    let before = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+
+    let warm = engine
+        .submit(request(prompt_tokens, SamplingParams::default(), 32))
+        .expect_finished();
+    let warm_cached = warm.cached_tokens.unwrap_or(0);
+    assert!(
+        warm_cached > 0,
+        "the warm request must still hit the KV prefix"
+    );
+    assert!(
+        !warm.tokens.is_empty(),
+        "the warm request produced no tokens"
+    );
+
+    let after = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert_eq!(
+        after.num_drafts, before.num_drafts,
+        "a capture-cache miss must fall back to plain decode (drafts {} -> {})",
+        before.num_drafts, after.num_drafts
+    );
+    eprintln!(
+        "capture miss fallback: cached_tokens={warm_cached} drafts={}->{}",
+        before.num_drafts, after.num_drafts
     );
 }

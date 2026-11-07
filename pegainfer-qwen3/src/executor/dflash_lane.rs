@@ -78,6 +78,7 @@ impl DFlashLaneState {
         model: DFlashDraftModel,
         max_decode_batch_size: usize,
         prefix_block_size: usize,
+        capture_cache_bytes: usize,
     ) -> Result<Self> {
         let scratch = model.new_batch_scratch(ctx, max_decode_batch_size)?;
         let sampling = model
@@ -116,14 +117,14 @@ impl DFlashLaneState {
             ctx,
             model.context_feature_dim(),
             prefix_block_size,
-            crate::spec_env::capture_cache_bytes(),
+            capture_cache_bytes,
         )?;
         if let Some(cache) = &capture_cache {
             log::info!(
                 "Qwen3 DFlash capture cache: {} slots x {} tokens ({} MiB budget)",
                 cache.slot_count(),
                 prefix_block_size,
-                crate::spec_env::capture_cache_bytes() / (1024 * 1024)
+                capture_cache_bytes / (1024 * 1024)
             );
         }
         let seal_shift =
@@ -163,9 +164,22 @@ impl DFlashLaneState {
             return Ok(());
         };
         for req in requests {
-            if req.capture_prefix_hashes.is_empty() || self.requests.contains_key(&req.request_id) {
+            if req.capture_prefix_hashes.is_empty()
+                || self.requests.contains_key(&req.request_id)
+                || !super::dflash_prefill::prefill_capture_supported(req)
+            {
                 continue;
             }
+            anyhow::ensure!(
+                req.capture_prefix_hashes.len() * cache.block_size()
+                    == req.cached_tokens.unwrap_or(0),
+                "DFlash prefix capture hashes ({} blocks x {}) disagree with cached_tokens {} \
+                 for {:?}",
+                req.capture_prefix_hashes.len(),
+                cache.block_size(),
+                req.cached_tokens.unwrap_or(0),
+                req.request_id
+            );
             let Some(slots) = cache.lookup(&req.capture_prefix_hashes) else {
                 log::warn!(
                     "Qwen3 DFlash prefix capture miss for {:?}: {} cached tokens not restored; \

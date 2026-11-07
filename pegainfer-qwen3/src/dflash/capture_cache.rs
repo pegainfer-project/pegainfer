@@ -106,6 +106,13 @@ impl DFlashCaptureCache {
         src: &HiddenStates,
         src_token_offset: usize,
     ) -> Result<Option<[u8; 16]>> {
+        anyhow::ensure!(
+            src_token_offset + self.block_size <= src.seq_len,
+            "DFlash capture source range [{}, {}) exceeds seq_len {}",
+            src_token_offset,
+            src_token_offset + self.block_size,
+            src.seq_len
+        );
         let last_used = self.tick();
         if let Some(entry) = self.entries.get_mut(&hash) {
             entry.last_used = last_used;
@@ -144,6 +151,13 @@ impl DFlashCaptureCache {
             slot < self.slot_count,
             "DFlash capture slot {slot} out of range {}",
             self.slot_count
+        );
+        anyhow::ensure!(
+            dst_token_offset + self.block_size <= dst.seq_len,
+            "DFlash capture destination range [{}, {}) exceeds seq_len {}",
+            dst_token_offset,
+            dst_token_offset + self.block_size,
+            dst.seq_len
         );
         ops::copy_hidden_token_range_into(
             ctx,
