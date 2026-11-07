@@ -43,6 +43,7 @@ def main() -> None:
     first_token_at: float | None = None
     pieces: list[str] = []
     finish_reason: str | None = None
+    done_received = False
     with urllib.request.urlopen(request, timeout=180) as response:
         for raw_line in response:
             line = raw_line.decode().strip()
@@ -50,6 +51,7 @@ def main() -> None:
                 continue
             data = line.removeprefix("data:").strip()
             if data == "[DONE]":
+                done_received = True
                 break
             event = json.loads(data)
             if "error" in event:
@@ -58,13 +60,23 @@ def main() -> None:
             if not choices:
                 continue
             choice = choices[0]
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                if reason not in ("stop", "length"):
+                    raise RuntimeError(
+                        f"router generation failed: finish_reason={reason!r}"
+                    )
+                finish_reason = reason
             text = choice.get("text", "")
             if text and first_token_at is None:
                 first_token_at = time.perf_counter()
             pieces.append(text)
-            finish_reason = choice.get("finish_reason") or finish_reason
 
     ended = time.perf_counter()
+    if not done_received:
+        raise RuntimeError("router stream ended before [DONE]")
+    if finish_reason is None:
+        raise RuntimeError("router stream ended without a successful finish_reason")
     if first_token_at is None:
         raise RuntimeError("router completed without emitting text")
     print(
