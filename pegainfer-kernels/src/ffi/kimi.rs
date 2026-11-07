@@ -34,6 +34,10 @@ unsafe extern "C" {
         request_indices: *const i32,
         kv_tile_indices: *const i32,
         kv_chunk_size_ptr: *const i32,
+        slot_indptr: *const i32,
+        row_valid: *const bool,
+        partial_ckv: *mut Half,
+        partial_lse: *mut f32,
         num_qo_heads: i32,
         ckv_stride_page: i64,
         ckv_stride_n: i64,
@@ -41,6 +45,7 @@ unsafe extern "C" {
         kpe_stride_n: i64,
         page_size: i32,
         batch_size: i32,
+        rows: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> i32;

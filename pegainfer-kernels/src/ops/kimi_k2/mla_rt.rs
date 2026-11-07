@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
@@ -107,6 +108,21 @@ pub fn kimi_mla_v_up_rt(
     Ok(())
 }
 
+/// Split-KV plan for one MLA decode step: row `row * tiles + tile` is tile
+/// `tile` of the request on decode row `row`, `slot_indptr` groups each
+/// request's rows for the merge, and `partial_ckv`/`partial_lse` hold one
+/// partial attention result per row.
+pub struct KimiMlaSplitKv<'a> {
+    pub row_slots: &'a CudaSlice<i32>,
+    pub row_tiles: &'a CudaSlice<i32>,
+    pub row_valid: &'a CudaSlice<u8>,
+    pub slot_indptr: &'a CudaSlice<i32>,
+    pub tile_tokens: &'a CudaSlice<i32>,
+    pub partial_ckv: &'a mut CudaSlice<half::bf16>,
+    pub partial_lse: &'a mut CudaSlice<f32>,
+    pub rows: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kimi_flashinfer_batch_decode_mla_rt(
     ctx: &DeviceContext,
@@ -119,13 +135,40 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
     page_indices_d: &CudaSlice<i32>,
     page_indptr_d: &CudaSlice<i32>,
     last_page_len_d: &CudaSlice<i32>,
-    request_indices_d: &CudaSlice<i32>,
-    kv_tile_indices_d: &CudaSlice<i32>,
-    kv_chunk_size_d: &CudaSlice<i32>,
+    split: KimiMlaSplitKv<'_>,
     sm_scale: f32,
     local_heads: usize,
 ) -> Result<()> {
     validate_paged_layout(layout, page_indices_d, page_indptr_d, last_page_len_d)?;
+    ensure!(
+        split.rows >= layout.batch_size,
+        "Kimi MLA split-KV rows {} cannot cover {} requests",
+        split.rows,
+        layout.batch_size
+    );
+    ensure!(
+        split.row_slots.len() >= split.rows
+            && split.row_tiles.len() >= split.rows
+            && split.row_valid.len() >= split.rows,
+        "Kimi MLA split-KV row metadata shorter than {} rows",
+        split.rows
+    );
+    ensure!(
+        split.slot_indptr.len() >= layout.batch_size + 1,
+        "Kimi MLA split-KV indptr {} shorter than {} rows",
+        split.slot_indptr.len(),
+        layout.batch_size + 1
+    );
+    ensure!(
+        !split.tile_tokens.is_empty(),
+        "Kimi MLA split-KV needs a tile length"
+    );
+    ensure!(
+        split.partial_ckv.len() >= split.rows * local_heads * KIMI_K2_MLA_KV_LORA_RANK
+            && split.partial_lse.len() >= split.rows * local_heads,
+        "Kimi MLA split-KV workspace too small for {} rows x {local_heads} heads",
+        split.rows
+    );
     let (q_abs_ptr, _g0) = q_abs_nope.data.device_ptr(&ctx.stream);
     let (q_pe_ptr, _g1) = q_pe.data.device_ptr(&ctx.stream);
     let (out_ptr, _g2) = output.data.device_ptr_mut(&ctx.stream);
@@ -134,9 +177,13 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
     let (pi_ptr, _g5) = page_indices_d.device_ptr(&ctx.stream);
     let (pip_ptr, _g6) = page_indptr_d.device_ptr(&ctx.stream);
     let (lpl_ptr, _g7) = last_page_len_d.device_ptr(&ctx.stream);
-    let (ri_ptr, _g8) = request_indices_d.device_ptr(&ctx.stream);
-    let (kti_ptr, _g9) = kv_tile_indices_d.device_ptr(&ctx.stream);
-    let (kcs_ptr, _g10) = kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _g8) = split.row_slots.device_ptr(&ctx.stream);
+    let (kti_ptr, _g9) = split.row_tiles.device_ptr(&ctx.stream);
+    let (kcs_ptr, _g10) = split.tile_tokens.device_ptr(&ctx.stream);
+    let (sip_ptr, _g11) = split.slot_indptr.device_ptr(&ctx.stream);
+    let (rv_ptr, _g12) = split.row_valid.device_ptr(&ctx.stream);
+    let (pc_ptr, _g13) = split.partial_ckv.device_ptr_mut(&ctx.stream);
+    let (pl_ptr, _g14) = split.partial_lse.device_ptr_mut(&ctx.stream);
     let result = unsafe {
         ffi::kimi_flashinfer_batch_decode_mla_cuda(
             q_abs_ptr as *const ffi::Half,
@@ -150,6 +197,10 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
             ri_ptr as *const i32,
             kti_ptr as *const i32,
             kcs_ptr as *const i32,
+            sip_ptr as *const i32,
+            rv_ptr as *const bool,
+            pc_ptr as *mut ffi::Half,
+            pl_ptr as *mut f32,
             local_heads as i32,
             layout.ckv_stride_page as i64,
             layout.ckv_stride_n as i64,
@@ -157,6 +208,7 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
             layout.kpe_stride_n as i64,
             layout.page_size as i32,
             layout.batch_size as i32,
+            split.rows as i32,
             sm_scale,
             ctx.stream.cu_stream(),
         )
