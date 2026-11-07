@@ -3900,6 +3900,7 @@ name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "pegainfer-frontend",
  "safetensors",
  "serde",
