@@ -52,3 +52,25 @@ HF_ENDPOINT=https://hf-mirror.com .venv/bin/python -u scripts/eval_mc.py mmlu_re
 
 - 补齐 MMLU-Pro / SuperGPQA 抽样全量(各 2000 题,预估合计 ~10h,吞吐 ~450 tok/s 前提)。
 - 若要把 C-Eval 收敛到官方 ±1pp:换更大的 thinking 预算复跑全量(无合并),并确认 Qwen 官方 harness 的 prompt 模板与本评测是否一致。
+
+## Rerun recovery
+
+Rerun artifacts are reusable only with matching source samples and generation
+settings. `eval_rerun_truncated.py` records this provenance in
+`<bench>_rerun_config.json`: the complete base-sample digest, benchmark, model,
+endpoint, temperature, token cap, and stop settings. Keep that sidecar with an
+interrupted rerun's partial JSONL and merged results. Changed inputs/settings or
+legacy artifacts without the sidecar start fresh, with a diagnostic; increasing
+the rerun cap therefore regenerates the truncated base samples at the new cap.
+
+Recovery copies only response fields onto current source metadata and rescores
+with the current extractor. Replacement data refreshes stale rerun scores even
+when no new generation is needed. An unchanged interrupted run retains completed
+responses without duplicate HTTP requests. A numeric index alone is insufficient:
+a stale partial previously replaced the current prompt and gold answer, silently
+reporting 100% in a local CLI reproduction whose fresh control scored 50%.
+
+This recovery contract is checked through real CLI subprocesses with local HTTP
+fixtures and the installed `httpx`/`datasets` dependencies. These checks validate
+harness provenance and scoring; the model evaluations above still need the GPU
+reruns listed under 下一步 before updating their reported accuracy.

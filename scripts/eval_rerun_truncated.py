@@ -10,14 +10,30 @@ new outputs back, and writes:
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from eval_mc import (first_capital, mmlupro_extract, repair_jsonl_tail,
                      sg_extract_labels, sg_extract_content, STOP_MAP)
 import httpx
+
+
+def restore_response(row, previous):
+    # Checkpoints own generated text, never the current dataset's gold,
+    # options, subject, or other source metadata.
+    restored = dict(row)
+    for field in ('output', 'reasoning', 'completion_tokens', 'finish_reason'):
+        if field in previous:
+            restored[field] = previous[field]
+    if previous.get('rerun_failed'):
+        restored['rerun_failed'] = True
+    else:
+        restored.pop('rerun_failed', None)
+    return restored
 
 
 def extract(bench, item, text):
@@ -46,6 +62,7 @@ async def run(base_url, model, temperature, rows, bench, max_tokens, concurrency
     # Recover rows from a killed previous attempt before touching the
     # checkpoint: the partial JSONL is appended to, never truncated.
     out_rows = {}
+    current_by_idx = {row['idx']: row for row in rows}
     if partial_path.exists():
         repair_jsonl_tail(partial_path, 'rerun')
         for line in partial_path.read_text(encoding='utf-8').splitlines():
@@ -53,8 +70,10 @@ async def run(base_url, model, temperature, rows, bench, max_tokens, concurrency
                 prev = json.loads(line)
             except json.JSONDecodeError:
                 continue  # defensive: repair_jsonl_tail cleaned the file
-            if prev.get('output') and not prev.get('rerun_failed'):
-                out_rows[prev['idx']] = prev
+            row = current_by_idx.get(prev.get('idx'))
+            if (row is not None and prev.get('prompt') == row['prompt']
+                    and prev.get('output') and not prev.get('rerun_failed')):
+                out_rows[row['idx']] = restore_response(row, prev)
         if out_rows:
             print(f'[rerun] recovered {len(out_rows)} completed rows from {partial_path.name}',
                   flush=True)
@@ -131,6 +150,43 @@ def main():
     args = ap.parse_args()
 
     out = Path(args.out_dir)
+    base_samples = json.loads((out / f'{args.benchmark}_samples.json').read_text())
+    summary = json.loads((out / f'{args.benchmark}_summary.json').read_text())
+    model = args.model or summary['model']
+    if model != summary['model']:
+        sys.exit(f"refusing to mix configurations: --model {model!r} does not match the "
+                 f"initial run's model {summary['model']!r} in "
+                 f"{out / f'{args.benchmark}_summary.json'}")
+    temperature = summary.get('temperature', 0.0)
+    merged_path = out / f'{args.benchmark}_samples_merged.json'
+    partial_path = out / f'{args.benchmark}_rerun.partial.jsonl'
+    config_path = out / f'{args.benchmark}_rerun_config.json'
+    has_rerun_results = (merged_path.exists() or partial_path.exists()
+                         or 'acc_merged' in summary)
+    fingerprint = json.dumps({
+        'version': 1, 'benchmark': args.benchmark, 'base_url': args.base_url,
+        'model': model, 'temperature': temperature, 'max_tokens': args.max_tokens,
+        'top_p': 1.0, 'stop': STOP_MAP.get(args.benchmark, []),
+        'samples_sha256': hashlib.sha256(json.dumps(
+            base_samples, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest(),
+    }, sort_keys=True)
+    same_run = (config_path.exists()
+                and config_path.read_text(encoding='utf-8') == fingerprint)
+    # Neither a numeric index nor prompt equality proves which generation
+    # settings produced a response. Legacy artifacts lack this provenance
+    # and must also start fresh rather than silently mixing evaluations.
+    if not same_run:
+        for stale in (merged_path, partial_path):
+            if stale.exists():
+                print(f'[rerun] {stale.name} does not match the current source samples '
+                      'and generation settings; starting fresh', file=sys.stderr, flush=True)
+                stale.unlink()
+        # A killed write must not tear the provenance used to recover
+        # completed responses. Matching sidecars are left untouched.
+        with tempfile.TemporaryDirectory(prefix=f'.{args.benchmark}_rerun-', dir=out) as tmp:
+            replacement = Path(tmp) / config_path.name
+            replacement.write_text(fingerprint, encoding='utf-8')
+            replacement.replace(config_path)
     # Resume from the merged state when a previous rerun already fixed some
     # rows: regenerating them would burn the large-budget completions again
     # and could turn a previously successful row into a failure. The merged
@@ -138,39 +194,32 @@ def main():
     # evaluation in this directory would have been overwritten by eval_mc
     # but the stale merged file could linger otherwise) — validate the
     # length and per-row prompt linkage before trusting it.
-    base_samples = json.loads((out / f'{args.benchmark}_samples.json').read_text())
-    merged_path = out / f'{args.benchmark}_samples_merged.json'
     if merged_path.exists():
         candidate = json.loads(merged_path.read_text())
         linked = (len(candidate) == len(base_samples)
-                  and all(c.get('prompt') == b.get('prompt')
+                  and all(c.get('idx') == b.get('idx')
+                          and c.get('prompt') == b.get('prompt')
                           for c, b in zip(candidate, base_samples)))
         if not linked:
             sys.exit(f'refusing to resume from {merged_path}: it does not match the '
                      'current base samples (stale rerun data from an older run). '
                      'Re-run eval_mc.py (it now clears stale rerun artifacts) or remove the file.')
-        samples = candidate
+        samples = [restore_response(base, previous) if not base['output'] else dict(base)
+                   for base, previous in zip(base_samples, candidate)]
         print(f'{args.benchmark}: resuming from {merged_path.name}', flush=True)
     else:
         samples = base_samples
-    summary = json.loads((out / f'{args.benchmark}_summary.json').read_text())
-
-    model = args.model or summary['model']
-    if model != summary['model']:
-        sys.exit(f"refusing to mix configurations: --model {model!r} does not match the "
-                 f"initial run's model {summary['model']!r} in "
-                 f"{out / f'{args.benchmark}_summary.json'}")
-    temperature = summary.get('temperature', 0.0)
-
     bad = [s for s in samples if not s['output']]
     print(f"{args.benchmark}: {len(samples)} total, {len(bad)} to re-run with "
           f"max_tokens={args.max_tokens} (model={model}, temperature={temperature})", flush=True)
-    if not bad:
+    # Invalidating a cache also invalidates its summary scores, even when
+    # the replacement source needs no new generations.
+    if not bad and not has_rerun_results:
         return
     fixed, rerun_errors = asyncio.run(run(args.base_url, model, temperature, bad,
                                           args.benchmark, args.max_tokens,
                                           args.concurrency, args.timeout,
-                                          out / f'{args.benchmark}_rerun.partial.jsonl'))
+                                          partial_path))
     fixed_by_idx = {f['idx']: f for f in fixed}
     merged = []
     for s in samples:
@@ -180,7 +229,7 @@ def main():
         merged.append(m)
     n_ok = sum(1 for m in merged if m['correct'])
     n_trunc_left = sum(1 for m in merged if not m['output'])
-    acc = round(100.0 * n_ok / len(merged), 2)
+    acc = round(100.0 * n_ok / max(len(merged), 1), 2)
     # Recompute the failure state from the merged rows; keep the initial
     # run's counts under explicit initial_* fields instead of letting a
     # stale incomplete flag stand after every failed row got fixed. A retry
