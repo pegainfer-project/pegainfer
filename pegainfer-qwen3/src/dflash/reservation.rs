@@ -40,13 +40,25 @@ impl DFlashMemoryReservation {
         draft_path: &str,
         logits_rows: usize,
         max_decode_batch_size: usize,
+        capture_cache_bytes: usize,
+        prefix_block_size: usize,
     ) -> Result<Self> {
         let mut config = DFlashConfig::from_file(draft_path)?;
         config.logits_rows = logits_rows;
-        Self::from_config(&config, max_decode_batch_size)
+        Self::from_config(
+            &config,
+            max_decode_batch_size,
+            capture_cache_bytes,
+            prefix_block_size,
+        )
     }
 
-    pub(crate) fn from_config(config: &DFlashConfig, max_decode_batch_size: usize) -> Result<Self> {
+    pub(crate) fn from_config(
+        config: &DFlashConfig,
+        max_decode_batch_size: usize,
+        capture_cache_bytes: usize,
+        prefix_block_size: usize,
+    ) -> Result<Self> {
         const BF16: usize = 2;
         let hidden = config.hidden_size;
         let kv_dim = sizing::product(&[config.num_key_value_heads, config.head_dim])?;
@@ -150,6 +162,17 @@ impl DFlashMemoryReservation {
         } else {
             0
         };
+        // Per-request partial-block seal (2 KV blocks of captured rows) plus
+        // the lane's one-block shift buffer. Zero when the capture cache is off
+        // (`prefix_block_size == 0`), so `--no-prefix-cache` does not reserve
+        // state it never allocates.
+        let seal_bytes = sizing::product(&[
+            hidden,
+            capture_layers,
+            sizing::product(&[2, prefix_block_size])?,
+            BF16,
+        ])?;
+        let seal_total = sizing::product(&[seal_bytes, max_decode_batch_size.saturating_add(1)])?;
 
         Ok(Self {
             kv_bytes_per_token,
@@ -161,6 +184,8 @@ impl DFlashMemoryReservation {
                 native,
                 selector,
                 sampling,
+                capture_cache_bytes,
+                seal_total,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),

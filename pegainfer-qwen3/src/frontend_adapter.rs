@@ -109,6 +109,7 @@ pub(crate) fn start_qwen3(
         draft,
         memory_options,
         decode_overlap,
+        !no_prefix_cache,
     )?;
     if let Some(path) = dump_graph_png {
         let summary = executor.dump_decode_graph_png(path)?;
@@ -124,9 +125,11 @@ pub(crate) fn start_qwen3(
     executor.set_no_prefix_cache(no_prefix_cache);
     executor.enable_decode_overlap(decode_overlap)?;
     // Speculative decoding loads its draft model after the target is up (the
-    // draft is built against the target's embeddings/head) and forces the
-    // prefix cache off, so it must follow set_no_prefix_cache. Its GPU footprint
-    // was already reserved during profiling from the draft path passed above.
+    // draft is built against the target's embeddings/head). DFlash keeps the
+    // prefix cache on when its capture cache is enabled and forces it off
+    // otherwise; either way the lane must see the final `set_no_prefix_cache`
+    // decision. Its GPU footprint was already reserved during profiling from
+    // the draft path passed above.
     if let Some(draft) = draft {
         executor.load_draft_model(draft)?;
     }

@@ -2,7 +2,7 @@
 
 **TL;DR**: Prefix caching is on by default for Qwen3-4B. Full-block token-hash matching via the vendored kvbm radix tree, wired at the executor level. Repeated ~1900-token prompt: TTFT 141.8ms → 16.3ms p50 (8.7×); warm TTFT ≈ 1 decode TPOT (11.4ms) + ~5ms request-setup/eager-launch overhead. Accuracy gated by `hf_golden_gate` cached-replay surfaces (warm deltas at the cold bf16 floor).
 
-Last touched: 2026-07
+Last touched: 2026-11
 
 ## How it works
 
@@ -14,6 +14,21 @@ Last touched: 2026-07
 - Eviction safety: matched blocks are held as `ImmutableBlock` (strong Arc) in the sequence's assignments for the request lifetime; the inactive-pool LRU cannot reclaim them mid-request.
 - **Pages are counted by reference, not by physical block.** N views holding the same cached prefix each list those page ids again, so anything sized off the pool's *physical* block count under-allocates under sharing — admission won't catch it, it also charges physical blocks. `BatchDecodeBuffers::page_indices_d` hit exactly this (#403 fault 1: cudarc copy assert → dead worker → wedged engine; deterministic with N concurrent same-prompt requests once the prefix is sealed). It is now sized for `max_batch × full-context views` and `sync_paged_meta` fails loud instead of tripping the assert. Any future consumer of concatenated per-request page lists must use the by-reference bound.
 - Toggle: `Qwen3Executor::set_prefix_cache_enabled(false)` — used by tests that need cold determinism; there is no server flag.
+
+## With speculative decoding (DFlash / DSpark)
+
+A prefix hit skips the forward that produces the drafter's target hidden rows, so the target KV alone is not enough to speculate. The engine keeps a **drafter capture cache**: each sealed 16-token KV block stores its aux hidden rows (`5 × 2560` bf16 = 25.6 KB/token on Qwen3-4B), keyed by the same `SequenceHash` lineage.
+
+- **Lifetime:** the capture cache is a lane-owned side cache with its own LRU and budget, not part of the KV block's refcount. A capture entry can be evicted while its KV block survives; the hit then falls back (below). Moving the payload into the KV block state so both share one lifetime is the follow-up tracked in #1238.
+- **Budget:** `PEGAINFER_SPEC_CAPTURE_CACHE_MB` (default 128 MiB; explicit `0` disables it, as does `--no-prefix-cache`). The budget is a fixed term in `DFlashMemoryReservation`, so the KV pool shrinks to fit. 128 MiB holds ~327 blocks (~5k tokens).
+- **Restore:** a prefix match hands the matched block hashes to the worker, which copies the rows into the draft's `pending_context`: the suffix prefill appends the rest and the first draft round rebuilds the draft KV from the restored rows. `draft_ready` still comes from the capture set + completed flag.
+- **Miss:** if any matched block has no capture entry (LRU eviction, or blocks sealed before the cache), the request keeps the target KV hit but is not draft-ready; the all-or-nothing gate falls back to plain decode. Correctness is unchanged; the request just does not speculate.
+- **Scope:** DFlash/DSpark only. EAGLE-3 has no capture cache yet and keeps the old `spec-on ⇒ APC off` behavior.
+- **Accounting:** the capture budget, the per-request partial-block seal, and the lane shift buffer are charged up front. The draft's own KV is still billed per pool block; with shared prefixes that is not a per-request bound yet (tracked in #1238).
+
+The warm-hit gate is `dflash_warm_prefix_keeps_drafting` in `tests/dflash_speculative_gate.rs`: cold fill, plain baseline, then a warm request that must hit the prefix, stay lossless up to bf16 ties, and keep the cold accept rate.
+
+**L20 run record** (2026-11, Qwen3-4B, `deepseek-ai/dflash_qwen3_4b_block7`, release): the warm gate reports **4 draft rounds / 27 accepted on both the cold and warm requests**; the 1 MiB capture-cache gate reports **400 cached tokens and 4 → 4 drafts** (a miss falls back to plain decode); the lever gate (`MAX_BATCH=1`, `MAX_DRAFTS=4/2`, `MAX_BATCH=3`) passes with the gated and trimmed rows. Run on one L20.
 
 ## Numbers (RTX 5090, 2026-06, drained-stream measurement)
 

@@ -13,11 +13,13 @@ use crate::dspark::MarkovScratch;
 use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
+mod capture_cache;
 mod conv;
 mod loading;
 mod reservation;
 mod selector;
 
+pub(crate) use capture_cache::DFlashCaptureCache;
 use conv::ConvScratch;
 use conv::LayerConvs;
 pub(crate) use reservation::DFlashMemoryReservation;
@@ -57,6 +59,18 @@ pub(crate) struct DFlashRequestState {
     context: DFlashContextScratch,
     committed_len: usize,
     max_cache_len: usize,
+    /// Committed target tokens whose hidden rows are in the capture history
+    /// (restored prefix + rows captured by this request).
+    captured_len: usize,
+    /// KV blocks already published to the prefix capture cache.
+    published_blocks: usize,
+    /// Rows of the partially-filled block that follows `published_blocks`:
+    /// prefill's tail plus the accepted rows appended by each verify round.
+    seal: HiddenStates,
+    seal_len: usize,
+    /// True while `pending_context` is the whole captured prompt (the first
+    /// draft round consumes it); false once verify rounds feed it in pieces.
+    pending_is_history: bool,
 }
 
 struct DFlashLayerCache {
@@ -118,6 +132,13 @@ pub(crate) struct DFlashBatchScratch {
 impl DFlashRequestState {
     pub(crate) fn pending_context_len(&self) -> Option<usize> {
         (self.pending_context.len > 0).then_some(self.pending_context.len)
+    }
+
+    /// The prefill chunk capture is now the pending history; the first draft
+    /// round will build the draft KV from it.
+    pub(crate) fn note_prefill_capture(&mut self) {
+        self.captured_len = self.pending_context.len;
+        self.pending_is_history = true;
     }
 }
 
@@ -470,6 +491,7 @@ impl DFlashDraftModel {
         &self,
         ctx: &DeviceContext,
         max_cache_len: usize,
+        prefix_block_size: usize,
     ) -> Result<DFlashRequestState> {
         anyhow::ensure!(
             max_cache_len <= self.config.max_position_embeddings,
@@ -499,6 +521,11 @@ impl DFlashDraftModel {
             )?,
             committed_len: 0,
             max_cache_len,
+            captured_len: 0,
+            published_blocks: 0,
+            seal: HiddenStates::zeros(ctx, self.context_feature_dim(), prefix_block_size * 2)?,
+            seal_len: 0,
+            pending_is_history: false,
         })
     }
 
@@ -543,6 +570,159 @@ impl DFlashDraftModel {
             token_count,
             state.max_cache_len,
         )?;
+        Ok(())
+    }
+
+    /// Seed a request's pending context from cached prefix blocks. The draft KV
+    /// is rebuilt from these rows by the first draft round, exactly as it is
+    /// from a cold prefill's capture.
+    pub(crate) fn append_restored_context(
+        ctx: &DeviceContext,
+        state: &mut DFlashRequestState,
+        cache: &DFlashCaptureCache,
+        slots: &[usize],
+    ) -> Result<()> {
+        let block = cache.block_size();
+        let total = slots
+            .len()
+            .checked_mul(block)
+            .context("DFlash restored context length overflow")?;
+        anyhow::ensure!(
+            total + block <= state.max_cache_len,
+            "DFlash restored context {} + block {} exceeds max cache {}",
+            total,
+            block,
+            state.max_cache_len
+        );
+        state
+            .pending_context
+            .ensure_capacity(ctx, total, state.max_cache_len)?;
+        // `copy_block` bounds-checks against `seq_len`, which is the logical
+        // extent here, so expose the whole allocation while filling it.
+        state.pending_context.buffer.seq_len = state.pending_context.capacity;
+        for (i, slot) in slots.iter().enumerate() {
+            cache.copy_block(ctx, *slot, &mut state.pending_context.buffer, i * block)?;
+        }
+        state.pending_context.len = total;
+        state.pending_context.buffer.seq_len = total;
+        state.captured_len = total;
+        state.published_blocks = slots.len();
+        state.pending_is_history = true;
+        Ok(())
+    }
+
+    /// Append the accepted verify rows to the partial block's seal buffer.
+    pub(crate) fn append_seal_rows(
+        ctx: &DeviceContext,
+        state: &mut DFlashRequestState,
+        captured_hidden: &HiddenStates,
+        token_offset: usize,
+        token_count: usize,
+    ) -> Result<()> {
+        if token_count == 0 || state.seal.seq_len == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            captured_hidden.seq_len >= token_offset + token_count,
+            "DFlash seal source range [{}, {}) exceeds captured rows {}",
+            token_offset,
+            token_offset + token_count,
+            captured_hidden.seq_len
+        );
+        anyhow::ensure!(
+            state.seal_len + token_count <= state.seal.seq_len,
+            "DFlash seal buffer overflow: {} + {} > {}",
+            state.seal_len,
+            token_count,
+            state.seal.seq_len
+        );
+        debug_assert_eq!(
+            state.seal_len,
+            state.captured_len - state.published_blocks * (state.seal.seq_len / 2),
+            "DFlash capture seal/ledger drift"
+        );
+        ops::copy_hidden_token_range_into(
+            ctx,
+            captured_hidden,
+            token_offset,
+            &mut state.seal,
+            state.seal_len,
+            token_count,
+        )?;
+        state.seal_len += token_count;
+        state.captured_len += token_count;
+        state.pending_is_history = false;
+        Ok(())
+    }
+
+    /// Publish every fully captured, committed KV block to the prefix cache.
+    /// `hashes` is the request's full assigned-block list in order; the first
+    /// `published_blocks` entries are already published (a restored prefix).
+    pub(crate) fn publish_prefix_captures(
+        ctx: &DeviceContext,
+        state: &mut DFlashRequestState,
+        cache: &mut DFlashCaptureCache,
+        hashes: &[[u8; 16]],
+        sealed_tokens: usize,
+        shift: &mut HiddenStates,
+    ) -> Result<()> {
+        let block = cache.block_size();
+        let target_blocks = state.captured_len.min(sealed_tokens) / block;
+        if target_blocks > state.published_blocks {
+            anyhow::ensure!(
+                hashes.len() >= target_blocks,
+                "DFlash capture publish needs {} block hashes, got {}",
+                target_blocks,
+                hashes.len()
+            );
+        }
+
+        if state.pending_is_history {
+            // Publish from the full prompt capture, then keep the partial tail
+            // for the verify rounds. This must also run when no block is full
+            // yet (a short prompt): the tail is the seed for later verifies.
+            for (i, hash) in hashes
+                .iter()
+                .enumerate()
+                .take(target_blocks)
+                .skip(state.published_blocks)
+            {
+                let _ = cache.insert(ctx, *hash, &state.pending_context.buffer, i * block)?;
+            }
+            let tail_start = target_blocks * block;
+            let tail_len = state.captured_len - tail_start;
+            state.seal_len = tail_len;
+            if tail_len > 0 {
+                ops::copy_hidden_token_range_into(
+                    ctx,
+                    &state.pending_context.buffer,
+                    tail_start,
+                    &mut state.seal,
+                    0,
+                    tail_len,
+                )?;
+            }
+            state.pending_is_history = false;
+        } else if target_blocks > state.published_blocks {
+            let start = state.published_blocks;
+            for (i, hash) in hashes.iter().enumerate().take(target_blocks).skip(start) {
+                let _ = cache.insert(ctx, *hash, &state.seal, (i - start) * block)?;
+            }
+            let consumed = (target_blocks - start) * block;
+            let remaining = state.seal_len - consumed;
+            if remaining > 0 {
+                anyhow::ensure!(
+                    shift.seq_len >= remaining,
+                    "DFlash seal shift buffer too small: {} < {}",
+                    shift.seq_len,
+                    remaining
+                );
+                ops::copy_hidden_token_range_into(ctx, &state.seal, consumed, shift, 0, remaining)?;
+                ops::copy_hidden_token_range_into(ctx, shift, 0, &mut state.seal, 0, remaining)?;
+            }
+            state.seal_len = remaining;
+        }
+        state.published_blocks = target_blocks;
         Ok(())
     }
 
@@ -973,7 +1153,7 @@ impl DFlashDraftModel {
         )
     }
 
-    fn context_feature_dim(&self) -> usize {
+    pub(crate) fn context_feature_dim(&self) -> usize {
         self.config.hidden_size * self.target_layer_ids().len()
     }
 
@@ -1051,9 +1231,10 @@ mod tests {
         // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
-        let reservation =
-            super::DFlashMemoryReservation::from_config(&dflash, /*max_decode_batch*/ 256)
-                .expect("reservation sizing");
+        let reservation = super::DFlashMemoryReservation::from_config(
+            &dflash, /*max_decode_batch*/ 256, 0, 0,
+        )
+        .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
@@ -1061,9 +1242,24 @@ mod tests {
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1)
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1, 0, 0)
             .expect("reservation sizing")
             .fixed_bytes;
+        // The capture cache is a fixed term; the budget passes through unshaped
+        // so a knob typo cannot silently under-reserve it. Enabling it also
+        // allocates one partial-block seal per request plus the lane's shift
+        // buffer, both of which must be reserved.
+        let with_capture =
+            super::DFlashMemoryReservation::from_config(&dflash, 1, 128 * 1024 * 1024, 16)
+                .expect("reservation sizing")
+                .fixed_bytes;
+        let capture_dim = dflash.hidden_size * dflash.target_layer_ids.len();
+        let seal_bytes = capture_dim * 2 * 16 * 2; // two KV blocks of bf16 rows
+        assert_eq!(
+            with_capture - fixed_batch1,
+            128 * 1024 * 1024 + 2 * seal_bytes,
+            "capture cache + per-request seal + lane shift must be reserved"
+        );
         assert!(
             (1_150_000_000..1_220_000_000).contains(&fixed_batch1),
             "draft weights ~1.1GiB, got {fixed_batch1}"
