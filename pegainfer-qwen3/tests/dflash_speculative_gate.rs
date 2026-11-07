@@ -1196,10 +1196,9 @@ fn dflash_warm_prefix_keeps_drafting() {
     );
 
     // Cold run: fills both the KV prefix cache and the drafter capture cache.
-    let cold_base = engine
-        .metrics()
-        .spec_decode
-        .expect("drafter must be loaded");
+    // Metrics before the first served step expose no counters yet; the delta
+    // from zero is still the cold run's own contribution.
+    let cold_base = engine.metrics().spec_decode.unwrap_or_default();
     let cold_outcome = engine
         .submit(request(
             prompt_tokens.clone(),
