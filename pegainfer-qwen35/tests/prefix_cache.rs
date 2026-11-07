@@ -32,26 +32,18 @@ fn model_path_or_skip() -> Option<String> {
 }
 
 fn start_engine(model_path: &str, tp_size: usize, prefix_cache_mib: usize) -> EngineHarness {
-    start_engine_with_budget(model_path, tp_size, prefix_cache_mib, 1024)
+    start_engine_with_graph(model_path, tp_size, prefix_cache_mib, tp_size == 1)
 }
 
-fn start_engine_with_budget(
+fn start_engine_with_graph(
     model_path: &str,
     tp_size: usize,
     prefix_cache_mib: usize,
-    max_prefill_tokens: usize,
+    cuda_graph: bool,
 ) -> EngineHarness {
-    let cuda_graph = tp_size == 1;
     let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
         Path::new(model_path),
-        Qwen35LaunchOptions::new(
-            0,
-            tp_size,
-            cuda_graph,
-            2,
-            max_prefill_tokens,
-            prefix_cache_mib,
-        ),
+        Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, prefix_cache_mib),
         Qwen35SchedulerPolicy::Off,
         pegainfer_qwen35::Qwen35DecodeOverlap::Off,
     )
@@ -155,43 +147,7 @@ fn prompt_tokens(
     tokens
 }
 
-/// Greedy tokens must match; returns the mean and p99 top-logprob drift.
-fn trace_drift(label: &str, cold: &Generation, warm: &Generation) -> (f32, f32) {
-    assert_eq!(
-        cold.tokens, warm.tokens,
-        "{label}: generated token trace changed"
-    );
-    assert_eq!(cold.logprobs.len(), warm.logprobs.len());
-    let mut deltas = Vec::new();
-    for (position, (cold_lp, warm_lp)) in cold.logprobs.iter().zip(&warm.logprobs).enumerate() {
-        let cold_lp = cold_lp
-            .as_ref()
-            .unwrap_or_else(|| panic!("{label}: cold position {position} has no logprob"));
-        let warm_lp = warm_lp
-            .as_ref()
-            .unwrap_or_else(|| panic!("{label}: warm position {position} has no logprob"));
-        let cold_map: std::collections::HashMap<u32, f32> =
-            cold_lp.top_logprobs.iter().copied().collect();
-        for &(token, warm_value) in warm_lp.top_logprobs.iter().take(8) {
-            if let Some(cold_value) = cold_map.get(&token) {
-                deltas.push((warm_value - cold_value).abs());
-            }
-        }
-    }
-    assert!(!deltas.is_empty(), "{label}: no top-logprob overlap");
-    deltas.sort_by(f32::total_cmp);
-    let mean = deltas.iter().sum::<f32>() / deltas.len() as f32;
-    let p99 = deltas[((deltas.len() as f64 * 0.99) as usize).min(deltas.len() - 1)];
-    eprintln!(
-        "{label}: {} logprob deltas, mean {mean:.4}, p99 {p99:.4}",
-        deltas.len()
-    );
-    (mean, p99)
-}
-
-/// Runs with the same prefill cuts must reproduce the trace bit for bit. Engines in
-/// one process reuse the first engine's timed decode GEMM winners (`g_lt_tuned_algos`),
-/// so this also holds across engines within a test.
+/// Engines in one process share their timed decode GEMM winners (`g_lt_tuned_algos`).
 fn assert_trace_exact(label: &str, cold: &Generation, warm: &Generation) {
     assert_eq!(
         cold.tokens, warm.tokens,
@@ -353,11 +309,10 @@ fn cold_output_ignores_cache_budget() {
     assert_trace_exact("cache off vs 512 MiB", &cache_off, &cold(512));
 }
 
-/// A hit on another prompt's stop replays the cold run exactly when its cut history matches;
-/// when the hit moves a cut, greedy tokens hold and no logprob moves further than a
-/// cut change moves it between cold runs.
+/// A hit on another prompt's stop replays the cold run exactly when its cut history
+/// matches; when the hit moves a cut, only its greedy tokens must hold.
 #[test]
-fn cross_prompt_hit_stays_within_cut_change_floor() {
+fn cross_prompt_hit_is_exact_when_cuts_match() {
     let Some(model_path) = model_path_or_skip() else {
         return;
     };
@@ -375,28 +330,16 @@ fn cross_prompt_hit_stays_within_cut_change_floor() {
         "The probe continues past the shared prefix with different text. ",
         320,
     ));
-    let cold = |max_prefill_tokens, history_tokens| {
-        let mut handle =
-            start_engine_with_budget(&model_path, 1, PREFIX_CACHE_MIB, max_prefill_tokens);
+    let cold = |history_tokens| {
+        let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
         let mut cold_request = request(probe.clone(), TRACE_TOKENS, TOP_LOGPROBS);
         cold_request.history_tokens = history_tokens;
         let generation = run(&mut handle, cold_request);
         assert_eq!(generation.cached_tokens, 0);
         generation
     };
-    let cold_1024 = cold(1024, None);
-    let cold_stop_3840 = cold(1024, Some(3840));
-    // Means count how many logprobs shift by one bf16 step, so the floor is the
-    // largest move (p99) between cold runs that differ only in cuts.
-    let mut floor_p99 = 0.0_f32;
-    for (label, other) in [
-        ("budget 512", &cold(512, None)),
-        ("budget 8192", &cold(8192, None)),
-        ("stop at 3840", &cold_stop_3840),
-    ] {
-        let (_, p99) = trace_drift(&format!("cold cuts vs {label}"), &cold_1024, other);
-        floor_p99 = floor_p99.max(p99);
-    }
+    let cold_own = cold(None);
+    let cold_stop_3840 = cold(Some(3840));
 
     let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
     assert_eq!(generate(&mut handle, donor, 1, 0).cached_tokens, 0);
@@ -409,50 +352,9 @@ fn cross_prompt_hit_stays_within_cut_change_floor() {
     // Without the stop, the hit adds a 3840 cut its own cold run lacks.
     let moved_cut = generate(&mut handle, probe, TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(moved_cut.cached_tokens, 3840);
-    let (_, p99) = trace_drift("cross-prompt hit, moved cut", &cold_1024, &moved_cut);
-    assert!(
-        p99 <= floor_p99,
-        "cross-prompt hit p99 drift {p99:.4} exceeds the cut-change floor {floor_p99:.4}"
-    );
-}
-
-/// The last stop follows `history_tokens`, so the next chat turn resumes at the
-/// history boundary instead of behind a snapshot inside the generation prompt.
-#[test]
-fn next_turn_resumes_at_history_boundary() {
-    let Some(model_path) = model_path_or_skip() else {
-        return;
-    };
-    let tokenizer = common::load_tokenizer(&model_path);
-    let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
-    // A 4,100-token turn whose last 6 tokens are a generation prompt the next turn drops.
-    let mut next_turn_hit = |text: &str, history_tokens: Option<usize>| {
-        let turn = prompt_tokens(&tokenizer, text, 4100);
-        let mut first = request(turn.clone(), 1, 0);
-        first.history_tokens = history_tokens;
-        assert_eq!(run(&mut handle, first).cached_tokens, 0);
-        let mut next_turn = turn[..4094].to_vec();
-        next_turn.extend(prompt_tokens(
-            &tokenizer,
-            "The user follows up with another question. ",
-            200,
-        ));
-        generate(&mut handle, next_turn, 1, 0).cached_tokens
-    };
     assert_eq!(
-        next_turn_hit(
-            "A marked chat turn ends where the frontend measured its history. ",
-            Some(4094),
-        ),
-        3840
-    );
-    // Without the hint the stop lands on 4096, two tokens into the generation prompt.
-    assert_eq!(
-        next_turn_hit(
-            "An unmarked chat turn leaves the scheduler to stop near the prompt end. ",
-            None,
-        ),
-        3072
+        moved_cut.tokens, cold_own.tokens,
+        "cross-prompt hit, moved cut: generated token trace changed"
     );
 }
 

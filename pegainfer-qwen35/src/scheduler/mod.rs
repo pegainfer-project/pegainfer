@@ -718,10 +718,8 @@ fn active_request_kv(request: &mut ActiveRequest35) -> Option<&mut RequestKv> {
         ActiveBackendState::Tp { .. } => None,
     }
 }
-/// Tokens one prefill step forwards. With the cache on, an unfinished step rounds
-/// its end down to a stride boundary and the last boundary at or below
-/// `history_tokens` (else the prompt length) is a step end, so cuts depend only on
-/// budget and prompt.
+/// Tokens one prefill step forwards: with the cache on, an unfinished step ends on a
+/// stride boundary and the history stop is always a step end.
 fn prefill_step_chunk(
     cursor: usize,
     chunk: usize,

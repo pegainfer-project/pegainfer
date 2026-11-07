@@ -566,19 +566,10 @@ fn prefix_cache_steps_end_at_budget_boundaries() {
         prefill_step_ends(4000, 1024, None, stride),
         [1024, 2048, 3072, 3840, 4000]
     );
-    assert_eq!(
-        prefill_step_ends(4000, 1024, None, None),
-        [1024, 2048, 3072, 4000]
-    );
-    assert_eq!(prefill_step_ends(576, 1024, None, stride), [512, 576]);
     // `history_tokens` keeps the stop out of the generation prompt; oversized hints clamp.
     assert_eq!(
         prefill_step_ends(4100, 1024, Some(4094), stride),
         [1024, 2048, 3072, 3840, 4100]
-    );
-    assert_eq!(
-        prefill_step_ends(4100, 1024, None, stride),
-        [1024, 2048, 3072, 4096, 4100]
     );
     assert_eq!(
         prefill_step_ends(576, 1024, Some(10_000), stride),

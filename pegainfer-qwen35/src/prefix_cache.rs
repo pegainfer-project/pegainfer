@@ -326,7 +326,6 @@ impl Qwen35PrefixCache {
             .pool()
             .active_prefix_hashes(prompt_tokens.to_vec(), lora_name);
         let block_size = self.kv.pool().block_size();
-        // Credit only what `begin_request` can attach: nothing past the history stop.
         let resident_tokens = (hashes.len() * block_size).min(history_stop(
             prompt_tokens.len(),
             history_tokens,
