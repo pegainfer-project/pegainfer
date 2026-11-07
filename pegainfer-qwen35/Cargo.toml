@@ -63,6 +63,10 @@ required-features = ["qwen35"]
 name = "serving_tp2"
 required-features = ["qwen35"]
 
+[[test]]
+name = "qwen38fn_gdn_prefill_parity"
+required-features = ["qwen35"]
+
 [[bench]]
 harness = false
 name = "qwen35_ops"

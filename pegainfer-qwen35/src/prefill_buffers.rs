@@ -20,10 +20,17 @@ use super::config::LocalGeometry;
 /// Buffers are explicit because the chunk-wise path is naturally a multi-stage
 /// pipeline rather than one opaque kernel launch.
 pub struct GdrChunkwiseScratch35 {
-    /// Chunk-local cumulative gate, fp32: [seq_len, num_value_heads]
-    pub(crate) g_cumsum: CudaSlice<f32>,
-    /// Beta values, fp32: [seq_len, num_value_heads]
-    pub(crate) beta: CudaSlice<f32>,
+    /// Raw per-token gate on entry to the chunk stages, folded in place into the
+    /// chunk-local cumulative gate, fp32: [seq_len, num_value_heads].
+    ///
+    /// `pub` because the prepare stage is what normally fills it: a caller that
+    /// drives the chunk stages with its own gate pair (see
+    /// `gated_delta_rule_prefill_chunkwise_from_gates_into`) writes the raw gate
+    /// here.
+    pub g_cumsum: CudaSlice<f32>,
+    /// Beta values, fp32: [seq_len, num_value_heads]. `pub` for the same reason
+    /// as `g_cumsum`.
+    pub beta: CudaSlice<f32>,
 
     /// Expanded + normalized q in token-major layout: [seq_len, num_value_heads * key_dim]
     pub(crate) q_expanded: HiddenStates,
