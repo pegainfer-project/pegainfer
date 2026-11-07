@@ -330,7 +330,7 @@ impl LocalQwen3Lane {
                     None => dflash.model.new_request_state(
                         &ctx,
                         max_cache_len,
-                        self.layout.page_size,
+                        dflash.prefix_block_size,
                     )?,
                 };
                 let pending_len = state.pending_context_len().unwrap_or(0);
