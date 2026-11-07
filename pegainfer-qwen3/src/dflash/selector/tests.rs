@@ -87,7 +87,16 @@ fn projection_and_graph_replay_match_scalar_selection() -> Result<()> {
                 expected.push(previous as u32);
             }
         }
-        let selected = head.select(&ctx, &hidden, &logits, &anchors, 3, &mut scratch)?;
+        let selected = head.select(
+            &ctx,
+            &hidden,
+            &logits,
+            &anchors,
+            &[0.0; 2][..batch],
+            &[0.0; 4][..batch * 2],
+            3,
+            &mut scratch,
+        )?;
         assert_eq!(selected, expected, "iteration {iteration}, batch {batch}");
         assert_eq!(
             ctx.stream
@@ -102,14 +111,32 @@ fn projection_and_graph_replay_match_scalar_selection() -> Result<()> {
     ctx.stream
         .memcpy_htod(&[bf16::NAN; 16], &mut logits.data.slice_mut(16..32))?;
     assert!(
-        head.select(&ctx, &hidden, &logits, &[0], 3, &mut scratch)
-            .is_err()
+        head.select(
+            &ctx,
+            &hidden,
+            &logits,
+            &[0],
+            &[0.0],
+            &[0.0; 2],
+            3,
+            &mut scratch
+        )
+        .is_err()
     );
     ctx.stream
         .memcpy_htod(&[bf16::ZERO; 16], &mut logits.data.slice_mut(16..32))?;
     assert!(
-        head.select(&ctx, &hidden, &logits, &[0], 3, &mut scratch)
-            .is_ok()
+        head.select(
+            &ctx,
+            &hidden,
+            &logits,
+            &[0],
+            &[0.0],
+            &[0.0; 2],
+            3,
+            &mut scratch
+        )
+        .is_ok()
     );
     Ok(())
 }

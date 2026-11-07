@@ -235,6 +235,12 @@ impl DFlashContextScratch {
 }
 
 impl DFlashBatchScratch {
+    pub(crate) fn selector_proposal(
+        &self,
+    ) -> Option<(&CudaSlice<u32>, &CudaSlice<f32>, &CudaSlice<u32>)> {
+        self.selector.as_ref().map(SelectorScratch::proposal)
+    }
+
     fn new(
         ctx: &DeviceContext,
         config: &DFlashConfig,
@@ -943,6 +949,8 @@ impl DFlashDraftModel {
         &self,
         ctx: &DeviceContext,
         anchors: &[u32],
+        temperatures: &[f32],
+        uniforms: &[f32],
         scratch: &mut DFlashBatchScratch,
     ) -> Result<Vec<u32>> {
         let head = self
@@ -958,6 +966,8 @@ impl DFlashDraftModel {
             &scratch.logits_normed,
             &scratch.logits,
             anchors,
+            temperatures,
+            uniforms,
             self.block_size(),
             selector,
         )
