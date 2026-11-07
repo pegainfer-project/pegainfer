@@ -64,6 +64,8 @@ impl LocalQwen3Lane {
             num_spec_tokens: EAGLE3_CHAIN_LENGTH,
             max_position_embeddings: model.config.max_position_embeddings,
             max_draft_batch: Some(EAGLE3_MAX_BATCH),
+            // EAGLE-3 has no prefix capture cache yet; keep APC off.
+            capture_cache: false,
         };
         self.eagle3 = Some(Eagle3LaneState {
             model,

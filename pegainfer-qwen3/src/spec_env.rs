@@ -10,6 +10,12 @@ use anyhow::bail;
 
 pub(crate) const MAX_BATCH: &str = "PEGAINFER_SPEC_MAX_BATCH";
 pub(crate) const MAX_DRAFTS: &str = "PEGAINFER_SPEC_MAX_DRAFTS";
+/// Fixed budget for the prefix-block drafter-capture cache. Unset uses
+/// [`CAPTURE_CACHE_DEFAULT_MB`]; an explicit `0` disables the cache (and keeps
+/// the prefix cache off while a drafter is loaded).
+pub(crate) const CAPTURE_CACHE_MB: &str = "PEGAINFER_SPEC_CAPTURE_CACHE_MB";
+pub(crate) const CAPTURE_CACHE_DEFAULT_MB: usize = 128;
+const CAPTURE_CACHE_MAX_MB: usize = 4096;
 
 /// Parse one knob: unset/blank = off (`0`), otherwise a non-negative integer.
 fn parse(name: &str, value: Option<&str>) -> Result<usize> {
@@ -42,10 +48,30 @@ pub(crate) fn read(name: &str) -> usize {
         .expect("spec knobs are validated before the engine starts")
 }
 
+/// Bytes reserved for the prefix-block drafter-capture cache.
+///
+/// Unlike the load knobs, unset means the documented default rather than off.
+/// A malformed value is rejected by [`validate`] before the engine starts.
+pub(crate) fn capture_cache_bytes() -> usize {
+    let mb = match env_value(CAPTURE_CACHE_MB) {
+        Ok(Some(value)) => parse(CAPTURE_CACHE_MB, Some(&value))
+            .expect("spec knobs are validated before the engine starts"),
+        Ok(None) => CAPTURE_CACHE_DEFAULT_MB,
+        Err(_) => 0,
+    };
+    mb.saturating_mul(1024 * 1024)
+}
+
 /// Reject malformed knob values before the engine starts.
 pub(crate) fn validate() -> Result<()> {
     for name in [MAX_BATCH, MAX_DRAFTS] {
         parse(name, env_value(name)?.as_deref())?;
+    }
+    if let Some(value) = env_value(CAPTURE_CACHE_MB)? {
+        let mb = parse(CAPTURE_CACHE_MB, Some(&value))?;
+        if mb > CAPTURE_CACHE_MAX_MB {
+            bail!("{CAPTURE_CACHE_MB}: expected at most {CAPTURE_CACHE_MAX_MB} MiB, got {mb}");
+        }
     }
     Ok(())
 }

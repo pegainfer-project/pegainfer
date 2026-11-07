@@ -111,8 +111,9 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         cuda_graph: true,
         dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
-        // The speculative engine forces the prefix cache off; match it on the
-        // baseline so both take the same cold prefill path.
+        // The legacy gates request the prefix cache off on both arms so they
+        // take the same cold prefill path. The joint APC+spec gate below leaves
+        // it on (the drafter's capture cache restores a warm hit).
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
         memory: Qwen3MemoryOptions::new(
@@ -1151,5 +1152,99 @@ fn dflash_spec_levers_keep_losslessness() {
         gated > 0 && drafting > 0 && resumed,
         "no request was gated and then later accepted drafts \
          (gated={gated}, drafting={drafting}):\n{trace}"
+    );
+}
+
+/// The same launch with the prefix cache left on, for the joint APC+spec gate.
+/// The legacy gates force it off so both arms take the same cold prefill path.
+fn launch_options_with_prefix_cache(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
+    let mut options = launch_options(draft);
+    options.no_prefix_cache = false;
+    options
+}
+
+/// A warm prefix hit must restore the drafter's captured rows, not just the
+/// target KV: the second request reuses the prompt's blocks, keeps producing
+/// the baseline tokens (up to a bf16 tie), and actually drafts again.
+#[test]
+fn dflash_warm_prefix_keeps_drafting() {
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt = "The quick brown fox jumps over the lazy dog. ".repeat(40);
+    let prompt_tokens = tokenizer.encode(&prompt, false).expect("encode failed");
+    assert!(
+        prompt_tokens.len() > 4 * 16,
+        "the prompt must span several 16-token blocks, got {} tokens",
+        prompt_tokens.len()
+    );
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    // Cold run: fills both the KV prefix cache and the drafter capture cache.
+    let cold_outcome = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams::default(),
+            32,
+        ))
+        .expect_finished();
+    let cold_cached = cold_outcome.cached_tokens.unwrap_or(0);
+    let _cold = to_run(cold_outcome);
+    assert_eq!(cold_cached, 0, "the first (cache-filling) run must be cold");
+    let before = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+
+    // Plain baseline with logprobs: it skips drafting and leaves the commit
+    // trace the lossless check needs.
+    let baseline = generate(&engine, prompt_tokens.clone(), LOGPROBS, 32);
+
+    // Warm run: same prompt, prefix hit, drafter restored from the capture
+    // cache. It must be the last run so `check_lossless` can read its trace.
+    let warm_outcome = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams::default(),
+            32,
+        ))
+        .expect_finished();
+    let warm_cached = warm_outcome.cached_tokens.unwrap_or(0);
+    let warm = to_run(warm_outcome);
+    assert!(
+        warm_cached > 0,
+        "the warm request did not report a prefix-cache hit"
+    );
+    check_lossless(&tokenizer, 0, &prompt, &prompt_tokens, &baseline, &warm)
+        .expect("warm-prefix speculative run must stay lossless");
+
+    let after = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(
+        after.num_drafts > before.num_drafts,
+        "the warm request did not draft (drafts {} -> {})",
+        before.num_drafts,
+        after.num_drafts
+    );
+    assert!(
+        after.num_accepted_tokens > before.num_accepted_tokens,
+        "the warm request drafted but accepted nothing (accepted {} -> {})",
+        before.num_accepted_tokens,
+        after.num_accepted_tokens
     );
 }

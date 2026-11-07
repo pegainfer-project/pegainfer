@@ -43,10 +43,18 @@ impl DFlashMemoryReservation {
     ) -> Result<Self> {
         let mut config = DFlashConfig::from_file(draft_path)?;
         config.logits_rows = logits_rows;
-        Self::from_config(&config, max_decode_batch_size)
+        Self::from_config(
+            &config,
+            max_decode_batch_size,
+            crate::spec_env::capture_cache_bytes(),
+        )
     }
 
-    pub(crate) fn from_config(config: &DFlashConfig, max_decode_batch_size: usize) -> Result<Self> {
+    pub(crate) fn from_config(
+        config: &DFlashConfig,
+        max_decode_batch_size: usize,
+        capture_cache_bytes: usize,
+    ) -> Result<Self> {
         const BF16: usize = 2;
         let hidden = config.hidden_size;
         let kv_dim = sizing::product(&[config.num_key_value_heads, config.head_dim])?;
@@ -161,6 +169,7 @@ impl DFlashMemoryReservation {
                 native,
                 selector,
                 sampling,
+                capture_cache_bytes,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),
