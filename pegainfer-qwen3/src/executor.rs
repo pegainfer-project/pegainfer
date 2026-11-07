@@ -1408,13 +1408,15 @@ impl Qwen3Executor {
             // drafter capture cache: the prefix match that would consume it is
             // off. The lane re-derives the same decision from
             // `prefix_cache_requested` before it loads.
-            let (capture_cache_bytes, capture_prefix_block_size) = if capture_cache_enabled {
-                (
-                    crate::spec_env::capture_cache_bytes(),
-                    memory_options.page_size,
-                )
+            let capture_cache_bytes = if capture_cache_enabled {
+                crate::spec_env::capture_cache_bytes()
             } else {
-                (0, 0)
+                0
+            };
+            let capture_prefix_block_size = if capture_cache_bytes > 0 {
+                memory_options.page_size
+            } else {
+                0
             };
             let (draft_kv_bytes_per_token, hedge_scratch_pages) = match draft {
                 Some(DraftModel::DFlash(path)) => {
@@ -3695,13 +3697,15 @@ impl LocalQwen3Lane {
             capture_cache: false,
         };
         let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
-        let (prefix_block_size, capture_cache_bytes) = if capture_cache {
-            (
-                self.layout.page_size,
-                crate::spec_env::capture_cache_bytes(),
-            )
+        let capture_cache_bytes = if capture_cache {
+            crate::spec_env::capture_cache_bytes()
         } else {
-            (0, 0)
+            0
+        };
+        let prefix_block_size = if capture_cache_bytes > 0 {
+            self.layout.page_size
+        } else {
+            0
         };
         let lane = DFlashLaneState::new(
             self.model.device_ctx(),
