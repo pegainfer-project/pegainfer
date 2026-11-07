@@ -26,6 +26,8 @@ pub mod worker;
 
 use profile::EngineProfile;
 use profile::LoadedEngineProfile;
+use profile::PredictorError;
+use profile::PredictorModel;
 use worker::CancelResult;
 use worker::GeneratedToken;
 use worker::RequestRejection;
@@ -141,6 +143,17 @@ impl SimulatedEngineConfig {
     /// validated for online step timing and scheduling.
     pub fn with_engine_profile(mut self, profile: LoadedEngineProfile) -> Result<Self> {
         profile.validate()?;
+        if let PredictorModel::Functional {
+            prefill,
+            decode,
+            mixed,
+        } = &profile.predictor.model
+        {
+            ensure!(
+                prefill.is_some() && decode.is_some() && mixed.is_some(),
+                "serving a functional profile requires prefill, decode, and mixed models"
+            );
+        }
         self.profile = Some(ProfileConfig { profile });
         Ok(self)
     }
@@ -337,7 +350,42 @@ impl ProfiledRuntime {
         };
         let step_id = plan.id();
         let shape = plan.shape();
-        let estimate = self.profile.estimate_step(shape)?;
+        let estimate = match self.profile.estimate_step(shape) {
+            Ok(estimate) => estimate,
+            Err(error) => {
+                let refused_requests: Vec<_> = plan
+                    .prefill()
+                    .iter()
+                    .map(|work| work.request_id)
+                    .chain(plan.decode().iter().map(|work| work.request_id))
+                    .collect();
+                self.worker
+                    .discard_step(step_id)
+                    .context("failed to roll back an unpriced worker step")?;
+                if !matches!(
+                    error.downcast_ref::<PredictorError>(),
+                    Some(
+                        PredictorError::OutOfDomain { .. }
+                            | PredictorError::UnsupportedShape { .. }
+                            | PredictorError::ModelCoverageGap { .. }
+                    )
+                ) {
+                    return Err(error);
+                }
+                let message = error.to_string();
+                for request_id in refused_requests {
+                    ensure!(
+                        self.worker.cancel(request_id) == CancelResult::Cancelled,
+                        "unpriced request {request_id} was not cancellable after step rollback"
+                    );
+                    self.requests
+                        .remove(&request_id)
+                        .with_context(|| format!("missing profiled request {request_id}"))?;
+                    ledger.fail(request_id, message.clone());
+                }
+                return Ok(());
+            }
+        };
         for &request_id in plan.admitted() {
             let request = self
                 .requests
@@ -811,11 +859,11 @@ mod tests {
     use crate::profile::CalibrationReference;
     use crate::profile::ENGINE_PROFILE_SCHEMA_VERSION;
     use crate::profile::PredictorCoverage;
+    use crate::profile::PredictorModel;
     use crate::profile::PredictorProfile;
     use crate::profile::PrefillPolicy;
     use crate::profile::SchedulerPolicy;
     use crate::profile::SchedulerProfile;
-    use crate::profile::TimingGrid;
 
     fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
         Request {
@@ -885,15 +933,11 @@ mod tests {
                         sum_decode_ctx_tokens: [0, 8],
                         prefill_tokens_in_step: [0, 4],
                     },
-                    grid: TimingGrid {
-                        decode_reqs: vec![0, 2],
-                        sum_decode_ctx_tokens: vec![0, 8],
-                        prefill_tokens_in_step: vec![0, 4],
-                        step_duration_us: vec![0; 8],
-                    },
+                    model: PredictorModel::FixedStep { duration_us: 0 },
                 },
             },
             manifest: CalibrationManifest {
+                schema_version: 1,
                 target_engine: "test-engine".to_string(),
                 engine_version: "0.0.0".to_string(),
                 model_id: "test-model".to_string(),
@@ -903,6 +947,17 @@ mod tests {
                 server_flags: Vec::new(),
                 collection_command: "test".to_string(),
                 source_artifacts: Vec::new(),
+                backend: None,
+                driver: None,
+                cuda: None,
+                parallelism: None,
+                quantization: None,
+                scheduler: None,
+                cache: None,
+                client: None,
+                workload: None,
+                split: None,
+                provenance: None,
             },
             profile_path: "profile.json".into(),
             manifest_path: "calibration.manifest.json".into(),

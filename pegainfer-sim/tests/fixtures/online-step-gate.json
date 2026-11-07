@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "calibration": {
     "manifest": "online-step-gate.manifest.json",
     "sha256": "f18277d0f85667cb6e6d7ab6f1c08113ffb3c56e90eaeaba5ea223cb4da9a8f0"
@@ -20,21 +20,9 @@
       "sum_decode_ctx_tokens": [0, 4],
       "prefill_tokens_in_step": [0, 4]
     },
-    "grid": {
-      "decode_reqs": [0, 1, 2],
-      "sum_decode_ctx_tokens": [0, 2, 4],
-      "prefill_tokens_in_step": [0, 2, 4],
-      "step_duration_us": [
-        50000, 150000, 250000,
-        60000, 160000, 260000,
-        70000, 170000, 270000,
-        75000, 175000, 275000,
-        85000, 185000, 285000,
-        95000, 195000, 295000,
-        100000, 200000, 300000,
-        110000, 210000, 310000,
-        120000, 220000, 320000
-      ]
+    "model": {
+      "kind": "fixed_step",
+      "duration_us": 1000
     }
   }
 }

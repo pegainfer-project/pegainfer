@@ -24,6 +24,8 @@ use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
+use pegainfer_sim::profile::MixedAdditive;
+use pegainfer_sim::profile::PredictorModel;
 use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
 use pegainfer_sim::start_engine_with_partitions;
@@ -287,6 +289,11 @@ fn profile_fixture(name: &str) -> Result<(TempDir, LoadedEngineProfile)> {
             "online-zero-cost.manifest.json",
             include_bytes!("fixtures/online-zero-cost.manifest.json"),
         ),
+        "functional-step-gate.json" => (
+            include_bytes!("fixtures/functional-step-gate.json"),
+            "functional-step-gate.manifest.json",
+            include_bytes!("fixtures/functional-step-gate.manifest.json"),
+        ),
         other => bail!("unknown profile fixture {other}"),
     };
     let dir = tempfile::tempdir()?;
@@ -333,7 +340,7 @@ fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace
         let estimate = profile.estimate_step(shape)?;
         assert!(matches!(
             estimate.source,
-            pegainfer_sim::profile::StepTimingSource::GridInterpolation
+            pegainfer_sim::profile::StepTimingSource::FixedStep
         ));
         assert!(
             shape.decode_reqs <= profile.scheduler.max_num_seqs,
@@ -425,15 +432,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
     assert!(
         first
             .iter()
-            .map(|step| step.duration_us)
-            .min()
-            .is_some_and(|minimum| {
-                first
-                    .iter()
-                    .map(|step| step.duration_us)
-                    .any(|duration| duration > minimum)
-            }),
-        "grid pricing must vary across the replayed step shapes"
+            .all(|step| step.duration_us == first[0].duration_us),
+        "fixed predictor must price every in-domain step consistently"
     );
 
     Ok(())
@@ -443,12 +443,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
 fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     assert!(
-        profile
-            .predictor
-            .grid
-            .step_duration_us
-            .iter()
-            .all(|duration| *duration == 0),
+        profile.predictor.model
+            == pegainfer_sim::profile::PredictorModel::FixedStep { duration_us: 0 },
         "zero-cost fixture must not add synthetic engine delay"
     );
     let estimate = profile.estimate_step(StepShape {
@@ -459,6 +455,145 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     assert_eq!(estimate.duration_us, 0);
 
     Ok(())
+}
+
+#[test]
+fn functional_profile_prices_pure_work_and_fails_closed() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("functional-step-gate.json")?;
+    let prefill = profile.estimate_step(StepShape {
+        decode_reqs: 0,
+        sum_decode_ctx_tokens: 0,
+        prefill_tokens_in_step: 2,
+    })?;
+    assert_eq!(prefill.duration_us, 1_000);
+    assert_eq!(
+        prefill.source,
+        pegainfer_sim::profile::StepTimingSource::PrefillPiecewise
+    );
+
+    let decode = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 0,
+    })?;
+    assert_eq!(decode.duration_us, 3_000);
+    assert_eq!(
+        decode.source,
+        pegainfer_sim::profile::StepTimingSource::DecodeSurface
+    );
+
+    let mixed = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 1,
+    });
+    assert!(
+        mixed.is_err(),
+        "mixed work must fail without a mixed predictor"
+    );
+
+    let out_of_domain = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 5,
+        prefill_tokens_in_step: 0,
+    });
+    assert!(out_of_domain.is_err(), "profile coverage must fail closed");
+    Ok(())
+}
+
+#[test]
+fn serving_rejects_incomplete_functional_profiles() -> Result<()> {
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { mixed, .. } = &mut profile.profile.predictor.model {
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    SimulatedEngineConfig::default().with_engine_profile(profile.clone())?;
+    for missing in ["prefill", "decode", "mixed"] {
+        let mut partial = profile.clone();
+        if let PredictorModel::Functional {
+            prefill,
+            decode,
+            mixed,
+        } = &mut partial.profile.predictor.model
+        {
+            match missing {
+                "prefill" => *prefill = None,
+                "decode" => *decode = None,
+                _ => *mixed = None,
+            }
+        }
+        SimulatedEngineConfig::default()
+            .with_engine_profile(partial)
+            .expect_err(&format!("serving must reject a missing {missing} model"));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpriced_prefill_and_decode_requests_leave_server_running() -> Result<()> {
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { decode, mixed, .. } = &mut profile.profile.predictor.model {
+        decode
+            .as_mut()
+            .context("fixture decode model missing")?
+            .sum_decode_ctx_tokens = vec![3, 4];
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let model_name = "pegainfer-sim-unpriced-request";
+    let server =
+        SimServer::spawn_with_config(model_dir_with_minimal_metadata()?, 1, model_name, config)
+            .await?;
+    let client = test_client()?;
+
+    for prompt in [vec![1], vec![1, 2]] {
+        let refused = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": prompt,
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let valid = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": [1, 2, 3],
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert_eq!(valid["choices"][0]["finish_reason"], "length");
+        assert_eq!(valid["usage"]["completion_tokens"], 2);
+    }
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:num_requests_running", "0", 0.0),
+            ("vllm:num_requests_waiting", "0", 0.0),
+        ],
+        model_name,
+    )
+    .await?;
+    server.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,14 +635,6 @@ async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
     };
 
     let mut requests = vec![post_request(client.clone()), post_request(client.clone())];
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[("vllm:num_requests_running", "0", 2.0)],
-        PROFILE_GATE_MODEL_NAME,
-    )
-    .await?;
-
     // Capacity ordering is asserted by the deterministic worker replay; the
     // HTTP gate checks stable post-drain counters instead of a transient scrape.
     requests.push(post_request(client.clone()));
