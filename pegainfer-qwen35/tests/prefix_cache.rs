@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -56,12 +57,7 @@ struct Generation {
     logprobs: Vec<Option<TokenLogprob>>,
 }
 
-fn submit(
-    handle: &EngineHarness,
-    prompt_tokens: Vec<u32>,
-    max_tokens: usize,
-    logprobs: usize,
-) -> RequestGuard {
+fn request(prompt_tokens: Vec<u32>, max_tokens: usize, logprobs: usize) -> Request {
     let mut request = common::request(
         prompt_tokens,
         SamplingParams {
@@ -71,7 +67,16 @@ fn submit(
         max_tokens,
     );
     request.logprobs = (logprobs > 0).then_some(logprobs);
-    handle.submit(request)
+    request
+}
+
+fn submit(
+    handle: &EngineHarness,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    logprobs: usize,
+) -> RequestGuard {
+    handle.submit(request(prompt_tokens, max_tokens, logprobs))
 }
 
 fn generate(
@@ -80,7 +85,12 @@ fn generate(
     max_tokens: usize,
     logprobs: usize,
 ) -> Generation {
-    let control = submit(handle, prompt_tokens, max_tokens, logprobs);
+    run(handle, request(prompt_tokens, max_tokens, logprobs))
+}
+
+fn run(handle: &mut EngineHarness, request: Request) -> Generation {
+    let max_tokens = request.max_tokens;
+    let control = handle.submit(request);
     let mut cached_tokens = None;
     let mut generated_tokens = Vec::with_capacity(max_tokens);
     let mut generated_logprobs = Vec::with_capacity(max_tokens);
@@ -125,7 +135,8 @@ fn prompt_tokens(
     text: &str,
     token_len: usize,
 ) -> Vec<u32> {
-    let prompt = text.repeat(80);
+    // Fixture sentences encode to at least 8 tokens, so this covers long prompts.
+    let prompt = text.repeat(80.max(token_len.div_ceil(8)));
     let mut tokens = tokenizer.encode(&prompt, false).expect("encode failed");
     assert!(
         tokens.len() >= token_len,
@@ -136,38 +147,34 @@ fn prompt_tokens(
     tokens
 }
 
-fn assert_trace_close(label: &str, cold: &Generation, warm: &Generation) {
+/// Engines in one process share their timed decode GEMM winners (`g_lt_tuned_algos`).
+fn assert_trace_exact(label: &str, cold: &Generation, warm: &Generation) {
     assert_eq!(
         cold.tokens, warm.tokens,
         "{label}: generated token trace changed"
     );
-    assert_eq!(cold.logprobs.len(), warm.logprobs.len());
-    let mut deltas = Vec::new();
-    for (position, (cold_lp, warm_lp)) in cold.logprobs.iter().zip(&warm.logprobs).enumerate() {
-        let cold_lp = cold_lp
-            .as_ref()
-            .unwrap_or_else(|| panic!("{label}: cold position {position} has no logprob"));
-        let warm_lp = warm_lp
-            .as_ref()
-            .unwrap_or_else(|| panic!("{label}: warm position {position} has no logprob"));
-        let cold_map: std::collections::HashMap<u32, f32> =
-            cold_lp.top_logprobs.iter().copied().collect();
-        for &(token, warm_value) in warm_lp.top_logprobs.iter().take(8) {
-            if let Some(cold_value) = cold_map.get(&token) {
-                deltas.push((warm_value - cold_value).abs());
-            }
+    // Missing logprobs on both sides would compare equal, so require one per token.
+    for (side, trace) in [("cold", cold), ("warm", warm)] {
+        assert_eq!(
+            trace.logprobs.len(),
+            trace.tokens.len(),
+            "{label}: {side} trace needs one logprob per token"
+        );
+        if let Some(i) = trace.logprobs.iter().position(Option::is_none) {
+            panic!("{label}: {side} position {i} has no logprob");
         }
     }
-    assert!(!deltas.is_empty(), "{label}: no top-logprob overlap");
-    deltas.sort_by(f32::total_cmp);
-    let mean = deltas.iter().sum::<f32>() / deltas.len() as f32;
-    let p99 = deltas[((deltas.len() as f64 * 0.99) as usize).min(deltas.len() - 1)];
-    eprintln!(
-        "{label}: {} logprob deltas, mean {mean:.4}, p99 {p99:.4}",
-        deltas.len()
-    );
-    assert!(mean <= 0.06, "{label}: mean logprob delta {mean:.4} > 0.06");
-    assert!(p99 <= 0.20, "{label}: p99 logprob delta {p99:.4} > 0.20");
+    let diverged = cold
+        .logprobs
+        .iter()
+        .zip(&warm.logprobs)
+        .position(|(cold_lp, warm_lp)| cold_lp != warm_lp);
+    if let Some(i) = diverged {
+        panic!(
+            "{label}: logprobs diverge at position {i}: {:?} vs {:?}",
+            cold.logprobs[i], warm.logprobs[i]
+        );
+    }
 }
 
 #[test]
@@ -253,22 +260,134 @@ fn boundary_selection_and_multitoken_restore_preserve_logits() {
     );
     let mut handle = start_engine(&model_path, 1, 512);
 
+    // The cold run stops only at its last boundary, 512, so both runs cut there.
     let cold = generate(&mut handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(cold.cached_tokens, 0);
     let warm = generate(&mut handle, long_prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(warm.cached_tokens, 512);
-    assert_trace_close("tp1 576-token restore", &cold, &warm);
+    assert_trace_exact("tp1 576-token restore", &cold, &warm);
 
     let exact_512 = generate(&mut handle, long_prompt[..512].to_vec(), 1, 0);
     assert_eq!(
-        exact_512.cached_tokens, 256,
-        "an exactly aligned prompt must retain one token for final prefill"
+        exact_512.cached_tokens, 0,
+        "an exactly aligned prompt must retain one token, so the 512 snapshot cannot serve it"
     );
+    // This prompt ends on a boundary and publishes it for the extension below.
     let exact_256 = generate(&mut handle, long_prompt[..256].to_vec(), 1, 0);
     assert_eq!(exact_256.cached_tokens, 0);
 
     let extended = generate(&mut handle, long_prompt[..320].to_vec(), 1, 0);
     assert_eq!(extended.cached_tokens, 256);
+    let longest = generate(&mut handle, long_prompt, 1, 0);
+    assert_eq!(
+        longest.cached_tokens, 512,
+        "the longest joint boundary must win"
+    );
+}
+
+/// Cold cuts depend only on budget and prompt: this prompt's last boundary is a step
+/// end, so the cache off and two cache sizes cut it, and decode it, identically.
+#[test]
+fn cold_output_ignores_cache_budget() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let tokenizer = common::load_tokenizer(&model_path);
+    let prompt = prompt_tokens(
+        &tokenizer,
+        "Cold prefill cuts depend only on the step budget and on the prompt itself. ",
+        4160,
+    );
+    let cold = |prefix_cache_mib| {
+        let mut handle = start_engine(&model_path, 1, prefix_cache_mib);
+        let generation = generate(&mut handle, prompt.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+        assert_eq!(generation.cached_tokens, 0);
+        generation
+    };
+    let cache_off = cold(0);
+    assert_trace_exact("cache off vs 128 MiB", &cache_off, &cold(PREFIX_CACHE_MIB));
+    assert_trace_exact("cache off vs 512 MiB", &cache_off, &cold(512));
+}
+
+/// A hit on another prompt's stop replays the cold run exactly when its cut history
+/// matches; when the hit moves a cut, only its greedy tokens must hold.
+#[test]
+fn cross_prompt_hit_is_exact_when_cuts_match() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let tokenizer = common::load_tokenizer(&model_path);
+    // The donor's last stop is 3840. The probe shares those tokens, but its own cold
+    // run cuts at 3072 and 4096, so restoring the donor's snapshot moves one cut.
+    let donor = prompt_tokens(
+        &tokenizer,
+        "A donor prompt publishes its last boundary for a later request to reuse. ",
+        4000,
+    );
+    let mut probe = donor[..3840].to_vec();
+    probe.extend(prompt_tokens(
+        &tokenizer,
+        "The probe continues past the shared prefix with different text. ",
+        320,
+    ));
+    let cold = |history_tokens| {
+        let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
+        let mut cold_request = request(probe.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+        cold_request.history_tokens = history_tokens;
+        let generation = run(&mut handle, cold_request);
+        assert_eq!(generation.cached_tokens, 0);
+        generation
+    };
+    let cold_own = cold(None);
+    let cold_stop_3840 = cold(Some(3840));
+
+    let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
+    assert_eq!(generate(&mut handle, donor, 1, 0).cached_tokens, 0);
+    // Stopping at 3840 too, the probe's hit keeps its cold cuts.
+    let mut same_cuts = request(probe.clone(), TRACE_TOKENS, TOP_LOGPROBS);
+    same_cuts.history_tokens = Some(3840);
+    let same_cuts = run(&mut handle, same_cuts);
+    assert_eq!(same_cuts.cached_tokens, 3840);
+    assert_trace_exact("cross-prompt hit, same cuts", &cold_stop_3840, &same_cuts);
+    // Without the stop, the hit adds a 3840 cut its own cold run lacks.
+    let moved_cut = generate(&mut handle, probe, TRACE_TOKENS, TOP_LOGPROBS);
+    assert_eq!(moved_cut.cached_tokens, 3840);
+    assert_eq!(
+        moved_cut.tokens, cold_own.tokens,
+        "cross-prompt hit, moved cut: generated token trace changed"
+    );
+}
+
+/// A warm hinted turn must not resume past its history stop, even when a longer
+/// snapshot of the same tokens exists, or the next turn loses that boundary.
+#[test]
+fn warm_hinted_turn_still_stops_at_history_boundary() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    let tokenizer = common::load_tokenizer(&model_path);
+    let mut handle = start_engine(&model_path, 1, PREFIX_CACHE_MIB);
+    let turn = prompt_tokens(
+        &tokenizer,
+        "A warm chat turn first arrives without the frontend's history hint. ",
+        4100,
+    );
+    // Unhinted, the turn's step ends include 3072 and 4096 but not 3840.
+    assert_eq!(generate(&mut handle, turn.clone(), 1, 0).cached_tokens, 0);
+    let mut hinted = request(turn.clone(), 1, 0);
+    hinted.history_tokens = Some(4094);
+    assert_eq!(
+        run(&mut handle, hinted).cached_tokens,
+        3072,
+        "a hinted lookup must not resume past its 3840 stop"
+    );
+    let mut next_turn = turn[..4094].to_vec();
+    next_turn.extend(prompt_tokens(
+        &tokenizer,
+        "The user follows up with another question. ",
+        200,
+    ));
+    assert_eq!(generate(&mut handle, next_turn, 1, 0).cached_tokens, 3840);
 }
 
 fn restore_during_live_decode(
@@ -333,10 +452,10 @@ fn restore_during_live_decode(
     assert_eq!(mixed_cold.tokens, cold.tokens);
     let warm = generate_with_background(&mut handle);
     assert_eq!(warm.cached_tokens, 512);
-    assert_trace_close("restore during live decode", &mixed_cold, &warm);
+    assert_trace_exact("restore during live decode", &mixed_cold, &warm);
     let again = generate(&mut handle, prompt, TRACE_TOKENS, TOP_LOGPROBS);
     assert_eq!(again.cached_tokens, 512);
-    assert_trace_close("restore after cancellation", &cold, &again);
+    assert_trace_exact("restore after cancellation", &cold, &again);
 }
 
 #[test]

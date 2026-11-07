@@ -504,7 +504,14 @@ pub(super) fn take_prefill_chunks(
     let chunks = plan_prefill_chunks(&remaining, prefill_budget);
     let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..chunks.len()).collect();
     for (p, chunk) in scheduled.iter_mut().zip(&chunks) {
-        p.step_chunk = clamp_prefill_chunk(p.cursor, *chunk, snapshot_stride);
+        let request = &p.req.request;
+        p.step_chunk = prefill_step_chunk(
+            p.cursor,
+            *chunk,
+            request.prompt_tokens.len(),
+            request.history_tokens,
+            snapshot_stride,
+        );
     }
     scheduled
 }
