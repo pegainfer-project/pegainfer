@@ -88,4 +88,13 @@ mod tests {
         let error = parse(MAX_DRAFTS, Some("4x")).unwrap_err().to_string();
         assert!(error.contains(MAX_DRAFTS), "{error}");
     }
+
+    #[test]
+    fn capture_cache_knob_parses_and_documents_its_default() {
+        assert_eq!(parse(CAPTURE_CACHE_MB, Some("128")).unwrap(), 128);
+        assert_eq!(parse(CAPTURE_CACHE_MB, Some("0")).unwrap(), 0);
+        let error = parse(CAPTURE_CACHE_MB, Some("4x")).unwrap_err().to_string();
+        assert!(error.contains(CAPTURE_CACHE_MB), "{error}");
+        assert_eq!(CAPTURE_CACHE_DEFAULT_MB, 128);
+    }
 }
