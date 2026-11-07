@@ -233,6 +233,14 @@ pub use norm::rms_norm_into;
 pub use norm::rms_norm_offset_into;
 pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockVariant;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_variant_into;
+#[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_select_into;
