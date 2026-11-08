@@ -1,5 +1,9 @@
 use std::path::Path;
 
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+
 const MODEL_PATH_ENV: &str = "PEGAINFER_TEST_MODEL_PATH";
 #[allow(dead_code)]
 const FRONTEND_MODEL_PATH_ENV: &str = "PEGAINFER_TEST_FRONTEND_MODEL_PATH";
@@ -39,47 +43,29 @@ fn fixture_path_from_env_or_skip(env: &str, test_name: &str) -> Option<String> {
 }
 
 fn validated_fixture_path_or_skip(env: &str, path: String, test_name: &str) -> Option<String> {
-    if path.trim().is_empty() {
-        return skip(test_name, &format!("{env} is empty"));
+    match validated_fixture_path(env, path) {
+        Ok(path) => Some(path),
+        Err(error) => skip(test_name, &format!("{error:#}")),
     }
+}
 
+pub(crate) fn validated_fixture_path(env: &str, path: String) -> Result<String> {
+    ensure!(!path.trim().is_empty(), "{env} is empty");
     let config_path = Path::new(&path).join("config.json");
-    let raw = match std::fs::read(&config_path) {
-        Ok(raw) => raw,
-        Err(err) => {
-            return skip(
-                test_name,
-                &format!("cannot read {} from {env}: {err}", config_path.display()),
-            );
-        }
-    };
-    let config: serde_json::Value = match serde_json::from_slice(&raw) {
-        Ok(config) => config,
-        Err(err) => {
-            return skip(
-                test_name,
-                &format!(
-                    "{} from {env} is not valid JSON: {err}",
-                    config_path.display()
-                ),
-            );
-        }
-    };
+    let raw = std::fs::read(&config_path)
+        .with_context(|| format!("cannot read {} from {env}", config_path.display()))?;
+    let config: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("{} from {env} is not valid JSON", config_path.display()))?;
     let root_model_type = config.get("model_type").and_then(serde_json::Value::as_str);
     let text_model_type = config
         .pointer("/text_config/model_type")
         .and_then(serde_json::Value::as_str);
-    if root_model_type != Some("qwen3_5") && text_model_type != Some("qwen3_5_text") {
-        return skip(
-            test_name,
-            &format!(
-                "{} from {env} is not a Qwen3.5 config",
-                config_path.display()
-            ),
-        );
-    }
-
-    Some(path)
+    ensure!(
+        root_model_type == Some("qwen3_5") || text_model_type == Some("qwen3_5_text"),
+        "{} from {env} is not a Qwen3.5 config",
+        config_path.display()
+    );
+    Ok(path)
 }
 
 fn skip<T>(test_name: &str, reason: &str) -> Option<T> {

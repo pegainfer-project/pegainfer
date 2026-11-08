@@ -20,6 +20,9 @@ use crate::prefix_cache::Qwen35PrefixCache;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::Qwen35Model;
 
+#[cfg(test)]
+mod hf_golden_gate;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(u64);
 

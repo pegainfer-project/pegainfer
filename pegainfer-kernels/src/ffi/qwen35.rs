@@ -1,11 +1,85 @@
+use std::ffi::c_void;
+
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
 
 use super::Half;
 
+/// Kernels-private Rust mirror of the stable C ABI. Model crates never import
+/// this struct: the safe `ops::Qwen35GdnAot` wrapper owns validation, workspace,
+/// handle lifetime, and conversion from semantic tensors to device addresses.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlashInferGdnPrefillArgs {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub q: u64,
+    pub k: u64,
+    pub v: u64,
+    pub output: u64,
+    pub alpha: u64,
+    pub beta: u64,
+    pub state: u64,
+    pub workspace: u64,
+    pub workspace_bytes: u64,
+    pub cu_seqlens: u64,
+    pub tokens: u32,
+    pub stream: CUstream,
+}
+
 // Qwen3.5 private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu.
 unsafe extern "C" {
+    pub(crate) fn pegainfer_qwen35_decode_gemm_prepare(
+        weights: *const Half,
+        rows: i32,
+        batch: i32,
+        cols: i32,
+        algorithm: *mut u64,
+        stream: CUstream,
+    ) -> i32;
+    pub(crate) fn pegainfer_qwen35_decode_gemm_launch(
+        algorithm: *const u64,
+        weights: *const Half,
+        input: *const Half,
+        output: *mut Half,
+        rows: i32,
+        batch: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub(crate) fn pegainfer_qwen35_gdn_abi_version() -> u32;
+    pub(crate) fn pegainfer_qwen35_gdn_aot_available() -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_create(handle: *mut *mut c_void, device: i32) -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_workspace_bytes(
+        handle: *mut c_void,
+        workspace_bytes: *mut usize,
+    ) -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_launch(
+        handle: *mut c_void,
+        args: *const FlashInferGdnPrefillArgs,
+    ) -> i32;
+    pub(crate) fn pegainfer_qwen35_gdn_destroy(handle: *mut c_void);
+
+    /// Native, non-expanded FlashInfer-GDN input preparation.
+    ///
+    /// `q_out`, `k_out`, and `v_out` are token-major `[T,H,D]`; alpha/beta are
+    /// FP32 `[T,Hv]`.
+    pub fn gated_delta_rule_prefill_native_prepare_cuda(
+        qkv: *const Half,
+        b_proj: *const Half,
+        a_proj: *const Half,
+        dt_bias: *const Half,
+        a_log: *const f32,
+        q_out: *mut Half,
+        k_out: *mut Half,
+        v_out: *mut Half,
+        alpha_out: *mut f32,
+        beta_out: *mut f32,
+        tokens: i32,
+        stream: CUstream,
+    ) -> CUresult;
     pub fn paged_attention_decode_cuda_hd256(
         q: *const Half,
         output: *mut Half,

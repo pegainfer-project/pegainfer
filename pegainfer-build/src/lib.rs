@@ -2,6 +2,9 @@ use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(feature = "qwen35-gdn")]
+pub mod qwen35_gdn;
+
 /// `targets/<dir>` names for the build target; aarch64 toolkits ship as
 /// either `aarch64-linux` or `sbsa-linux`. Host arch outside build scripts.
 fn target_dirs() -> Vec<String> {

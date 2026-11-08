@@ -249,6 +249,14 @@ pub use qwen35::GDN_AOT_VALUE_HEAD_DIM;
 #[cfg(feature = "qwen35")]
 pub use qwen35::LINEAR_CONV_MAX_KERNEL_DIM;
 #[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35DecodeGemm;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnAot;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnGeometry;
+#[cfg(feature = "qwen35")]
+pub use qwen35::Qwen35GdnWorkspace;
+#[cfg(feature = "qwen35")]
 pub use qwen35::conv1d_decode_batch_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::gated_delta_rule_decode_batch_into;

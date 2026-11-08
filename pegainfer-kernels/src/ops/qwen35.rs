@@ -1,12 +1,17 @@
-//! Qwen3.5 wrappers: the HD256 full-attention decode prep and paged attention
-//! reads, and the Gated DeltaNet decode step over
-//! `csrc/qwen35/{gated_delta_rule,conv1d}.cu`.
+//! Qwen3.5 HD256 attention, GDN decode and explicit FlashInfer GDN prefill.
+
+mod decode_gemm;
+mod gdn;
 
 use anyhow::Context as _;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+pub use decode_gemm::Qwen35DecodeGemm;
+pub use gdn::Qwen35GdnAot;
+pub use gdn::Qwen35GdnGeometry;
+pub use gdn::Qwen35GdnWorkspace;
 use half::bf16;
 
 use super::PrefillPagedPlan;
@@ -648,3 +653,6 @@ pub fn conv1d_decode_batch_into<'a>(
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

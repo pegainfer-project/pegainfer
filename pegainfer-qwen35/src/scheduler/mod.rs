@@ -5,6 +5,10 @@
 //! - `BatchDecodeGraphState` for CUDA Graph batch decode (stable-address slots)
 
 mod backend;
+#[cfg(test)]
+mod chunked_prefill_tests;
+#[cfg(test)]
+mod e2e_tests;
 mod emit;
 mod plan;
 mod steps;

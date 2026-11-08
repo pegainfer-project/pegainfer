@@ -22,7 +22,7 @@
 
 ## Tools
 
-The per-layer dump binaries and HF dump scripts from the Qwen3.5-4B investigation are gone. For Qwen3 and Qwen3.5 the HF reference is now a golden fixture: `tools/accuracy/dump_qwen3_hf_golden.py` and `dump_qwen35_hf_golden.py` write it, and each line's `tests/hf_golden_gate.rs` checks pegainfer against it. A first-diff or per-layer dump is a probe to rebuild for the investigation at hand, following the ladder above.
+The per-layer dump binaries and HF dump scripts from the Qwen3.5-4B investigation are gone. For Qwen3 and Qwen3.5 the HF reference is now a golden fixture: `tools/accuracy/dump_qwen3_hf_golden.py` and `dump_qwen35_hf_golden.py` write it, and `pegainfer-qwen3/tests/hf_golden_gate.rs` and `pegainfer-qwen35/src/executor/hf_golden_gate.rs` checks pegainfer against it. A first-diff or per-layer dump is a probe to rebuild for the investigation at hand, following the ladder above.
 
 ## High-Signal Tricks
 

@@ -969,3 +969,7 @@ int gemm_per_token_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
 }
 
 } // extern "C"
+
+#ifdef PEGAINFER_QWEN35
+#include "qwen35/decode_gemm.cuh"
+#endif
