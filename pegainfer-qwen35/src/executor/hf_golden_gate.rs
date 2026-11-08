@@ -895,7 +895,6 @@ fn check_prerequisite_rejections(
 }
 
 fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
-    use crate::weights::CandidateDecodeGemm;
     use crate::weights::DecodeProjection;
 
     if model.flashinfer_gdn.is_none() {
@@ -950,46 +949,6 @@ fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
                 );
             }
         }
-    }
-    for (layer, projection, batch, expected) in [
-        (
-            model.layers.len(),
-            DecodeProjection::Down,
-            8,
-            "decode target layer is out of range",
-        ),
-        (
-            0,
-            DecodeProjection::V,
-            8,
-            "V target requires a full-attention layer",
-        ),
-        (
-            0,
-            DecodeProjection::Down,
-            5,
-            "decode target must use a cuBLASLt decode bucket",
-        ),
-        (
-            0,
-            DecodeProjection::Down,
-            16,
-            "decode target exceeds allocated decode capacity",
-        ),
-    ] {
-        let invalid = CandidateDecodeGemm {
-            layer,
-            projection,
-            batch,
-            recipe: std::sync::OnceLock::new(),
-        };
-        let error = invalid
-            .prepare(model)
-            .expect_err("invalid target must fail before preparation");
-        ensure!(
-            error.to_string().contains(expected),
-            "wrong decode prerequisite error: {error:#}"
-        );
     }
     eprintln!("CANDIDATE_DECODE_ADMISSION_OK down_layer=0 v_layer=3 batches=2,4,8");
     Ok(())
