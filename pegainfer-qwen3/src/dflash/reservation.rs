@@ -25,6 +25,13 @@ use crate::sizing;
 // batched allocation.
 pub(crate) struct DFlashMemoryReservation {
     pub(crate) kv_bytes_per_token: usize,
+    /// The subset of [`Self::kv_bytes_per_token`] each *request* owns: the draft
+    /// KV, the projected-context scratch, and the pending capture buffer. The
+    /// tail scratch is lane-level and shared, so it is excluded here. The lane
+    /// charges this per token of a request's `max_cache_len` against the draft
+    /// budget, which is what keeps shared prefixes from overcommitting state
+    /// the pool reservation only billed once.
+    pub(crate) request_state_bytes_per_token: usize,
     pub(crate) fixed_bytes: usize,
     /// Drafter block size, surfaced so startup budgets (hedge scratch pages,
     /// verify-plan metadata) can share the config read.
@@ -80,6 +87,9 @@ impl DFlashMemoryReservation {
         ])?;
         let pending = sizing::product(&[hidden, capture_layers, BF16])?; // context_feature_dim
         let kv_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, tail_scratch, pending])?;
+        // Per-request state only; the shared tail scratch is not owned by a
+        // request and is allocated once for the lane.
+        let request_state_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, pending])?;
 
         // Lane-level batched dense scratch: every dense buffer is sized for the
         // whole decode batch (`max_batch * block_size` rows), allocated once.
@@ -176,6 +186,7 @@ impl DFlashMemoryReservation {
 
         Ok(Self {
             kv_bytes_per_token,
+            request_state_bytes_per_token,
             fixed_bytes: sizing::sum(&[
                 weights,
                 scratch_total,

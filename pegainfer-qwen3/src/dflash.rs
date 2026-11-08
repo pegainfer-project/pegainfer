@@ -62,7 +62,9 @@ pub(crate) struct DFlashRequestState {
     /// Committed target tokens whose hidden rows are in the capture history
     /// (restored prefix + rows captured by this request).
     captured_len: usize,
-    /// KV blocks already published to the prefix capture cache.
+    /// KV blocks already consumed from the capture history: published to the
+    /// prefix capture cache, or skipped because the request has more blocks
+    /// than the cache has slots (it can never be restored whole).
     published_blocks: usize,
     /// Rows of the partially-filled block that follows `published_blocks`:
     /// prefill's tail plus the accepted rows appended by each verify round.
@@ -130,6 +132,12 @@ pub(crate) struct DFlashBatchScratch {
 }
 
 impl DFlashRequestState {
+    /// Token lifetime this request's buffers were sized for; the lane charges
+    /// its draft-state budget per this token count.
+    pub(crate) fn max_cache_len(&self) -> usize {
+        self.max_cache_len
+    }
+
     pub(crate) fn pending_context_len(&self) -> Option<usize> {
         (self.pending_context.len > 0).then_some(self.pending_context.len)
     }
@@ -676,18 +684,44 @@ impl DFlashDraftModel {
                 hashes.len()
             );
         }
+        // A prefix longer than the cache can never be restored whole (the
+        // all-or-nothing lookup needs every block), and inserting it would
+        // evict every other conversation on the way to evicting its own head.
+        // Keep draining the seal so it cannot overflow, but store nothing.
+        log::debug!(
+            "Qwen3 DFlash capture publish: request_blocks={} target_blocks={} published={} \
+             captured={} sealed={} seal_len={} cache_slots={}",
+            hashes.len(),
+            target_blocks,
+            state.published_blocks,
+            state.captured_len,
+            sealed_tokens,
+            state.seal_len,
+            cache.slot_count()
+        );
+        let can_publish = hashes.len() <= cache.slot_count();
+        if !can_publish {
+            log::debug!(
+                "Qwen3 DFlash capture publish skipped: request has {} blocks, cache has {} slots \
+                 (the budget caps the longest restorable prefix)",
+                hashes.len(),
+                cache.slot_count()
+            );
+        }
 
         if state.pending_is_history {
             // Publish from the full prompt capture, then keep the partial tail
             // for the verify rounds. This must also run when no block is full
             // yet (a short prompt): the tail is the seed for later verifies.
-            for (i, hash) in hashes
-                .iter()
-                .enumerate()
-                .take(target_blocks)
-                .skip(state.published_blocks)
-            {
-                let _ = cache.insert(ctx, *hash, &state.pending_context.buffer, i * block)?;
+            if can_publish {
+                for (i, hash) in hashes
+                    .iter()
+                    .enumerate()
+                    .take(target_blocks)
+                    .skip(state.published_blocks)
+                {
+                    let _ = cache.insert(ctx, *hash, &state.pending_context.buffer, i * block)?;
+                }
             }
             let tail_start = target_blocks * block;
             let tail_len = state.captured_len - tail_start;
@@ -705,8 +739,10 @@ impl DFlashDraftModel {
             state.pending_is_history = false;
         } else if target_blocks > state.published_blocks {
             let start = state.published_blocks;
-            for (i, hash) in hashes.iter().enumerate().take(target_blocks).skip(start) {
-                let _ = cache.insert(ctx, *hash, &state.seal, (i - start) * block)?;
+            if can_publish {
+                for (i, hash) in hashes.iter().enumerate().take(target_blocks).skip(start) {
+                    let _ = cache.insert(ctx, *hash, &state.seal, (i - start) * block)?;
+                }
             }
             let consumed = (target_blocks - start) * block;
             let remaining = state.seal_len - consumed;
@@ -1238,6 +1274,10 @@ mod tests {
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
             "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
+        );
+        assert_eq!(
+            reservation.request_state_bytes_per_token, 56_320,
+            "request-owned draft KV(20480) + scratch-ctx(10240) + pending(25600) per token"
         );
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail

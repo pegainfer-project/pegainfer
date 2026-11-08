@@ -1270,6 +1270,107 @@ fn dflash_warm_prefix_keeps_drafting() {
     );
 }
 
+/// A conversation whose final served step seals a block must publish that
+/// block on finish: the next turn's prompt reaches the boundary, so without a
+/// publish-on-drop its all-or-nothing lookup misses and it plain-decodes.
+#[test]
+fn dflash_finish_publishes_last_sealed_block() {
+    const RESPONSE: usize = 20;
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(80);
+    let encoded = tokenizer.encode(&text, false).expect("encode failed");
+    let blocks = encoded.len() / 16;
+    assert!(blocks >= 8, "the text must span several blocks");
+    // `prompt + response` is one token past the boundary, so the final served
+    // step seals a full block and then emits a partial tail. That is the case
+    // a finish publish can recover (the boundary token was forwarded); a turn
+    // ending exactly on the boundary ends on the uncaptured bonus token.
+    let prompt_len = blocks * 16 + 1 - RESPONSE;
+    let prompt_tokens = encoded[..prompt_len].to_vec();
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    // First turn: exactly RESPONSE tokens (ignore EOS), so `prompt_len +
+    // RESPONSE` lands on a block boundary and the last step seals it.
+    let first = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            RESPONSE,
+        ))
+        .expect_finished();
+    assert_eq!(
+        first.tokens.len(),
+        RESPONSE,
+        "ignore_eos must produce exactly the max-token count"
+    );
+    assert_eq!(
+        first.cached_tokens.unwrap_or(0),
+        0,
+        "the first turn must be cold"
+    );
+    let first_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(
+        first_spec.num_drafts > 0,
+        "the first turn did not draft, so it never sealed the final block through verify"
+    );
+
+    // Second turn: the first turn's exact prompt + response + one suffix token.
+    // The match cap is `(len - 1) / 16`, so it can reuse every block of the
+    // finished turn only if the last one was published on finish.
+    let mut second_prompt = prompt_tokens;
+    second_prompt.extend_from_slice(&first.tokens);
+    second_prompt.push(encoded[prompt_len]);
+    let warm_base = first_spec;
+    let second = engine
+        .submit(request(
+            second_prompt,
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            8,
+        ))
+        .expect_finished();
+    let cached = second.cached_tokens.unwrap_or(0);
+    assert_eq!(
+        cached,
+        blocks * 16,
+        "the second turn did not reuse the finished turn's last sealed block"
+    );
+    let warm_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(
+        warm_spec.num_drafts > warm_base.num_drafts,
+        "the warm turn kept the KV hit but did not draft ({} -> {} drafts); \
+         the finish publish is missing",
+        warm_base.num_drafts,
+        warm_spec.num_drafts
+    );
+}
+
 /// A capture-cache miss must fall back to plain decode, not fail or seed a
 /// shifted draft context. Run in a child so the 1 MiB budget (two blocks, far
 /// less than the prompt) is read at engine start.
@@ -1319,9 +1420,10 @@ fn dflash_capture_cache_miss_falls_back_to_plain_decode() {
         .expect("failed to start speculative engine"),
     );
 
-    // 1 MiB holds two 16-token blocks, far less than this prompt's ~22. The
-    // cold run's publishes evict the early blocks, so the warm restore's
-    // all-or-nothing lookup misses.
+    // 1 MiB holds two 16-token blocks, far less than this prompt's ~22. A
+    // request longer than the cache is not published at all (inserting it
+    // would evict its own head and every other conversation), so the warm
+    // restore's all-or-nothing lookup misses.
     let cold = engine
         .submit(request(
             prompt_tokens.clone(),
