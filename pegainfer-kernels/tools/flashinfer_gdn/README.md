@@ -12,6 +12,35 @@ Rust identity from the validated final link inputs. The loaded GDN object retain
 it; serving does not depend on test environment variables. Local candidate hashes establish
 internal consistency and compatibility, not trusted distribution provenance.
 
+## Quick start
+
+Use Linux x86_64 and an SM120 GPU with Qwen3.5-4B at TP1. Download the complete
+`Qwen/Qwen3.5-4B` checkpoint, including weights, configuration and tokenizer.
+
+1. Follow the repository's [source build setup](../../../README.md#build-from-source);
+   the Qwen3-only prebuilt release does not contain this backend. Prepare a separate
+   CuTe generation environment using [requirements-cu13.lock](requirements-cu13.lock)
+   and the Python/toolchain versions in [source-lock.json](source-lock.json).
+   Keep the normal Qwen3.5 Triton build environment separate.
+2. Run `compile_sm120.py` with the generation environment's Python. Point
+   `--flashinfer-dir` to an independent clean checkout at the source-lock pin,
+   and `--output` to a new bundle directory outside the repository. Do not
+   replace the repository's shared FlashInfer submodule.
+3. Set `PEGAINFER_QWEN35_GDN_AOT_BUNDLE` to the generated bundle's absolute path
+   and `PEGAINFER_TRITON_PYTHON` to the Triton environment's Python. Build the
+   server in release mode with `--features qwen35`; the bundle is validated
+   and linked at build time.
+4. Start the resulting `pegainfer` binary with `--model-path` pointing to the
+   downloaded Qwen3.5-4B checkpoint and
+   `--qwen35-gdn-backend flashinfer-candidate`. Check the startup log for
+   `resolved=flashinfer-candidate` and `object_sha256`. Omitting the backend
+   option selects Triton even in this build.
+
+Once ready, use the [HTTP API](../../../README.md#api) to send a nonempty
+completion request, using the model ID returned by `/v1/models`.
+
+## Generation and validation
+
 `source-lock.json` owns the frozen geometry, dtypes, dynamic-token bounds,
 in-place ABI, tensor views, workspace formula, toolchain and FlashInfer pin.
 Both the generation tools and the independent typed Rust validator consume
@@ -64,13 +93,10 @@ substitutes for it.
 The canonical runner additionally executes the single Rust host mutation test
 against the real generated bundle, explicitly selecting it with `--ignored`;
 ordinary Cargo test runs leave it ignored. It shares one valid fixture across all
-metadata and file/path rejection cases; it does not manufacture a fake object
-or claim host validation proves GPU execution. One corrupted real object also
+metadata and file/path rejection cases. One corrupted real object also
 exercises the actual build-script rejection before linking.
-There is no C-string identity query or special identity-test link mode. Every
-Qwen3.5 build overwrites the generated Rust identity, including when the bundle
-is removed. ABI version 3 retires the identity query; launch argument layout and
-in-place state semantics are unchanged. The runner also rebuilds the same target
+Every Qwen3.5 build overwrites the generated Rust identity, including when the
+bundle is removed. The runner also rebuilds the same target
 without a bundle and checks archive/link inputs and explicit startup rejection.
 Candidate executable snapshots are retained before that rebuild.
 
@@ -84,8 +110,7 @@ crate-private test modules; ordinary entries continue to select Triton.
 Before positive HF replay, the candidate short test directly asserts errors from
 the same fixture/revision/identity prerequisite functions: missing/malformed
 expected SHA, missing model/fixture, unresolved/wrong revision and wrong actual
-model identity. The last check uses the executor's already-loaded model. There
-are no extra negative HF processes, panic-output parsers or extra model loads.
+model identity. The last check uses the executor's already-loaded model.
 All HF entries reject an unresolved revision. Gate 3 reuses both existing short
 and long HF golden scenarios. The long test checks
 4097/8192-token outputs against an external oracle; HTTP and Shared-SM lifecycle
@@ -94,5 +119,4 @@ a passing lifecycle test alone does not establish it.
 
 Generated objects, oracle source copies, references, logs, model weights and
 profiling results remain outside the source tree's tracked files. The runner
-owns their temporary/evidence directory. Neither the upstream oracle nor a
-separate-state ABI exists in the serving binary.
+owns their temporary/evidence directory.

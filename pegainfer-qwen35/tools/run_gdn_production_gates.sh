@@ -367,4 +367,3 @@ sha256sum -c "$log_root/qwen35-test-binary-sha256.log"
   echo "candidate object changed during acceptance" >&2; exit 3;
 }
 echo "all five Qwen3.5 GDN functional gate categories passed for $commit_sha tree $tree_sha object $object_sha"
-echo "Stage 20 also requires analysis of the Shared-SM Nsight timeline and same-head performance A/B."

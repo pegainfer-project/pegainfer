@@ -115,7 +115,7 @@ pub(super) struct CandidateDecodeGemm {
     pub(super) layer: usize,
     pub(super) projection: DecodeProjection,
     pub(super) batch: usize,
-    pub(super) recipe: OnceLock<pegainfer_kernels::ops::Qwen35DecodeGemm>,
+    recipe: OnceLock<pegainfer_kernels::ops::Qwen35DecodeGemm>,
 }
 
 impl CandidateDecodeGemm {
@@ -134,7 +134,7 @@ impl CandidateDecodeGemm {
         }
     }
 
-    pub(super) fn prepare(&self, model: &Qwen35Model) -> Result<()> {
+    fn prepare(&self, model: &Qwen35Model) -> Result<()> {
         anyhow::ensure!(
             model.flashinfer_gdn.is_some(),
             "decode adjustment requires a candidate"
@@ -199,22 +199,6 @@ fn candidate_decode_targets(
 }
 
 impl Qwen35Model {
-    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
-    pub fn from_safetensors_with_options(
-        model_path: &str,
-        enable_cuda_graph: bool,
-        max_batch: usize,
-    ) -> Result<Self> {
-        Self::from_safetensors_with_runtime_and_capacity(
-            model_path,
-            ModelRuntimeConfig {
-                enable_cuda_graph,
-                ..Default::default()
-            },
-            max_batch,
-        )
-    }
-
     /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
     /// It need not be a decode bucket: the physical decode capacity is rounded
     /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
