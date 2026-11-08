@@ -43,12 +43,13 @@ its scheduler, so that scheduler needs no second startup handshake. See
 [scheduler metrics](load-snapshot.md) for publication, cancellation and idle
 polling.
 
-Qwen3.5 suppresses model EOS unless `ignore_eos` is set, and a stop finishes
-without a typed cause. The bridge supplies its legacy sentinel so HTTP usage
-still counts suppressed EOS; ledger counts cover only emitted tokens.
-Request-scoped stop IDs and retained trigger/logprob metadata remain
-follow-up work. Qwen3.5 rejects non-null `prompt_logprobs` before backend
-allocation and does not provide prompt echo.
+Final prefill and decode apply `Request.stop_policy`: ignoring EOS does not
+disable explicit stop IDs, and a token stop takes precedence over the length
+limit. After backend cleanup succeeds, the scheduler emits the actual trigger
+and its requested logprob with a typed stop cause. The bridge can therefore
+report explicit stop IDs without adding a legacy sentinel. Qwen3.5 rejects
+non-null `prompt_logprobs` before backend allocation and does not provide
+prompt echo.
 
 ## Build and validation
 

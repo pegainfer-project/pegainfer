@@ -7,7 +7,9 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  # An edit that leaves the title alone skips every job, so it gets a group of its
+  # own and cannot cancel the run for a push.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.action == 'edited' && !github.event.changes.title && github.run_id || 'label' }}
   cancel-in-progress: true
 
 permissions:
@@ -44,3 +46,15 @@ jobs:
             args+=(--remove-label "$remove")
           fi
           gh pr edit "$PR_NUMBER" -R "$REPO" "${args[@]}"
+
+  needs-rebase:
+    name: Sync the needs-rebase label
+    needs: label
+    # After the labeler, which writes back the whole label set it read and would
+    # undo a needs-rebase change made in between.
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/needs-rebase.yml
+    with:
+      pr: ${{ github.event.pull_request.number }}

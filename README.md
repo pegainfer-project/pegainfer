@@ -11,7 +11,7 @@
   <a href="https://pegainfer.org/">
     <img src="https://img.shields.io/badge/Docs%20%26%20Blog-pegainfer.org-2ea44f" alt="Docs and engineering blog">
   </a>
-  <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-41scnc53a-d0McNJDjK2lVqFGoSLUgXA">
+  <a href="https://join.slack.com/t/openinferhq/shared_invite/zt-4fhvbqhup-dBO0rbL0UrVJNDz6RMwMqg">
     <img src="https://img.shields.io/badge/Slack-join%20the%20community-4A154B?logo=slack&logoColor=white" alt="Join the PegaInfer Slack">
   </a>
   <a href="LICENSE">
@@ -150,7 +150,7 @@ Only **`qwen3`** is enabled by default, including in the prebuilt binary. Build 
 | --- | --- | --- | --- |
 | **Qwen3 · dense 0.6B to 32B** | Full attention, GQA | `qwen3` · default | Greedy + sampling, tensor parallel, prefix cache, KV offload; DFlash / DSpark on 4B. [Model page](https://pegainfer.org/models/qwen3-4b/) |
 | **Qwen3.5 · dense 0.8B to 27B** | Gated DeltaNet + full attention | `qwen35` | Text-only BF16; build-time Triton. Qwen3.8-27B rides the same feature. [Model page](https://pegainfer.org/models/qwen35/) · [Qwen3.8 support record](docs/models/qwen35/support-qwen38.md) |
-| **Gemma 4 · 12B and 26B-A4B** | Sliding-window + global attention; NVFP4 routed experts on 26B | `gemma4` | Text-only, single GPU, batched decode and optional chunked prefill. [Model page](https://pegainfer.org/models/gemma4/) |
+| **Gemma 4 · 12B and 26B-A4B** | Sliding-window + global attention; NVFP4 routed experts on 26B | `gemma4` | Text-only, batched decode and optional chunked prefill; the dense sizes also run at tensor parallel 2, one rank per device. [Model page](https://pegainfer.org/models/gemma4/) |
 | **DeepSeek-V2-Lite** | MLA + MoE | `deepseek-v2-lite` | 2-GPU EP2 correctness path. [Status and limits](docs/models/deepseek-v2-lite/status.md) |
 | **Kimi-K2 / K2.5** | MLA + MoE, Marlin INT4 | `kimi-k2` | 8-GPU expert parallelism. [Model roadmap](docs/models/kimi-k2/roadmap.md) |
 | **GLM-5.2** | Sparse MLA + MoE, FP8 | `glm52` | Blackwell; EP decode, TP4 prefill, native MTP speculative decoding, P/D disaggregation. Bring-up. [Model page](https://pegainfer.org/models/glm52/) |

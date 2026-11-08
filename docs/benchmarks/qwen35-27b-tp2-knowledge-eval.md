@@ -8,7 +8,7 @@
 
 ## 环境
 
-- GPU:2× RTX 4090(48 GB 版本),`--tp-size 2 --cuda-graph false`(P2c 起 TP+CUDA Graph 不再 fail-closed:由编译后 GQA 门控决定——4B/9B TP2 捕获 graph;本评测为 27B group-6,门控回落 eager 而非报错)
+- GPU:2× RTX 4090(48 GB 版本),`--tp-size 2 --cuda-graph false`(P2c 起 TP+CUDA Graph 不再 fail-closed:由编译后 GQA 门控决定。本评测显式 `--cuda-graph false`,故走 batched eager decode;注:27B group-6 自 #1145 起已编译、TP2 可捕获 graph,此处 eager 来自该 flag 而非门控回落)
 - 模型:Qwen/Qwen3.5-27B `fc05daec`,BF16,served-model-name `qwen35-27b-tp2`
 - 采样:temperature=0.0,top_p=1.0,chat completions(thinking 模式,即模板默认行为)
 - 评测器:`scripts/eval_mc.py`(自研,统一 `/v1/chat/completions` 并发 48),配方逐项复刻官方 harness:

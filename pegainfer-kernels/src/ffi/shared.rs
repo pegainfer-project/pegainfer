@@ -5,6 +5,20 @@ use super::Half;
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
+    pub fn dflash2_grouped_conv_cuda(
+        input: *const Half,
+        dynamic: *const Half,
+        base: *const Half,
+        output: *mut Half,
+        rows: i32,
+        hidden: i32,
+        block: i32,
+        group_size: i32,
+        taps: i32,
+        side: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn rms_norm_cuda(
         x: *const Half,
         weight: *const Half,
@@ -143,16 +157,6 @@ unsafe extern "C" {
         dst_seq_len: i32,
         stream: CUstream,
     ) -> CUresult;
-
-    pub fn fused_add_rms_norm_cuda(
-        hidden: *mut Half,
-        residual: *const Half,
-        weight: *const Half,
-        out: *mut Half,
-        n: i32,
-        eps: f32,
-        stream: CUstream,
-    );
 
     pub fn layer_norm_cuda(
         x: *const Half,
@@ -320,6 +324,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    /// `y[rows] = W[rows, cols] * x[cols]`, bf16 in and out with fp32 accumulation.
+    pub fn gemv_bf16_cuda(
+        w: *const Half,
+        x: *const Half,
+        y: *mut Half,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> i32;
+
     /// cuBLAS `cublasGemmStridedBatchedEx` (bf16, workspace-free, graph-safe).
     pub fn gemm_strided_batched_bf16_cuda(
         op_a: i32,
@@ -421,15 +435,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
-    pub fn embedding_decode_cuda(
-        embed: *const Half,
-        token_id: *const u32,
-        out: *mut Half,
-        hidden_size: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn silu_mul_fused_cuda(
         gate_up: *const Half,
         out: *mut Half,
@@ -478,14 +483,35 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
-    // Per-head RMSNorm with F32 weight + SiLU gate
+    // Per-head RMSNorm with F32 weight + SiLU gate. `num_heads` counts every
+    // head of every slot; `heads_per_slot` splits that back into (slot, head)
+    // so `x` and `gate` can each carry their own tensor's slot stride.
     pub fn rms_norm_gated_cuda(
         x: *const Half,
         weight: *const f32,
         gate: *const Half,
         out: *mut Half,
         num_heads: i32,
+        heads_per_slot: i32,
         head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // The same kernel with a sigmoid gate, for the lines whose
+    // `output_gate_type` selects it.
+    pub fn rms_norm_gated_sigmoid_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        heads_per_slot: i32,
+        head_dim: i32,
+        x_stride: i32,
+        gate_stride: i32,
         eps: f32,
         stream: CUstream,
     );
@@ -571,13 +597,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the number of Q tiles for batch prefill (needed to size plan arrays).
-    pub fn batch_prefill_paged_num_tiles(
-        seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
         seq_len: i32,
         num_qo_heads: i32,
@@ -587,13 +606,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Return the CTA tile size for batch prefill planning.
-    pub fn batch_prefill_cta_tile_q(
-        total_seq_len: i32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-    ) -> i32;
-
     pub fn batch_prefill_cta_tile_q_with_override(
         total_seq_len: i32,
         num_qo_heads: i32,
@@ -603,33 +615,6 @@ unsafe extern "C" {
     ) -> i32;
 
     // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
-    pub fn batch_prefill_paged_cuda(
-        q: *const Half,
-        output: *mut Half,
-        kv_data: *const Half,
-        k_offset_elems: i64,
-        v_offset_elems: i64,
-        page_indices: *const i32,
-        page_indptr: *const i32,
-        last_page_len_d: *const i32,
-        q_indptr: *const i32,
-        request_indices: *const i32,
-        qo_tile_indices: *const i32,
-        kv_tile_indices: *const i32,
-        kv_chunk_size_ptr: *const i32,
-        total_num_rows: *const u32,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        page_size: i32,
-        seq_len: i32,
-        batch_size: i32,
-        padded_batch_size: i32,
-        stride_page: i64,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
     pub fn batch_prefill_paged_cuda_with_cta_tile_q(
         q: *const Half,
         output: *mut Half,
@@ -690,22 +675,6 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn single_prefill_nhd_noncausal_cuda_hd64(
-        q: *const Half,
-        output: *mut Half,
-        k_cache: *const Half,
-        v_cache: *const Half,
-        num_qo_heads: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        seq_len: i32,
-        kv_len: i32,
-        max_seq_len: i32,
-        sm_scale: f32,
-        stream: CUstream,
-    ) -> i32;
-
-    // Causal NHD single-sequence prefill (same layout, causal mask).
-    pub fn single_prefill_nhd_causal_cuda(
         q: *const Half,
         output: *mut Half,
         k_cache: *const Half,
@@ -990,4 +959,75 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     pub fn pegainfer_kernels_last_error() -> *const std::os::raw::c_char;
+}
+
+// Native DFlash2 candidate selection. All entries guard C++ exceptions;
+// nonfinite selected candidates and computed scores use the error flag.
+unsafe extern "C" {
+    pub fn dflash2_prepare_cuda(
+        logits: *const Half,
+        hidden: *const Half,
+        predecessor: *const Half,
+        successor: *const Half,
+        anchors: *const u32,
+        ids: *mut u32,
+        unary: *mut f32,
+        gated: *mut f32,
+        successors: *mut f32,
+        error: *mut u32,
+        topk_values: *mut Half,
+        row_states: *mut u8,
+        batch: i32,
+        block_size: i32,
+        vocab: i32,
+        rank: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn dflash2_finish_cuda(
+        edges: *mut f32,
+        unary: *const f32,
+        ids: *const u32,
+        temperatures: *const f32,
+        uniforms: *const f32,
+        proposal_probs: *mut f32,
+        selected: *mut u32,
+        error: *mut u32,
+        batch: i32,
+        length: i32,
+        stream: CUstream,
+    ) -> i32;
+    pub fn gpu_sample_probs_flashinfer_cuda(
+        logits: *const Half,
+        row_indices: *const i32,
+        probs: *mut f32,
+        temperatures: *const f32,
+        top_k: *const i32,
+        top_p: *const f32,
+        row_states: *mut u8,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        rows: i32,
+        vocab: i32,
+        has_top_k: i32,
+        has_top_p: i32,
+        min_p: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn sparse_speculative_sample_cuda(
+        probs: *mut f32,
+        min_p: *const f32,
+        requests: *const i32,
+        candidates: *const u32,
+        q: *const f32,
+        drafts: *const u32,
+        uniforms: *const f32,
+        output: *mut u32,
+        num_rows: i32,
+        num_requests: i32,
+        block_size: i32,
+        vocab: i32,
+        stream: CUstream,
+    ) -> i32;
 }

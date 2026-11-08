@@ -22,10 +22,81 @@ use pegainfer_core::tensor::HiddenStates;
 
 use crate::config::Gemma4Config;
 use crate::config::MoeConfig;
+use crate::config::TensorParallelConfig;
 use crate::moe::MoeScratch;
 use crate::weights::Gemma4Layer;
 use crate::weights::Linear;
 use crate::weights::LinearScratch;
+
+/// The NCCL communicator of this rank's tensor-parallel group, or `None` at
+/// world size 1, where every collective is a no-op.
+///
+/// Shareable so that the engine can abort a rank's communicator from its own
+/// thread — a peer stuck inside a collective is unblocked by aborting *its*
+/// communicator, which is local to it, rather than by the near end aborting and
+/// hoping the far end notices. `ncclCommAbort` is documented as callable at any
+/// time from any thread to fail the communicator's pending and future
+/// operations, which is what makes the sharing sound; aborting drops the inner
+/// `Comm`, whose own `Drop` is what calls it, so nothing aborts twice.
+#[derive(Clone)]
+pub(crate) struct TpComm(std::sync::Arc<TpCommSlot>);
+
+struct TpCommSlot {
+    /// `None` once aborted, which is also what makes the abort idempotent and
+    /// what makes every reduction after it refuse rather than run comm-less.
+    comm: std::sync::Mutex<Option<cudarc::nccl::safe::Comm>>,
+}
+
+// SAFETY: the mutex is the only way either thread reaches the communicator, and
+// it is held for one enqueue — not across the collective — so the outer `abort`
+// can take and drop the `Comm` while a reduction it started is still running.
+// That concurrent abort is exactly what NCCL's contract allows, and the rank
+// that *uses* the communicator is still exactly one thread at a time.
+unsafe impl Send for TpCommSlot {}
+unsafe impl Sync for TpCommSlot {}
+
+impl TpComm {
+    pub(crate) fn new(comm: cudarc::nccl::safe::Comm) -> Self {
+        Self(std::sync::Arc::new(TpCommSlot {
+            comm: std::sync::Mutex::new(Some(comm)),
+        }))
+    }
+
+    /// Sum this rank's buffer across the group. The lock covers the enqueue
+    /// only, so a concurrent `abort` cannot be held off by a running kernel.
+    pub(crate) fn all_reduce_in_place<T>(
+        &self,
+        buff: &mut impl cudarc::driver::DevicePtrMut<T>,
+        op: &cudarc::nccl::safe::ReduceOp,
+    ) -> Result<()>
+    where
+        T: cudarc::nccl::safe::NcclType,
+    {
+        let guard = self
+            .0
+            .comm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let comm = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the communicator was aborted"))?;
+        comm.all_reduce_in_place(buff, op)
+            .map_err(|e| anyhow::anyhow!("gemma4 tensor-parallel all-reduce failed: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Fail every pending and future operation on this rank. Idempotent, and
+    /// callable from any thread.
+    pub(crate) fn abort(&self) {
+        let taken = self
+            .0
+            .comm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(taken);
+    }
+}
 
 /// The geometry a layer runs at, read off the validated config — the local
 /// and global kinds differ only in head width and KV head count.
@@ -40,28 +111,34 @@ pub(crate) struct LayerGeometry {
 }
 
 impl LayerGeometry {
-    pub(crate) fn local_of(config: &Gemma4Config) -> Self {
-        Self {
+    /// This rank's geometry for the sliding family. The residual stream and
+    /// the head width stay whole — every rank holds whole heads — while the
+    /// head counts and the MLP width shard.
+    pub(crate) fn local_of(config: &Gemma4Config, tp: TensorParallelConfig) -> Result<Self> {
+        Ok(Self {
             hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size,
-            num_q_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
+            intermediate_size: tp.local_intermediate(config)?,
+            num_q_heads: tp.local_q_heads(config)?,
+            num_kv_heads: tp.local_sliding_kv_heads(config)?,
             head_dim: config.head_dim,
             rms_norm_eps: config.rms_norm_eps,
             moe: config.moe,
-        }
+        })
     }
 
-    pub(crate) fn global_of(config: &Gemma4Config) -> Self {
-        Self {
+    /// This rank's geometry for the global family. Its KV heads take the
+    /// two-branch range — shard when the world size divides them, replicate
+    /// when it does not — which the config resolves.
+    pub(crate) fn global_of(config: &Gemma4Config, tp: TensorParallelConfig) -> Result<Self> {
+        Ok(Self {
             hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size,
-            num_q_heads: config.num_attention_heads,
-            num_kv_heads: config.num_global_key_value_heads,
+            intermediate_size: tp.local_intermediate(config)?,
+            num_q_heads: tp.local_q_heads(config)?,
+            num_kv_heads: tp.global_kv_head_range(config)?.1,
             head_dim: config.global_head_dim,
             rms_norm_eps: config.rms_norm_eps,
             moe: config.moe,
-        }
+        })
     }
 }
 
@@ -251,14 +328,50 @@ impl EpilogueScratch {
     }
 }
 
+/// Sum this rank's partial projection across the tensor-parallel group, in
+/// place. Only the live rows are handed to NCCL: a decode arena is padded to
+/// its power-of-two bucket and the rows past `seq_len` are zero padding no
+/// rank reads back, so reducing them would move bytes for nothing. The extent
+/// is `hidden_size * seq_len`, the same on every rank of the step; inside a
+/// captured graph `seq_len` is the bucket, so the recorded shape stays
+/// constant across replays. At world size 1 `comm` is `None` and this is free.
+fn all_reduce_rows(
+    comm: Option<&TpComm>,
+    geom: &LayerGeometry,
+    buf: &mut HiddenStates,
+    seq_len: usize,
+) -> Result<()> {
+    let Some(comm) = comm else {
+        return Ok(());
+    };
+    let elems = geom
+        .hidden_size
+        .checked_mul(seq_len)
+        .context("tensor-parallel reduction extent overflows")?;
+    anyhow::ensure!(
+        buf.data.len() >= elems,
+        "a tensor-parallel reduction needs {elems} elements, the buffer holds {}",
+        buf.data.len()
+    );
+    comm.all_reduce_in_place(
+        &mut buf.data.slice_mut(..elems),
+        &cudarc::nccl::safe::ReduceOp::Sum,
+    )?;
+    Ok(())
+}
+
 /// Everything downstream of attention — o_proj through the `layer_scalar`
 /// multiply (applied after both residual adds, not either branch) — is
 /// identical for both layer kinds; one implementation keeps the two
 /// forwards' numerics from drifting apart.
+///
+/// Under tensor parallelism both projections here are row-parallel sums, so
+/// each is reduced across the group before the residual it feeds is formed.
 pub(crate) fn attention_epilogue_into(
     ctx: &DeviceContext,
     layer: &Gemma4Layer,
     geom: &LayerGeometry,
+    comm: Option<&TpComm>,
     x: &HiddenStates,
     attn: &HiddenStates,
     scratch: &mut EpilogueScratch,
@@ -285,6 +398,10 @@ pub(crate) fn attention_epilogue_into(
         .attention
         .o_proj
         .project_into(ctx, attn, &scratch.linear, &mut scratch.attn_proj)?;
+    // o_proj is row-parallel: its output is this rank's partial sum over
+    // the whole hidden width, so it is summed across the group before the
+    // residual add reads it.
+    all_reduce_rows(comm, geom, &mut scratch.attn_proj, seq_len)?;
     // The first normalized value and its residual sum still round to bf16
     // before the second reduction reads them.
     ops::rms_norm_add_rms_norm_round_batch_into(
@@ -315,7 +432,7 @@ pub(crate) fn attention_epilogue_into(
         .mlp
         .down
         .project_into(ctx, &scratch.act, &scratch.linear, &mut scratch.down)?;
-    let feed_forward = match (&layer.moe, &mut scratch.moe) {
+    let feed_forward: &mut HiddenStates = match (&layer.moe, &mut scratch.moe) {
         (Some(moe), Some(moe_scratch)) => {
             crate::moe::moe_into(
                 ctx,
@@ -328,11 +445,14 @@ pub(crate) fn attention_epilogue_into(
                 // and has the same shape, so the routed block's result reuses it.
                 &mut scratch.attn_proj,
             )?;
-            &scratch.attn_proj
+            &mut scratch.attn_proj
         }
-        (None, _) => &scratch.down,
+        (None, _) => &mut scratch.down,
         (Some(_), None) => anyhow::bail!("Gemma 4: a routed layer met a dense epilogue scratch"),
     };
+    // `down` is row-parallel as well, and a routed block's output is summed
+    // the same way.
+    all_reduce_rows(comm, geom, feed_forward, seq_len)?;
     ops::rms_norm_add_scale_batch_into(
         ctx,
         feed_forward,

@@ -15,6 +15,8 @@ use pegainfer_kv_cache::BlockPool;
 use super::test_support::FakeExecutor;
 use super::test_support::request;
 use super::*;
+use crate::executor::PrefillRequestResult;
+use crate::executor::PrefillResult;
 use crate::speculative::VerifyRequestResult;
 
 fn active_state(request_id: u64, generated_count: usize, max_tokens: usize) -> ActiveRequestState {
@@ -76,8 +78,19 @@ fn admission_splits_deferred_into_pending_deferred_and_rejected() {
     ];
 
     // available 4 blocks - 2 reserved for active growth = budget of 2.
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 4, 4, usize::MAX, 64, 32, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        4,
+        4,
+        usize::MAX,
+        64,
+        32,
+        |_| 0,
+    );
 
     let ids = |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.raw()).collect::<Vec<_>>();
     assert_eq!(
@@ -115,8 +128,19 @@ fn requests_exceeding_context_window_are_rejected() {
         mk(3, 40, 1),  // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
     ];
 
-    let outcome =
-        admit_deferred_requests(deferred, &active, &[], 16, 1000, 1000, 32, 64, 64, |_| 0);
+    let outcome = admit_deferred_requests(
+        deferred,
+        &active,
+        &[],
+        &[],
+        16,
+        1000,
+        1000,
+        32,
+        64,
+        64,
+        |_| 0,
+    );
 
     let pending_ids = outcome
         .pending
@@ -152,6 +176,7 @@ fn admission_respects_decode_batch_capacity() {
         vec![pending],
         &active,
         &[],
+        &[],
         16,
         1024,
         1024,
@@ -171,6 +196,53 @@ fn admission_respects_decode_batch_capacity() {
         "capacity-starved request should stay deferred"
     );
     assert!(outcome.rejected.is_empty());
+}
+
+#[test]
+fn inflight_prefill_reservation_is_unchanged_by_its_result() {
+    let executor = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())));
+    // 40 prompt + 20 output tokens: 4 lifetime blocks.
+    let launched = |prefill_pos: usize, step_chunk: usize| PendingRequest {
+        prefill_pos,
+        step_chunk,
+        ..PendingRequest::from_request(RequestId::new(1), request(40, 20))
+    };
+    // A middle chunk returns to `prefilling`; the last one promotes to decode.
+    for (req, owed) in [(launched(0, 32), 2), (launched(32, 8), 1)] {
+        let floor = admitted_future_blocks(&executor, &[], &[], std::slice::from_ref(&req));
+        assert_eq!(floor, owed, "the launched chunk is already allocated");
+
+        let prefill_pos = req.prefill_pos + req.step_chunk;
+        let result = PrefillResult {
+            requests: vec![PrefillRequestResult {
+                request_id: req.request_id,
+                first_token: 100,
+                first_token_logprob: None,
+                prompt_logprobs: None,
+                // No lookup ran for this chunk, so neither leg is reported.
+                cached_tokens: None,
+                external_hit_tokens: None,
+                completed: prefill_pos == req.prompt_tokens.len(),
+                prefill_pos,
+            }],
+            draft_context_captured_requests: Vec::new(),
+        };
+        let artifacts = plan::ExecutionArtifacts::Prefill {
+            pending: vec![req],
+            result,
+        };
+        let effects = resolve::resolve_step(&executor, &[], artifacts);
+        let (active, prefilling) = match effects.pending.into_iter().next() {
+            Some(effects::PendingEffect::ContinuePrefill { req }) => (Vec::new(), vec![req]),
+            Some(effects::PendingEffect::Promote { state, .. }) => (vec![state], Vec::new()),
+            _ => panic!("a launched chunk resolves to continue or promote"),
+        };
+        assert_eq!(
+            admitted_future_blocks(&executor, &active, &prefilling, &[]),
+            floor,
+            "applying the result neither frees nor double counts the reservation"
+        );
+    }
 }
 
 #[test]
@@ -317,6 +389,7 @@ fn oversized_prompt_logprobs_request_is_rejected_at_admission() {
         vec![mk_prompt_logprobs(1, 33), mk(2, 64)],
         &active,
         &[],
+        &[],
         16,
         1024,
         1024,
@@ -357,6 +430,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
         vec![mk(1, 16, 17)],
         &active,
         &[],
+        &[],
         16,
         2,
         2,
@@ -378,6 +452,7 @@ fn page_boundary_lifetime_blocks_gate_admission() {
     let exactly_reserved = admit_deferred_requests(
         vec![mk(2, 16, 17)],
         &active,
+        &[],
         &[],
         16,
         3,
@@ -708,4 +783,40 @@ fn speculative_resolves_each_request_independently() {
         effects::DecodeEffect::FinishMany { request_id, finish_reason: FinishReason::Stop, .. }
             if *request_id == RequestId::new(2)
     ));
+}
+
+#[test]
+fn a_gated_batch_runs_a_verify_round_not_a_plain_decode() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 9),
+            Some(plan::ExecutionPlan::SpeculativeDecode)
+        ),
+        "under the threshold the batch drafts and verifies"
+    );
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, Vec::new(), 8),
+            Some(plan::ExecutionPlan::GatedSpeculativeDecode)
+        ),
+        "at the threshold the batch verifies a one-token span"
+    );
+}
+
+#[test]
+fn a_gated_batch_with_pending_work_prefills_first() {
+    let exec = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new()))).with_speculative();
+    let active: Vec<ActiveRequestState> = (1..=8).map(|id| active_state(id, 0, 32)).collect();
+    let pending = PendingRequest::from_request(RequestId::new(9), request(16, 1));
+
+    assert!(
+        matches!(
+            runtime_plan_at(&exec, &active, vec![pending], 4),
+            Some(plan::ExecutionPlan::Prefill { .. })
+        ),
+        "a gated batch still prefills its arrivals, so they capture their draft context"
+    );
 }

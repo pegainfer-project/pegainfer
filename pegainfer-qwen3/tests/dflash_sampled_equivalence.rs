@@ -1,8 +1,8 @@
 //! Sampled speculative decoding must be *distribution-lossless* (#512).
 //!
-//! Sampled-verify (the #589 mechanism) commits only tokens the verify pass
-//! sampled from the target model's own distribution — spec-on and spec-off
-//! differ in *how* tokens are produced, never in *what law* they follow. Token-by-token
+//! Deterministic drafts use target-sample prefix matching; sampled DFlash2
+//! proposals use their conditional probabilities for rejection sampling.
+//! Both must preserve the target sampling distribution. Token-by-token
 //! equality is meaningless for sampled decoding (each run is a fresh draw), so
 //! the gate is statistical: for a fixed prompt set and representative sampling
 //! configs, generate many independent runs per arm and compare the per-position
@@ -27,7 +27,8 @@
 //!
 //! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent. Knobs:
+//! (drafter, including native DFlash2). Explicit paths must load successfully;
+//! an unconfigured local run skips when the default weights are absent. Knobs:
 //! `PEGAINFER_EQ_RUNS` (default 256 per arm), `PEGAINFER_EQ_BATCH` (default
 //! 16 concurrent identical requests per wave — the arms see the same batch
 //! shapes), `PEGAINFER_EQ_OUT` (optional JSON dump of every token matrix, for
@@ -40,6 +41,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -157,6 +163,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
+        eagle3_draft_model_path: None,
     }
 }
 
@@ -449,7 +456,7 @@ fn dflash_sampled_equivalence_gate() {
         arm
     };
 
-    // Arm B: DFlash speculative engine; sampled requests ride chain rejection.
+    // Arm B: the checkpoint selects deterministic or probabilistic proposals.
     let spec_on = {
         let engine = EngineHarness::new(
             pegainfer_qwen3::launch(
@@ -459,6 +466,15 @@ fn dflash_sampled_equivalence_gate() {
             .expect("failed to start speculative engine"),
         );
         let arm = collect_arm(&engine, &encoded, runs, batch);
+        let counters = engine.metrics().spec_decode.expect("speculative metrics");
+        assert!(
+            counters.num_drafts > 0 && counters.num_draft_tokens > 0,
+            "sampled requests must execute the speculative path"
+        );
+        eprintln!(
+            "sampled proposals: rounds={}, proposed={}, accepted={}",
+            counters.num_drafts, counters.num_draft_tokens, counters.num_accepted_tokens
+        );
         drop(engine);
         arm
     };
@@ -525,6 +541,7 @@ fn dflash_sampled_seeded_determinism() {
         .expect("failed to start speculative engine"),
     );
 
+    let mut stop_case = None;
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let tokens = tokenizer.encode(prompt, false).expect("encode failed");
         let params = SamplingParams {
@@ -537,7 +554,75 @@ fn dflash_sampled_seeded_determinism() {
             first, second,
             "prompt {i}: a seeded spec-on request must replay byte-identically"
         );
+        if i == 0 {
+            let stop_id = first[0]
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(position, token)| !first[0][..*position].contains(token))
+                .map(|(_, &token)| token)
+                .expect("fixture needs a new token after the prefill token");
+            stop_case = Some((tokens, params, stop_id));
+        }
     }
+
+    // Different budgets retire requests while the sampled lane still holds
+    // proposal rows for its neighbours. A known stop must retain its trigger
+    // without emitting any later token from the verified block.
+    let (tokens, params, stop_id) = stop_case.expect("first prompt produced a stop fixture");
+    let mut stopped = request(tokens.clone(), params, POSITIONS);
+    stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+    let before = engine.metrics().spec_decode.unwrap_or_default();
+    let streams: Vec<_> = [
+        request(
+            tokens.clone(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            9,
+        ),
+        request(tokens.clone(), sampling(CONFIGS[1]), 3),
+        request(tokens, sampling(CONFIGS[3]), POSITIONS),
+        stopped,
+    ]
+    .into_iter()
+    .map(|req| engine.submit(req))
+    .collect();
+    for (index, stream) in streams.into_iter().enumerate() {
+        let outcome = stream.expect_finished();
+        if index == 3 {
+            assert_eq!(outcome.tokens.last(), Some(&stop_id));
+            assert_eq!(
+                outcome.tokens.iter().position(|&token| token == stop_id),
+                Some(outcome.tokens.len() - 1),
+                "a stop token must end the emitted prefix"
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Token(id)),
+                    completion_tokens,
+                    ..
+                } if id == stop_id && completion_tokens == outcome.tokens.len()
+            ));
+        } else {
+            let budget = [9, 3, POSITIONS][index];
+            assert_eq!(outcome.tokens.len(), budget);
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    stop_cause: None,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == budget
+            ));
+        }
+    }
+    let after = engine.metrics().spec_decode.expect("speculative metrics");
+    assert!(after.num_drafts > before.num_drafts);
     drop(engine);
 }
 

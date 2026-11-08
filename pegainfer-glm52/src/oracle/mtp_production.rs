@@ -26,7 +26,7 @@ pub(super) const PATHOLOGICAL_PROMPT: &[u32] = &[
 ];
 
 #[test]
-#[ignore = "requires 8×H200 + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4"]
+#[ignore = "requires 8 Blackwell GPUs + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4"]
 fn native_mtp_uses_final_normalized_target_hidden() -> Result<()> {
     let model_path = std::env::var_os("PEGAINFER_TEST_MODEL_PATH")
         .map(PathBuf::from)

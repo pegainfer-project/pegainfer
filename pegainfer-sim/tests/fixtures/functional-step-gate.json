@@ -1,0 +1,36 @@
+{
+  "schema_version": 3,
+  "calibration": {
+    "manifest": "functional-step-gate.manifest.json",
+    "sha256": "07ba93b9fa4364adf402a079d0ec57ac185e2bc35fd255d1774a2e38696c99db"
+  },
+  "scheduler": {
+    "policy": "vllm_v1",
+    "max_num_seqs": 2,
+    "max_num_batched_tokens": 4,
+    "max_model_len": 16,
+    "prefill": {
+      "mode": "whole"
+    }
+  },
+  "predictor": {
+    "coverage": {
+      "decode_reqs": [0, 2],
+      "sum_decode_ctx_tokens": [0, 4],
+      "prefill_tokens_in_step": [0, 4]
+    },
+    "model": {
+      "kind": "functional",
+      "prefill": {
+        "input_tokens": [2, 4],
+        "duration_us": [1000, 2000]
+      },
+      "decode": {
+        "decode_reqs": [1, 2],
+        "sum_decode_ctx_tokens": [2, 4],
+        "duration_us": [3000, 4000, 5000, 6000]
+      },
+      "mixed": null
+    }
+  }
+}

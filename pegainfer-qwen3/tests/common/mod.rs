@@ -1,4 +1,5 @@
 pub(crate) mod harness;
+pub(crate) mod lossless;
 
 use std::sync::Arc;
 

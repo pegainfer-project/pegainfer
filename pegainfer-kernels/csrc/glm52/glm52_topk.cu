@@ -46,7 +46,7 @@ extern "C" int glm52_flashinfer_topk_2048_cuda(
   if (err != cudaSuccess) {
     fprintf(stderr, "glm52_flashinfer_topk_2048_cuda: FilteredTopK failed: %s\n",
             cudaGetErrorString(err));
-    return static_cast<int>(CUDA_ERROR_LAUNCH_FAILED);
+    return static_cast<int>(map_cuda_error(err));
   }
   err = flashinfer::sampling::LaunchFinalizeTopKIndices<
       /*SORT_LOCAL_INDICES=*/true, flashinfer::sampling::FilteredTopKMode::Plain, float, int>(
@@ -57,7 +57,7 @@ extern "C" int glm52_flashinfer_topk_2048_cuda(
     fprintf(stderr,
             "glm52_flashinfer_topk_2048_cuda: LaunchFinalizeTopKIndices failed: %s\n",
             cudaGetErrorString(err));
-    return static_cast<int>(CUDA_ERROR_LAUNCH_FAILED);
+    return static_cast<int>(map_cuda_error(err));
   }
   return static_cast<int>(CUDA_SUCCESS);
   PEGAINFER_FFI_GUARD_END(-1)

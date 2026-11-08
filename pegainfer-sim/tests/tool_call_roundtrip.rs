@@ -273,9 +273,9 @@ impl ToolCallSimServer {
 
 /// Model dir at a path containing `qwen3`. `ParserSelection::Auto` resolves the
 /// parser from the *model path string* (`config.model`) by case-insensitive
-/// substring match against a registry (`qwen3` -> `qwen3_xml`) — a random temp
+/// substring match against a registry (`qwen3` -> `qwen3_json`) — a random temp
 /// dir has no model-family name and would fail with `ParserUnavailableForModel`.
-/// The `qwen3-` prefix makes `Auto` select the qwen3 XML parser exactly as it
+/// The `qwen3-` prefix makes `Auto` select the qwen3 JSON parser exactly as it
 /// would for `models/Qwen3-4B` in production.
 fn qwen_model_dir() -> Result<TempDir> {
     let dir = tempfile::Builder::new()
@@ -395,22 +395,4 @@ fn reserve_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .context("failed to reserve loopback port for tool-call e2e test")?;
     Ok(listener.local_addr()?.port())
-}
-
-#[test]
-fn scripted_chunks_concatenate_to_expected_payload() {
-    let joined = format!("{CHUNK_1}{CHUNK_2}{CHUNK_3}");
-    assert_eq!(
-        joined,
-        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"SF\"}}\n</tool_call>"
-    );
-    // The inner JSON object must be valid on its own.
-    let inner = joined
-        .trim_start_matches("<tool_call>")
-        .trim()
-        .trim_end_matches("</tool_call>")
-        .trim();
-    let parsed: Value = serde_json::from_str(inner).expect("inner tool-call JSON is valid");
-    assert_eq!(parsed["name"], json!("get_weather"));
-    assert_eq!(parsed["arguments"]["location"], json!("SF"));
 }

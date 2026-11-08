@@ -2637,7 +2637,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "llm-multimodal"
 version = "1.7.1"
-source = "git+https://github.com/smg-project/llm-multimodal?rev=53ca0d6ea829af7477b6b63851cc70bed409bbc8#53ca0d6ea829af7477b6b63851cc70bed409bbc8"
+source = "git+https://github.com/smg-project/llm-multimodal?rev=f0985ef65967615db2c79279aa07818499301bfd#f0985ef65967615db2c79279aa07818499301bfd"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3619,7 +3619,9 @@ dependencies = [
  "pegainfer-kernels",
  "rayon",
  "safetensors",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -3759,7 +3761,10 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
+ "safetensors",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tvm-ffi",
 ]
 
@@ -3798,7 +3803,6 @@ dependencies = [
  "half",
  "kvbm-logical",
  "pegainfer-kernels",
- "tokio",
 ]
 
 [[package]]
@@ -3895,6 +3899,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-qwen4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pegainfer-frontend",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "pegainfer-sample"
 version = "0.1.0"
 dependencies = [
@@ -3922,6 +3938,7 @@ dependencies = [
  "pegainfer-kimi-k2",
  "pegainfer-qwen3",
  "pegainfer-qwen35",
+ "pegainfer-qwen4",
  "serde_json",
  "tikv-jemallocator",
  "tokio",
@@ -3942,6 +3959,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
 ]
@@ -5281,15 +5299,17 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.19.0"
+version = "3.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05839ce67618e14a09b286535c0d9c94e85ef25469b0e13cb4f844e5593eb19"
+checksum = "ee78f1fbe43ac4a0e47aadb3dbd357b69eb0d3793e948624cd03dd2750ab1c0a"
 dependencies = [
  "base64 0.22.1",
+ "bs58",
  "chrono",
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.0",
+ "jiff",
  "schemars 0.9.0",
  "schemars 1.2.1",
  "serde_core",
@@ -5300,9 +5320,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.19.0"
+version = "3.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
+checksum = "8705578779c2b6bd90d84d66eb2e206b708b1a4d7b9f17641b293545bf1c7e46"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -6874,18 +6894,19 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 [[package]]
 name = "vllm-build-info"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 
 [[package]]
 name = "vllm-chat"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
  "easy-ext",
  "futures",
  "half",
+ "image",
  "itertools 0.14.0",
  "llm-multimodal",
  "minijinja",
@@ -6904,6 +6925,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "trait-set",
  "uuid",
  "vllm-engine-core-client",
@@ -6918,7 +6940,7 @@ dependencies = [
 [[package]]
 name = "vllm-engine-core-client"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -6930,6 +6952,7 @@ dependencies = [
  "half",
  "hex",
  "itertools 0.14.0",
+ "libc",
  "parking_lot",
  "rmp-serde",
  "rmpv",
@@ -6939,6 +6962,7 @@ dependencies = [
  "serde_repr",
  "serde_tuple",
  "serde_with",
+ "socket2",
  "task-local",
  "thiserror 2.0.18",
  "thiserror-ext",
@@ -6952,7 +6976,7 @@ dependencies = [
 [[package]]
 name = "vllm-llm"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "easy-ext",
  "enum-as-inner",
@@ -6972,7 +6996,7 @@ dependencies = [
 [[package]]
 name = "vllm-metrics"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "itertools 0.14.0",
  "prometheus-client",
@@ -6981,14 +7005,20 @@ dependencies = [
 [[package]]
 name = "vllm-parser"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
+ "auto_impl",
  "easy-ext",
+ "educe",
+ "regex-automata",
+ "regex-syntax",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serde_with",
  "thiserror 2.0.18",
  "thiserror-ext",
+ "tracing",
  "vllm-tokenizer",
  "winnow",
  "xgrammar-structural-tag",
@@ -6996,8 +7026,8 @@ dependencies = [
 
 [[package]]
 name = "vllm-proto"
-version = "0.4.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+version = "0.6.0"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "prost",
  "prost-types",
@@ -7010,12 +7040,13 @@ dependencies = [
 [[package]]
 name = "vllm-server"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
  "auto_enums",
  "axum",
+ "base64 0.22.1",
  "educe",
  "futures",
  "http-body",
@@ -7041,7 +7072,6 @@ dependencies = [
  "tls-listener",
  "tokio",
  "tokio-openssl",
- "tokio-stream",
  "tokio-util",
  "tonic",
  "tonic-health",
@@ -7065,7 +7095,7 @@ dependencies = [
 [[package]]
 name = "vllm-text"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "anyhow",
  "asynk-strim-attr",
@@ -7091,7 +7121,7 @@ dependencies = [
 [[package]]
 name = "vllm-tokenizer"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "base64 0.22.1",
  "fastokens",
@@ -7111,7 +7141,7 @@ dependencies = [
 [[package]]
 name = "vllm-tracing"
 version = "0.1.0"
-source = "git+https://github.com/vllm-project/vllm.git?rev=15ed1262e70873a65582d82f7973784a0f11e5a2#15ed1262e70873a65582d82f7973784a0f11e5a2"
+source = "git+https://github.com/vllm-project/vllm.git?rev=fce64bc5c2c939a4521bfb9b462c8c74c1c13893#fce64bc5c2c939a4521bfb9b462c8c74c1c13893"
 dependencies = [
  "time",
  "tracing",
@@ -7713,9 +7743,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xgrammar-structural-tag"
-version = "0.3.0+xgrammar.0.2.7.82505d0"
+version = "0.4.1+xgrammar.0.2.8.9778737"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3864005575c2ab76057f789898f59fb9fa1378d07c5ceabc24764e012d0e90bb"
+checksum = "06637fe6ff753ef929b4cea2933b9432f78335255c6931dc748957122b9b492c"
 dependencies = [
  "auto_impl",
  "serde",
@@ -7803,22 +7833,21 @@ checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 [[package]]
 name = "zeromq"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efb2c254fd8f366755335c9e43b865f8484fe3bd717d65ffe7c3f28852863030"
+source = "git+https://github.com/zeromq/zmq.rs?rev=67dcba97559ebe8e8206dab753710d8b9cb07591#67dcba97559ebe8e8206dab753710d8b9cb07591"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
  "bytes",
  "crossbeam-queue",
  "futures",
+ "futures-channel",
  "log",
- "num-traits",
- "once_cell",
  "parking_lot",
- "rand 0.9.4",
+ "rand 0.10.1",
  "regex",
  "scc",
- "thiserror 1.0.69",
+ "socket2",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "uuid",

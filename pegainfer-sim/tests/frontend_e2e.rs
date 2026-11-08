@@ -12,7 +12,9 @@ use anyhow::anyhow;
 use anyhow::bail;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
+use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
+use pegainfer_frontend::engine::PrefixCacheCounters;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RequestId;
 use pegainfer_frontend::engine::RequestLedger;
@@ -22,6 +24,8 @@ use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::profile::EngineProfile;
 use pegainfer_sim::profile::LoadedEngineProfile;
+use pegainfer_sim::profile::MixedAdditive;
+use pegainfer_sim::profile::PredictorModel;
 use pegainfer_sim::profile::StepShape;
 use pegainfer_sim::start_engine;
 use pegainfer_sim::start_engine_with_partitions;
@@ -40,12 +44,27 @@ const MODEL_NAME: &str = "pegainfer-sim-e2e";
 const METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-metrics";
 const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
 const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
+const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
 const PROFILE_GATE_MODEL_NAME: &str = "pegainfer-sim-online-gate";
 const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// The pretend drafter the spec-metrics server runs: `K` and how many of those
 /// draft tokens each verify step accepts.
 const SPEC_K: usize = 3;
 const SPEC_ACCEPTED: usize = 2;
+const ABORT_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-abort-metrics";
+const PREFIX_MISS_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-miss-metrics";
+const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metrics";
+/// Long enough that a request is admitted (counting its lookup) well before it
+/// can emit a token, so abandoning it leaves a delta with no output to ride.
+const ABORT_TTFT_MS: f64 = 400.0;
+/// Short enough that the client gives up inside that prefill window.
+const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(60);
+/// The pretend lookup the prefix-metrics server reports on every admitted
+/// ordinary request: 8 prompt tokens queried, 5 found in local KV and 2 of the
+/// remainder restored from the connector.
+const PREFIX_PROMPT: usize = 8;
+const PREFIX_LOCAL_HITS: usize = 5;
+const PREFIX_EXTERNAL_HITS: usize = 2;
 const SERVER_START_ATTEMPTS: usize = 5;
 
 struct SimServer {
@@ -80,6 +99,48 @@ impl SimServer {
             SPEC_METRICS_MODEL_NAME,
             SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
                 .with_speculative_decoding(SPEC_K, SPEC_ACCEPTED),
+        )
+        .await
+    }
+
+    /// A single engine that reports a scripted prefix lookup on every admitted
+    /// request, so the stepped bridge has prefix-cache counters (local and
+    /// external) to stamp onto its batches. Each server gets its own name
+    /// because they share one process-wide Prometheus registry: two tests
+    /// driving the same `model_name` would add into the same series and each
+    /// would then see the other's totals.
+    async fn spawn_with_prefix_cache_as(model_name: &'static str) -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            model_name,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+                .with_prefix_cache(PREFIX_LOCAL_HITS, PREFIX_EXTERNAL_HITS),
+        )
+        .await
+    }
+
+    /// As `spawn_with_prefix_cache_as`, but the scripted lookup matches nothing, so the counters must
+    /// show a query with no hit rather than a cache that was never asked.
+    async fn spawn_with_miss_prefix_cache() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            PREFIX_MISS_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?.with_prefix_cache(0, 0),
+        )
+        .await
+    }
+
+    /// A scripted lookup plus a slow prefill: the request counts its lookup on
+    /// admission and is then abandoned without ever emitting a token.
+    async fn spawn_aborting_prefix_cache() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            ABORT_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(ABORT_TTFT_MS, 1000.0, 0.0, 1)?
+                .with_prefix_cache(PREFIX_LOCAL_HITS, PREFIX_EXTERNAL_HITS),
         )
         .await
     }
@@ -228,6 +289,11 @@ fn profile_fixture(name: &str) -> Result<(TempDir, LoadedEngineProfile)> {
             "online-zero-cost.manifest.json",
             include_bytes!("fixtures/online-zero-cost.manifest.json"),
         ),
+        "functional-step-gate.json" => (
+            include_bytes!("fixtures/functional-step-gate.json"),
+            "functional-step-gate.manifest.json",
+            include_bytes!("fixtures/functional-step-gate.manifest.json"),
+        ),
         other => bail!("unknown profile fixture {other}"),
     };
     let dir = tempfile::tempdir()?;
@@ -274,7 +340,7 @@ fn replay_profiled_worker(profile: &LoadedEngineProfile) -> Result<Vec<PlanTrace
         let estimate = profile.estimate_step(shape)?;
         assert!(matches!(
             estimate.source,
-            pegainfer_sim::profile::StepTimingSource::GridInterpolation
+            pegainfer_sim::profile::StepTimingSource::FixedStep
         ));
         assert!(
             shape.decode_reqs <= profile.scheduler.max_num_seqs,
@@ -366,15 +432,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
     assert!(
         first
             .iter()
-            .map(|step| step.duration_us)
-            .min()
-            .is_some_and(|minimum| {
-                first
-                    .iter()
-                    .map(|step| step.duration_us)
-                    .any(|duration| duration > minimum)
-            }),
-        "grid pricing must vary across the replayed step shapes"
+            .all(|step| step.duration_us == first[0].duration_us),
+        "fixed predictor must price every in-domain step consistently"
     );
 
     Ok(())
@@ -384,12 +443,8 @@ fn profiled_worker_replay_is_deterministic_and_bounded() -> Result<()> {
 fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     let (_fixture_dir, profile) = profile_fixture("online-zero-cost.json")?;
     assert!(
-        profile
-            .predictor
-            .grid
-            .step_duration_us
-            .iter()
-            .all(|duration| *duration == 0),
+        profile.predictor.model
+            == pegainfer_sim::profile::PredictorModel::FixedStep { duration_us: 0 },
         "zero-cost fixture must not add synthetic engine delay"
     );
     let estimate = profile.estimate_step(StepShape {
@@ -400,6 +455,145 @@ fn zero_cost_profile_fixture_is_valid() -> Result<()> {
     assert_eq!(estimate.duration_us, 0);
 
     Ok(())
+}
+
+#[test]
+fn functional_profile_prices_pure_work_and_fails_closed() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("functional-step-gate.json")?;
+    let prefill = profile.estimate_step(StepShape {
+        decode_reqs: 0,
+        sum_decode_ctx_tokens: 0,
+        prefill_tokens_in_step: 2,
+    })?;
+    assert_eq!(prefill.duration_us, 1_000);
+    assert_eq!(
+        prefill.source,
+        pegainfer_sim::profile::StepTimingSource::PrefillPiecewise
+    );
+
+    let decode = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 0,
+    })?;
+    assert_eq!(decode.duration_us, 3_000);
+    assert_eq!(
+        decode.source,
+        pegainfer_sim::profile::StepTimingSource::DecodeSurface
+    );
+
+    let mixed = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 2,
+        prefill_tokens_in_step: 1,
+    });
+    assert!(
+        mixed.is_err(),
+        "mixed work must fail without a mixed predictor"
+    );
+
+    let out_of_domain = profile.estimate_step(StepShape {
+        decode_reqs: 1,
+        sum_decode_ctx_tokens: 5,
+        prefill_tokens_in_step: 0,
+    });
+    assert!(out_of_domain.is_err(), "profile coverage must fail closed");
+    Ok(())
+}
+
+#[test]
+fn serving_rejects_incomplete_functional_profiles() -> Result<()> {
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { mixed, .. } = &mut profile.profile.predictor.model {
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    SimulatedEngineConfig::default().with_engine_profile(profile.clone())?;
+    for missing in ["prefill", "decode", "mixed"] {
+        let mut partial = profile.clone();
+        if let PredictorModel::Functional {
+            prefill,
+            decode,
+            mixed,
+        } = &mut partial.profile.predictor.model
+        {
+            match missing {
+                "prefill" => *prefill = None,
+                "decode" => *decode = None,
+                _ => *mixed = None,
+            }
+        }
+        SimulatedEngineConfig::default()
+            .with_engine_profile(partial)
+            .expect_err(&format!("serving must reject a missing {missing} model"));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpriced_prefill_and_decode_requests_leave_server_running() -> Result<()> {
+    let (_fixture_dir, mut profile) = profile_fixture("functional-step-gate.json")?;
+    if let PredictorModel::Functional { decode, mixed, .. } = &mut profile.profile.predictor.model {
+        decode
+            .as_mut()
+            .context("fixture decode model missing")?
+            .sum_decode_ctx_tokens = vec![3, 4];
+        *mixed = Some(MixedAdditive {
+            intercept_us: 0,
+            kind: None,
+        });
+    }
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let model_name = "pegainfer-sim-unpriced-request";
+    let server =
+        SimServer::spawn_with_config(model_dir_with_minimal_metadata()?, 1, model_name, config)
+            .await?;
+    let client = test_client()?;
+
+    for prompt in [vec![1], vec![1, 2]] {
+        let refused = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": prompt,
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?;
+        assert_eq!(refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        let valid = client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": model_name,
+                "prompt": [1, 2, 3],
+                "max_tokens": 2,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        assert_eq!(valid["choices"][0]["finish_reason"], "length");
+        assert_eq!(valid["usage"]["completion_tokens"], 2);
+    }
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:num_requests_running", "0", 0.0),
+            ("vllm:num_requests_waiting", "0", 0.0),
+        ],
+        model_name,
+    )
+    .await?;
+    server.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,14 +635,6 @@ async fn profiled_online_worker_serves_multi_request_workload() -> Result<()> {
     };
 
     let mut requests = vec![post_request(client.clone()), post_request(client.clone())];
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[("vllm:num_requests_running", "0", 2.0)],
-        PROFILE_GATE_MODEL_NAME,
-    )
-    .await?;
-
     // Capacity ordering is asserted by the deterministic worker replay; the
     // HTTP gate checks stable post-drain counters instead of a transient scrape.
     requests.push(post_request(client.clone()));
@@ -654,6 +840,269 @@ async fn stepped_bridge_reports_spec_decode_counters_to_prometheus() -> Result<(
         leaked.is_empty(),
         "per-position series past K={SPEC_K} were exposed: {leaked:?}"
     );
+
+    server.shutdown().await
+}
+
+/// A request that is admitted and then aborted produces no tokens to carry its
+/// prefix delta: only the cached-token metadata record, then nothing. The
+/// stepped bridge still has to ship that delta in a stats-only batch, or the
+/// lookup is lost for good (and a later batch must not re-send it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_request_still_ships_its_prefix_lookup() -> Result<()> {
+    let server = SimServer::spawn_aborting_prefix_cache().await?;
+    let client = test_client()?;
+    let abandoning = test_client_with_timeout(ABORT_CLIENT_TIMEOUT)?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": vec![1u32; PREFIX_PROMPT],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    })
+    .to_string();
+
+    // Abandoned mid-prefill: admitted (so its lookup was counted), never served.
+    // Asserting the timeout is what keeps this an abort rather than a normal
+    // completion — with `let _ =` the test would also pass if it finished.
+    match abandoning
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+    {
+        Ok(response) => panic!(
+            "the abandoned request was served instead of timing out: {}",
+            response.status()
+        ),
+        Err(error) => assert!(
+            error.is_timeout(),
+            "the abandoned request failed for the wrong reason: {error}"
+        ),
+    }
+
+    // A second request drives the next step — the moment a stranded delta would
+    // be flushed, and the moment a re-sent one would double the total.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // All four families carry both lookups exactly once. Only the second
+    // request emits tokens, yet the first one's lookup must land too: the
+    // totals are those of two admitted requests, split into the local hits and
+    // the externally-restored hits, with no delta replayed on top.
+    let queries = 2.0 * PREFIX_PROMPT as f64;
+    let external_queries = 2.0 * (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", queries),
+            (
+                "vllm:prefix_cache_hits_total",
+                "0",
+                2.0 * PREFIX_LOCAL_HITS as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                external_queries,
+            ),
+            (
+                "vllm:external_prefix_cache_hits_total",
+                "0",
+                2.0 * PREFIX_EXTERNAL_HITS as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// A cache that is asked and misses is different from one that is never asked,
+/// and the counters must keep them apart: the query advances while the hit
+/// stays at zero. Counting hits alone would report a 100% hit rate for a cache
+/// that never warms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_cache_miss_counts_its_query_without_a_hit() -> Result<()> {
+    let server = SimServer::spawn_with_miss_prefix_cache().await?;
+    let client = test_client()?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": vec![1u32; PREFIX_PROMPT],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    });
+
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // The whole prompt was queried and nothing came back locally. With no local
+    // hit to subtract, the connector was asked about all of it and restored
+    // none — every family is present, but only the queries move.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64),
+            ("vllm:prefix_cache_hits_total", "0", 0.0),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                PREFIX_PROMPT as f64,
+            ),
+            ("vllm:external_prefix_cache_hits_total", "0", 0.0),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// A prompt-scoring request forwards its prompt whole instead of consulting the
+/// prefix cache, so it must move none of the four families — on a server that
+/// does report a lookup for ordinary requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_logprobs_request_counts_no_prefix_lookup() -> Result<()> {
+    let server = SimServer::spawn_with_prefix_cache_as(PREFIX_LOGPROBS_MODEL_NAME).await?;
+    let client = test_client()?;
+
+    // Establish that this engine does count, so the zeroes below cannot come
+    // from a server that never counts anything.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": server.model_name,
+                "prompt": vec![1u32; PREFIX_PROMPT],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "ignore_eos": true,
+            })
+            .to_string(),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64)],
+        &server.model_name,
+    )
+    .await?;
+
+    // Same prompt, but scored: no lookup runs, so the totals must not move.
+    // They are cumulative, so a second lookup would show up as `2 * PROMPT`.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": server.model_name,
+                "prompt": vec![1u32; PREFIX_PROMPT],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "prompt_logprobs": 0,
+            })
+            .to_string(),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64),
+            (
+                "vllm:prefix_cache_hits_total",
+                "0",
+                PREFIX_LOCAL_HITS as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_hits_total",
+                "0",
+                PREFIX_EXTERNAL_HITS as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// Without the knob there is no lookup at all, so a cache-disabled engine must
+/// report zero queries — not the prompt length of everything it served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_cache_counters_stay_zero_when_no_lookup_runs() -> Result<()> {
+    let server = SimServer::spawn().await?;
+    let client = test_client()?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": vec![1u32; PREFIX_PROMPT],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    });
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // The completion returning proves requests were served; the prefix
+    // families must nevertheless never have moved.
+    for _ in 0..20 {
+        let metrics = client
+            .get(format!("{}/metrics", server.base_url))
+            .send()
+            .await?
+            .text()
+            .await?;
+        let exported = |name: &str| -> bool {
+            metrics.lines().any(|line| {
+                line.starts_with(name)
+                    && line.contains(&format!("model_name=\"{}\"", server.model_name))
+                    && !line.trim_end().ends_with(" 0")
+            })
+        };
+        assert!(
+            !exported("vllm:prefix_cache_queries_total")
+                && !exported("vllm:prefix_cache_hits_total")
+                && !exported("vllm:external_prefix_cache_queries_total")
+                && !exported("vllm:external_prefix_cache_hits_total"),
+            "a cache-disabled engine reported a prefix lookup: {metrics}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 
     server.shutdown().await
 }
@@ -867,6 +1316,134 @@ impl Scheduler for HoldScheduler {
     }
 }
 
+/// One prefix-cache lookup per admitted request, taken from a fixed script of
+/// turns, published as cumulative totals the way a tiered engine does; each
+/// request then finishes after one token.
+struct TieredPrefixCacheScheduler {
+    turns: std::vec::IntoIter<PrefixCacheCounters>,
+    queued: Vec<RequestId>,
+    totals: PrefixCacheCounters,
+}
+
+impl Scheduler for TieredPrefixCacheScheduler {
+    fn submit(&mut self, request: QueuedRequest) {
+        self.queued.push(request.id);
+    }
+
+    fn step(&mut self, ledger: &mut RequestLedger) -> Result<()> {
+        for id in self.queued.drain(..) {
+            ledger.admit(id);
+            let turn = self.turns.next().context("no scripted turn left")?;
+            self.totals.queries += turn.queries;
+            self.totals.hits += turn.hits;
+            self.totals.host_queries += turn.host_queries;
+            self.totals.host_hits += turn.host_hits;
+            self.totals.external_unspecified_hits += turn.external_unspecified_hits;
+            ledger.push_tokens(id, &[0], &[]);
+            ledger.finish(id, FinishReason::Length);
+        }
+        Ok(())
+    }
+
+    fn metrics(&self) -> SchedulerMetrics {
+        SchedulerMetrics {
+            num_waiting_reqs: self.queued.len() as u64,
+            prefix_cache: Some(self.totals),
+            ..SchedulerMetrics::default()
+        }
+    }
+}
+
+/// A scheduler that serves hits from several tiers reaches `/metrics` with the
+/// split intact: device hits in `vllm:prefix_cache_*` and `source="device"`,
+/// connector lookups and hits in `vllm:external_prefix_cache_*`, labeled
+/// `source="host"` when the engine knows the tier and
+/// `source="external_unspecified"` when it cannot say. The frontend credits
+/// every local hit to device, so an external hit carried as a local one would
+/// export as device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Result<()> {
+    let scheduler = TieredPrefixCacheScheduler {
+        turns: vec![
+            // A cold turn: 4096 tokens looked up, none cached.
+            PrefixCacheCounters {
+                queries: 4096,
+                ..PrefixCacheCounters::default()
+            },
+            // A later turn: 4352 looked up, 3072 resident on device; the 1280
+            // that missed device were looked up in host, which had 1024.
+            PrefixCacheCounters {
+                queries: 4352,
+                hits: 4096,
+                host_queries: 1280,
+                host_hits: 1024,
+                ..PrefixCacheCounters::default()
+            },
+            // A turn whose connector restored 512 tokens from a tier it cannot
+            // name: 2048 looked up, 1024 resident on device; the 1024 that
+            // missed device went to the connector.
+            PrefixCacheCounters {
+                queries: 2048,
+                hits: 1536,
+                host_queries: 1024,
+                external_unspecified_hits: 512,
+                ..PrefixCacheCounters::default()
+            },
+        ]
+        .into_iter(),
+        queued: Vec::new(),
+        totals: PrefixCacheCounters::default(),
+    };
+    let (base_url, _server, _model_dir) = serve_schedulers_as(
+        PREFIX_METRICS_MODEL_NAME,
+        vec![spawn_scheduler("tiered-prefix", scheduler)],
+    )
+    .await?;
+    let client = test_client()?;
+    for _ in 0..3 {
+        post_completion(&client, &base_url, PREFIX_METRICS_MODEL_NAME, false).await?;
+    }
+
+    wait_for_metrics(
+        &client,
+        &base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", 10496.0),
+            ("vllm:prefix_cache_hits_total", "0", 4096.0),
+            ("vllm:external_prefix_cache_queries_total", "0", 2304.0),
+            ("vllm:external_prefix_cache_hits_total", "0", 1536.0),
+        ],
+        PREFIX_METRICS_MODEL_NAME,
+    )
+    .await?;
+    wait_for_labeled_metrics(
+        &client,
+        &base_url,
+        &[
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "device")][..],
+                4096.0,
+            ),
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "host")][..],
+                1024.0,
+            ),
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "external_unspecified")][..],
+                512.0,
+            ),
+        ],
+        PREFIX_METRICS_MODEL_NAME,
+    )
+    .await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frontend_shuts_down_when_its_scheduler_panics() -> Result<()> {
     let scheduler = FatalScheduler {
@@ -917,6 +1494,15 @@ async fn a_failed_scheduler_answers_and_stops_the_other_engines() -> Result<()> 
 async fn serve_schedulers(
     schedulers: Vec<LiveScheduler>,
 ) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
+    serve_schedulers_as(MODEL_NAME, schedulers).await
+}
+
+/// [`serve_schedulers`] under `model_name`, so a test's counters are not
+/// shared with other servers in this process.
+async fn serve_schedulers_as(
+    model_name: &str,
+    schedulers: Vec<LiveScheduler>,
+) -> Result<(String, oneshot::Receiver<Result<()>>, TempDir)> {
     let model_dir = model_dir_with_minimal_metadata()?;
     let port = reserve_loopback_port()?;
     let engine_count = schedulers.len();
@@ -929,6 +1515,7 @@ async fn serve_schedulers(
         lora: None,
     };
     let model_path = model_dir.path().to_path_buf();
+    let model_name = model_name.to_string();
     let (done_tx, done) = oneshot::channel();
     std::thread::spawn(move || {
         let result = tokio::runtime::Runtime::new()
@@ -937,7 +1524,7 @@ async fn serve_schedulers(
                 runtime.block_on(pegainfer_frontend::vllm::serve_with_engine_count(
                     std::future::ready(Ok(engine.into())),
                     &model_path,
-                    vec![MODEL_NAME.to_string()],
+                    vec![model_name],
                     pegainfer_frontend::vllm::ParserSelection::Auto,
                     port,
                     Some(128),
@@ -1408,7 +1995,13 @@ async fn simulated_frontend_metadata_contract_is_executable() -> Result<()> {
     let server = SimServer::spawn_with_model_dir(model_dir).await?;
     server.shutdown().await?;
 
-    let error = match SimServer::spawn_with_model_dir(empty_model_dir()?).await {
+    let failed = tokio::time::timeout(
+        HTTP_TIMEOUT,
+        SimServer::spawn_with_model_dir(empty_model_dir()?),
+    )
+    .await
+    .context("a frontend that cannot load its tokenizer must fail fast")?;
+    let error = match failed {
         Ok(server) => {
             server.shutdown().await?;
             bail!("empty local model metadata directory should fail frontend startup");
@@ -1510,8 +2103,14 @@ async fn post_completion_stream(
 }
 
 fn test_client() -> Result<Client> {
+    test_client_with_timeout(HTTP_TIMEOUT)
+}
+
+/// A client that gives up mid-prefill, which is how a test abandons a request
+/// without the server's cooperation.
+fn test_client_with_timeout(timeout: Duration) -> Result<Client> {
     Client::builder()
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .build()
         .context("failed to build HTTP test client")
 }

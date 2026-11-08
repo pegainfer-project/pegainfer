@@ -30,18 +30,18 @@ pub struct BatchSamplingRow {
 
 /// Device buffers for `gpu_sample_batch_into`, sized for `max_rows` x `vocab`.
 pub struct BatchSamplingScratch {
-    probs: CudaSlice<f32>,
-    row_indices: CudaSlice<i32>,
-    temperature: CudaSlice<f32>,
-    top_k: CudaSlice<i32>,
-    top_p: CudaSlice<f32>,
-    min_p: CudaSlice<f32>,
-    topk_row_states: CudaSlice<u8>,
+    pub(super) probs: CudaSlice<f32>,
+    pub(super) row_indices: CudaSlice<i32>,
+    pub(super) temperature: CudaSlice<f32>,
+    pub(super) top_k: CudaSlice<i32>,
+    pub(super) top_p: CudaSlice<f32>,
+    pub(super) min_p: CudaSlice<f32>,
+    pub(super) topk_row_states: CudaSlice<u8>,
     valid: CudaSlice<u8>,
     out: CudaSlice<i32>,
-    softmax_workspace: CudaSlice<u8>,
-    max_rows: usize,
-    vocab: usize,
+    pub(super) softmax_workspace: CudaSlice<u8>,
+    pub(super) max_rows: usize,
+    pub(super) vocab: usize,
 }
 
 impl BatchSamplingScratch {

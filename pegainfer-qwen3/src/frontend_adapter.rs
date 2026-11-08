@@ -13,10 +13,12 @@
 //!   [`Engine`] bundle from `launch`.
 //!
 //! Cancellation is reactive: the frontend flips a request's abort flag and
-//! this adapter retires it on its next touch — the scheduler mechanics never
-//! see aborts. Finishes ride the committed step unless the executor withholds
+//! this adapter retires it, at the top of the next step while it is queued or
+//! waiting for its next prefill chunk, and on its next touch once it is
+//! decoding or has a prefill in flight — the scheduler mechanics never see
+//! aborts. Finishes ride the committed step unless the executor withholds
 //! them ([`ModelExecutor::withholds_finishes`]): a P/D prefill executor takes
-//! them as [`RequestLedger::defer_finish`] tokens and delivers each request's
+//! them as [`RequestLedger::defer_finish_with_cause`] tokens and delivers each request's
 //! final record once its KV saves are peer-visible.
 
 #[cfg(test)]
@@ -54,6 +56,7 @@ use crate::Qwen3OffloadOptions;
 use crate::executor::ModelExecutor;
 use crate::executor::Qwen3Executor;
 use crate::executor::RequestId;
+use crate::executor::WorkerLost;
 use crate::scheduler::ActiveRequestState;
 use crate::scheduler::PendingRequest;
 use crate::scheduler::RejectReason as AdmissionReject;
@@ -77,6 +80,7 @@ use crate::scheduler::resolve::resolve_step;
 use crate::scheduler::runtime_plan;
 use crate::scheduler::servable_len;
 use crate::scheduler::take_prefill_chunks;
+use crate::speculative::DraftModel;
 use crate::weights::Qwen3MemoryOptions;
 
 // ── Engine assembly ─────────────────────────────────────────────────────
@@ -92,7 +96,7 @@ pub(crate) fn start_qwen3(
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
     decode_overlap: crate::DecodeOverlap,
-    dflash_draft_model_path: Option<&str>,
+    draft: Option<DraftModel<'_>>,
     dump_graph_png: Option<&Path>,
 ) -> Result<Engine> {
     let mut executor = Qwen3Executor::from_runtime_with_decode_environment(
@@ -102,7 +106,7 @@ pub(crate) fn start_qwen3(
         Qwen3LoraOptions::default(),
         offload_options,
         max_prefill_tokens,
-        dflash_draft_model_path,
+        draft,
         memory_options,
         decode_overlap,
     )?;
@@ -123,8 +127,8 @@ pub(crate) fn start_qwen3(
     // draft is built against the target's embeddings/head) and forces the
     // prefix cache off, so it must follow set_no_prefix_cache. Its GPU footprint
     // was already reserved during profiling from the draft path passed above.
-    if let Some(draft_path) = dflash_draft_model_path {
-        executor.load_dflash_draft_model(draft_path)?;
+    if let Some(draft) = draft {
+        executor.load_draft_model(draft)?;
     }
 
     Ok(start_with_executor(
@@ -243,6 +247,16 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     /// it cannot run against an adapter set the command was about to change.
     pending_control: VecDeque<LoraControl>,
     post_control_deferred: Vec<PendingRequest>,
+    /// Cumulative prefix-cache queries, in tokens: every admitted request adds
+    /// its prompt length once, on its first prefill chunk. Monotonic; reported
+    /// verbatim in `SchedulerMetrics`.
+    prefix_cache_queries: u64,
+    /// Cumulative prefix-cache hits, in tokens: of the queried tokens, those
+    /// already cached locally. Same unit as `prefix_cache_queries`, so
+    /// `hit_rate = hits/queries` stays in [0, 1]. Monotonic; the bridge exports
+    /// per-send deltas of this total so Prometheus does not re-add the running
+    /// total on every token batch.
+    prefix_cache_hits: u64,
 }
 
 impl<E: ModelExecutor> Qwen3Scheduler<E> {
@@ -267,7 +281,13 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
             lora_rx,
             pending_control: VecDeque::new(),
             post_control_deferred: Vec::new(),
+            prefix_cache_queries: 0,
+            prefix_cache_hits: 0,
         }
+    }
+
+    fn inflight_prefills(&self) -> &[PendingRequest] {
+        self.inflight_prefill_pending.as_deref().unwrap_or_default()
     }
 
     fn idle(&self) -> bool {
@@ -307,6 +327,32 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         let _ = self.executor.drop_request(request_id);
     }
 
+    /// Retire every aborted request that has no prefill in flight: queued ones
+    /// before they take admission room, and admitted ones waiting for their
+    /// next prefill chunk, including those part way through their prompt,
+    /// before that chunk runs. `loading` waits for its prefetch to settle,
+    /// `active` retires on its next decode, and an in-flight async prefill
+    /// keeps its KV until its result lands.
+    fn retire_aborted_waiting(&mut self, ledger: &mut RequestLedger) {
+        for queue in [&mut self.deferred, &mut self.post_control_deferred] {
+            let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(queue)
+                .into_iter()
+                .partition(|req| ledger.is_aborted(req.request_id));
+            *queue = kept;
+            for req in &aborted {
+                ledger.retire(req.request_id);
+                release_rejected(&mut self.executor, &mut self.tracker, req);
+            }
+        }
+        let (aborted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.prefilling)
+            .into_iter()
+            .partition(|req| ledger.is_aborted(req.request_id));
+        self.prefilling = kept;
+        for req in aborted {
+            self.retire_aborted(req.request_id, ledger);
+        }
+    }
+
     /// Fail the batch a step execution error touched, then clear the running
     /// set — the same requests the plan was about to advance.
     fn fail_touched_requests(
@@ -331,6 +377,23 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         self.active.clear();
     }
 
+    /// Absorb a step execution error by failing the batch it touched. A lost
+    /// rank worker leaves nothing to serve with, so that error is returned and
+    /// the driver winds the engine down.
+    fn absorb_step_failure(
+        &mut self,
+        targets: Vec<RequestId>,
+        error: anyhow::Error,
+        ledger: &mut RequestLedger,
+    ) -> Result<()> {
+        if WorkerLost::caused(&error) {
+            return Err(error);
+        }
+        warn!("Execution step failed: {error}");
+        self.fail_touched_requests(targets, &error.to_string(), ledger);
+        Ok(())
+    }
+
     /// Translate one step's pure effects into ledger writes, executor
     /// bookkeeping, and state transitions. The old per-token send-failure
     /// signal is replaced by explicit abort probes on the ledger.
@@ -344,6 +407,11 @@ impl<E: ModelExecutor> Qwen3Scheduler<E> {
         // terminal rides the committed step, which the driver ships after
         // publishing metrics — the finishing batch's send-time stats then
         // read the drained occupancy instead of racing the publish.
+        // Fold this step's prefix-cache counters into the cumulative totals
+        // before any effect is dropped, so retries/re-queues never lose a count.
+        self.prefix_cache_queries += effects.prefix_queries;
+        self.prefix_cache_hits += effects.prefix_hits;
+
         let mut finishes: Vec<(RequestId, FinishReason, Option<StopCause>)> = Vec::new();
 
         for cached in effects.cached {
@@ -590,12 +658,18 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             let effects = resolve_step(&self.executor, &self.active, artifacts);
             self.apply_effects(effects, ledger);
         }
+        self.retire_aborted_waiting(ledger);
 
         // 2. Reclaim settled prefetches, then offer fresh requests to
         // prefetch. Control commands gate generation, so only offer once no
         // control is pending (a prefetch must not race ahead of an adapter
         // load it depends on).
-        let reserve_floor = admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+        let reserve_floor = admitted_future_blocks(
+            &self.executor,
+            &self.active,
+            &self.prefilling,
+            self.inflight_prefills(),
+        );
         reclaim_ready_prefetch(
             &mut self.executor,
             &mut self.deferred,
@@ -625,8 +699,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         // driver.
         if self.idle() {
             if !self.loading.is_empty() {
-                let reserve_floor =
-                    admitted_future_blocks(&self.executor, &self.active, &self.prefilling);
+                let reserve_floor = admitted_future_blocks(
+                    &self.executor,
+                    &self.active,
+                    &self.prefilling,
+                    self.inflight_prefills(),
+                );
                 block_on_loading(
                     &mut self.executor,
                     &mut self.deferred,
@@ -654,6 +732,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             lora_validation.accepted,
             &self.active,
             &self.prefilling,
+            self.inflight_prefills(),
             self.executor.block_size(),
             self.executor.available_blocks(),
             self.executor.max_request_blocks(),
@@ -723,11 +802,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 &mut self.rng,
             ) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
             // Only decode effects come out of the unified result (its prefill
             // request list is empty until the poll resolves).
@@ -738,16 +813,12 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
         }
 
         // 8. Execute, resolve, apply. A step failure kills the touched batch
-        // but not the engine.
+        // but not the engine, unless a rank worker is gone.
         let targets = failure_target_ids(&self.active, &plan);
         let artifacts =
             match execute_plan(&mut self.executor, &mut self.active, plan, &mut self.rng) {
                 Ok(v) => v,
-                Err(e) => {
-                    warn!("Execution step failed: {e}");
-                    self.fail_touched_requests(targets, &e.to_string(), ledger);
-                    return Ok(());
-                }
+                Err(e) => return self.absorb_step_failure(targets, e, ledger),
             };
         let effects = resolve_step(&self.executor, &self.active, artifacts);
         self.apply_effects(effects, ledger);
@@ -759,6 +830,9 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
     /// not-yet-running queue (KV-deferred, prefetch-loading, post-control)
     /// into one number.
     fn metrics(&self) -> SchedulerMetrics {
+        // The external family lives on the executor: a connector lookup is
+        // settled there whether or not its request ever reaches a prefill.
+        let connector = self.executor.connector_lookup_counters();
         SchedulerMetrics {
             kv_used_blocks: self
                 .kv_total
@@ -772,6 +846,22 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 + self.loading.len()
                 + self.post_control_deferred.len()) as u64,
             spec_decode: self.executor.spec_decode_counters(),
+            prefix_cache: Some(pegainfer_frontend::engine::PrefixCacheCounters {
+                queries: self.prefix_cache_queries,
+                // hits = local hits + connector hits; the bridge derives the
+                // local ones as `hits - external hits` for
+                // `vllm:prefix_cache_hits`.
+                hits: self.prefix_cache_hits + connector.hits,
+                // The connector's lookups ride `host_queries`, the family's
+                // source-agnostic query count. A connector query returns only
+                // a block count: it can be answered from host memory, a P2P
+                // peer or SSD, and nothing says which. So the hits are
+                // `external_unspecified`, not `host`, which would mislabel the
+                // peer and disk restores.
+                host_queries: connector.queries,
+                external_unspecified_hits: connector.hits,
+                ..pegainfer_frontend::engine::PrefixCacheCounters::default()
+            }),
         }
     }
 }

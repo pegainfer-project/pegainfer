@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""Validate the Qwen3 stop contract against a live, un-migrated Qwen3.5 server.
+"""Validate the stop contract of live Qwen3, Qwen3.5, and Gemma 4 servers.
 
-Both servers must already be running. The default explicit stop set covers the
+Selected servers must already be running. The default explicit stop set covers the
 vocabulary, so its first returned token must stop generation. --stop-token-id
 selects a known trigger instead. Token IDs, token-ID-formatted logprobs, usage,
 and the first terminal position are checked together. SSE is consumed through
 [DONE] to HTTP EOF, including content sharing a frame with finish metadata.
 
-Provide each model's primary EOS ID as resolved by the serving tokenizer;
-an unverified EOS must never count as a passing contract check. A healthy legacy
-server may fail the new stop semantics, but malformed responses or unavailable
-servers are not evidence of a compatibility gap.
+Provide each selected model's primary EOS ID as resolved by the serving tokenizer;
+an unverified EOS must never count as a passing contract check. A single target
+must pass every contract check. The default two-target mode permits a healthy
+legacy Qwen3.5 server to fail the new semantics unless --strict-both is set;
+malformed responses or unavailable servers are not evidence of a compatibility gap.
 
 Example (Qwen3-4B and Qwen3.5-0.8B):
     python3 scripts/qwen3_stop_contract_probe.py \
       --qwen3-eos-token-id 151645 --qwen35-eos-token-id 248046 \
       --require-legacy-gap --out stop-contract-ab.json
+
+Example (adapted Qwen3.5 only):
+    python3 scripts/qwen3_stop_contract_probe.py \
+      --target qwen35 --qwen35-model qwen35-adapted \
+      --qwen35-eos-token-id 248046
+
+Example (Gemma 4 only; supply a prompt rendered with its chat template):
+    python3 scripts/qwen3_stop_contract_probe.py \
+      --target gemma4 --gemma4-model gemma4-stop-policy \
+      --gemma4-eos-token-id 1 --prompt "$PROMPT"
 
 --self-check tests this probe's assertions using isolated malformed HTTP
 responses. It needs no GPU and is not evidence about inference correctness.
@@ -882,9 +893,16 @@ def run_self_check() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--target",
+        choices=("qwen3", "qwen35", "gemma4", "both"),
+        default="both",
+        help="Select servers to probe; a single target must satisfy the full stop contract",
+    )
     for prefix, port, model, vocab in (
         ("qwen3", 18081, "qwen3-adapted", 151936),
         ("qwen35", 18082, "qwen35-legacy", 248320),
+        ("gemma4", 18083, "gemma4-stop-policy", 262144),
     ):
         parser.add_argument(f"--{prefix}-url", default=f"http://127.0.0.1:{port}")
         parser.add_argument(f"--{prefix}-model", default=model)
@@ -925,12 +943,13 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if not args.self_check:
-        if args.qwen3_eos_token_id is None or args.qwen35_eos_token_id is None:
-            parser.error(
-                "live validation requires both --qwen3-eos-token-id and --qwen35-eos-token-id"
-            )
+        for prefix in ("qwen3", "qwen35") if args.target == "both" else (args.target,):
+            if getattr(args, f"{prefix}_eos_token_id") is None:
+                parser.error(f"live validation requires --{prefix}-eos-token-id")
         if args.max_tokens <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
             parser.error("--max-tokens and --timeout must be positive and finite")
+        if args.target != "both" and (args.strict_both or args.require_legacy_gap):
+            parser.error("--strict-both and --require-legacy-gap require --target both")
         if args.strict_both and args.require_legacy_gap:
             parser.error("--strict-both conflicts with --require-legacy-gap")
     return args
@@ -950,13 +969,16 @@ def main() -> int:
                 args,
                 getattr(args, f"{prefix}_eos_token_id"),
             )
-            for prefix in ("qwen3", "qwen35")
+            for prefix in (("qwen3", "qwen35") if args.target == "both" else (args.target,))
         }
     except InvalidResponse as error:
         print(str(error), file=sys.stderr)
         return 2
-    adapted, legacy = targets["qwen3"], targets["qwen35"]
-    gap = adapted["new_contract_passed"] and legacy["explicit_stop_gap"]
+    gap = (
+        args.target == "both"
+        and targets["qwen3"]["new_contract_passed"]
+        and targets["qwen35"]["explicit_stop_gap"]
+    )
     report = {
         "schema_version": 3,
         "config": {key: value for key, value in vars(args).items() if key != "out"},
@@ -965,10 +987,14 @@ def main() -> int:
     }
     for target in targets.values():
         print_target(target)
-    print(f"\nlegacy_gap_observed={gap}")
+    if args.target == "both":
+        print(f"\nlegacy_gap_observed={gap}")
     if args.out:
         args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"wrote {args.out}")
+    if args.target != "both":
+        return int(not targets[args.target]["new_contract_passed"])
+    adapted, legacy = targets["qwen3"], targets["qwen35"]
     return int(
         not adapted["new_contract_passed"]
         or not legacy["healthy"]

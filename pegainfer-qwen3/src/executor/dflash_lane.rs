@@ -11,6 +11,9 @@ use anyhow::Result;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::sampler::SamplingParams;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use super::LocalQwen3Lane;
 use super::PrefillStepItem;
@@ -31,7 +34,10 @@ pub(super) struct DFlashLaneState {
     requests: HashMap<RequestId, DFlashRequestState>,
     /// Lane-level batched draft scratch, allocated once for the whole decode
     /// batch so the dense draft ops run once instead of once per request.
-    scratch: DFlashBatchScratch,
+    pub(super) scratch: DFlashBatchScratch,
+    /// Sampled proposals from this round: request -> (scratch row, round seed).
+    pub(super) proposal_rows: HashMap<RequestId, (usize, u64)>,
+    pub(super) sampling: Option<pegainfer_kernels::ops::SparseVerifyScratch>,
     verified_draft_tokens: usize,
     accepted_draft_tokens: usize,
     /// Hedge chains proposed by the last draft round (`PEGAINFER_SPEC_HEDGE`):
@@ -64,6 +70,16 @@ impl DFlashLaneState {
         max_decode_batch_size: usize,
     ) -> Result<Self> {
         let scratch = model.new_batch_scratch(ctx, max_decode_batch_size)?;
+        let sampling = model
+            .uses_selector()
+            .then(|| {
+                pegainfer_kernels::ops::SparseVerifyScratch::new(
+                    ctx,
+                    max_decode_batch_size,
+                    model.block_size(),
+                )
+            })
+            .transpose()?;
         let geometry = spec_hedge_effective(model.block_size());
         let hedge_branch_positions = geometry.positions;
         let hedge_cap = if model.uses_markov_head() && !hedge_branch_positions.is_empty() {
@@ -90,6 +106,8 @@ impl DFlashLaneState {
             model,
             requests: HashMap::new(),
             scratch,
+            proposal_rows: HashMap::new(),
+            sampling,
             verified_draft_tokens: 0,
             accepted_draft_tokens: 0,
             hedge_blocks: HashMap::new(),
@@ -202,6 +220,7 @@ impl LocalQwen3Lane {
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
         verify_round: u64,
+        gated: bool,
     ) -> Result<()> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
@@ -252,11 +271,14 @@ impl LocalQwen3Lane {
             } else {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
+            let verified_draft = req.token_ids.len().saturating_sub(1);
             log::debug!(
-                "Qwen3 DFlash context round={} request={} accepted_draft={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
+                "Qwen3 DFlash context round={} request={} accepted_draft={} verified_draft={} gated={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
                 verify_round,
                 req.request_id,
                 result.matched_draft_tokens,
+                verified_draft,
+                u8::from(gated),
                 result.accepted_tokens.len(),
                 context_len,
                 rate,
@@ -268,13 +290,17 @@ impl LocalQwen3Lane {
                 .iter()
                 .map(|result| result.accepted_tokens.len())
                 .sum();
-            controller.tick(dflash.round_chains, committed);
+            if gated {
+                controller.break_window();
+            } else {
+                controller.tick(dflash.round_chains, committed);
+            }
         }
         Ok(())
     }
 
-    /// Roll out one draft span per request: draft forward + greedy argmax over
-    /// the block. Returns the verify span `[current_token, draft_1, …]`.
+    /// Roll out one draft span per request using the checkpoint's proposal head.
+    /// Returns the verify span `[current_token, draft_1, …]`.
     pub(super) fn execute_dflash_draft(
         &mut self,
         requests: &[DraftStepItem],
@@ -290,6 +316,7 @@ impl LocalQwen3Lane {
             anyhow::bail!("DFlash draft requested but DFlash is not loaded");
         };
         let result = (|| -> Result<Vec<DraftRequestResult>> {
+            dflash.proposal_rows.clear();
             // Pull every active request's state out of the map so the batched
             // forward can hold `&mut` to all of them at once. Re-inserted below.
             let mut taken: Vec<(RequestId, DFlashRequestState)> =
@@ -312,6 +339,7 @@ impl LocalQwen3Lane {
                 round_chains,
                 hedge_cap,
                 hedge_branch_positions,
+                proposal_rows,
                 ..
             } = &mut dflash;
             let mut state_refs: Vec<&mut DFlashRequestState> =
@@ -338,9 +366,9 @@ impl LocalQwen3Lane {
                 draft_len
             };
 
-            // Propose tokens from the base logits. DFlash takes an independent
-            // greedy argmax per position; DSpark adds the Markov bias and samples
-            // the block left-to-right (anchor-first, all `block_size` positions).
+            // Plain DFlash uses independent argmax; the selector adds learned
+            // pair scores over top-16 candidates. DSpark uses its Markov head
+            // with an anchor-first layout (all `block_size` positions).
             let markov = model.uses_markov_head();
             let hedge_positions = if *hedge_cap > 0 {
                 hedge_branch_positions.as_slice()
@@ -413,7 +441,34 @@ impl LocalQwen3Lane {
             );
             let hedging = ladder_chains > 0 && !hedged.is_empty();
             *round_chains = if hedging { ladder_chains } else { 0 };
-            let sampled = if markov {
+            let selector = model.uses_selector();
+            let sampled = if selector {
+                let mut temperatures = Vec::with_capacity(requests.len());
+                let mut uniforms = Vec::with_capacity(requests.len() * (block_size - 1));
+                for (row, req) in requests.iter().enumerate() {
+                    let greedy = pegainfer_sample::effectively_greedy(
+                        &req.params,
+                        self.model.config().decodable_vocab,
+                    );
+                    temperatures.push(if greedy { 0.0 } else { req.params.temperature });
+                    if greedy {
+                        uniforms.resize(uniforms.len() + block_size - 1, 0.0);
+                    } else {
+                        // Separate proposal draws from acceptance and correction draws.
+                        let mut rng =
+                            StdRng::seed_from_u64(pegainfer_sample::mix_seed(req.sample_seed, 0));
+                        uniforms.extend((0..block_size - 1).map(|_| rng.random::<f32>()));
+                        proposal_rows.insert(req.request_id, (row, req.sample_seed));
+                    }
+                }
+                model.selected_draft_tokens(
+                    self.model.device_ctx(),
+                    &current_tokens,
+                    &temperatures,
+                    &uniforms,
+                    scratch,
+                )?
+            } else if markov {
                 if hedging {
                     let ctx = self.model.device_ctx();
                     let chain_a = model.markov_draft_with_runners(
@@ -456,26 +511,26 @@ impl LocalQwen3Lane {
                 state_map.insert(request_id, state);
             }
 
+            // Selector already drops the anchor slot. Legacy proposals still
+            // carry full blocks, with the checkpoint-specific layout below.
+            let sampled_stride = block_size - usize::from(selector);
             anyhow::ensure!(
-                sampled.len() == requests.len() * block_size,
-                "DFlash batched draft sampled {} tokens for {} requests x block {}",
+                sampled.len() == requests.len() * sampled_stride,
+                "DFlash batched draft sampled {} tokens for {} requests x stride {}",
                 sampled.len(),
                 requests.len(),
-                block_size
+                sampled_stride
             );
 
-            // Split the batched samples per request: request `i` owns rows
-            // `[i * block_size, (i + 1) * block_size)`. Verify span = [current
-            // dangling token, draft_1, …]. Anchor-drop checkpoints discard block
-            // position 0 (the anchor slot; only the mask positions draft), giving
-            // `block_size - 1` drafts; anchor-first checkpoints have position 0
-            // already predict the first draft, giving all `block_size` drafts —
-            // a one-token-longer span. This is a checkpoint property, not a markov
-            // one: a `markov_rank == 0` DeepSpec checkpoint is still anchor-first.
-            let drafts_start = usize::from(!model.anchor_first());
+            // Each request owns sampled_stride entries. Selector output already
+            // excludes its anchor; legacy anchor-drop skips position 0 here.
+            // Anchor-first checkpoints use every sample. Prepend the actual
+            // dangling token once for all three paths before target verification.
+            let drafts_start = usize::from(!selector && !model.anchor_first());
+            let keep = model.effective_drafts();
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
-                let block = &sampled[i * block_size..(i + 1) * block_size];
+                let block = &sampled[i * sampled_stride..(i + 1) * sampled_stride];
                 let drafts = &block[drafts_start..];
                 anyhow::ensure!(
                     !drafts.is_empty(),
@@ -483,9 +538,15 @@ impl LocalQwen3Lane {
                     i,
                     block_size
                 );
-                let mut token_ids = Vec::with_capacity(drafts.len() + 1);
+                anyhow::ensure!(
+                    keep <= drafts.len(),
+                    "draft trim {} exceeds the block's {} draft tokens",
+                    keep,
+                    drafts.len()
+                );
+                let mut token_ids = Vec::with_capacity(keep + 1);
                 token_ids.push(req.current_token);
-                token_ids.extend(drafts.iter().copied());
+                token_ids.extend(drafts[..keep].iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,
@@ -522,17 +583,31 @@ pub(super) fn spec_hedge_auto() -> bool {
 pub(super) struct HedgeGeometry {
     pub(super) cap: usize,
     pub(super) positions: Vec<usize>,
+    /// Most hedge chain spans one verify round can carry.
+    pub(super) chain_spans: usize,
 }
 
 pub(super) fn spec_hedge_effective(block_size: usize) -> HedgeGeometry {
-    let positions = spec_hedge_positions()
+    let positions: Vec<usize> = spec_hedge_positions()
         .iter()
         .copied()
         .filter(|&p| p < block_size)
         .collect();
+    let cap = spec_hedge_cap();
+    let chain_spans = match spec_hedge_knee() {
+        _ if cap == 0 || positions.is_empty() => 0,
+        0 => cap.saturating_mul(positions.len()),
+        knee => knee_chain_spans(
+            block_size,
+            knee,
+            positions.len(),
+            crate::batch_decode_buffers::BATCH_BUCKETS,
+        ),
+    };
     HedgeGeometry {
-        cap: spec_hedge_cap(),
+        cap,
         positions,
+        chain_spans,
     }
 }
 
@@ -549,7 +624,8 @@ pub(super) fn hedge_pages_per_chain(block_size: usize, page_size: usize) -> usiz
 }
 
 /// `PEGAINFER_SPEC_HEDGE=<H>` enables the parallel hedge and caps the number
-/// of hedged requests per verify round at `H`. Each hedged request costs one
+/// of hedged requests per verify round at `H`, unless
+/// `PEGAINFER_SPEC_HEDGE_KNEE` plans the round. Each hedged request costs one
 /// extra verify span and [`hedge_pages_per_chain`] lane scratch KV pages PER
 /// CHAIN, so a request branching at C positions costs C of each.
 /// `0`/unset/unparsable = off. Read once.
@@ -620,6 +696,23 @@ pub(super) fn batch_adaptive_chains(
         }
     }
     best
+}
+
+/// Most hedge chain spans one round can carry under the knee policy, which
+/// hedges the whole batch at the chain count [`batch_adaptive_chains`] picks:
+/// the planner's own `batch * C` maximum over every batch size.
+fn knee_chain_spans(
+    block_size: usize,
+    knee_rows: usize,
+    max_chains: usize,
+    buckets: &[usize],
+) -> usize {
+    (1..=buckets.last().copied().unwrap_or(0))
+        .map(|batch| {
+            batch * batch_adaptive_chains(batch, block_size, knee_rows, max_chains, buckets)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// `PEGAINFER_SPEC_HEDGE_POSITIONS="0,1,2"` — draft positions at which hedge
@@ -697,7 +790,7 @@ mod tests {
     use super::*;
 
     fn item(id: u64, budget: usize) -> DraftStepItem {
-        DraftStepItem::new(RequestId::new(id), 7, budget)
+        DraftStepItem::new(RequestId::new(id), 7, budget, SamplingParams::default(), 0)
     }
 
     const BLOCK: usize = 7;
@@ -733,6 +826,19 @@ mod tests {
         assert_eq!(batch_adaptive_chains(1, BLOCK, 0, 7, bk), 0);
         assert_eq!(batch_adaptive_chains(0, BLOCK, 96, 7, bk), 0);
         assert_eq!(batch_adaptive_chains(1, BLOCK, 96, 0, bk), 0);
+    }
+
+    #[test]
+    fn knee_chain_spans_is_the_planners_maximum() {
+        let bk = crate::batch_decode_buffers::BATCH_BUCKETS;
+        // block 7, knee 96 rows = 12 spans. One position: only batches 1, 2
+        // and 4 land on a bucket with a chain each, so at most 4 chain spans.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 1, bk), 4);
+        // Three positions: batch 2 at 3 chains (8 spans) carries 6.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 3, bk), 6);
+        // Seven positions: batch 1 at 7 chains carries 7.
+        assert_eq!(knee_chain_spans(BLOCK, 96, 7, bk), 7);
+        assert_eq!(knee_chain_spans(BLOCK, 0, 7, bk), 0);
     }
 
     #[test]

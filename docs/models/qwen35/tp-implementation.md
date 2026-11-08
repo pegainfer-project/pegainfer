@@ -1,6 +1,6 @@
 # Qwen3.5 TP Implementation
 
-> **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled. Remaining TP work: group-6 batch-decode kernels for 27B graphs, perf gates.
+> **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled. Remaining TP work: perf gates.
 >
 > **Last touched:** 2026-10
 
@@ -116,8 +116,8 @@ The snapshot budget is reserved independently on each rank through
 ## P2c — CUDA Graph under TP
 
 Graph mode requires both the launch option and a compiled decode GQA group.
-4B/9B TP2 can capture; group-6 27B execution stays eager until that kernel is
-available. A graph request falling back to eager is logged at startup.
+4B/9B and 27B TP2 can capture (the pinned FlashInfer compiles group 6; #1145).
+A graph request falling back to eager is logged at startup.
 
 The scheduler assigns dense `slot_idx` values and supplies compaction moves;
 workers do not infer slot ownership. Each graph worker owns fixed-address

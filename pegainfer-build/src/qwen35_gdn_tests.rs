@@ -5,6 +5,7 @@ use super::*;
 // A real generated bundle is the shared fixture: passing this host test is
 // contract evidence only. Canonical Gate 1 separately links and launches it.
 #[test]
+#[ignore = "requires a real generated candidate via PEGAINFER_QWEN35_GDN_AOT_BUNDLE"]
 fn candidate_contract_rejects_mutations() {
     let kernel_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../pegainfer-kernels")

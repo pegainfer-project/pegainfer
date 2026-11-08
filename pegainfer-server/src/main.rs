@@ -37,32 +37,35 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_qwen3::model_line::MODEL_LINE,
         #[cfg(feature = "qwen35")]
         &pegainfer_qwen35::model_line::MODEL_LINE,
+        #[cfg(feature = "qwen4")]
+        &pegainfer_qwen4::model_line::MODEL_LINE,
     ]
 }
 
-/// When no compiled-in line claims the config but the identity belongs to a
-/// known family, tell the user which feature to rebuild with.
+/// One row of [`families`]: a line's feature, the identities its `probe` claims,
+/// and whether that line is compiled into this binary.
+struct Family {
+    feature: &'static str,
+    model_types: &'static [&'static str],
+    text_model_types: &'static [&'static str],
+    compiled: bool,
+}
+
+/// Every line the server can be built with, and the identities its `probe`
+/// claims.
 ///
-/// The identity strings here must stay in sync with each line's `probe`
-/// gate: this table exists precisely because the line (and its probe) is
-/// compiled out, so the duplication cannot be derived away.
-fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
-    struct Family {
-        feature: &'static str,
-        model_types: &'static [&'static str],
-        text_model_types: &'static [&'static str],
-        compiled: bool,
-    }
-    let model_type = config
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let text_model_type = config
-        .get("text_config")
-        .and_then(|text| text.get("model_type"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let families = [
+/// This is **a second source of truth by necessity**: the hint exists for the
+/// case where the line — and therefore its `probe` — is compiled out, so these
+/// strings cannot be read from the line crate. The `qwen4` row is bound to that
+/// crate's own `MODEL_TYPE`/`TEXT_MODEL_TYPE` by a test under the feature
+/// (`qwen4_hint_identity_matches_the_line_crate`).
+///
+/// The hint is **identity-only**: it cannot run a compiled-out probe, so it also
+/// fires for a variant that probe would refuse — a quantized sibling (its
+/// `quantization_config`), tied embeddings, a YaRN rope. It names the feature to
+/// rebuild with; it is not a promise that the checkpoint is servable.
+fn families() -> [Family; 8] {
+    [
         Family {
             feature: "deepseek-v2-lite",
             model_types: &["deepseek_v2"],
@@ -105,8 +108,29 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
             text_model_types: &["qwen3_5_text"],
             compiled: cfg!(feature = "qwen35"),
         },
-    ];
-    families.iter().find_map(|family| {
+        Family {
+            feature: "qwen4",
+            model_types: &["qwen4_exp"],
+            text_model_types: &["qwen4_exp_text"],
+            compiled: cfg!(feature = "qwen4"),
+        },
+    ]
+}
+
+/// When no compiled-in line claims the config but the identity belongs to a
+/// known family, tell the user which feature to rebuild with. See [`families`]
+/// for the identity table and its limits.
+fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
+    let model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let text_model_type = config
+        .get("text_config")
+        .and_then(|text| text.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    families().iter().find_map(|family| {
         (!family.compiled
             && (family.model_types.contains(&model_type)
                 || family.text_model_types.contains(&text_model_type)))
@@ -295,5 +319,20 @@ mod tests {
     fn hint_is_silent_for_an_unknown_family() {
         let config = serde_json::json!({"model_type": "frobnicate_lm"});
         assert!(feature_gate_hint(&config).is_none());
+    }
+
+    /// Binds the qwen4 row of [`families`] to the line crate's own constants, so
+    /// changing one side without the other fails here.
+    #[cfg(feature = "qwen4")]
+    #[test]
+    fn qwen4_hint_identity_matches_the_line_crate() {
+        use pegainfer_qwen4::MODEL_TYPE;
+        use pegainfer_qwen4::TEXT_MODEL_TYPE;
+        let family = families()
+            .into_iter()
+            .find(|family| family.feature == "qwen4")
+            .expect("the qwen4 family is always listed");
+        assert_eq!(family.model_types, [MODEL_TYPE].as_slice());
+        assert_eq!(family.text_model_types, [TEXT_MODEL_TYPE].as_slice());
     }
 }

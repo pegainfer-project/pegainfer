@@ -4,6 +4,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::HiddenStates;
@@ -57,7 +58,8 @@ impl Qwen35DecodeGemm {
         };
         ensure!(
             status == 0,
-            "Qwen3.5 decode GEMM FP32 reduction preparation failed: status={status}"
+            "Qwen3.5 decode GEMM FP32 reduction preparation failed: {}",
+            ffi_status_detail(status)
         );
         Ok(Self {
             algorithm,
@@ -120,7 +122,8 @@ impl Qwen35DecodeGemm {
         };
         ensure!(
             status == 0,
-            "Qwen3.5 decode GEMM launch failed: status={status}"
+            "Qwen3.5 decode GEMM launch failed: {}",
+            ffi_status_detail(status)
         );
         Ok(())
     }

@@ -22,7 +22,7 @@
 > calls round-trip streaming and non-streaming), and the TP2 short/long
 > logits rows are recorded below. Tracked in #1067.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-10
 
 ## What the checkpoint actually is
 
@@ -52,9 +52,11 @@ like a numerics break. It is not, on three independent grounds:
    release matching the checkpoint's declared `5.8.0.dev0`) and 5.17.0. The
    only consumer in the whole wheel is `qwen4_exp`, a different architecture.
 2. **Reading it would change nothing.** swish ≡ silu, and the gated RMSNorm
-   silu is exactly what PegaInfer already applies
-   (`pegainfer-kernels/csrc/shared/norm.cu:58`), matching HF's
-   `Qwen3_5RMSNormGated`.
+   SiLU branch of `rms_norm_gated_kernel`
+   (`pegainfer-kernels/csrc/shared/norm.cu`) is exactly what PegaInfer already
+   applies, matching HF's `Qwen3_5RMSNormGated`. Scoped to `qwen3_5`: that
+   kernel now also carries a sigmoid entry point for the `qwen4_exp`
+   architecture of item 1, and Qwen3.8-27B never reaches it.
 3. **The weights say so.** Swap `torch.sigmoid` for `x·sigmoid(x)` at the
    module's single call site and teacher-force both hypotheses: Qwen3.8-27B
    NLL **1.82** (sigmoid, coherent prose) vs 14.27 (silu, token soup); a
@@ -176,7 +178,7 @@ Guangzhou
 
 Under `Auto` the upstream matcher resolves the parser by case-insensitive
 substring match against the model *path* (`qwen3.5` → `qwen3_coder`, bare
-`qwen3` → `qwen3_xml`), so a `Qwen3.8-27B` directory picks `qwen3_xml` and
+`qwen3` → `qwen3_json`), so a `Qwen3.8-27B` directory picks `qwen3_json` and
 that block lands in `content` unparsed (observed). The Qwen3.5 line
 therefore resolves `auto` itself: `ServePlan::auto_tool_call_parser` maps
 it to `qwen3_coder` regardless of the directory name, and an explicit
@@ -226,18 +228,19 @@ HTTP request; the serving row covers the frontend layers.
 
 | Gate | Device / build | Result |
 | --- | --- | --- |
-| `hf_golden_gate` short, Qwen3.8-27B TP2 | 2×L20 (sm_89) | sequential eager, 108 positions: mean 0.0238 / p50 0.0199 / p99 0.0862 / max 0.1593. Batched eager, 72 positions: mean 0.0231 / p99 0.0823 / max 0.1274. No argmax violation. |
+| `hf_golden_gate` short, Qwen3.8-27B TP2 | 2×L20 (sm_89) | eager, 108 positions: mean 0.0233 / p50 0.0190 / p99 0.0944 / max 0.1628; batched eager, 72 positions: mean 0.0214 / p99 0.0751. Graph (group 6 compiled, #1145): sequential 108 pos mean 0.0225 / p99 0.0795; batched 45 pos mean 0.0216 / p99 0.0805; slot-compaction 38 pos mean 0.0216 / p99 0.0759. No argmax violation. |
 | `hf_golden_gate` long, Qwen3.8-27B TP2 | 2×L20 (sm_89) | 4097 + 8192-token prompts, 18 positions: mean 0.0226 / p50 0.0206 / p99 0.0860 / max 0.0882. |
 | `hf_golden_gate` Qwen3.5-0.8B, single GPU + TP2 (tied head) | L20 | single GPU: short and long both pass. The captured-graph path is not bit-reproducible between runs — sequential graph mean 0.0293–0.0299 / p99 0.0954–0.1097 across two runs, batched and slot-compaction inside tolerance. TP2 short: batched eager mean 0.0300 / p99 0.1127, identical in both — the sharded load path on a second geometry. |
 | `hf_golden_gate` Qwen3.5-2B, single GPU (tied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0301 / p99 0.1172. Long, 18 positions: mean 0.0238 / p99 0.0778. |
 | `hf_golden_gate` Qwen3.5-4B, single GPU (untied head) | 1×A40 (sm_80 build) | short sequential, 108 positions: mean 0.0238 / p99 0.0813. Long, 18 positions: mean 0.0223 / p99 0.0705. |
-| serving, real Qwen3.8-27B TP2 | 2×L20 (sm_89) | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under `qwen3_xml`; with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
+| serving, real Qwen3.8-27B TP2 | 2×L20 (sm_89) | the startup probe arms `[("high","xhigh"),("max","xhigh"),("minimal","low")]` from the checkpoint's own template ~2 s into boot; a `reasoning_effort:"high"` chat request returns 200 with reasoning; tool calls round-trip under `qwen3_coder` (non-streaming `tool_calls` + SSE deltas) and come back raw under the JSON parser (then named `qwen3_xml`; upstream renamed it `qwen3_json` and made `qwen3_xml` an alias of `qwen3_coder`); with no flag at all the line default logs `using tool parser parser_name="qwen3_coder"` and parses the same request. |
 | CPU suites | — | `pegainfer-frontend`, `pegainfer-core` and `pegainfer-qwen35 --features qwen35` libs (the last on the GPU box, its recurrent tests included), plus the sim `frontend_e2e` — which carries the guarded-template `reasoning_effort` case and still fails a kwargs-only effort, the deliberate boundary — and `tool_call_roundtrip`. clippy `-D warnings` and `cargo fmt --all --check` clean. |
 
 Tolerances are the line's existing 4B calibration (`MEAN_TOL 0.06`,
 `P99_TOL 0.20`) — no new constants, and every size sits inside them. Run each
 TP2 test by exact name (see "How to run"): a `_tp2` substring filter also
-selects the graph test, whose group-6 skip is not an eager pass.
+selects the graph variant, whose skip (an uncompiled group, or a missing
+`PEGAINFER_TEST_MODEL_PATH`) reports `ok` without running — not an eager pass.
 
 ## How to run
 
@@ -258,7 +261,8 @@ python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
   --prompt-lens 4097,8192 --decode-tokens 8
 
 # 2. the gates. Run each TP2 test by exact name: a `_tp2` substring filter also
-#    selects the graph test, whose group-6 skip is not an eager pass.
+#    selects the graph variant, whose skip (uncompiled group, or no model path)
+#    reports ok without running — not an eager pass.
 PEGAINFER_TEST_MODEL_PATH=$D PEGAINFER_TEST_MODEL_REVISION=1d4bf0f2… \
   PEGAINFER_TEST_TP_DEVICES=2,6 \
   cargo test -r --locked -p pegainfer-qwen35 --features qwen35 --test hf_golden_gate \
@@ -307,8 +311,9 @@ One environment trap, not guarded in code:
    the tensor carries.
 2. **Native MTP drafting** — both generations ship the head
    (`mtp_num_hidden_layers: 1`, 15 `mtp.*` tensors) and nobody loads it.
-3. **Group-6 batch-decode kernels** so 27B can capture CUDA Graphs (tracked in
-   `docs/models/qwen35/tp-design.md`).
+3. ~~**Group-6 batch-decode kernels** so 27B can capture CUDA Graphs~~ **Done
+   (#1145)**: the pinned FlashInfer compiles group 6, so 27B TP2 captures and
+   replays CUDA Graphs like 4B/9B (see `docs/models/qwen35/tp-design.md`).
 4. **`reasoning_effort` the layer does not own is still raw** — the
    normalization layer rewrites the API field against the default template
    only; a caller addressing the template directly, through

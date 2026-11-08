@@ -881,10 +881,9 @@ mod tests {
     /// (`k3_dspark_reference.py`), compare drafts and per-row top-8 logits.
     /// Round 1 runs at serving-scale context (197 rows, cold cache); round 2
     /// exercises the cached-KV + rope-offset path (committed 197, 5 fresh
-    /// rows). Ignored: needs a GPU and the checkpoint
-    /// (`PEGAINFER_K3_TEST_DSPARK`, default `/mnt/shared/weights/kimi-k3-dspark`).
+    /// rows). The checkpoint defaults to `/mnt/shared/weights/kimi-k3-dspark`.
     #[test]
-    #[ignore]
+    #[ignore = "needs a GPU and the DSpark checkpoint (PEGAINFER_K3_TEST_DSPARK)"]
     fn dspark_reference_cross_check() -> Result<()> {
         const T1: usize = 197;
         const T2: usize = 5;

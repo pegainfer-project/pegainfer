@@ -4,6 +4,8 @@ mod config;
 #[cfg(feature = "deepseek-v2-lite")]
 mod device;
 #[cfg(feature = "deepseek-v2-lite")]
+mod device_kv;
+#[cfg(feature = "deepseek-v2-lite")]
 mod engine;
 mod ep;
 #[cfg(feature = "deepseek-v2-lite")]
@@ -36,8 +38,6 @@ use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;
 use pegainfer_frontend::engine::EngineHandle;
 use pegainfer_frontend::engine::EngineLoadOptions;
-#[cfg(feature = "deepseek-v2-lite")]
-use pegainfer_frontend::engine::EpBackend;
 #[cfg(feature = "deepseek-v2-lite")]
 pub use runtime::BatchedGenerationResult;
 #[cfg(feature = "deepseek-v2-lite")]
@@ -91,7 +91,7 @@ pub fn start_engine(_model_path: &Path, _options: EngineLoadOptions) -> Result<E
 /// call. The server EP=2 path does not enable CUDA Graph capture, so it ignores
 /// the request (warning if one came in). The diagnostic decode graph probe lives
 /// in the attribution gate. The EP=2 topology (devices `0..1`) is fixed by the
-/// model.
+/// model, and `PEGAINFER_DSV2_LITE_EP_BACKEND` picks the EP backend.
 #[cfg(feature = "deepseek-v2-lite")]
 fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
     if cuda_graph {
@@ -102,9 +102,7 @@ fn launch(model_path: &Path, cuda_graph: bool) -> Result<EngineHandle> {
         EngineLoadOptions {
             enable_cuda_graph: false,
             device_ordinals: vec![0, 1],
-            parallel_config: None,
-            ep_backend: EpBackend::Nccl,
-            seed: 42,
+            ..EngineLoadOptions::default()
         },
     )
 }

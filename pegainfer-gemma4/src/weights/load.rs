@@ -26,6 +26,9 @@ use super::Gemma4Weights;
 use super::Linear;
 use super::StackedProjection;
 use crate::config::Gemma4Config;
+use crate::config::LayerKind;
+use crate::config::TensorParallelConfig;
+use crate::config::head_dim_of;
 use crate::manifest::schema::ExpertTensors;
 use crate::manifest::schema::Manifest;
 use crate::manifest::schema::Matrix2d;
@@ -110,27 +113,59 @@ struct RecordedPlan {
     layers: Vec<LayerSlots>,
 }
 
-fn record_matrix(loader: &mut StagedWeightLoader, tensor: &Matrix2d) -> Result<SlotId> {
-    loader.matrix(&tensor.name, tensor.rows, tensor.cols)
+/// How much of a checkpoint matrix this rank stages. `Whole` is the
+/// single-rank path and must stay reachable so TP1 numerics cannot move.
+#[derive(Clone, Copy)]
+enum Shard {
+    Whole,
+    /// A column range: the input-sharded linears (o_proj, down).
+    Cols {
+        offset: usize,
+        cols: usize,
+    },
 }
 
-/// The rows of `parts` stacked in order into one device matrix.
-fn record_stacked<'m>(
+/// `Whole` at world size 1 so the single-rank load path is untouched.
+fn col_shard(tp: TensorParallelConfig, offset: usize, cols: usize) -> Shard {
+    if tp.is_single() {
+        Shard::Whole
+    } else {
+        Shard::Cols { offset, cols }
+    }
+}
+
+fn record_matrix(
     loader: &mut StagedWeightLoader,
-    parts: impl IntoIterator<Item = &'m Matrix2d>,
+    tensor: &Matrix2d,
+    shard: Shard,
 ) -> Result<SlotId> {
-    let parts: Vec<&Matrix2d> = parts.into_iter().collect();
+    match shard {
+        Shard::Whole => loader.matrix(&tensor.name, tensor.rows, tensor.cols),
+        Shard::Cols { offset, cols } => {
+            loader.col_shard(&tensor.name, tensor.rows, tensor.cols, offset, cols)
+        }
+    }
+}
+
+/// The rows of `parts` stacked in order into one device matrix. Each part
+/// carries its own `(row_offset, rows)` so a rank stages its own head run from
+/// every input; at world size 1 those ranges are the whole matrix, which is the
+/// path this loader has always taken.
+fn record_stacked(
+    loader: &mut StagedWeightLoader,
+    parts: &[(&Matrix2d, usize, usize)],
+) -> Result<SlotId> {
     let cols = parts
         .first()
-        .map(|part| part.cols)
+        .map(|(part, _, _)| part.cols)
         .ok_or_else(|| anyhow::anyhow!("Gemma 4: a stacked load needs at least one part"))?;
     let fused: Vec<FusedPart> = parts
         .iter()
-        .map(|part| FusedPart {
+        .map(|(part, offset, rows)| FusedPart {
             name: part.name.as_str(),
             src_rows: part.rows,
-            row_offset: 0,
-            rows: part.rows,
+            row_offset: *offset,
+            rows: *rows,
         })
         .collect();
     loader.fused_rows(cols, &fused)
@@ -202,6 +237,9 @@ fn tensor_bytes<'a>(shards: &'a [SafeTensors<'a>], name: &str) -> Result<&'a [u8
 
 /// Upload every layer's W4A16 linears in the GEMMs' layout: one entry per
 /// layer, empty on a bf16 checkpoint.
+///
+/// Reached only at world size 1: `validate_for` refuses a W4A16 checkpoint under
+/// tensor parallelism precisely because these linears are staged whole.
 fn upload_w4a16(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -317,6 +355,9 @@ struct StackedExperts {
 
 /// Upload every routed layer's experts. Returns one entry per layer, empty on
 /// the sizes that do not route.
+///
+/// Reached only at world size 1: a routed checkpoint is refused under tensor
+/// parallelism, which shards neither the experts nor these whole-tensor tiles.
 fn upload_experts(
     ctx: &DeviceContext,
     shards: &[SafeTensors],
@@ -478,12 +519,33 @@ fn record_plan(
     loader: &mut StagedWeightLoader,
     shards: &[SafeTensors],
     manifest: &Manifest,
+    config: &Gemma4Config,
+    tp: TensorParallelConfig,
 ) -> Result<RecordedPlan> {
-    let embed_tokens = record_matrix(loader, &manifest.embed_tokens)?;
+    let embed_tokens = record_matrix(loader, &manifest.embed_tokens, Shard::Whole)?;
     let norm = record_vector(loader, &manifest.norm)?;
+    let local_intermediate = tp.local_intermediate(config)?;
+    // The global family's KV heads take the two-branch range the config
+    // resolves: shard when the world size divides them, else replicate.
+    let (global_kv_offset, _) = tp.global_kv_head_range(config)?;
     let mut layers = Vec::with_capacity(manifest.layers.len());
-    for layer in &manifest.layers {
+    for (index, layer) in manifest.layers.iter().enumerate() {
         let attention = &layer.attention;
+        let kind = config.layer_types[index];
+        // Query rows are a contiguous run of this rank's query heads; the same
+        // run shards o_proj's columns, which is what makes the sum-reduce
+        // exact.
+        let local_q_dim = tp.local_q_dim(config, kind)?;
+        let q_offset = tp.rank * local_q_dim;
+        // K rows follow their family's own range (V, on sliding layers, matches
+        // K): a shard of the sliding family's KV heads, or the global family's
+        // two-branch range.
+        let local_kv_dim = tp.local_kv_dim(config, kind)?;
+        let kv_offset = match kind {
+            LayerKind::Sliding => tp.rank * local_kv_dim,
+            LayerKind::Global => global_kv_offset * head_dim_of(config, kind),
+        };
+        let inter_offset = tp.rank * local_intermediate;
         layers.push(LayerSlots {
             input_layernorm: record_vector(loader, &layer.input_layernorm)?,
             post_attention_layernorm: record_vector(loader, &layer.post_attention_layernorm)?,
@@ -493,16 +555,32 @@ fn record_plan(
             linears: if attention.q_proj.w4a16.is_some() {
                 None
             } else {
+                let mut qkv: Vec<(&Matrix2d, usize, usize)> = vec![
+                    (&attention.q_proj, q_offset, local_q_dim),
+                    (&attention.k_proj, kv_offset, local_kv_dim),
+                ];
+                if let Some(v_proj) = attention.v_proj.as_ref() {
+                    qkv.push((v_proj, kv_offset, local_kv_dim));
+                }
                 Some(LinearSlots {
-                    qkv: record_stacked(
+                    qkv: record_stacked(loader, &qkv)?,
+                    o_proj: record_matrix(
                         loader,
-                        [&attention.q_proj, &attention.k_proj]
-                            .into_iter()
-                            .chain(attention.v_proj.as_ref()),
+                        &attention.o_proj,
+                        col_shard(tp, q_offset, local_q_dim),
                     )?,
-                    o_proj: record_matrix(loader, &attention.o_proj)?,
-                    gate_up: record_stacked(loader, [&layer.mlp.gate, &layer.mlp.up])?,
-                    down: record_matrix(loader, &layer.mlp.down)?,
+                    gate_up: record_stacked(
+                        loader,
+                        &[
+                            (&layer.mlp.gate, inter_offset, local_intermediate),
+                            (&layer.mlp.up, inter_offset, local_intermediate),
+                        ],
+                    )?,
+                    down: record_matrix(
+                        loader,
+                        &layer.mlp.down,
+                        col_shard(tp, inter_offset, local_intermediate),
+                    )?,
                 })
             },
             q_norm: record_vector(loader, &attention.q_norm)?,
@@ -524,7 +602,7 @@ fn record_plan(
                             loader,
                             &moe.post_feedforward_layernorm_2,
                         )?,
-                        router_proj: record_matrix(loader, &moe.router.proj)?,
+                        router_proj: record_matrix(loader, &moe.router.proj, Shard::Whole)?,
                         router_scale: record_vector(loader, &moe.router.scale)?,
                         router_per_expert_scale: record_vector(
                             loader,
@@ -547,6 +625,7 @@ fn materialize(
     loader: &mut StagedWeightLoader,
     plan: RecordedPlan,
     config: Gemma4Config,
+    tp: TensorParallelConfig,
     experts: Vec<Option<StackedExperts>>,
     w4a16: Vec<Option<W4a16Linears>>,
 ) -> Result<Gemma4Weights> {
@@ -626,6 +705,7 @@ fn materialize(
             })
             .collect::<Result<Vec<_>>>()?,
         config,
+        tp,
     })
 }
 
@@ -654,6 +734,7 @@ impl Gemma4Weights {
         model_path: &str,
         device_ordinal: usize,
         config: Gemma4Config,
+        tp: TensorParallelConfig,
     ) -> Result<Self> {
         let started = Instant::now();
         let manifest = Manifest::from_config(&config)?;
@@ -671,7 +752,7 @@ impl Gemma4Weights {
         let mut loader = StagedWeightLoader::new(&ctx, &shards, &weight_map)?;
 
         let recording = Instant::now();
-        let plan = record_plan(&mut loader, &shards, &manifest)?;
+        let plan = record_plan(&mut loader, &shards, &manifest, &config, tp)?;
         let record_api_wall_ms = elapsed_ms(recording);
 
         let uploading = Instant::now();
@@ -680,7 +761,7 @@ impl Gemma4Weights {
 
         let experts = upload_experts(&ctx, &shards, &manifest)?;
         let w4a16 = upload_w4a16(&ctx, &shards, &manifest)?;
-        let weights = materialize(&mut loader, plan, config, experts, w4a16)?;
+        let weights = materialize(&mut loader, plan, config, tp, experts, w4a16)?;
         drop(loader);
         drop(prefetch);
         let device_free_bytes = free_device_bytes()?;
@@ -770,10 +851,15 @@ mod tests {
 
         let staged_path = staged.path().to_str().context("temp path is not UTF-8")?;
         let parsed = Gemma4Config::from_file(staged_path).expect("config");
-        let err = Gemma4Weights::from_safetensors(staged_path, UNOPENABLE_DEVICE, parsed)
-            .err()
-            .context("a config that disagrees with the checkpoint was accepted")?
-            .to_string();
+        let err = Gemma4Weights::from_safetensors(
+            staged_path,
+            UNOPENABLE_DEVICE,
+            parsed,
+            TensorParallelConfig::SINGLE,
+        )
+        .err()
+        .context("a config that disagrees with the checkpoint was accepted")?
+        .to_string();
 
         let layers = config["text_config"]["layer_types"]
             .as_array()

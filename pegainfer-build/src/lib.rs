@@ -5,55 +5,6 @@ use std::path::PathBuf;
 #[cfg(feature = "qwen35-gdn")]
 pub mod qwen35_gdn;
 
-/// Finds a package's install root: probes `$env_var` first, then each of
-/// `default_paths`, for any of the `check_files` — several cover layout
-/// variants like `include/` vs `targets/<arch>/include/`. Returns the
-/// matched root and check file.
-///
-/// # Panics
-/// When nothing matches.
-#[cfg(test)]
-fn find_package(
-    provider: &str,
-    env_var: &str,
-    default_paths: &[&str],
-    check_files: &[&str],
-) -> (PathBuf, PathBuf) {
-    println!("cargo:rerun-if-env-changed={}", env_var);
-    let env_root = env::var_os(env_var).map(PathBuf::from);
-    let roots: Vec<PathBuf> = env_root
-        .clone()
-        .into_iter()
-        .chain(default_paths.iter().map(PathBuf::from))
-        .collect();
-    for root in &roots {
-        for check in check_files {
-            let found = root.join(check);
-            if found.is_file() {
-                if let Some(env_root) = &env_root
-                    && env_root != root
-                {
-                    println!(
-                        "cargo:warning={provider}: ${env_var} ({}) contains none of \
-                         {check_files:?}; using {} instead",
-                        env_root.display(),
-                        root.display()
-                    );
-                }
-                return (root.clone(), found);
-            }
-        }
-    }
-    panic!(
-        "{provider} build error: none of {check_files:?} found. \
-         Looked at `${env_var}` ({env_status}) and default paths {default_paths:?}. \
-         Hint: install the provider headers or set `{env_var}` to their install root.",
-        env_status = env_root
-            .map(|root| format!("set to {root:?}"))
-            .unwrap_or_else(|| "unset".to_string()),
-    )
-}
-
 /// `targets/<dir>` names for the build target; aarch64 toolkits ship as
 /// either `aarch64-linux` or `sbsa-linux`. Host arch outside build scripts.
 fn target_dirs() -> Vec<String> {
@@ -269,34 +220,5 @@ mod tests {
         assert!(tk.lib_dirs.is_empty());
         assert!(tk.include_dirs.is_empty());
         assert_eq!(tk.header_dir("cuda.h"), None);
-    }
-
-    #[test]
-    fn find_package_returns_matching_root_and_check_file() {
-        let tree = TempTree::new();
-        tree.touch("include/gdrapi.h");
-        let root_str = tree.root().to_str().unwrap().to_string();
-
-        let (root, header) = find_package(
-            "test",
-            "PEGAINFER_TEST_UNSET_ENV",
-            &[&root_str],
-            &["targets/missing/include/gdrapi.h", "include/gdrapi.h"],
-        );
-        assert_eq!(root, tree.root());
-        assert_eq!(header, tree.root().join("include/gdrapi.h"));
-    }
-
-    #[test]
-    #[should_panic(expected = "none of")]
-    fn missing_header_panics_with_all_candidates() {
-        let tree = TempTree::new();
-        let root_str = tree.root().to_str().unwrap().to_string();
-        find_package(
-            "test",
-            "PEGAINFER_TEST_UNSET_ENV",
-            &[&root_str],
-            &["include/cuda.h"],
-        );
     }
 }

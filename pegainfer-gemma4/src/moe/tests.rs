@@ -468,7 +468,8 @@ fn the_routed_block_matches_the_reference_formulas() {
     let config = crate::config::Gemma4Config::from_file(&model).expect("config");
     let eps = config.rms_norm_eps;
     let manifest = Manifest::from_config(&config).expect("manifest");
-    let geom = LayerGeometry::local_of(&config);
+    let geom = LayerGeometry::local_of(&config, crate::config::TensorParallelConfig::SINGLE)
+        .expect("geometry");
     let routed = geom.moe.expect("the checkpoint routes");
     let hidden = geom.hidden_size;
     let width = routed.intermediate_size;
@@ -476,8 +477,13 @@ fn the_routed_block_matches_the_reference_formulas() {
     assert_eq!(super::marlin_block(NARROW_EDGE_ROWS * top_k), 16);
     assert_eq!(super::marlin_block(COARSE_ROWS * top_k), 64);
 
-    let weights =
-        crate::weights::Gemma4Weights::from_safetensors(&model, 0, config).expect("weights");
+    let weights = crate::weights::Gemma4Weights::from_safetensors(
+        &model,
+        0,
+        config,
+        crate::config::TensorParallelConfig::SINGLE,
+    )
+    .expect("weights");
     let ctx = DeviceContext::new_with_device(0).expect("device");
     let layer = &weights.layers[0];
     let moe = layer.moe.as_ref().expect("layer 0 routes");

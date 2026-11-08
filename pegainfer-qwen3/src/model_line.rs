@@ -3,6 +3,7 @@
 //! binary only sees `&MODEL_LINE`.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use clap::Args as ClapArgs;
 use clap::FromArgMatches;
@@ -105,6 +106,13 @@ struct Qwen3Cli {
     /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     batch_invariant: bool,
+
+    /// EAGLE-3 drafter model path. A greedy request drafts while it is the only
+    /// active request; larger batches decode plainly. Single-GPU only, not with
+    /// --dflash-draft-model-path, --enable-lora, --kv-offload, --decode-overlap
+    /// or --batch-invariant, and forces the prefix cache off.
+    #[arg(long)]
+    eagle3_draft_model_path: Option<PathBuf>,
 }
 
 fn resolve_decode_overlap(overlap: CliDecodeOverlap, decode_sm_pct: u32) -> DecodeOverlap {
@@ -249,6 +257,31 @@ impl ModelLine for Qwen3Line {
                 ));
             }
         }
+        if cli.eagle3_draft_model_path.is_some() {
+            let conflicts = [
+                (
+                    shared.dflash_draft_model_path.is_some(),
+                    "--dflash-draft-model-path",
+                ),
+                (cli.enable_lora, "--enable-lora"),
+                (shared.kv_offload, "--kv-offload"),
+                (
+                    shared.decode_overlap != CliDecodeOverlap::Off,
+                    "--decode-overlap",
+                ),
+                (cli.batch_invariant, "--batch-invariant"),
+            ];
+            if let Some((_, flag)) = conflicts.iter().find(|(set, _)| *set) {
+                return Err(CliError::rule(format!(
+                    "--eagle3-draft-model-path is not supported with {flag}"
+                )));
+            }
+            if shared.tp_size != 1 {
+                return Err(CliError::rule(
+                    "--eagle3-draft-model-path currently requires --tp-size=1",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -327,6 +360,7 @@ impl ModelLine for Qwen3Line {
                 decode_overlap: resolve_decode_overlap(shared.decode_overlap, shared.decode_sm_pct),
                 batch_invariant: cli.batch_invariant,
                 dflash_draft_model_path: shared.dflash_draft_model_path.clone(),
+                eagle3_draft_model_path: cli.eagle3_draft_model_path,
             },
         )
         .map(LaunchedEngine::Stepped)
@@ -443,6 +477,26 @@ mod tests {
                 .to_string()
                 .contains("not supported with --enable-lora")
         );
+    }
+
+    #[test]
+    fn eagle3_draft_rejects_unsupported_combinations() {
+        validate_argv(&["pegainfer", "--eagle3-draft-model-path", "e"])
+            .expect("EAGLE-3 alone should validate");
+        for (extra, rule) in [
+            (
+                &["--dflash-draft-model-path", "d"][..],
+                "--dflash-draft-model-path",
+            ),
+            (&["--enable-lora"][..], "--enable-lora"),
+            (&["--kv-offload"][..], "--kv-offload"),
+            (&["--tp-size", "2"][..], "--tp-size=1"),
+        ] {
+            let mut argv = vec!["pegainfer", "--eagle3-draft-model-path", "e"];
+            argv.extend_from_slice(extra);
+            let error = validate_argv(&argv).expect_err(rule);
+            assert!(error.to_string().contains(rule), "{error}");
+        }
     }
 
     #[test]

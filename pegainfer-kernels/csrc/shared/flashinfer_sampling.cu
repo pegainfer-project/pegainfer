@@ -34,6 +34,21 @@ __global__ void gather_cast_logits_f32_kernel(const __nv_bfloat16* __restrict__ 
   }
 }
 
+cudaError_t prepare_probs(const __nv_bfloat16* logits, const int* row_indices, float* probs,
+                          const float* temperatures, void* workspace, size_t workspace_bytes,
+                          int rows, int vocab, cudaStream_t stream) {
+  dim3 grid((vocab + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
+                (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
+            rows);
+  gather_cast_logits_f32_kernel<<<grid, GATHER_CAST_BLOCK, 0, stream>>>(
+      logits, row_indices, probs, vocab);
+  auto err = cudaGetLastError();
+  if (err != cudaSuccess) return err;
+  return flashinfer::sampling::OnlineSoftmax<float>(
+      probs, probs, rows, vocab, const_cast<float*>(temperatures), 1.0f, workspace,
+      workspace_bytes, false, stream);
+}
+
 }  // namespace
 
 // Batched temperature/top-k/top-p sampling over a bf16 logits arena.
@@ -74,23 +89,9 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
     size_t softmax_workspace_bytes, int n_rows, int vocab_size, int has_top_k_filter,
     int has_top_p_filter, uint64_t seed, uint64_t offset, cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
-  dim3 gather_grid(
-      (vocab_size + GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD - 1) /
-          (GATHER_CAST_BLOCK * GATHER_CAST_ELEMS_PER_THREAD),
-      n_rows);
-  gather_cast_logits_f32_kernel<<<gather_grid, GATHER_CAST_BLOCK, 0, stream>>>(
-      logits, row_indices, probs_scratch, vocab_size);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    return static_cast<int>(err);
-  }
-
-  // In-place: phase 2 of both OnlineSoftmax strategies is an elementwise
-  // read-then-write of the same index.
-  err = flashinfer::sampling::OnlineSoftmax<float>(
-      probs_scratch, probs_scratch, n_rows, vocab_size, const_cast<float*>(temperature_arr),
-      /*temperature_val=*/1.0f, softmax_workspace, softmax_workspace_bytes,
-      /*enable_pdl=*/false, stream);
+  cudaError_t err = prepare_probs(logits, row_indices, probs_scratch, temperature_arr,
+                                  softmax_workspace, softmax_workspace_bytes, n_rows,
+                                  vocab_size, stream);
   if (err != cudaSuccess) {
     return static_cast<int>(err);
   }
@@ -107,7 +108,7 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
       // each element from its own index.
       err = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
           probs_scratch, probs_scratch, const_cast<int*>(top_k_arr), n_rows,
-          /*top_k_val=*/0, vocab_size, row_states, stream);
+          /*top_k_val=*/0, vocab_size, row_states, /*deterministic=*/false, stream);
       if (err != cudaSuccess) {
         return static_cast<int>(err);
       }
@@ -144,6 +145,42 @@ extern "C" int gpu_sample_batch_flashinfer_cuda(
         /*deterministic=*/true, /*seed_arr=*/nullptr, seed, /*offset_arr=*/nullptr, offset,
         stream);
   }
+  return static_cast<int>(err);
+  PEGAINFER_FFI_GUARD_END(-1)
+}
+
+// Materialize the same target distribution for probability-aware verification.
+// With no min-p, the sampler uses the intersection of top-k and the nucleus
+// of the original distribution. Applying top-p first preserves that nucleus.
+// The min-p path instead follows the existing top-k -> top-p -> min-p order;
+// the final min-p mask and normalization run with the sparse verifier.
+extern "C" int gpu_sample_probs_flashinfer_cuda(
+    const __nv_bfloat16* logits, const int* row_indices, float* probs,
+    const float* temperatures, const int* top_k, const float* top_p,
+    uint8_t* row_states, void* workspace, size_t workspace_bytes,
+    int rows, int vocab, int has_top_k, int has_top_p, int min_p, cudaStream_t stream) {
+  PEGAINFER_FFI_GUARD_BEGIN
+  auto err = prepare_probs(logits, row_indices, probs, temperatures, workspace,
+                           workspace_bytes, rows, vocab, stream);
+  if (err != cudaSuccess) return static_cast<int>(err);
+  auto filter_k = [&]() {
+    return flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
+        probs, probs, const_cast<int*>(top_k), rows, 0, vocab,
+        reinterpret_cast<flashinfer::sampling::RadixRowState*>(row_states), true, stream);
+  };
+  auto filter_p = [&]() {
+    return flashinfer::sampling::TopPRenormProb<float>(
+        probs, probs, const_cast<float*>(top_p), rows, 1.0f, vocab, stream);
+  };
+  if (min_p && has_top_k) {
+    err = filter_k();
+    if (err != cudaSuccess) return static_cast<int>(err);
+  }
+  if (has_top_p) {
+    err = filter_p();
+    if (err != cudaSuccess) return static_cast<int>(err);
+  }
+  if (!min_p && has_top_k) err = filter_k();
   return static_cast<int>(err);
   PEGAINFER_FFI_GUARD_END(-1)
 }

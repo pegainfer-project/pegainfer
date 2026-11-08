@@ -33,7 +33,7 @@ Design decisions worth knowing before touching it:
 
 - **Step-batched wire.** One message per scheduler step with request updates or metric changes, not one channel per request: the scheduler's natural output unit is the step batch, and per-request channels were tried and rejected (the scheduler for-loop over N channels was the bottleneck). The protocol stack demuxes.
 - **Flat `RequestUpdate`.** All facts a step produced for one request travel in one struct, so intra-request ordering is structure, not convention. The ledger merges every write for an id into that one record before the driver commits the step.
-- **Typed stop contract.** `Request.stop_policy` keeps model EOS handling separate from explicit request stop IDs. A token-driven finish retains the triggering token in the emitted output and carries `Terminal::Finished.stop_cause`: The vLLM primary EOS maps to `Eos(id)` with no wire `stop_reason`; secondary EOS IDs join the explicit stop set and map to `Token(id)`, reporting the actual matching ID. `ignore_eos` disables only model EOS. Qwen3.5 still suppresses EOS and leaves the cause empty for the bridge's legacy sentinel; its stop-policy migration remains follow-up work.
+- **Typed stop contract.** `Request.stop_policy` keeps model EOS handling separate from explicit request stop IDs. A token-driven finish retains the triggering token in the emitted output and carries `Terminal::Finished.stop_cause`: The vLLM primary EOS maps to `Eos(id)` with no wire `stop_reason`; secondary EOS IDs join the explicit stop set and map to `Token(id)`, reporting the actual matching ID. `ignore_eos` disables only model EOS.
 - **Ledger lifecycle.** `RequestLedger` owns one account for every unanswered submission. A scheduler receives only `QueuedRequest { id, request }` and writes every lifecycle transition by id. The ledger rejects touches after closure, derives completion counts from `push_tokens`, and writes off every open account when an engine-fatal `step` error ends the driver.
 - **Ledger as single writer.** Schedulers never touch the step channel; they call ledger methods. `admit` stamps `ScheduledInfo` from the registered prompt length, `push_tokens` tallies completions, and `commit_step` publishes the merged statement once per driver iteration.
 - **Polling driver, scheduler-owned park.** `spawn_scheduler` owns the serve loop: drain submissions, `Scheduler::step`, publish metrics, commit. An idle iteration ends in a `spin_loop` hint. Gemma 4 has one deliberate park inside this policy: while async prefill is the only remaining work, its scheduler drains the lane and joins it rather than hot-polling the completion (a drain failure is engine-fatal); when decode or queued work exists it keeps polling the lane without blocking. Qwen3.5 likewise polls its in-flight prefill while decode is active, but waits on the prefill event inside the step when no decoder remains.
@@ -73,6 +73,8 @@ pegainfer-frontend
     ├── bridge/stepped.rs  # SteppedEngineBridge: StepOutputs -> EngineCore messages
     ├── wire.rs        #   EngineCoreSamplingParams <-> SamplingParams translation
     ├── lora.rs        #   /v1/{load,unload}_lora_adapter over LoraClient
+    ├── reasoning_effort.rs  # chat-route reasoning_effort -> the template's vocabulary
+    ├── history.rs     #   chat-route history boundary -> vllm_xargs.generation_prompt_tokens -> Request::history_tokens
     └── request_contract.rs  # GLM5.2 prefill-only route guard
 ```
 
@@ -93,7 +95,7 @@ All six lines are onboarded. Adding a model line = write `model_line.rs` in the 
 
 ## Protocol stacks
 
-**`vllm` (current default, fleet-proven).** Impersonates a vLLM EngineCore process over in-process ZMQ/msgpack because upstream `vllm-server` assumes the engine is a separate process. HTTP routes, OpenAI types, tokenizer, chat templates, Prometheus live in the external `vllm-server`/`vllm-metrics`/`vllm-text` crates. `SteppedEngineBridge` translates each `RequestUpdate` 1:1 into an EngineCore output (wall-clock timestamps are reconstructed from the contract's `Instant`s via a per-bridge unix anchor; a `Finished{Stop}` without a typed cause appends the legacy stop sentinel token, which is how usage keeps counting Qwen3.5's suppressed EOS).
+**`vllm` (current default, fleet-proven).** Impersonates a vLLM EngineCore process over in-process ZMQ/msgpack because upstream `vllm-server` assumes the engine is a separate process. HTTP routes, OpenAI types, tokenizer, chat templates, Prometheus live in the external `vllm-server`/`vllm-metrics`/`vllm-text` crates. `SteppedEngineBridge` translates each `RequestUpdate` 1:1 into an EngineCore output (wall-clock timestamps are reconstructed from the contract's `Instant`s via a per-bridge unix anchor; a `Finished{Stop}` without a typed cause appends the legacy stop sentinel token).
 
 **`dynamo` (planned second stack).** dynamo's `lib/llm` in-process path removes the wire protocol entirely (`EngineConfig::InProcessTokens` + `run_input`). The step contract was shaped so this stack can consume `StepOutputs` directly without impersonation overhead. Decision gate: prototype, A/B against the vllm stack, let TTFT/step-overhead numbers pick the default.
 

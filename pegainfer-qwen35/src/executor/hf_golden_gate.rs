@@ -684,27 +684,7 @@ fn report_and_assert(label: &str, stats: &Stats) {
     );
 }
 
-fn build_executor(model_path: &str, acceptance: &common::GdnAcceptance) -> Qwen35Executor {
-    let model = acceptance
-        .load_model(
-            model_path,
-            MAX_EXECUTOR_BATCH,
-            crate::DEFAULT_MAX_PREFILL_TOKENS,
-            crate::Qwen35SchedulerPolicy::Off,
-            crate::Qwen35DecodeOverlap::Off,
-        )
-        .expect("load Qwen3.5 logits executor model");
-    for target in &model.candidate_decode {
-        assert!(
-            model
-                .candidate_decode_recipe(
-                    target.weights(&model).expect("real target weights"),
-                    target.batch
-                )
-                .is_err(),
-            "selected projection must reject launch before tuning"
-        );
-    }
+fn build_executor(model: crate::weights::Qwen35Model) -> Qwen35Executor {
     model
         .tune_decode_gemm_algos()
         .expect("tune Qwen3.5 logits executor GEMMs");
@@ -733,8 +713,8 @@ fn build_tp2_executor(model_path: &str) -> Qwen35TpExecutor {
 }
 
 /// TP2 executor with CUDA Graph requested. Returns `None` when the loaded
-/// model's TP-local decode GQA group has no compiled kernel (27B group 6) —
-/// the P2c gate keeps that path eager, so there is no graph to gate on.
+/// model's TP-local decode GQA group has no compiled kernel — the P2c gate
+/// keeps that path eager, so there is no graph to gate on.
 fn build_tp2_graph_executor(model_path: &str, label: &str) -> Option<Qwen35TpExecutor> {
     let devices = common::tp2_device_ordinals();
     let ex = Qwen35TpExecutor::from_runtime_with_capacity(
@@ -843,7 +823,11 @@ fn run_tp_with_slot_compaction(
     (stats, fingerprint)
 }
 
-fn check_prerequisite_rejections(model_path: &str, golden: &Golden) -> Result<()> {
+fn check_prerequisite_rejections(
+    model_path: &str,
+    golden: &Golden,
+    object_sha256: &str,
+) -> Result<()> {
     let reject = |expected: &str, error: anyhow::Error| {
         assert!(
             format!("{error:#}").contains(expected),
@@ -854,10 +838,18 @@ fn check_prerequisite_rejections(model_path: &str, golden: &Golden) -> Result<()
         "requires PEGAINFER_TEST_QWEN35_GDN_OBJECT_SHA256",
         common::GdnAcceptance::candidate_with_identity(None).unwrap_err(),
     );
-    reject(
-        "64-character hexadecimal",
-        common::GdnAcceptance::candidate_with_identity(Some("not-a-sha256".into())).unwrap_err(),
-    );
+    let mut non_hex = object_sha256.to_owned();
+    non_hex.replace_range(..1, "g");
+    for invalid in [
+        object_sha256[..63].to_owned(),
+        format!("{object_sha256}0"),
+        non_hex,
+    ] {
+        reject(
+            "64-character hexadecimal",
+            common::GdnAcceptance::candidate_with_identity(Some(invalid)).unwrap_err(),
+        );
+    }
     let temporary = tempfile::tempdir()?;
     let missing = temporary.path().join("missing-model");
     assert!(
@@ -922,16 +914,24 @@ fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
         .map(|target| (target.layer, target.projection, target.batch))
         .collect();
     ensure!(
-        targets == [(0, DecodeProjection::Down, 8), (3, DecodeProjection::V, 8)],
-        "4B HF must exercise only down0/V3 at N8: {targets:?}"
+        targets
+            == [
+                (0, DecodeProjection::Down, 8),
+                (3, DecodeProjection::V, 8),
+                (0, DecodeProjection::Down, 4),
+                (3, DecodeProjection::V, 4),
+                (0, DecodeProjection::Down, 2),
+                (3, DecodeProjection::V, 2),
+            ],
+        "4B HF must prepare only down0/V3 at N2/N4/N8: {targets:?}"
     );
     for (index, layer) in model.layers.iter().enumerate() {
-        for batch in [4, 8] {
+        for batch in [1, 2, 4, 8, 16] {
             ensure!(
                 model
                     .candidate_decode_recipe(&layer.mlp.down_proj, batch)?
                     .is_some()
-                    == (index == 0 && batch == 8),
+                    == (index == 0 && [2, 4, 8].contains(&batch)),
                 "down target escaped its layer/bucket"
             );
             if let crate::weights::LayerKind::FullAttention(attn) = &layer.attn {
@@ -939,7 +939,7 @@ fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
                     model
                         .candidate_decode_recipe(&attn.v_proj, batch)?
                         .is_some()
-                        == (index == 3 && batch == 8),
+                        == (index == 3 && [2, 4, 8].contains(&batch)),
                     "V target escaped its layer/bucket"
                 );
                 ensure!(
@@ -991,7 +991,7 @@ fn check_decode_policy(model: &crate::weights::Qwen35Model) -> Result<()> {
             "wrong decode prerequisite error: {error:#}"
         );
     }
-    eprintln!("CANDIDATE_DECODE_ADMISSION_OK down_layer=0 v_layer=3 batch=8");
+    eprintln!("CANDIDATE_DECODE_ADMISSION_OK down_layer=0 v_layer=3 batches=2,4,8");
     Ok(())
 }
 
@@ -1020,18 +1020,45 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
         std::env::var(REVISION_ENV).ok().as_deref(),
     )
     .expect("HF fixture provenance");
-    if acceptance.is_candidate() {
+    if let common::GdnAcceptance::Candidate { object_sha256 } = acceptance {
         assert!(
             golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2,
             "candidate short HF acceptance requires both bucket-straddling batches and slot-compaction coverage"
         );
-        check_prerequisite_rejections(&model_path, &golden).expect("HF prerequisite rejections");
+        check_prerequisite_rejections(&model_path, &golden, object_sha256)
+            .expect("HF prerequisite rejections");
     }
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
+    let load_model = || {
+        acceptance
+            .load_model(
+                &model_path,
+                MAX_EXECUTOR_BATCH,
+                crate::DEFAULT_MAX_PREFILL_TOKENS,
+                crate::Qwen35SchedulerPolicy::Off,
+                crate::Qwen35DecodeOverlap::Off,
+            )
+            .expect("load Qwen3.5 logits executor model")
+    };
 
     {
-        let mut ex = build_executor(&model_path, acceptance);
+        let model = load_model();
+        for target in &model.candidate_decode {
+            let Err(error) = model.candidate_decode_recipe(
+                target.weights(&model).expect("real target weights"),
+                target.batch,
+            ) else {
+                panic!("selected projection must reject launch before tuning");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("candidate decode recipe must be prepared before decode"),
+                "wrong unprepared-recipe error: {error:#}"
+            );
+        }
+        let mut ex = build_executor(model);
         check_decode_policy(&ex.model).expect("decode selection and preparation boundaries");
         if let common::GdnAcceptance::Candidate { object_sha256 } = acceptance {
             let mut wrong_sha = object_sha256.clone();
@@ -1042,7 +1069,7 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
                 error.to_string().contains("artifact identity mismatch"),
                 "{error:#}"
             );
-            eprintln!("GDN_ACCEPTANCE_REJECTIONS_OK cases=7");
+            eprintln!("GDN_ACCEPTANCE_REJECTIONS_OK");
         }
 
         let (stats, fp1) = run(&golden, &mut ex, &all, false);
@@ -1058,13 +1085,14 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
                 let (batched, _) = run(&golden, &mut ex, &all[..n], true);
                 report_and_assert(&format!("batched graph ({n} padded)"), &batched);
                 let buffers = &mut ex.graph_state.buffers;
-                if let Some(recipe) = ex
-                    .model
-                    .candidate_decode_recipe(
-                        &ex.model.layers[0].mlp.down_proj,
-                        buffers.act_out.seq_len,
-                    )
-                    .expect("prepared decode selection")
+                if n == BUCKET_STRADDLES[0]
+                    && let Some(recipe) = ex
+                        .model
+                        .candidate_decode_recipe(
+                            &ex.model.layers[0].mlp.down_proj,
+                            buffers.act_out.seq_len,
+                        )
+                        .expect("prepared decode selection")
                 {
                     let ctx = ex.model.device_ctx();
                     // SAFETY: the model's live stream remains valid in this scope.
@@ -1100,14 +1128,14 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
 
     if golden.num_seqs >= SLOT_COMPACTION_BATCH && golden.decode_len >= 2 {
         let fp1 = {
-            let mut ex = build_executor(&model_path, acceptance);
+            let mut ex = build_executor(load_model());
             let (compacted, fp) =
                 run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             report_and_assert("slot-compaction graph", &compacted);
             fp
         };
         let fp2 = {
-            let mut ex = build_executor(&model_path, acceptance);
+            let mut ex = build_executor(load_model());
             let (_, fp) = run_with_slot_compaction(&golden, &mut ex, &all[..SLOT_COMPACTION_BATCH]);
             fp
         };
@@ -1159,7 +1187,16 @@ fn run_long_golden(acceptance: &common::GdnAcceptance) {
     report_fixture_shape(&golden);
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    let mut ex = build_executor(&model_path, acceptance);
+    let model = acceptance
+        .load_model(
+            &model_path,
+            MAX_EXECUTOR_BATCH,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::Off,
+        )
+        .expect("load Qwen3.5 logits executor model");
+    let mut ex = build_executor(model);
     let (stats, fp1) = run(&golden, &mut ex, &all, false);
     report_and_assert("long sequential bs=1 graph", &stats);
     let (_, fp2) = run(&golden, &mut ex, &all, false);

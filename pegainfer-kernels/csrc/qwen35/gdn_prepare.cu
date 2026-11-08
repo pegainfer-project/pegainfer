@@ -1,6 +1,5 @@
 #include "common.cuh"
-
-#include <cuda.h>
+#include "shared/ffi_guard.cuh"
 
 namespace {
 
@@ -86,16 +85,6 @@ __global__ void gdn_prefill_native_prepare_hv32_kernel(
 
 }
 
-CUresult map_cuda_error(cudaError_t error) {
-    if (error == cudaSuccess) {
-        return CUDA_SUCCESS;
-    }
-    if (error == cudaErrorInvalidValue || error == cudaErrorInvalidDevicePointer) {
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    return CUDA_ERROR_UNKNOWN;
-}
-
 }  // namespace
 
 extern "C" CUresult gated_delta_rule_prefill_native_prepare_cuda(
@@ -122,5 +111,5 @@ extern "C" CUresult gated_delta_rule_prefill_native_prepare_cuda(
     gdn_prefill_native_prepare_hv32_kernel<<<grid, kThreads, 0, stream>>>(
         qkv, b_proj, a_proj, dt_bias, a_log, q_out, k_out, v_out, alpha_out,
         beta_out);
-    return map_cuda_error(cudaGetLastError());
+    return consume_last_cuda_error();
 }

@@ -48,7 +48,7 @@ use report_support::dense::DenseKernelKind;
 use report_support::dense::GemmProjection;
 use report_support::dense::HIDDEN_SIZE;
 use report_support::dense::INTERMEDIATE_SIZE;
-use report_support::dense::VOCAB_SIZE;
+use report_support::dense::LOGITS_ROWS;
 use report_support::prefill_attention::AttentionPrefillCase;
 use report_support::prefill_attention::PrefillAttentionShape;
 use report_support::prefill_attention::PrefillAttentionSpec;
@@ -1744,7 +1744,7 @@ fn analytic_model(case: &CaseResult) -> Option<AnalyticModel> {
     let bs = shape.batch_size as f64;
     let hidden = HIDDEN_SIZE as f64;
     let inter = INTERMEDIATE_SIZE as f64;
-    let vocab = VOCAB_SIZE as f64;
+    let vocab = LOGITS_ROWS as f64;
 
     if let Some((family, phase)) = dense_op_for(&case.op) {
         let rows = match phase {
@@ -2090,7 +2090,7 @@ mod tests {
 
     fn dense_case(op: &str, variant: &str, batch: usize, seq: Option<usize>) -> CaseResult {
         let (gemm_out_dim, gemm_in_dim) = match variant {
-            "lm_head" => (Some(VOCAB_SIZE), Some(HIDDEN_SIZE)),
+            "lm_head" => (Some(LOGITS_ROWS), Some(HIDDEN_SIZE)),
             _ => (None, None),
         };
         CaseResult {
@@ -2131,7 +2131,7 @@ mod tests {
         // activation column in and logits column out.
         let case = dense_case("decode_projection_gemm", "lm_head", 1, None);
         let model = analytic_model(&case).expect("gemm model");
-        let v = VOCAB_SIZE as f64;
+        let v = LOGITS_ROWS as f64;
         let h = HIDDEN_SIZE as f64;
         assert!((model.min_bytes - 2.0 * (v * h + h + v)).abs() < 1.0);
         assert!((model.flops - 2.0 * v * h).abs() < 1.0);

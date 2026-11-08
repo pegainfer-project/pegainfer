@@ -9,6 +9,7 @@
 // int32 index-remap: page = block_table[t, off//bs]; slot = page*bs + off%bs.
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 #include "glm52_min_gemv.cuh"
 
 #include <cfloat>
@@ -160,18 +161,6 @@ __global__ void indexer_weights_fold_kernel(
              n_heads_scale;
   }
 }
-
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
-CUresult consume_last_cuda_error() { return map_cuda_error(cudaGetLastError()); }
 
 bool valid_cache_layout(int head_dim, int quant_block_size,
                         int cache_block_size,

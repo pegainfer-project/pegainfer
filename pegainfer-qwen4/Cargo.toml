@@ -1,0 +1,20 @@
+[package]
+autobenches = false
+autobins = false
+edition = "2024"
+license = "Apache-2.0"
+name = "pegainfer-qwen4"
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+pegainfer-frontend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+safetensors = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

@@ -94,6 +94,7 @@
 // exists; otherwise every entry point compiles as a NOT_SUPPORTED stub.
 
 #include "../shared/ffi_guard.cuh"
+#include "k3_mega_moe_limits.cuh"
 
 #include <cuda.h>
 #include <cstdint>
@@ -112,20 +113,6 @@ constexpr int kTransformSfWordK = kTransformSfGroupK * kTransformSfPerWord;  // 
 
 // Weight-row interleave granularity for the fused gate|up projection.
 constexpr int kInterleaveGran = 8;
-
-CUresult transform_map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
-CUresult consume_last_cuda_error() {
-  return transform_map_cuda_error(cudaGetLastError());
-}
 
 // ---------------------------------------------------------------------------
 // Row permutations (host/device agreeing pure index math)
@@ -371,11 +358,7 @@ extern "C" {
 // Token-count alignment the mega API enforces (`layout::kLCMCandidateBlockM`).
 int k3_mega_token_alignment(void) { return 384; }
 
-// Token capacity one rank's slab and the AOT kernels are built for
-// (`num_max_tokens_per_rank`). The launch accepts exactly this value — the
-// ring capacities derived from it are kernel template parameters — so slabs
-// are allocated at exactly this size, whatever the executor's live batch is.
-int k3_mega_max_tokens_per_rank(void) { return 16896; }
+int k3_mega_max_tokens_per_rank(void) { return k3_mega::kProtocolMaxTokensPerRank; }
 
 // Whether the AOT matrix carries a kernel for this world (GLOBAL expert count
 // x rank count, situ activation). One definition of the supported set — the
@@ -417,26 +400,26 @@ CUresult k3_mega_open_peer_access(int self_ordinal, int peer_ordinal) {
   if (self_ordinal == peer_ordinal) return CUDA_SUCCESS;
   int reachable = 0;
   const cudaError_t query = cudaDeviceCanAccessPeer(&reachable, self_ordinal, peer_ordinal);
-  if (query != cudaSuccess) return transform_map_cuda_error(query);
+  if (query != cudaSuccess) return map_cuda_error(query);
   if (reachable == 0) return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
 
   const cudaError_t bind = cudaSetDevice(self_ordinal);
-  if (bind != cudaSuccess) return transform_map_cuda_error(bind);
+  if (bind != cudaSuccess) return map_cuda_error(bind);
   const cudaError_t enable = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
   if (enable == cudaErrorPeerAccessAlreadyEnabled) {
     (void)cudaGetLastError();
   } else if (enable != cudaSuccess) {
-    return transform_map_cuda_error(enable);
+    return map_cuda_error(enable);
   }
 
   cudaMemPool_t pool = nullptr;
   const cudaError_t pool_err = cudaDeviceGetDefaultMemPool(&pool, self_ordinal);
-  if (pool_err != cudaSuccess) return transform_map_cuda_error(pool_err);
+  if (pool_err != cudaSuccess) return map_cuda_error(pool_err);
   cudaMemAccessDesc desc{};
   desc.location.type = cudaMemLocationTypeDevice;
   desc.location.id = peer_ordinal;
   desc.flags = cudaMemAccessFlagsProtReadWrite;
-  return transform_map_cuda_error(cudaMemPoolSetAccess(pool, &desc, 1));
+  return map_cuda_error(cudaMemPoolSetAccess(pool, &desc, 1));
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 

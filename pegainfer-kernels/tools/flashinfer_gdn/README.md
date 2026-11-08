@@ -62,7 +62,8 @@ validation must establish whether this contract passes; no historical result
 substitutes for it.
 
 The canonical runner additionally executes the single Rust host mutation test
-against the real generated bundle. It shares one valid fixture across all
+against the real generated bundle, explicitly selecting it with `--ignored`;
+ordinary Cargo test runs leave it ignored. It shares one valid fixture across all
 metadata and file/path rejection cases; it does not manufacture a fake object
 or claim host validation proves GPU execution. One corrupted real object also
 exercises the actual build-script rejection before linking.
@@ -87,8 +88,9 @@ model identity. The last check uses the executor's already-loaded model. There
 are no extra negative HF processes, panic-output parsers or extra model loads.
 All HF entries reject an unresolved revision. Gate 3 reuses both existing short
 and long HF golden scenarios. The long test checks
-4097/8192-token outputs against an external oracle; the production HTTP and
-Shared-SM checks cover request flow and overlap, so they do not replace it.
+4097/8192-token outputs against an external oracle; HTTP and Shared-SM lifecycle
+checks do not replace it. Actual GPU overlap requires Nsight timeline analysis;
+a passing lifecycle test alone does not establish it.
 
 Generated objects, oracle source copies, references, logs, model weights and
 profiling results remain outside the source tree's tracked files. The runner

@@ -1,9 +1,3 @@
-use cudarc::driver::CudaSlice;
-use half::bf16;
-
-use crate::buffer::KvBuffer;
-use crate::layout::KvLayout;
-
 /// Lightweight, non-owning view of a request's KV state.
 ///
 /// Built from a `SchedulableSequence`'s assigned block IDs before each
@@ -52,50 +46,5 @@ impl KvView {
 
     pub fn page_indices(&self) -> &[i32] {
         &self.page_indices
-    }
-
-    pub fn desc<'a>(&'a self, buffer: &'a KvBuffer) -> KvViewDesc<'a> {
-        KvViewDesc {
-            layout: *buffer.layout(),
-            buffer: buffer.buffer(),
-            pages: &self.page_indices,
-            seq_len: self.seq_len,
-            last_page_len: self.last_page_len(),
-        }
-    }
-}
-
-/// Kernel-facing metadata bundle.
-pub struct KvViewDesc<'a> {
-    layout: KvLayout,
-    buffer: &'a CudaSlice<bf16>,
-    pages: &'a [i32],
-    seq_len: usize,
-    last_page_len: usize,
-}
-
-impl KvViewDesc<'_> {
-    pub fn layout(&self) -> &KvLayout {
-        &self.layout
-    }
-
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
-    pub fn last_page_len(&self) -> usize {
-        self.last_page_len
-    }
-
-    pub fn num_pages(&self) -> usize {
-        self.pages.len()
-    }
-
-    pub fn page_indices(&self) -> &[i32] {
-        self.pages
-    }
-
-    pub fn buffer(&self) -> &CudaSlice<bf16> {
-        self.buffer
     }
 }

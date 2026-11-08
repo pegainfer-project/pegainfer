@@ -191,7 +191,7 @@ impl Qwen3Model {
 
         let kv_refs: Vec<&KvView> = kv_views.iter().collect();
         bufs.sync_paged_meta(&self.ctx, &kv_refs, padded_bs)?;
-        crate::green_ctx::fence_producers_before_override(&self.ctx)?;
+        pegainfer_kernels::tensor::fence_producers_before_override(&self.ctx)?;
         let attention_path =
             BatchDecodeBuffers::attention_path(padded_bs, bufs.policy_at_construction);
         #[cfg(feature = "kernel-call-trace")]
@@ -307,13 +307,8 @@ impl Qwen3Model {
             )?;
         }
 
-        // Output projection: logits [vocab_size, bs]
-        dag.lm_head(
-            dag_label!("lm_head"),
-            self.output_projection(),
-            &bufs.normed,
-            &mut bufs.logits,
-        );
+        // Output projection: logits [logits_rows, bs]
+        dag.lm_head(dag_label!("lm_head"), &bufs.normed, &mut bufs.logits)?;
 
         Ok(())
     }

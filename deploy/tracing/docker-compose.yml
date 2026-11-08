@@ -35,8 +35,11 @@ services:
     restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
-      # Viewer, not Admin: Explore/dashboards need no write access.
+      # Viewer, not Editor: anonymous visitors only read traces.
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      # Grafana 11 keeps Viewers out of Explore unless this is set; saving
+      # dashboards stays forbidden.
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
       GF_AUTH_DISABLE_LOGIN_FORM: "true"
       # Enable the TraceQL editor and search UX.
       GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceqlSearch"

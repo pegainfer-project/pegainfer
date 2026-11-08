@@ -4,12 +4,15 @@ use std::time::Instant;
 
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
+use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::LiveScheduler;
 use pegainfer_frontend::engine::Request;
 use pegainfer_frontend::engine::RequestControl;
 use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::spawn_scheduler;
 
 pub(super) use super::lane_step_collector::Drained;
@@ -32,15 +35,19 @@ impl Harness {
         }
     }
 
-    pub(super) fn from_state(state: super::EngineState) -> Self {
-        let servable_len = Some(u32::try_from(state.max_context).expect("servable ceiling"));
-        let mut scheduler = spawn_scheduler("gemma4-test", super::Gemma4Scheduler::new(state));
+    pub(super) fn from_scheduler(scheduler: impl Scheduler + 'static, max_context: usize) -> Self {
+        let mut scheduler = spawn_scheduler("gemma4-test", scheduler);
         let steps = scheduler.handle.take_steps().expect("fresh step stream");
         Self {
             scheduler: Some(scheduler),
             steps: StepCollector::new(steps),
-            servable_len,
+            servable_len: Some(u32::try_from(max_context).expect("servable ceiling")),
         }
+    }
+
+    pub(super) fn from_state(state: super::EngineState) -> Self {
+        let max_context = state.max_context;
+        Self::from_scheduler(super::Gemma4Scheduler::new(state), max_context)
     }
 
     pub(super) fn submit(&self, prompt_tokens: Vec<u32>, max_tokens: usize) -> RequestControl {
@@ -56,17 +63,33 @@ impl Harness {
         logprobs: Option<usize>,
         prompt_logprobs: Option<usize>,
     ) -> RequestControl {
+        self.submit_with_policy(
+            prompt_tokens,
+            max_tokens,
+            logprobs,
+            prompt_logprobs,
+            StopPolicy::new(EosPolicy::Ignore, vec![]),
+        )
+    }
+
+    pub(super) fn submit_with_policy(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
+        stop_policy: StopPolicy,
+    ) -> RequestControl {
         self.scheduler
             .as_ref()
             .expect("live scheduler")
             .handle
             .submit(Request {
                 prompt_tokens,
-                params: pegainfer_frontend::sampler::SamplingParams {
-                    ignore_eos: true,
-                    ..pegainfer_frontend::sampler::SamplingParams::default()
-                },
-                stop_policy: pegainfer_frontend::engine::StopPolicy::default(),
+                params: pegainfer_frontend::sampler::SamplingParams::default(),
+                history_tokens: None,
+                history_marks: Vec::new(),
+                stop_policy,
                 max_tokens,
                 lora_adapter: None,
                 kv_transfer_params: None,
@@ -83,6 +106,15 @@ impl Harness {
             .expect("live scheduler")
             .handle
             .metrics()
+    }
+
+    /// Whether the scheduler thread has exited — the engine's own signal that it
+    /// stopped, which a gate can wait on with a deadline instead of racing the
+    /// frontend's error propagation.
+    pub(super) fn scheduler_finished(&self) -> bool {
+        self.scheduler
+            .as_ref()
+            .is_some_and(|scheduler| scheduler.join.is_finished())
     }
 
     pub(super) fn shutdown(&mut self, aborts: &[&RequestControl]) {
@@ -114,6 +146,7 @@ impl Harness {
             .expect("scheduler not shut down twice");
         drop(scheduler.handle);
         scheduler.join.join().expect("scheduler thread exits");
+        self.steps.pump_available();
     }
 }
 
@@ -130,13 +163,15 @@ pub(super) fn knob_table<'a>(
 }
 
 pub(super) fn launch(overrides: &[(&str, &str)]) -> Harness {
+    launch_with(&EngineLoadOptions::default(), overrides)
+}
+
+/// Start a real engine from explicit load options — the seam a tensor-parallel
+/// gate uses to ask for two device ordinals and a topology.
+pub(super) fn launch_with(options: &EngineLoadOptions, overrides: &[(&str, &str)]) -> Harness {
     let dir = crate::testkit::model_path();
-    let engine = super::start_with_knobs(
-        Path::new(&dir),
-        &EngineLoadOptions::default(),
-        &knob_table(overrides),
-    )
-    .expect("engine start");
+    let engine = super::start_with_knobs(Path::new(&dir), options, &knob_table(overrides))
+        .expect("engine start");
     Harness::from_engine(engine)
 }
 
@@ -144,8 +179,8 @@ pub(super) fn load_state(overrides: &[(&str, &str)]) -> anyhow::Result<super::En
     let dir = crate::testkit::model_path();
     let config = crate::config::Gemma4Config::from_file(&dir)?;
     let knobs = super::ServingKnobs::resolve(&knob_table(overrides), &config)?;
-    let policy = super::generation_policy(&dir)?;
-    super::EngineState::load(&dir, config, knobs, 0, policy, 0x5EED, true)
+    let policy = super::generation_policy(&dir, config.vocab_size)?;
+    super::EngineState::load(&dir, &config, knobs, &[0], policy, 0x5EED, true)
 }
 
 pub(super) fn ids(len: usize, salt: u32) -> Vec<u32> {

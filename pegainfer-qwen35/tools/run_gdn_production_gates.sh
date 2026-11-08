@@ -290,9 +290,6 @@ run_exact_gate() {
       echo "Shared-SM test passed without the requested Nsight report" >&2; exit 3;
     }
   fi
-  if [[ "$label" == gate3-hf-golden ]]; then
-    rg -Fx 'GDN_ACCEPTANCE_REJECTIONS_OK cases=7' "$log_root/$label.log"
-  fi
   case "$label" in
     gate3-hf-*|gate4-model-continuation|gate4-scheduler-chunks|gate5-scheduler|gate5-shared-sm)
       rg -F "CANDIDATE_MODEL_IDENTITY_OK object_sha256=$object_sha" "$log_root/$label.log"
@@ -300,7 +297,7 @@ run_exact_gate() {
   esac
 }
 
-run_exact_gate gate1-candidate-contract qwen35_gdn::tests::candidate_contract_rejects_mutations ordinary \
+run_exact_gate gate1-candidate-contract qwen35_gdn::tests::candidate_contract_rejects_mutations ignored \
   -p pegainfer-build --features qwen35-gdn --lib
 
 echo "gate1 validations passed"

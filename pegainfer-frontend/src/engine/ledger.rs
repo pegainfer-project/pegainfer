@@ -5,7 +5,7 @@
 //! [`RequestLedger::register`]; exactly one terminal transition closes it
 //! ([`RequestLedger::finish`], [`RequestLedger::fail`],
 //! [`RequestLedger::reject`], [`RequestLedger::retire`], or
-//! [`RequestLedger::defer_finish`]); accounts still open when the ledger
+//! [`RequestLedger::defer_finish_with_cause`]); accounts still open when the ledger
 //! drops are written off as `Failed` terminals (engine teardown). Because
 //! every open is a submit and every close is a terminal, "terminal exactly
 //! once" and "nothing after the terminal" are enforced here: touching a
@@ -285,16 +285,12 @@ impl RequestLedger {
         self.statement.extract(id);
     }
 
-    /// Turn the request's finish into a token the scheduler can deliver later
-    /// from any thread (P/D prefill roles gate `Finished` on KV-save
-    /// visibility). Closes the account; the request's buffered update for
-    /// this step — tokens included — folds into the returned message, so late
-    /// delivery cannot reorder against the step stream.
-    pub fn defer_finish(&mut self, id: RequestId, reason: FinishReason) -> DeferredFinish {
-        self.defer_finish_with_cause(id, reason, None)
-    }
-
-    /// Defer a finish while preserving a typed token-level stop cause.
+    /// Turn the request's finish, with its typed token-level stop cause, into
+    /// a token the scheduler can deliver later from any thread (P/D prefill
+    /// roles gate `Finished` on KV-save visibility). Closes the account; the
+    /// request's buffered update for this step — tokens included — folds into
+    /// the returned message, so late delivery cannot reorder against the step
+    /// stream.
     pub fn defer_finish_with_cause(
         &mut self,
         id: RequestId,
@@ -404,6 +400,8 @@ mod tests {
         Request {
             prompt_tokens: prompt,
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
+            history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 8,
             lora_adapter: None,

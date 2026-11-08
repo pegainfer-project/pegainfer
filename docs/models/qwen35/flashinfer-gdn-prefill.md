@@ -3,7 +3,7 @@
 > **TL;DR:** Qwen3.5 supports an explicitly selected SM120 FlashInfer GDN
 > prefill candidate with lower scratch requirements. Triton remains the default.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-11
 
 ## Integration Boundary
 
@@ -23,9 +23,10 @@ peak prefill scratch. Normal prefill retains stream/event ordering without
 diagnostic host barriers.
 
 For Qwen3.5-4B's candidate, MLP down at layer 0 and full-attention V at layer 3
-use FP32 split-K partials and reduction at decode batch N=8. Inputs, weights
-and final output remain BF16. The model owns a copy of the tuned cuBLASLt recipe with only the reduction
-scheme changed; unsupported recipes fail before graph capture. This uses the
+use FP32 split-K partials and reduction at allocated decode buckets N=2,4,8.
+Inputs, weights and final output remain BF16. The model copies the tuned
+cuBLASLt recipe and changes only its reduction scheme; unsupported recipes
+fail before graph capture. This uses the
 existing decode workspace and leaves Triton, other projections and the shared
 algorithm cache unchanged. The scope follows the measured padded-decode
 regressions. One private model rule selects the projection, layer and decode
@@ -45,12 +46,16 @@ The short HF gate has exposed a configuration-dependent candidate regression
 in padded decode. Passing retries do not establish numerical stability;
 the down/V combination must be checked against both retained opposing
 configurations on the final integration tree before claiming a production fix.
+Current main uses a fused BA projection; its split9/split16 controls do not
+exactly reconstruct the historical separate a/b configurations.
 
-The candidate reduces prefill scratch requirements. Retained same-context HTTP
+Historical same-context HTTP
 comparisons against seven-stage Triton, using synthetic token-ID prompts
 with Shared-SM enabled, show modest throughput gains with workload-dependent
 tail-latency regressions. These results do not establish natural-language
 workload performance or justify changing the default backend.
+Performance claims require matched A/B on the final integration tree, reporting
+TPOT and end-to-end latency alongside throughput.
 
 Generation and gate details are documented in the
 [kernel tool README](../../../pegainfer-kernels/tools/flashinfer_gdn/README.md).

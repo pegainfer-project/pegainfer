@@ -1,8 +1,6 @@
 # Accuracy Parity Playbook
 
 > **TL;DR:** 精度对齐先定义真值，再找 first diff，再只拆那一段。对 bf16 模型，很多“只差一点”的 bug 不是算子全错，而是少了一次 materialization round、走错了 truth path、或者被 argmax tie 放大。
->
-> **Status:** Active reference. Updated 2026-03-27.
 
 ## What Counts As "Correct"
 
@@ -22,94 +20,9 @@
 
 这样做的目的很简单：不要在已经分叉的文本上做层级比较，那样定位几乎总是错的。
 
-## Verified Commands
+## Tools
 
-这些命令已经在 Qwen3.5-4B 精度排查里跑过，可以直接复用。
-
-先找 first diff：
-
-```bash
-./target/release/qwen35_trace_greedy \
-  --model-path models/Qwen3.5-4B \
-  --prompt 'Tell me a story' \
-  --steps 25 \
-  --topk 5 \
-  --out target/accuracy/tell_story_trace_after_convfix.json
-
-./.venv/bin/python tools/accuracy/hf_dump_qwen35_greedy_tokens.py \
-  --model-path models/Qwen3.5-4B \
-  --prompt 'Tell me a story' \
-  --steps 25 \
-  --out target/accuracy/hf_tell_story_trace_after_convfix.json
-```
-
-固定 exact token ids，比某一层：
-
-```bash
-./target/release/qwen35_dump_layer_ids \
-  --model-path models/Qwen3.5-4B \
-  --token-ids-json target/accuracy/python_prime_prefix_step1_ids.json \
-  --layer 0 \
-  --out target/accuracy/peg_python_prime_layer0_prefill_after_convfix.json
-
-./.venv/bin/python tools/accuracy/hf_dump_qwen35_layer_ids.py \
-  --model-path models/Qwen3.5-4B \
-  --token-ids-json target/accuracy/python_prime_prefix_step1_ids.json \
-  --layer 0 \
-  --out target/accuracy/hf_python_prime_layer0_prefill.json
-
-./.venv/bin/python tools/accuracy/compare_qwen35_dump.py \
-  target/accuracy/hf_python_prime_layer0_prefill.json \
-  target/accuracy/peg_python_prime_layer0_prefill_after_convfix.json
-```
-
-固定 exact token ids，比最终 incremental logits：
-
-```bash
-./target/release/qwen35_dump_incremental_final_ids \
-  --model-path models/Qwen3.5-4B \
-  --prompt-token-ids-json target/accuracy/chinese_prompt_ids_after_convfix.json \
-  --decode-token-ids-json target/accuracy/chinese_decode_common_ids_after_convfix.json \
-  --out target/accuracy/peg_chinese_incremental_final_after_convfix.json
-
-./.venv/bin/python tools/accuracy/hf_dump_qwen35_incremental_final_ids.py \
-  --model-path models/Qwen3.5-4B \
-  --prompt-token-ids-json target/accuracy/chinese_prompt_ids_after_convfix.json \
-  --decode-token-ids-json target/accuracy/chinese_decode_common_ids_after_convfix.json \
-  --out target/accuracy/hf_chinese_incremental_final_after_convfix.json
-```
-
-检查线性注意力 `seq_len=1` 的 production path 和 recurrent path 是否等价：
-
-```bash
-./target/release/qwen35_compare_linear_seq1_ids \
-  --model-path models/Qwen3.5-4B \
-  --prompt-token-ids-json target/accuracy/python_prime_prompt_ids.json \
-  --decode-token-ids-json target/accuracy/python_prime_decode_ids_step1.json \
-  --layer 0
-```
-
-历史 case-level 覆盖率排查命令如下。`test_data/Qwen3.5-4B.json`
-已经退役，新排查应优先走 `pegainfer-qwen35/src/executor/hf_golden_gate.rs`
-或重建同等的 HF `past_key_values` token-id/logits dump：
-
-```bash
-./target/release/qwen35_generate_cases \
-  --model-path models/Qwen3.5-4B \
-  --cases test_data/Qwen3.5-4B.json \
-  --out target/accuracy/qwen35_cases_after_silu_fix.json
-
-./.venv/bin/python tools/accuracy/hf_generate_qwen35_cases.py \
-  --model-path models/Qwen3.5-4B \
-  --cases test_data/Qwen3.5-4B.json \
-  --out target/accuracy/hf_cases_after_convfix.json
-```
-
-如果怀疑是某个小 kernel 的 bf16 语义错了，先跑聚焦的算子测试：
-
-```bash
-cargo test --release test_conv1d_prefill_handoff_matches_single_prefill -- --nocapture
-```
+The per-layer dump binaries and HF dump scripts from the Qwen3.5-4B investigation are gone. For Qwen3 and Qwen3.5 the HF reference is now a golden fixture: `tools/accuracy/dump_qwen3_hf_golden.py` and `dump_qwen35_hf_golden.py` write it, and `pegainfer-qwen3/tests/hf_golden_gate.rs` and `pegainfer-qwen35/src/executor/hf_golden_gate.rs` checks pegainfer against it. A first-diff or per-layer dump is a probe to rebuild for the investigation at hand, following the ladder above.
 
 ## High-Signal Tricks
 

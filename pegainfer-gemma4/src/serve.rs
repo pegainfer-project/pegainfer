@@ -30,7 +30,6 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
-use crate::config::Gemma4Config;
 use crate::config::LayerKind;
 use crate::forward::embed_scale_bf16;
 use crate::forward::logits_tail;
@@ -39,10 +38,12 @@ use crate::forward::validate_tokens;
 use crate::kv::GLOBAL_PAGE_SIZE;
 use crate::kv::GemmaKv;
 use crate::kv::LOCAL_PAGE_SIZE;
+use crate::kv::RankKv;
 use crate::kv::SlidingLocalKv;
 use crate::kv::admit_tokens;
 use crate::layer::EpilogueScratch;
 use crate::layer::LayerGeometry;
+use crate::layer::TpComm;
 use crate::layer::attention_epilogue_into;
 use crate::layer::build_proportional_rope_tables;
 use crate::weights::Gemma4Layer;
@@ -504,49 +505,6 @@ impl Projections {
     }
 }
 
-/// Order `ctx.stream` producers (plan uploads, token-id H2D, buffer
-/// allocations) before the override stream consumes them. No-op without an
-/// override.
-fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
-    use cudarc::driver::sys;
-    if !pegainfer_core::tensor::has_stream_override() {
-        return Ok(());
-    }
-    let override_stream = pegainfer_core::tensor::active_cu_stream(ctx);
-    let producer = ctx.stream.cu_stream();
-    unsafe {
-        let mut event: sys::CUevent = std::ptr::null_mut();
-        let create = sys::cuEventCreate(
-            &raw mut event,
-            sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-        );
-        anyhow::ensure!(
-            create == sys::CUresult::CUDA_SUCCESS,
-            "cuEventCreate (producer fence) failed: {create:?}"
-        );
-        let record = sys::cuEventRecord(event, producer);
-        let wait = if record == sys::CUresult::CUDA_SUCCESS {
-            sys::cuStreamWaitEvent(override_stream, event, 0)
-        } else {
-            record
-        };
-        let destroy = sys::cuEventDestroy_v2(event);
-        anyhow::ensure!(
-            record == sys::CUresult::CUDA_SUCCESS,
-            "cuEventRecord (producer fence) failed: {record:?}"
-        );
-        anyhow::ensure!(
-            wait == sys::CUresult::CUDA_SUCCESS,
-            "cuStreamWaitEvent (producer fence) failed: {wait:?}"
-        );
-        anyhow::ensure!(
-            destroy == sys::CUresult::CUDA_SUCCESS,
-            "cuEventDestroy (producer fence) failed: {destroy:?}"
-        );
-    }
-    Ok(())
-}
-
 /// The tower's whole working set for one step: attention buffers, epilogue
 /// buffers, and the hidden pair the layers alternate between so no layer
 /// writes the buffer it is reading.
@@ -843,6 +801,14 @@ impl StepArena {
     pub(crate) fn logits_and_ids(&mut self) -> (&mut HiddenStates, &mut CudaSlice<u32>) {
         (&mut self.logits, &mut self.ids)
     }
+
+    /// Release the captured graphs. Called on teardown, before the communicator
+    /// goes away, because NCCL's abort waits for a graph that references it to be
+    /// destroyed. A tensor-parallel launch captures nothing, so there is nothing
+    /// to release on that path.
+    pub(crate) fn release_graphs(&mut self) {
+        self.graphs.clear();
+    }
 }
 
 /// The allocators wrap the driver error in a message rather than keeping the
@@ -944,12 +910,17 @@ impl GlobalAttn {
 /// as. FlashInfer's decode dispatcher compiles GQA groups {1,2,3,4,8}: a
 /// dispatchable group passes through whole, and a non-dispatchable group
 /// over one KV head halves into pseudo-requests — an exact memory identity
-/// only because MQA gives every query head the same KV head (the 12B
-/// global family's 16 over 1). Anything else fails loud.
-pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
+/// only because MQA gives every query head the same KV head (12B's global
+/// family is 16 over 1 at TP1). Anything else fails loud.
+///
+/// This reads the *resolved per-rank* geometry, not the config: query heads
+/// shard with the world size while KV heads follow their own range, so the
+/// same group is 16 at TP1, 8 at TP2, 4 at TP4 — and lands back inside the
+/// compiled decode set above TP1, where the split factor returns 1.
+pub(crate) fn global_split_factor(geom: &LayerGeometry) -> Result<usize> {
     const DISPATCHABLE: [usize; 5] = [1, 2, 3, 4, 8];
-    let q = config.num_attention_heads;
-    let kv = config.num_global_key_value_heads;
+    let q = geom.num_q_heads;
+    let kv = geom.num_kv_heads;
     anyhow::ensure!(
         kv > 0 && q.is_multiple_of(kv),
         "global family of {q} query heads over {kv} KV heads is not a whole GQA group"
@@ -966,6 +937,21 @@ pub(crate) fn global_split_factor(config: &Gemma4Config) -> Result<usize> {
          (GQA group {group}): supported are groups 1,2,3,4,8 whole, or twice one of \
          those over a single KV head"
     )
+}
+
+/// One phase of the decode-graph pre-capture sweep. `Warm` and `Launch`
+/// execute, and so enqueue collectives that need every rank's matching call;
+/// `Capture` only records.
+#[derive(Clone, Copy)]
+pub(crate) enum PrecapturePhase {
+    Warm,
+    Capture,
+    Launch,
+}
+
+impl PrecapturePhase {
+    /// The sweep's phases in order.
+    pub(crate) const ALL: [Self; 3] = [Self::Warm, Self::Capture, Self::Launch];
 }
 
 /// Everything a serving step needs that outlives requests.
@@ -994,12 +980,26 @@ pub(crate) struct GemmaServe {
     /// Model layer index -> index within its family's pool layer axis.
     family_index: Vec<usize>,
     linear: LinearScratch,
+    /// This rank's tensor-parallel communicator, `None` at world size 1 where
+    /// every reduction is a no-op. Attached after construction, once every
+    /// rank's compute stream exists.
+    tp_comm: Option<TpComm>,
 }
+
+// SAFETY: A serve is pinned to one CUDA device and driven by one thread at a
+// time: the thread that loads it (the load-time warm walks the ranks one after
+// another, never in parallel), and afterwards exactly one thread per step — the
+// scheduler's for rank 0, and one scoped thread per extra rank, which hands its
+// `&mut` back at the join before the scheduler touches that rank again
+// (`EngineState::drive_ranks`). No two threads hold a serve at once, so the raw
+// NCCL communicator it may hold never crosses a thread while in use. (Same
+// assertions `Qwen3Model` makes.)
+unsafe impl Send for GemmaServe {}
 
 impl GemmaServe {
     fn decode_row(
         &self,
-        kv: &GemmaKv,
+        kv: &RankKv,
         local_pages: &mut Vec<i32>,
         global_pages: &mut Vec<i32>,
     ) -> Result<DecodeRow> {
@@ -1030,6 +1030,9 @@ impl GemmaServe {
     ) -> Result<Self> {
         // One source of truth for geometry, rope tables and layer numbering.
         let config = &weights.config;
+        // The weights carry the shard they were cut as, so the geometry and the
+        // pools sized below cannot belong to a different rank than they hold.
+        let tp = weights.tp;
         let device_ordinal = ctx.device_ordinal;
         // One tensor answers for the set: the loader materializes every
         // weight through a single context.
@@ -1039,7 +1042,9 @@ impl GemmaServe {
             "weights live on device {weights_ordinal} but this context \
              allocates on device {device_ordinal}"
         );
-        let global_split_factor = global_split_factor(config)?;
+        let local_geom = LayerGeometry::local_of(config, tp)?;
+        let global_geom = LayerGeometry::global_of(config, tp)?;
+        let global_split_factor = global_split_factor(&global_geom)?;
         let (mut locals, mut globals) = (0usize, 0usize);
         let family_index = config
             .layer_types
@@ -1055,11 +1060,14 @@ impl GemmaServe {
                 }
             })
             .collect();
+        // Both pools are laid out at the *per-rank* head counts: the geometry
+        // above is what this rank's kernels read, so a pool sized to the full
+        // config would disagree with them.
         let local_pool = KvPool::with_storage(
             ctx,
             locals,
-            config.num_key_value_heads,
-            config.head_dim,
+            local_geom.num_kv_heads,
+            local_geom.head_dim,
             LOCAL_PAGE_SIZE,
             local_pages,
             local_kv_storage,
@@ -1067,15 +1075,13 @@ impl GemmaServe {
         let global_pool = KvPool::with_storage_and_format(
             ctx,
             globals,
-            config.num_global_key_value_heads,
-            config.global_head_dim,
+            global_geom.num_kv_heads,
+            global_geom.head_dim,
             GLOBAL_PAGE_SIZE,
             global_pages,
             KvStorage::Bf16,
             global_attn.format(config.global_rotary_dim),
         )?;
-        let local_geom = LayerGeometry::local_of(config);
-        let global_geom = LayerGeometry::global_of(config);
         let (sliding_cos, sliding_sin) = pegainfer_core::rope::precompute_rope(
             ctx,
             &RopeTableSpec {
@@ -1112,7 +1118,32 @@ impl GemmaServe {
             family_index,
             tilelang_global_attn: global_attn.tilelang(),
             linear,
+            tp_comm: None,
         })
+    }
+
+    /// Attach this rank's tensor-parallel communicator, built on this rank's
+    /// compute stream so the reduction is issued where its operands are.
+    pub(crate) fn attach_tp_comm(&mut self, comm: TpComm) {
+        self.tp_comm = Some(comm);
+    }
+
+    /// Fail this rank's communicator. Reachable without borrowing the serve —
+    /// the engine holds its own handle — which is what lets the scheduler abort
+    /// a peer's communicator while that peer is inside a collective. A
+    /// comm-less step would otherwise reduce to a no-op, so the engine must
+    /// stop afterwards.
+    pub(crate) fn abort_tp_comm(&self) {
+        if let Some(comm) = self.tp_comm.as_ref() {
+            comm.abort();
+        }
+    }
+
+    /// This rank's communicator as a handle of its own, so a step's thread can
+    /// abort it — or a peer's — without borrowing either serve. `TpComm` is a
+    /// handle over a shared slot, so the clone reaches the same communicator.
+    pub(crate) fn tp_comm(&self) -> Option<TpComm> {
+        self.tp_comm.clone()
     }
 
     /// The global family's prefill, through whichever kernel this engine was
@@ -1316,6 +1347,14 @@ impl GemmaServe {
         )
     }
 
+    /// This rank's families alone, for the rank-`r` step of a multi-rank KV.
+    pub(crate) fn alloc_rank_kv(&self) -> RankKv {
+        RankKv::new(
+            SlidingLocalKv::new(self.local_pool.clone()),
+            self.global_pool.alloc(),
+        )
+    }
+
     /// Copy a request's post-prefill KV into cache-owned pages — the
     /// capture half of the conversation-tail prefix cache. Returns `None`
     /// when either pool cannot spare the pages: capture is strictly
@@ -1323,10 +1362,14 @@ impl GemmaServe {
     /// the copies safe — the prompt's KV writes were enqueued on
     /// `ctx.stream` before this call, and the copies enqueue after them on
     /// the same stream.
+    ///
+    /// Rank 0's families only: `PEGAINFER_PREFIX_CACHE` is refused under tensor
+    /// parallelism, so this never runs beside `twins`, and a multi-rank capture
+    /// would have to take every rank's shard to be resumable.
     pub(crate) fn capture_checkpoint(
         &self,
         ctx: &DeviceContext,
-        kv: &GemmaKv,
+        kv: &RankKv,
         token_ids: &[u32],
     ) -> Option<crate::prefix_cache::CachedKv> {
         // Slack guard: cache pages must never push either pool to the edge,
@@ -1471,11 +1514,11 @@ impl GemmaServe {
         ))
     }
 
-    fn advance_local(&self, kv: &mut GemmaKv, tokens: usize) -> Result<()> {
+    fn advance_local(&self, kv: &mut RankKv, tokens: usize) -> Result<()> {
         kv.local.advance_and_release(tokens, self.sliding_window)
     }
 
-    fn check_step_bounds(&self, kv: &GemmaKv, kv_len: usize) -> Result<()> {
+    fn check_step_bounds(&self, kv: &RankKv, kv_len: usize) -> Result<()> {
         anyhow::ensure!(
             kv.local.seq_len() == kv.global.seq_len(),
             "the two families' frontiers diverged: local {} global {}",
@@ -1498,7 +1541,7 @@ impl GemmaServe {
     fn plan_step(
         &self,
         ctx: &DeviceContext,
-        kv: &GemmaKv,
+        kv: &RankKv,
         start_pos: usize,
         seq_len: usize,
     ) -> Result<GemmaStepPlan> {
@@ -1741,7 +1784,16 @@ impl GemmaServe {
                 )?;
             }
         }
-        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
+        attention_epilogue_into(
+            ctx,
+            layer,
+            geom,
+            self.tp_comm.as_ref(),
+            x,
+            &scratch.attn,
+            epilogue,
+            out,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1968,7 +2020,16 @@ impl GemmaServe {
                 scratch.attn.seq_len = seq_len;
             }
         }
-        attention_epilogue_into(ctx, layer, geom, x, &scratch.attn, epilogue, out)
+        attention_epilogue_into(
+            ctx,
+            layer,
+            geom,
+            self.tp_comm.as_ref(),
+            x,
+            &scratch.attn,
+            epilogue,
+            out,
+        )
     }
 
     /// Expand each global row into `global_split_factor` pseudo requests, build
@@ -2014,7 +2075,7 @@ impl GemmaServe {
         global_split.upload_csr(ctx, &csr)
     }
 
-    fn decode_fingerprint(kvs: &[&mut GemmaKv], padded: usize) -> Option<SteadyDecode> {
+    fn decode_fingerprint(kvs: &[&mut RankKv], padded: usize) -> Option<SteadyDecode> {
         let rows = kvs
             .iter()
             .map(|kv| {
@@ -2039,7 +2100,7 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &mut StepArena,
-        kvs: &[&mut GemmaKv],
+        kvs: &[&mut RankKv],
         padded: usize,
     ) -> Result<()> {
         let batch = kvs.len();
@@ -2232,7 +2293,7 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &'a mut StepArena,
-        kvs: &mut [&mut GemmaKv],
+        kvs: &mut [&mut RankKv],
         tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
         self.decode_batch_step_inner(ctx, arena, kvs, Some(tokens))
@@ -2244,7 +2305,7 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &'a mut StepArena,
-        kvs: &mut [&mut GemmaKv],
+        kvs: &mut [&mut RankKv],
     ) -> Result<&'a mut HiddenStates> {
         self.decode_batch_step_inner(ctx, arena, kvs, None)
     }
@@ -2253,7 +2314,7 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &'a mut StepArena,
-        kvs: &mut [&mut GemmaKv],
+        kvs: &mut [&mut RankKv],
         tokens: Option<&[u32]>,
     ) -> Result<&'a mut HiddenStates> {
         let batch = kvs.len();
@@ -2371,8 +2432,8 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &'a mut StepArena,
-        prefills: &mut [(&mut GemmaKv, &[u32])],
-        decode_kvs: &mut [&mut GemmaKv],
+        prefills: &mut [(&mut RankKv, &[u32])],
+        decode_kvs: &mut [&mut RankKv],
         decode_tokens: &[u32],
     ) -> Result<&'a mut HiddenStates> {
         let prompts = prefills.len();
@@ -2601,7 +2662,7 @@ impl GemmaServe {
         &self,
         ctx: &DeviceContext,
         arena: &mut StepArena,
-        kvs: &[&mut GemmaKv],
+        kvs: &[&mut RankKv],
         tokens: Option<&[u32]>,
     ) -> Result<usize> {
         let batch = kvs.len();
@@ -2656,11 +2717,31 @@ impl GemmaServe {
         self.step(ctx, &mut kv, &[0])?;
         let mut bucket = 1usize;
         while bucket <= arena.max_rows {
-            arena.min_bucket = bucket;
-            arena.steady = None;
-            admit_tokens(&self.local_pool, &self.global_pool, &mut kv, 1)?;
-            {
-                let mut kvs: [&mut GemmaKv; 1] = [&mut kv];
+            for phase in PrecapturePhase::ALL {
+                self.precapture_bucket(ctx, arena, &mut kv, bucket, phase)?;
+            }
+            bucket *= 2;
+        }
+        arena.min_bucket = 1;
+        ctx.sync()
+    }
+
+    /// One bucket of the sweep, one phase at a time. `Capture` only records, while
+    /// `Warm` executes an eager pass and `Launch` drives the serving path.
+    pub(crate) fn precapture_bucket(
+        &self,
+        ctx: &DeviceContext,
+        arena: &mut StepArena,
+        kv: &mut RankKv,
+        bucket: usize,
+        phase: PrecapturePhase,
+    ) -> Result<()> {
+        match phase {
+            PrecapturePhase::Warm => {
+                arena.min_bucket = bucket;
+                arena.steady = None;
+                admit_tokens(&self.local_pool, &self.global_pool, kv, 1)?;
+                let kvs: [&mut RankKv; 1] = [&mut *kv];
                 let padded = self.prepare_decode_step(ctx, arena, &kvs, Some(&[0]))?;
                 let StepArena {
                     tower,
@@ -2672,7 +2753,6 @@ impl GemmaServe {
                     ids,
                     head_normed,
                     logits,
-                    graphs,
                     ..
                 } = arena;
                 self.decode_gpu_body(
@@ -2687,13 +2767,28 @@ impl GemmaServe {
                     local_origins,
                     head_normed,
                     logits,
-                )?;
-                graphs[decode_bucket_slot(padded)].capture_only(ctx, || {
+                )
+            }
+            PrecapturePhase::Capture => {
+                let StepArena {
+                    tower,
+                    local_plan,
+                    global_tables,
+                    global_split,
+                    local_split,
+                    local_origins,
+                    ids,
+                    head_normed,
+                    logits,
+                    graphs,
+                    ..
+                } = arena;
+                graphs[decode_bucket_slot(bucket)].capture_only(ctx, || {
                     self.decode_gpu_body(
                         ctx,
                         tower,
                         ids,
-                        padded,
+                        bucket,
                         local_plan,
                         global_tables,
                         global_split,
@@ -2702,13 +2797,14 @@ impl GemmaServe {
                         head_normed,
                         logits,
                     )
-                })?;
-                self.decode_batch_step(ctx, arena, &mut kvs, &[0])?;
+                })
             }
-            bucket *= 2;
+            PrecapturePhase::Launch => {
+                let mut kvs: [&mut RankKv; 1] = [&mut *kv];
+                self.decode_batch_step(ctx, arena, &mut kvs, &[0])?;
+                Ok(())
+            }
         }
-        arena.min_bucket = 1;
-        ctx.sync()
     }
 
     /// The host-side prologue every single-request prompt pass shares. All of it
@@ -2717,7 +2813,7 @@ impl GemmaServe {
     fn prepare_single(
         &self,
         ctx: &DeviceContext,
-        kv: &GemmaKv,
+        kv: &RankKv,
         tokens: &[u32],
         what: &str,
     ) -> Result<SinglePass> {
@@ -2786,7 +2882,7 @@ impl GemmaServe {
     pub(crate) fn step(
         &self,
         ctx: &DeviceContext,
-        kv: &mut GemmaKv,
+        kv: &mut RankKv,
         tokens: &[u32],
     ) -> Result<HiddenStates> {
         self.step_scoring(ctx, kv, tokens, None)
@@ -2794,14 +2890,32 @@ impl GemmaServe {
 
     /// [`GemmaServe::step`] that also hands `score` the head's logits for
     /// every row but the last, `PROMPT_SCORE_ROWS` rows at a time with the
-    /// first row's index: row `r` predicts token `r + 1`.
+    /// first row's index: row `r` predicts token `r + 1`. The readback and the
+    /// tower are split so a driver sharing one thread across ranks can launch
+    /// every rank's tower before rank 0's readback waits on its collective.
     pub(crate) fn step_scoring(
         &self,
         ctx: &DeviceContext,
-        kv: &mut GemmaKv,
+        kv: &mut RankKv,
         tokens: &[u32],
         score: Option<PromptScorer<'_>>,
     ) -> Result<HiddenStates> {
+        let mut tower = self.launch_prompt_tower(ctx, kv, tokens)?;
+        if let Some(score) = score {
+            self.score_prompt_tower(ctx, &mut tower, score)?;
+        }
+        Ok(tower.into_logits())
+    }
+
+    /// Run the prompt's tower and head, and hold the rows a later
+    /// [`GemmaServe::score_prompt_tower`] reads. Nothing is read back to the
+    /// host here, so the launch never waits on the rank's collective.
+    pub(crate) fn launch_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        kv: &mut RankKv,
+        tokens: &[u32],
+    ) -> Result<PromptTower> {
         let seq_len = tokens.len();
         let mut pass = self.prepare_single(ctx, kv, tokens, "step")?;
         log::debug!(
@@ -2811,36 +2925,6 @@ impl GemmaServe {
             kv.global.held_pages()
         );
         let src = self.run_single_tower(ctx, &mut pass, seq_len)?;
-        if let Some(score) = score
-            && seq_len > 1
-        {
-            let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
-            let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
-            let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
-            let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
-            for start in (0..seq_len - 1).step_by(rows) {
-                let n = rows.min(seq_len - 1 - start);
-                hidden.seq_len = n;
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &pass.tower.hidden[src],
-                    start,
-                    &mut hidden,
-                    0,
-                    n,
-                )?;
-                logits_tail_into(
-                    ctx,
-                    &self.weights,
-                    &hidden,
-                    self.local_geom.rms_norm_eps,
-                    self.final_logit_softcapping,
-                    &mut normed,
-                    &mut logits,
-                )?;
-                score(&mut logits, start)?;
-            }
-        }
         let logits = logits_tail(
             ctx,
             &self.weights,
@@ -2855,7 +2939,53 @@ impl GemmaServe {
         // leave one family ahead of the other.
         self.advance_local(kv, seq_len)?;
         kv.global.advance(seq_len);
-        Ok(logits)
+        Ok(PromptTower {
+            pass,
+            src,
+            seq_len,
+            logits,
+        })
+    }
+
+    /// The per-row readback a scored prompt owes rank 0. It blocks on this
+    /// rank's collectives, so call it only once every rank's tower is launched.
+    pub(crate) fn score_prompt_tower(
+        &self,
+        ctx: &DeviceContext,
+        tower: &mut PromptTower,
+        score: PromptScorer<'_>,
+    ) -> Result<()> {
+        let seq_len = tower.seq_len;
+        if seq_len <= 1 {
+            return Ok(());
+        }
+        let rows = PROMPT_SCORE_ROWS.min(seq_len - 1);
+        let mut hidden = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, rows)?;
+        let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, rows)?;
+        for start in (0..seq_len - 1).step_by(rows) {
+            let n = rows.min(seq_len - 1 - start);
+            hidden.seq_len = n;
+            ops::copy_hidden_token_range_into(
+                ctx,
+                &tower.pass.tower.hidden[tower.src],
+                start,
+                &mut hidden,
+                0,
+                n,
+            )?;
+            logits_tail_into(
+                ctx,
+                &self.weights,
+                &hidden,
+                self.local_geom.rms_norm_eps,
+                self.final_logit_softcapping,
+                &mut normed,
+                &mut logits,
+            )?;
+            score(&mut logits, start)?;
+        }
+        Ok(())
     }
 
     /// Whole-prompt prefill left in flight on the active stream — the
@@ -2873,14 +3003,14 @@ impl GemmaServe {
     pub(crate) fn prefill_into_logits(
         &self,
         ctx: &DeviceContext,
-        kv: &mut GemmaKv,
+        kv: &mut RankKv,
         tokens: &[u32],
     ) -> Result<PrefillPass> {
         let seq_len = tokens.len();
         let mut pass = self.prepare_single(ctx, kv, tokens, "prefill")?;
         let mut normed = HiddenStates::zeros(ctx, self.local_geom.hidden_size, 1)?;
         let mut logits = HiddenStates::zeros(ctx, self.weights.embed_tokens.rows, 1)?;
-        fence_producers_before_override(ctx)?;
+        pegainfer_core::tensor::fence_producers_before_override(ctx)?;
         self.run_single_tower(ctx, &mut pass, seq_len)?;
         logits_tail_into(
             ctx,
@@ -2903,8 +3033,24 @@ impl GemmaServe {
     /// The deferred append-then-attend release for an overlapped prefill:
     /// call once its completion event has fired, before the request joins
     /// the decode batch.
-    pub(crate) fn release_prefill_window(&self, kv: &mut GemmaKv) -> Result<()> {
+    pub(crate) fn release_prefill_window(&self, kv: &mut RankKv) -> Result<()> {
         self.advance_local(kv, 0)
+    }
+}
+
+/// A launched prompt tower and the head rows a later scored pass reads. Kept
+/// alive across the peer ranks' tower launches so rank 0's own readback — the
+/// only part that waits on its collective — runs after every rank is in flight.
+pub(crate) struct PromptTower {
+    pass: SinglePass,
+    src: usize,
+    seq_len: usize,
+    logits: HiddenStates,
+}
+
+impl PromptTower {
+    pub(crate) fn into_logits(self) -> HiddenStates {
+        self.logits
     }
 }
 

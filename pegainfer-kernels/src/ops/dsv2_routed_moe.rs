@@ -9,6 +9,7 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::ffi_status_detail;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::HiddenStates;
@@ -263,7 +264,11 @@ impl Dsv2RoutedMoeScratch {
                 routes as i32,
                 stream,
             );
-            ensure!(code == 0, "routed MoE gate/up pointer GEMM error {code}");
+            ensure!(
+                code == 0,
+                "routed MoE gate/up pointer GEMM failed: {}",
+                ffi_status_detail(code)
+            );
         }
         drop((gate_up_guard, activation_guard, rows_guard));
         super::silu_mul_fused_batch_into(ctx, &self.gate_up, &mut self.activation)?;
@@ -279,7 +284,11 @@ impl Dsv2RoutedMoeScratch {
                 routes as i32,
                 stream,
             );
-            ensure!(code == 0, "routed MoE down pointer GEMM error {code}");
+            ensure!(
+                code == 0,
+                "routed MoE down pointer GEMM failed: {}",
+                ffi_status_detail(code)
+            );
             ffi::dsv2_lite_route_reduce_cuda(
                 rows as _,
                 ids as _,
@@ -311,7 +320,7 @@ pub fn dsv2_lite_route_logits_into(
         "invalid routed MoE batch"
     );
     ensure!(
-        summary.len() > 3 && layer_idx < summary.len() - 3 && layer_idx <= i32::MAX as usize,
+        summary.len() > 3 && layer_idx < summary.len() - 3 && i32::try_from(layer_idx).is_ok(),
         "routed MoE layer exceeds summary capacity"
     );
     ensure!(

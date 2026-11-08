@@ -39,11 +39,10 @@ use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
 
 use super::BridgeLink;
-use super::SpecDecodeTracker;
+use super::StatsTracker;
 use super::connect_link;
 use super::engine_output;
 use super::now_secs_f64;
-use super::scheduler_stats_from;
 use super::send_outputs;
 use super::send_terminal_output;
 use super::send_utility_response;
@@ -58,6 +57,8 @@ use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
 use crate::engine::StopCause;
 use crate::engine::Terminal;
+use crate::vllm::history::GENERATION_PROMPT_TOKENS;
+use crate::vllm::history::HISTORY_MARKS;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::convert_stop_policy;
@@ -86,12 +87,12 @@ impl SteppedEngineBridge {
             .scheduler
             .take_steps()
             .context("partition step stream already taken")?;
-        let mut spec = SpecDecodeTracker::default();
-        let BridgeLink {
+        let mut tracker = StatsTracker::default();
+        let Some(BridgeLink {
             mut input,
             output_tx,
             mut child_tasks,
-        } = connect_link(
+        }) = connect_link(
             &self.input_address,
             &self.output_address,
             self.engine_index,
@@ -102,12 +103,15 @@ impl SteppedEngineBridge {
             Some(engine_dead.clone()),
             &shutdown,
         )
-        .await?;
+        .await?
+        else {
+            return Ok(());
+        };
         send_outputs(
             &output_tx,
             RequestBatchOutputs {
                 engine_index: self.engine_index,
-                scheduler_stats: Some(Box::new(self.stats(&mut spec))),
+                scheduler_stats: Some(Box::new(self.stats(&mut tracker))),
                 timestamp: now_secs_f64(),
                 ..Default::default()
             }
@@ -150,7 +154,7 @@ impl SteppedEngineBridge {
                         &anchor,
                         &mut streams,
                         &mut names,
-                        &mut spec,
+                        &mut tracker,
                         &output_tx,
                     ) {
                         break Err(error).context("failed to dispatch local engine step");
@@ -209,13 +213,10 @@ impl SteppedEngineBridge {
         run_result
     }
 
-    /// Stats for an outgoing batch; the spec delta runs from the last batch
-    /// stamped, not the last step run.
-    fn stats(&self, spec: &mut SpecDecodeTracker) -> SchedulerStats {
-        let snapshot = self.scheduler.metrics();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
-        stats
+    /// Stats for an outgoing batch; the counter deltas run from the last
+    /// batch stamped, not the last step run.
+    fn stats(&self, tracker: &mut StatsTracker) -> SchedulerStats {
+        tracker.stats(&self.scheduler.metrics())
     }
 
     fn dispatch_step(
@@ -224,7 +225,7 @@ impl SteppedEngineBridge {
         anchor: &UnixAnchor,
         streams: &mut HashMap<RequestId, SteppedStream>,
         names: &mut HashMap<String, RequestId>,
-        spec: &mut SpecDecodeTracker,
+        tracker: &mut StatsTracker,
         output_tx: &tokio::sync::mpsc::UnboundedSender<
             vllm_engine_core_client::protocol::output::EngineCoreOutputs,
         >,
@@ -257,8 +258,9 @@ impl SteppedEngineBridge {
                 engine_index: self.engine_index,
                 outputs,
                 finished_requests: (!finished_requests.is_empty()).then_some(finished_requests),
-                scheduler_stats: Some(Box::new(self.stats(spec))),
+                scheduler_stats: Some(Box::new(self.stats(tracker))),
                 timestamp: now_secs_f64(),
+                weight_version: None,
             }
             .into(),
         )
@@ -386,11 +388,32 @@ impl SteppedEngineBridge {
                 );
             }
         };
-        let kv_transfer_params = sampling_params
-            .extra_args
-            .as_ref()
-            .and_then(|args| args.get("kv_transfer_params"))
-            .cloned();
+        let extra_arg = |key: &str| {
+            sampling_params
+                .extra_args
+                .as_ref()
+                .and_then(|args| args.get(key))
+        };
+        let kv_transfer_params = extra_arg("kv_transfer_params").cloned();
+        // The chat layer measured the generation prompt's token count at the
+        // tail of a prompt only it saw as text; a count the prompt cannot hold
+        // is no boundary.
+        let history_tokens = extra_arg(GENERATION_PROMPT_TOKENS)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|tail| prompt_tokens.len().checked_sub(tail as usize));
+        // The earlier turns' ends the chat layer measured, kept where they
+        // fall inside this turn's history.
+        let history_marks: Vec<usize> = extra_arg(HISTORY_MARKS)
+            .and_then(serde_json::Value::as_array)
+            .map(|marks| {
+                marks
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|m| m as usize)
+                    .filter(|&m| m > 0 && history_tokens.is_some_and(|h| m < h))
+                    .collect()
+            })
+            .unwrap_or_default();
         // Older stepped model producers still suppress their terminal token
         // and report only `FinishReason::Stop`. Keep the legacy sentinel for
         // that producer shape; typed stop causes carry the real token and do
@@ -414,9 +437,11 @@ impl SteppedEngineBridge {
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             // Keep the legacy SamplingParams lowering unchanged for stepped
-            // producers that have not migrated to StopPolicy. Qwen3 uses the
-            // independent policy below for stop classification.
+            // producers that have not migrated to StopPolicy; the others
+            // classify stops with the independent policy below.
             params: convert_sampling(&sampling_params),
+            history_tokens,
+            history_marks,
             stop_policy: convert_stop_policy(&sampling_params),
             max_tokens: sampling_params.max_tokens as usize,
             lora_adapter,
@@ -623,7 +648,7 @@ fn reduce_update(
         state.take_prefill_stats(),
     );
     output.new_prompt_logprobs_tensors = prompt_logprobs;
-    output.kv_transfer_params = state.kv_transfer_params.take();
+    output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
     (Some(output), terminated)
 }
 
@@ -671,6 +696,8 @@ mod tests {
         Request {
             prompt_tokens: vec![1, 2],
             params: crate::sampler::SamplingParams::default(),
+            history_tokens: None,
+            history_marks: Vec::new(),
             stop_policy: StopPolicy::default(),
             max_tokens: 1,
             lora_adapter: None,
@@ -740,7 +767,7 @@ mod tests {
         )]);
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut spec = SpecDecodeTracker::default();
+        let mut tracker = StatsTracker::default();
         for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
             backend.metrics.publish(&crate::engine::SchedulerMetrics {
                 num_running_reqs: running,
@@ -752,7 +779,7 @@ mod tests {
                     &UnixAnchor::now(),
                     &mut streams,
                     &mut HashMap::new(),
-                    &mut spec,
+                    &mut tracker,
                     &tx,
                 )
                 .unwrap();

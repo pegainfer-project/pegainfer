@@ -17,6 +17,9 @@
 #include <cuda_fp8.h>
 #include <cstdint>
 
+#include "../shared/ffi_guard.cuh"
+#include "k3_mega_moe_limits.cuh"
+
 // `layout::Data`'s constructor uses DG_UNIFIED_ASSERT, which expands to a raw
 // `asm("trap;")`. That is device-only asm, but `MegaMoEBuffer` is also built on
 // the host here (and inside `CUTLASS_HOST_DEVICE` constexpr code), so give the
@@ -57,20 +60,6 @@ constexpr int kHidden = 3584;
 constexpr int kIntermediate = 3072;
 constexpr int kNumTopk = 16;
 
-// Token capacity one rank's slab and kernel instantiation carry
-// (`num_max_tokens_per_rank`): the chunked-prefill ceiling, 44x the upstream
-// token alignment (`layout::kLCMCandidateBlockM`, 384). This is the ONLY value
-// any launch accepts: the ring capacities derived from it are kernel template
-// parameters, so a slab allocated for any other value addresses the rings
-// wrong. Exported to the Rust side through `k3_mega_max_tokens_per_rank`.
-//
-// 16896 = 4 x the historical 4224 ceiling: a 16k-class chunk lands the MoE
-// GEMMs in their efficient shape range and lets a CP gang swallow a 64k
-// prompt in one superstep at CP4 (16 x 16896 at CP16). The bill is the slab —
-// the rings scale linearly with the protocol max (~6.3 GiB at EP4/224,
-// ~19.6 GiB at EP16/896, measured via `k3_mega_symm_buffer_layout`).
-constexpr int kProtocolMaxTokensPerRank = 16896;
-
 // MXFP4 / activation scale-factor group size along K, and how many such groups
 // pack into one i32 word.
 constexpr int kSfGroupK = 32;
@@ -89,16 +78,6 @@ constexpr int kNumNonEpilogueThreads = 128;
 
 constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 constexpr int alignup(int a, int b) { return cdiv(a, b) * b; }
-
-inline CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
 
 // `get_symm_buffer_size_for_mega_moe`'s ring-capacity loop.
 constexpr int mega_ring_tokens(int num_ranks, int num_experts, int num_max_tokens_per_rank,
