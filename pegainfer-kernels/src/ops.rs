@@ -241,6 +241,10 @@ pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::PleBlockVariant;
+#[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4MoeGeometry;
 #[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4RouteSemantics;
@@ -256,6 +260,10 @@ pub use qwen4::hc_scatter_add_into;
 pub use qwen4::hc_sigmoid_affine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_silu_scaled_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::ple_block_variant_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen4")]
