@@ -241,6 +241,12 @@ pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4MoeGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4RouteSemantics;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4SharedBranchScratch;
+#[cfg(feature = "qwen4")]
 pub use qwen4::hc_mix_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::hc_mul_branch_combine_into;
@@ -254,6 +260,12 @@ pub use qwen4::hc_silu_scaled_into;
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_select_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_combine_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_route_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_shared_branch_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::rms_norm_grouped_offset_batch_into;
 #[cfg(feature = "qwen35")]
