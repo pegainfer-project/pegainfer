@@ -20,19 +20,16 @@
 //! surface; only these three were missing. Frozen semantics live in
 //! `csrc/qwen4/qwen4_hc_block.cu`.
 //!
-//! The MoE block below is the device half of the committed MoE golden's
-//! consumer — the host half is `pegainfer-qwen4/tests/moe_block_replay.rs`.
-//! It owns only what has no production fit: the routing kernel and the shared
-//! expert's per-token gate combine; the router GEMM, the shared branch's
-//! projections and its `silu(gate)·up` go through the same ops every other
-//! line uses. Frozen semantics: `Qwen4ExpTextSparseMoeBlock` in
+//! The MoE block below owns only what has no shared entry point: the routing
+//! kernel and the shared expert's per-token gate combine; the router GEMM, the
+//! shared branch's projections and its `silu(gate)·up` go through the same ops
+//! every other line uses. Frozen semantics: `Qwen4ExpTextSparseMoeBlock` in
 //! `csrc/qwen4/qwen4_moe_route.cu`.
 //!
-//! The PLE block below is the device half of the n-gram golden's consumer:
-//! the per-layer-embedding block one decoder layer injects, starting at the
-//! two recorded projections. Its three grouped `(1 + w)` RMSNorms are calls
-//! to the grouped entry point above, on the stream in place. Frozen
-//! semantics: `csrc/qwen4/qwen4_ple_block.cu`.
+//! The PLE block below is the per-layer-embedding block one decoder layer
+//! injects, from its two projections onward. Its three grouped `(1 + w)`
+//! RMSNorms are calls to the grouped entry point above, on the stream in
+//! place. Frozen semantics: `csrc/qwen4/qwen4_ple_block.cu`.
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -463,24 +460,20 @@ pub fn hc_sigmoid_affine_into(
 /// Combine `branches` gated branches of a hyper-connection stream:
 ///
 /// ```text
-/// out[r, c] = bf16(combine_scale * sum_j f32(bf16(a[r, j*hidden+c] * b[r, j*hidden+c])))
+/// out[r, c] = bf16(sum_j f32(bf16(a[r, j*hidden+c] * b[r, j*hidden+c])) / branches)
 /// ```
 ///
 /// `a` and `b` are row-major `[rows, branches * hidden]`, `out` is
 /// `[rows, hidden]`. The inner cast is the reference's bf16 `gate * normed`
-/// product; the f32 accumulate and the single cast out are torch's
-/// `.mean(dim=-2)`, so `combine_scale = 1.0 / branches as f32` reproduces it.
-/// A different `combine_scale` is a caller asking for a different reduce — the
-/// parity gate's negative control passes `1.0` for the sum.
+/// product; the f32 accumulate, the division by the branch count and the
+/// single cast out are torch's `.mean(dim=-2)`.
 pub fn hc_mul_branch_combine_into(
     ctx: &DeviceContext,
     a: &HiddenStates,
     b: &HiddenStates,
     branches: usize,
-    combine_scale: f32,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    ensure_finite(combine_scale, "combine scale")?;
     ensure!(
         branches > 0,
         "hyper-connection branch count must be positive"
@@ -525,7 +518,6 @@ pub fn hc_mul_branch_combine_into(
             rows,
             hidden,
             branches_i32,
-            combine_scale,
             active_cu_stream(ctx),
         )
     };
@@ -758,14 +750,7 @@ pub fn hc_mix_into(
     hc_silu_scaled_into(ctx, &scratch.down, divisor, &mut scratch.bottleneck)?;
     gemm_into_checked(ctx, up, &scratch.bottleneck, &mut scratch.up)?;
     hc_sigmoid_affine_into(ctx, &scratch.up, 1.0, 1.0, &mut scratch.gate)?;
-    hc_mul_branch_combine_into(
-        ctx,
-        &scratch.gate,
-        &scratch.normed,
-        branches,
-        divisor,
-        mixed,
-    )?;
+    hc_mul_branch_combine_into(ctx, &scratch.gate, &scratch.normed, branches, mixed)?;
     if let (Some(weight), Some(logits), Some(out)) =
         (inject_weight, scratch.inject_logits.as_mut(), inject_out)
     {
@@ -819,44 +804,19 @@ impl Qwen4MoeGeometry {
     }
 }
 
-/// The routing contract's two semantic switches.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Qwen4RouteSemantics {
-    /// The checkpoint's `norm_topk_prob`: renormalize the selected weights so
-    /// they sum to 1. Absent from `config.json` and defaulting to `true`
-    /// upstream — the trap the golden exists for.
-    pub renorm: bool,
-    /// Carry the softmax probabilities in bf16 instead of the reference's fp32
-    /// upcast. **Not a production choice**: this is the port mistake the parity
-    /// gate's negative control prices, exposed so that control runs through the
-    /// production kernel. Production callers use [`Self::norm_topk_prob`],
-    /// which leaves it false.
-    pub softmax_bf16: bool,
-}
-
-impl Qwen4RouteSemantics {
-    /// Production semantics: fp32 softmax, renormalization per the checkpoint's
-    /// (defaulted) `norm_topk_prob`.
-    pub fn norm_topk_prob(renorm: bool) -> Self {
-        Self {
-            renorm,
-            softmax_bf16: false,
-        }
-    }
-}
-
 /// Route one batch of bf16 router logits.
 ///
 /// `logits` is the router GEMM's stored bf16 output, `[seq_len, experts]` —
 /// the reference's softmax reads exactly those bits, so the GEMM's rounding is
-/// part of the routing contract (the gate's chained check pins it).
-/// `weights` receives `[seq_len, top_k]` bf16 renormalized weights and `ids`
-/// the matching i32 expert ids, in the canonical order: descending
-/// probability, ascending expert index inside a tie.
+/// part of the routing contract. `weights` receives `[seq_len, top_k]` bf16
+/// weights and `ids` the matching i32 expert ids, in the canonical order:
+/// descending probability, ascending expert index inside a tie. `renorm` is
+/// the checkpoint's `norm_topk_prob`, renormalizing the selected weights to
+/// sum to 1; it is absent from `config.json` and defaults to `true` upstream.
 pub fn qwen4_moe_route_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
-    semantics: &Qwen4RouteSemantics,
+    renorm: bool,
     logits: &HiddenStates,
     weights: &mut CudaSlice<bf16>,
     ids: &mut CudaSlice<i32>,
@@ -907,8 +867,7 @@ pub fn qwen4_moe_route_into(
             rows,
             experts,
             top_k,
-            i32::from(semantics.renorm),
-            i32::from(semantics.softmax_bf16),
+            i32::from(renorm),
             active_cu_stream(ctx),
         )
     }
@@ -1027,9 +986,8 @@ pub fn qwen4_moe_shared_branch_into(
 /// every operator bf16-rounded where the reference rounds.
 ///
 /// `gate_logit` is the `[1, hidden]` gate linear's stored bf16 output, one
-/// scalar per token. The routed-expert half (`expert_out`) is an input: the
-/// fused 512-expert stack is #1107's, and until it lands the golden's recorded
-/// activation is what this reads.
+/// scalar per token. The routed-expert half (`expert_out`) is an input, the
+/// expert path's combined output.
 pub fn qwen4_moe_combine_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
@@ -1183,57 +1141,6 @@ impl PleBlockGeometry {
     }
 }
 
-/// Which arithmetic the block computes.
-///
-/// [`Reference`](PleBlockVariant::Reference) is the frozen
-/// `Qwen4ExpTextPLELayer` semantics and the only variant
-/// [`ple_block_into`] passes. The other three are the parity gate's negative
-/// controls, on the device side: each turns exactly one knob and each must move
-/// the output past the gate's bound, which is what proves the *device* path is
-/// pinned and not only the host oracle that mirrors it.
-///
-/// They live here rather than in a second copy of the kernels because a control
-/// that runs different code from the thing it controls proves nothing: the same
-/// launches, the same buffers and the same entry points run with one scalar
-/// changed, so a control that passed would mean the gate cannot see that fault.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PleBlockVariant {
-    /// The frozen semantics.
-    Reference,
-    /// Control: drop the sign restore after the sqrt, so a negative gate reaches
-    /// the sigmoid as its magnitude and inverts that branch's contribution.
-    UnsignedSqrtGate,
-    /// Control: one dot over the whole `hc_count * hidden` stream instead of one
-    /// per branch, so all four branches share a gate scaled by four.
-    FullStreamGate,
-    /// Control: conv dilation 1 instead of `ngram_size`, so three of the four
-    /// taps read rows the reference never looks at.
-    Dilation1Conv,
-}
-
-impl PleBlockVariant {
-    /// Channels one gate's dot reduces over.
-    fn gate_span(self, geometry: &PleBlockGeometry) -> usize {
-        match self {
-            Self::FullStreamGate => geometry.width(),
-            _ => geometry.hidden,
-        }
-    }
-
-    /// Whether the sqrt's sign is restored.
-    fn signed_sqrt(self) -> i32 {
-        i32::from(self != Self::UnsignedSqrtGate)
-    }
-
-    /// The conv's dilation.
-    fn dilation(self, geometry: &PleBlockGeometry) -> usize {
-        match self {
-            Self::Dilation1Conv => 1,
-            _ => geometry.dilation,
-        }
-    }
-}
-
 /// Run one PLE block over `seq_len` rows.
 ///
 /// `hidden`, `key` and `out` are row-major `[seq_len, width()]` — `hidden` is
@@ -1245,48 +1152,9 @@ impl PleBlockVariant {
 /// `workspace` is caller-owned scratch of [`PleBlockGeometry::workspace_len`]
 /// elements; see that method for the layout. Nothing is allocated here, so the
 /// call is capturable.
-///
-/// This is the frozen semantics; see [`ple_block_variant_into`] for the gate's
-/// control surface.
 pub fn ple_block_into(
     ctx: &DeviceContext,
     geometry: &PleBlockGeometry,
-    hidden: &CudaSlice<bf16>,
-    key: &CudaSlice<bf16>,
-    value: &CudaSlice<bf16>,
-    norm_key: &CudaSlice<bf16>,
-    norm_query: &CudaSlice<bf16>,
-    norm_conv: &CudaSlice<bf16>,
-    conv_weight: &CudaSlice<bf16>,
-    seq_len: usize,
-    out: &mut CudaSlice<bf16>,
-    workspace: &mut CudaSlice<bf16>,
-) -> Result<()> {
-    ple_block_variant_into(
-        ctx,
-        geometry,
-        PleBlockVariant::Reference,
-        hidden,
-        key,
-        value,
-        norm_key,
-        norm_query,
-        norm_conv,
-        conv_weight,
-        seq_len,
-        out,
-        workspace,
-    )
-}
-
-/// [`ple_block_into`] with one knob turned. Only the parity gate's negative
-/// controls call this with a variant other than
-/// [`Reference`](PleBlockVariant::Reference); see that type for why the knobs
-/// are here and not in a second copy of the kernels.
-pub fn ple_block_variant_into(
-    ctx: &DeviceContext,
-    geometry: &PleBlockGeometry,
-    variant: PleBlockVariant,
     hidden: &CudaSlice<bf16>,
     key: &CudaSlice<bf16>,
     value: &CudaSlice<bf16>,
@@ -1351,9 +1219,7 @@ pub fn ple_block_variant_into(
     let group_i = checked_i32(group, "PLE block group width")?;
     let branches_i = checked_i32(geometry.hc_count, "PLE block branch count")?;
     let conv_kernel_i = checked_i32(geometry.conv_kernel, "PLE block conv kernel")?;
-    let dilation = variant.dilation(geometry);
-    let dilation_i = checked_i32(dilation, "PLE block conv dilation")?;
-    let gate_span_i = checked_i32(variant.gate_span(geometry), "PLE block gate span")?;
+    let dilation_i = checked_i32(geometry.dilation, "PLE block conv dilation")?;
 
     let (hidden_ptr, _hidden_guard) = hidden.device_ptr(&ctx.stream);
     let (key_ptr, _key_guard) = key.device_ptr(&ctx.stream);
@@ -1408,9 +1274,7 @@ pub fn ple_block_variant_into(
             rows,
             group_i,
             branches_i,
-            gate_span_i,
             geometry.sqrt_hidden(),
-            variant.signed_sqrt(),
             stream,
         )
     };
@@ -1491,9 +1355,7 @@ fn grouped_norm(
 #[cfg(test)]
 mod tests {
     use super::PleBlockGeometry;
-    use super::PleBlockVariant;
     use super::Qwen4MoeGeometry;
-    use super::Qwen4RouteSemantics;
     use super::qsa_score_splits;
 
     /// Four CTAs per SM, capped by the row's block count. These include the
@@ -1551,16 +1413,6 @@ mod tests {
                 mutated.validate().is_err(),
                 "a geometry with another {field} must be refused"
             );
-        }
-    }
-
-    /// Production semantics never carry the control's bf16 softmax.
-    #[test]
-    fn production_semantics_upcast_the_softmax() {
-        for renorm in [true, false] {
-            let semantics = Qwen4RouteSemantics::norm_topk_prob(renorm);
-            assert_eq!(semantics.renorm, renorm);
-            assert!(!semantics.softmax_bf16);
         }
     }
 
@@ -1632,38 +1484,5 @@ mod tests {
                 "a geometry with another {field} must be refused"
             );
         }
-    }
-
-    /// Each control turns exactly one knob, and the reference turns none. A
-    /// control that changed two would not say which one the gate can see.
-    #[test]
-    fn every_control_turns_one_knob() {
-        let geometry = PleBlockGeometry::qwen38_flash_next();
-        let reference = PleBlockVariant::Reference;
-        assert_eq!(reference.gate_span(&geometry), geometry.hidden);
-        assert_eq!(reference.signed_sqrt(), 1);
-        assert_eq!(reference.dilation(&geometry), geometry.dilation);
-        for variant in [
-            PleBlockVariant::UnsignedSqrtGate,
-            PleBlockVariant::FullStreamGate,
-            PleBlockVariant::Dilation1Conv,
-        ] {
-            let knobs = [
-                variant.gate_span(&geometry) != reference.gate_span(&geometry),
-                variant.signed_sqrt() != reference.signed_sqrt(),
-                variant.dilation(&geometry) != reference.dilation(&geometry),
-            ];
-            assert_eq!(
-                knobs.iter().filter(|turned| **turned).count(),
-                1,
-                "{variant:?} must differ from the reference in exactly one knob, got {knobs:?}"
-            );
-        }
-        assert_eq!(
-            PleBlockVariant::FullStreamGate.gate_span(&geometry),
-            geometry.width()
-        );
-        assert_eq!(PleBlockVariant::UnsignedSqrtGate.signed_sqrt(), 0);
-        assert_eq!(PleBlockVariant::Dilation1Conv.dilation(&geometry), 1);
     }
 }

@@ -45,15 +45,6 @@
 // three kernels are SIMT: two are element-wise copies/maps and the third is a
 // 2560-wide dot with a shuffle-and-shared-memory block reduction, a shape an
 // `m16n8k16` body cannot tile without padding one row to sixteen.
-//
-// Negative-control surface: `gate_span` and `signed_sqrt` are arguments rather
-// than compiled constants so the parity gate can turn exactly one knob on the
-// device path — a full-stream dot, or an unsigned sqrt — and assert the output
-// leaves its bound. `dilation` is genuine geometry (`ngram_size`), and the parity
-// gate drives it to 1 for the same reason. A serving path reaches none of them:
-// `ops::ple_block_into` is the production entry and passes the reference values,
-// and only `ops::ple_block_variant_into` — whose sole callers are the gate's
-// three controls — turns a knob.
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
@@ -116,31 +107,24 @@ __device__ __forceinline__ float block_all_sum(float value, float* shared) {
 // branch's channels. Every buffer is the block's row-major `[seq_len, kWidth]`
 // stream, except `value`, which is `[seq_len, kHidden]` and is broadcast over
 // the branches that share it.
-//
-// `gate_span` is `kHidden` for the reference's per-branch dot and `kWidth` for
-// the full-stream control, which folds all four branches into one dot — every
-// branch then gets the same gate, which is the fault the control stands for.
 __global__ void qwen4_ple_gate_kernel(
     const __nv_bfloat16* __restrict__ key_normed,
     const __nv_bfloat16* __restrict__ query_normed,
     const __nv_bfloat16* __restrict__ value,
-    __nv_bfloat16* __restrict__ gated, int seq_len, float sqrt_hidden,
-    int gate_span, int signed_sqrt) {
+    __nv_bfloat16* __restrict__ gated, int seq_len, float sqrt_hidden) {
   __shared__ float shared[kGateWarps];
 
   const int block = blockIdx.x;
   const int branch = block % kHc;
   const int row = block / kHc;
-  // The branch's group is a contiguous `kHidden` window of the row; the
-  // full-stream control starts at the row instead and runs the whole width.
+  // The branch's group is a contiguous `kHidden` window of the row.
   const int64_t row_base = static_cast<int64_t>(row) * kWidth;
-  const int64_t first =
-      (gate_span == kWidth) ? 0 : static_cast<int64_t>(branch) * kHidden;
+  const int64_t first = static_cast<int64_t>(branch) * kHidden;
 
   // Each product rounds to bf16 before it is summed, as the reference's does:
   // the multiply happens inside the submodule that produces it.
   float partial = 0.0f;
-  for (int j = threadIdx.x; j < gate_span; j += kGateThreads) {
+  for (int j = threadIdx.x; j < kHidden; j += kGateThreads) {
     const int64_t at = row_base + first + j;
     const float k = __bfloat162float(key_normed[at]);
     const float q = __bfloat162float(query_normed[at]);
@@ -153,7 +137,7 @@ __global__ void qwen4_ple_gate_kernel(
   const float pre_gate = bf16_round(bf16_round(dot) / sqrt_hidden);
   const float magnitude = bf16_round(fmaxf(fabsf(pre_gate), kGateClampMin));
   const float root = bf16_round(sqrtf(magnitude));
-  const float restore = signed_sqrt != 0 ? torch_sign(pre_gate) : 1.0f;
+  const float restore = torch_sign(pre_gate);
   const float gate = bf16_round(root * restore);
   const float weight = bf16_round(1.0f / (1.0f + expf(-gate)));
 
@@ -231,14 +215,12 @@ extern "C" {
 //
 // `sqrt_hidden` is `sqrt(hidden_size)` in the f32 the reference divides by; it
 // is an argument because a divide and a reciprocal multiply round differently.
-// `gate_span` is `hidden` for the reference and `width` for the full-stream
-// control; `signed_sqrt` is 1 for the reference and 0 for the unsigned control.
 CUresult qwen4_ple_gate_cuda(const __nv_bfloat16* key_normed,
                                 const __nv_bfloat16* query_normed,
                                 const __nv_bfloat16* value,
                                 __nv_bfloat16* gated, int seq_len, int hidden,
-                                int hc_count, int gate_span, float sqrt_hidden,
-                                int signed_sqrt, cudaStream_t stream) {
+                                int hc_count, float sqrt_hidden,
+                                cudaStream_t stream) {
   if (key_normed == nullptr || query_normed == nullptr || value == nullptr ||
       gated == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -247,12 +229,6 @@ CUresult qwen4_ple_gate_cuda(const __nv_bfloat16* key_normed,
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (hidden != kHidden || hc_count != kHc) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (gate_span != kHidden && gate_span != kWidth) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (signed_sqrt != 0 && signed_sqrt != 1) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   // A non-finite or non-positive divisor would put NaN in every gate; refuse it
@@ -272,8 +248,7 @@ CUresult qwen4_ple_gate_cuda(const __nv_bfloat16* key_normed,
   }
   const int grid = static_cast<int>(gate_grid);
   qwen4_ple_gate_kernel<<<grid, kGateThreads, 0, stream>>>(
-      key_normed, query_normed, value, gated, seq_len, sqrt_hidden, gate_span,
-      signed_sqrt);
+      key_normed, query_normed, value, gated, seq_len, sqrt_hidden);
   return consume_last_cuda_error();
 }
 

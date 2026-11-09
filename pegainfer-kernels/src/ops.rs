@@ -243,11 +243,7 @@ pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
 pub use qwen4::PleBlockGeometry;
 #[cfg(feature = "qwen4")]
-pub use qwen4::PleBlockVariant;
-#[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4MoeGeometry;
-#[cfg(feature = "qwen4")]
-pub use qwen4::Qwen4RouteSemantics;
 #[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4SharedBranchScratch;
 #[cfg(feature = "qwen4")]
@@ -262,8 +258,6 @@ pub use qwen4::hc_sigmoid_affine_into;
 pub use qwen4::hc_silu_scaled_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::ple_block_into;
-#[cfg(feature = "qwen4")]
-pub use qwen4::ple_block_variant_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen4")]

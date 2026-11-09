@@ -10,7 +10,7 @@
 //   inj  = 2 * sigmoid(block_inject_weight(n) / B)     // [S, B]
 //
 // The three GEMMs and the grouped norm are not here: they are the shared
-// cuBLAS wrapper and `rms_norm_batched_offset_cuda`, and the parity gate
+// cuBLAS wrapper and `rms_norm_batched_offset_cuda`, and `ops::hc_mix_into`
 // composes them with these three kernels. A standalone sigmoid and the branch
 // combine have no default-feature entry point at all. The scaled SiLU does
 // have an equivalent on default features — `scale_bf16_in_place` followed by
@@ -29,9 +29,8 @@
 //   * `silu` / `sigmoid` run in f32 over the bf16 input and cast once.
 //   * `gate * n` is a bf16-by-bf16 product: f32 multiply, cast to bf16.
 //   * `.mean(-2)` accumulates those *rounded* products in f32, divides by `B`
-//     and casts once. `combine_scale` is that division, kept a parameter so a
-//     caller can ask for the sum instead — which is what the parity gate's
-//     negative control does.
+//     and casts once. The launcher folds that division into a `1 / B` multiply,
+//     which is exact for the power-of-two count.
 //   * `2 * sigmoid(...)` is exact for the same power-of-two reason, so the gain
 //     is applied to the already-rounded sigmoid and rounds again to no effect.
 //
@@ -138,10 +137,11 @@ __global__ void qwen4_hc_sigmoid_affine_vec4_kernel(const __nv_bfloat16 *__restr
   *reinterpret_cast<uint4 *>(out + base) = w;
 }
 
-// out[r, c] = bf16(combine_scale * sum_j f32(bf16(a[r, j*H+c] * b[r, j*H+c]))).
-// `a` and `b` are row-major [rows, branches*H]; `out` is [rows, H]. The inner
-// cast is the reference's bf16 product; the f32 accumulate over branches and
-// the single cast out are torch's `mean(dim=-2)`.
+// out[r, c] = bf16(combine_scale * sum_j f32(bf16(a[r, j*H+c] * b[r, j*H+c]))),
+// with `combine_scale = 1 / branches`. `a` and `b` are row-major
+// [rows, branches*H]; `out` is [rows, H]. The inner cast is the reference's bf16
+// product; the f32 accumulate over branches and the single cast out are torch's
+// `mean(dim=-2)`.
 __global__ void qwen4_hc_mul_branch_combine_kernel(const __nv_bfloat16 *__restrict__ a,
                                                    const __nv_bfloat16 *__restrict__ b,
                                                    __nv_bfloat16 *__restrict__ out, int n_out,
@@ -349,8 +349,7 @@ CUresult qwen4_hc_sigmoid_affine_cuda(const __nv_bfloat16 *x, __nv_bfloat16 *out
 
 CUresult qwen4_hc_mul_branch_combine_cuda(const __nv_bfloat16 *a, const __nv_bfloat16 *b,
                                           __nv_bfloat16 *out, int rows, int hidden,
-                                          int branches, float combine_scale,
-                                          cudaStream_t stream) {
+                                          int branches, cudaStream_t stream) {
   if (a == nullptr || b == nullptr || out == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
@@ -360,6 +359,9 @@ CUresult qwen4_hc_mul_branch_combine_cuda(const __nv_bfloat16 *a, const __nv_bfl
   if (rows == 0) {
     return CUDA_SUCCESS;
   }
+  // torch's `.mean(-2)`: the f32 sum divided by the branch count. The Rust
+  // wrapper admits power-of-two counts only, so the multiply is the division.
+  const float combine_scale = 1.0f / static_cast<float>(branches);
   const long long stream_width = static_cast<long long>(branches) * hidden;
   const long long source_elems = static_cast<long long>(rows) * stream_width;
   const long long out_elems = static_cast<long long>(rows) * hidden;

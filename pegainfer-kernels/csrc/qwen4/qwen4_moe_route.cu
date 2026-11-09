@@ -3,10 +3,9 @@
 //
 // Frozen semantics: transformers 5.16.1 `qwen4_exp`,
 // `Qwen4ExpTextSparseMoeBlock` at the frozen checkpoint's geometry — hidden
-// 2560, 512 experts, top-10 routed plus 1 shared. The device-free replay
-// `pegainfer-qwen4/tests/moe_block_replay.rs` pins the same chain on the host;
-// this file is its device half, and `tests/qwen4_moe_block_parity.rs` drives
-// both against the one committed golden.
+// 2560, 512 experts, top-10 routed plus 1 shared. This file holds the two
+// pieces with no shared entry point; the router GEMM, the shared branch's
+// projections and the expert GEMMs go through the ops every line uses.
 //
 // Routing (one block per token):
 //
@@ -14,19 +13,11 @@
 //           upcasts (`softmax(router_logits, dtype=torch.float)`); the logits
 //           themselves stay bf16, as the router GEMM stores them.
 //   top-k = 10 picks in the canonical order: descending probability, ascending
-//           expert index inside a tie (`torch.topk` defines no order, so the
-//           golden is graded as a weight-matched set, but this kernel is
-//           deterministic and matches the replay's canonical rule).
+//           expert index inside a tie (`torch.topk` defines no order; this
+//           kernel is deterministic).
 //   w     = p / sum(selected p) when `renorm` — the checkpoint's
 //           `norm_topk_prob`, absent from `config.json` and defaulting to True
 //           upstream — else p. Rounded to bf16 once, at the store.
-//
-// `probs_bf16` rounds the softmax probabilities back to bf16 before selection
-// and renormalization. It is not a production choice: the reference upcasts,
-// and a port that skips the upcast routes differently (the committed gate's
-// bf16-softmax control prices it). It exists so the parity gate can run that
-// port mistake through this exact kernel and assert it FAILS; production
-// callers pass 0.
 //
 // A non-finite logit fails the whole row closed — NaN weights and placeholder
 // ids (the slot index) — the policy gemma4's router established, by the
@@ -44,9 +35,8 @@
 //         reference sigmoid-materializes in bf16 before the multiply.
 //   out = bf16(expert_out + bf16(g * shared_out))
 //
-// every operator bf16-rounded exactly where the reference rounds. Dropping the
-// gate moves the block output by up to 22 absolute (measured by the device-free
-// replay's control), so the gate is fused here rather than left to the caller.
+// every operator bf16-rounded exactly where the reference rounds. The gate is
+// fused here rather than left to the caller.
 //
 // Target: the sm_89-common portable subset — no TMA, no cluster, no wgmma;
 // plain SIMT shuffle/shared-memory block reductions with a fixed tree, so the
@@ -128,8 +118,7 @@ __device__ __forceinline__ void block_reduce_best(float value, int index,
 
 // Block-wide sum, broadcast to every thread. Same fixed tree as the max, so
 // the fp32 softmax denominator is run-to-run deterministic (its *order* still
-// differs from torch's; the gate measures what that is worth after the bf16
-// store, which is where the reference rounds).
+// differs from torch's; the bf16 store is where the reference rounds).
 __device__ __forceinline__ float block_reduce_sum(float value,
                                                   float (&s)[kWarps],
                                                   float& b) {
@@ -164,7 +153,7 @@ __device__ __forceinline__ void fail_row_closed(__nv_bfloat16* weights,
 __global__ void qwen4_moe_route_kernel(const __nv_bfloat16* __restrict__ logits,
                                           __nv_bfloat16* __restrict__ weights,
                                           int* __restrict__ ids, int rows,
-                                          int renorm, int probs_bf16) {
+                                          int renorm) {
   const int row = blockIdx.x;
   if (row >= rows) return;
   const int tid = threadIdx.x;
@@ -236,11 +225,6 @@ __global__ void qwen4_moe_route_kernel(const __nv_bfloat16* __restrict__ logits,
 #pragma unroll
   for (int slot = 0; slot < kPerThread; ++slot) {
     held[slot] /= total;
-    if (probs_bf16 != 0) {
-      // The port mistake the parity gate controls for: probabilities carried
-      // in bf16 instead of the reference's fp32 upcast.
-      held[slot] = __bfloat162float(__float2bfloat16(held[slot]));
-    }
   }
 
   // Top-k by K masked argmax passes, all of them inside one warp: the row's
@@ -248,8 +232,7 @@ __global__ void qwen4_moe_route_kernel(const __nv_bfloat16* __restrict__ logits,
   // slice [16l, 16l+16) into registers, and each pass is a 16-deep lane scan
   // plus a shuffle tree. Pass k takes the k-th canonical pick, so the picks
   // come out in the canonical order and the running selected sum accumulates in
-  // that same descending order — the order the device-free replay's
-  // renormalization sums in.
+  // that same descending order.
   //
   // The picks and the weights are bit-identical to a block-wide reduction per
   // pass: (value desc, expert asc) is a total order, the passes take the same
@@ -355,25 +338,23 @@ __global__ void qwen4_moe_shared_combine_kernel(
 extern "C" {
 
 // `logits` is `[rows, 512]` bf16 as the router GEMM stores it; `weights` and
-// `ids` are `[rows, 10]`. `renorm` is the checkpoint's `norm_topk_prob`;
-// `probs_bf16` is the parity gate's negative control and must be 0 in
-// production (see the header).
+// `ids` are `[rows, 10]`. `renorm` is the checkpoint's `norm_topk_prob`.
 CUresult qwen4_moe_route_cuda(const __nv_bfloat16* logits,
                                  __nv_bfloat16* weights, int* ids, int rows,
                                  int experts, int top_k, int renorm,
-                                 int probs_bf16, cudaStream_t stream) {
+                                 cudaStream_t stream) {
   if (logits == nullptr || weights == nullptr || ids == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (rows < 0 || experts != kExperts || top_k != kTopK) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  if ((renorm != 0 && renorm != 1) || (probs_bf16 != 0 && probs_bf16 != 1)) {
+  if (renorm != 0 && renorm != 1) {
     return CUDA_ERROR_INVALID_VALUE;
   }
   if (rows == 0) return CUDA_SUCCESS;
   qwen4_moe_route_kernel<<<rows, kThreads, 0, stream>>>(
-      logits, weights, ids, rows, renorm, probs_bf16);
+      logits, weights, ids, rows, renorm);
   return map_cuda_error(cudaGetLastError());
 }
 

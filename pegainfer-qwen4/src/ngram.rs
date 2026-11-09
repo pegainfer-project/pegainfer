@@ -39,10 +39,8 @@
 //! of them before padding. A gather turns `ids` into `rows x heads x head_dim`
 //! activation, and nothing here needs the table itself to exist.
 //!
-//! Pinned by `pegainfer-qwen4/tests/ple_ngram_replay.rs` against a golden
-//! recorded from the reference at the frozen checkpoint's real geometry: the ids
-//! are compared with i64 equality at zero tolerance, so a wrong window, fold,
-//! modulus, offset or layout fails rather than drifting.
+//! The ids are integers, so a wrong window, fold, modulus, offset or layout is
+//! an exact mismatch against the reference rather than a tolerance question.
 
 use anyhow::Result;
 use anyhow::ensure;
@@ -200,7 +198,7 @@ impl NgramHasher {
     ///
     /// A decode step instead carries its own `ngram_size - 1` token window as
     /// state and hands that in; this is the no-state case, which is what the
-    /// reference's prefill and what the golden record.
+    /// reference's prefill computes.
     pub fn padded_history(&self, input_ids: &[i64]) -> Vec<i64> {
         let mut history = vec![self.eos_token_id; self.context()];
         history.extend_from_slice(input_ids);

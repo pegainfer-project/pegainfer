@@ -91,11 +91,9 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// `out[r, c] = bf16(combine_scale * sum_j f32(bf16(a[r, j*hidden+c] *
-    /// b[r, j*hidden+c])))`, with `a`/`b` row-major `[rows, branches*hidden]`
-    /// and `out` `[rows, hidden]` — the branch combine. `combine_scale =
-    /// 1/branches` is the reference's `.mean(-2)`; anything else is a caller
-    /// asking for a different reduce.
+    /// `out[r, c] = bf16(sum_j f32(bf16(a[r, j*hidden+c] * b[r, j*hidden+c]))
+    /// / branches)`, with `a`/`b` row-major `[rows, branches*hidden]` and `out`
+    /// `[rows, hidden]` — the branch combine, the reference's `.mean(-2)`.
     pub fn qwen4_hc_mul_branch_combine_cuda(
         a: *const Half,
         b: *const Half,
@@ -103,7 +101,6 @@ unsafe extern "C" {
         rows: i32,
         hidden: i32,
         branches: i32,
-        combine_scale: f32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -127,8 +124,7 @@ unsafe extern "C" {
     /// canonical order (descending probability, ascending index inside a tie),
     /// optional `norm_topk_prob` renormalization, bf16 weights and i32 expert
     /// ids. `logits` is `[rows, experts]` bf16; `weights` / `ids` are
-    /// `[rows, top_k]`. `renorm` and `probs_bf16` are 0/1 flags; `probs_bf16`
-    /// is the parity gate's negative control and must be 0 in production.
+    /// `[rows, top_k]`. `renorm` is a 0/1 flag.
     pub fn qwen4_moe_route_cuda(
         logits: *const Half,
         weights: *mut Half,
@@ -137,7 +133,6 @@ unsafe extern "C" {
         experts: i32,
         top_k: i32,
         renorm: i32,
-        probs_bf16: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -163,9 +158,6 @@ unsafe extern "C" {
     ///
     /// `key_normed`, `query_normed` and `gated` are the row-major
     /// `[seq_len, hc_count * hidden]` stream; `value` is `[seq_len, hidden]`.
-    /// `gate_span` is `hidden` for the reference's per-branch dot and `width`
-    /// for the full-stream negative control; `signed_sqrt` is 1 for the
-    /// reference and 0 for the unsigned control.
     pub fn qwen4_ple_gate_cuda(
         key_normed: *const Half,
         query_normed: *const Half,
@@ -174,9 +166,7 @@ unsafe extern "C" {
         seq_len: i32,
         hidden: i32,
         hc_count: i32,
-        gate_span: i32,
         sqrt_hidden: f32,
-        signed_sqrt: i32,
         stream: CUstream,
     ) -> CUresult;
 
