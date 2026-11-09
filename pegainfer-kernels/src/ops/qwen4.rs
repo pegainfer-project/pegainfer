@@ -13,17 +13,26 @@
 //!
 //! The grouped `(1+weight)` RMSNorm serves the hyper-connection and PLE streams
 //! (`csrc/qwen4/qwen4_grouped_rmsnorm.cu`); its contract is on the wrapper.
+//!
+//! The hyper-connection tail below is `Qwen4ExpTextGatedResidual`'s elementwise half:
+//! a scaled SiLU, an affine sigmoid and the branch combine. The norm and the
+//! projections it sits between already have entry points above and in the shared
+//! surface; only these three were missing. Frozen semantics live in
+//! `csrc/qwen4/qwen4_hc_block.cu`.
 
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys::CUresult;
 use half::bf16;
 
 use crate::ffi;
 use crate::ops::checked_i32;
+use crate::ops::gemm_into_checked;
 use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
 use crate::tensor::active_cu_stream;
@@ -336,6 +345,417 @@ pub fn qsa_indexer_select_into(
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
+}
+
+fn ensure_finite(value: f32, what: &str) -> Result<()> {
+    ensure!(
+        value.is_finite(),
+        "hyper-connection {what} {value} is not finite"
+    );
+    Ok(())
+}
+
+fn launch(result: CUresult, what: &str) -> Result<()> {
+    ensure!(
+        result == CUresult::CUDA_SUCCESS,
+        "hyper-connection {what} launch failed: {result:?}"
+    );
+    Ok(())
+}
+
+/// `out = bf16(silu(f32(x) * scale))`, elementwise.
+///
+/// The mix path's `silu(input_mix_weight_down(n) / hc_count)`: `hc_count` is a
+/// power of two, so dividing the bf16 projection output by it is exact and the
+/// caller folds it into `scale`, leaving the SiLU's own cast as the only
+/// rounding — which is where the reference's lands.
+pub fn hc_silu_scaled_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    scale: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure_finite(scale, "silu scale")?;
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "hyper-connection silu output [{}, {}] does not match input [{}, {}]",
+        out.hidden_dim,
+        out.seq_len,
+        x.hidden_dim,
+        x.seq_len
+    );
+    let n = x.checked_extent("hyper-connection silu input")?;
+    out.checked_extent("hyper-connection silu output")?;
+    let n = checked_i32(n, "hyper-connection silu element count")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::qwen4_hc_silu_scaled_cuda(
+            x_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n,
+            scale,
+            active_cu_stream(ctx),
+        )
+    };
+    launch(result, "silu_scaled")
+}
+
+/// `out = bf16(gain * f32(bf16(sigmoid(f32(x) * scale))))`, elementwise.
+///
+/// Two reference steps share it: `scale = 1, gain = 1` is the mix path's
+/// `sigmoid(input_mix_weight_up(g))`, and `scale = 1/hc_count, gain = 2` is the
+/// injection weights `2 * sigmoid(block_inject_weight(n) / hc_count)`. The
+/// inner cast is the reference's own — `torch.sigmoid` on a bf16 tensor
+/// materialises bf16 before anything reads it.
+pub fn hc_sigmoid_affine_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    scale: f32,
+    gain: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure_finite(scale, "sigmoid scale")?;
+    ensure_finite(gain, "sigmoid gain")?;
+    ensure!(
+        out.hidden_dim == x.hidden_dim && out.seq_len == x.seq_len,
+        "hyper-connection sigmoid output [{}, {}] does not match input [{}, {}]",
+        out.hidden_dim,
+        out.seq_len,
+        x.hidden_dim,
+        x.seq_len
+    );
+    let n = x.checked_extent("hyper-connection sigmoid input")?;
+    out.checked_extent("hyper-connection sigmoid output")?;
+    let n = checked_i32(n, "hyper-connection sigmoid element count")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::qwen4_hc_sigmoid_affine_cuda(
+            x_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            n,
+            scale,
+            gain,
+            active_cu_stream(ctx),
+        )
+    };
+    launch(result, "sigmoid_affine")
+}
+
+/// Combine `branches` gated branches of a hyper-connection stream:
+///
+/// ```text
+/// out[r, c] = bf16(combine_scale * sum_j f32(bf16(a[r, j*hidden+c] * b[r, j*hidden+c])))
+/// ```
+///
+/// `a` and `b` are row-major `[rows, branches * hidden]`, `out` is
+/// `[rows, hidden]`. The inner cast is the reference's bf16 `gate * normed`
+/// product; the f32 accumulate and the single cast out are torch's
+/// `.mean(dim=-2)`, so `combine_scale = 1.0 / branches as f32` reproduces it.
+/// A different `combine_scale` is a caller asking for a different reduce — the
+/// parity gate's negative control passes `1.0` for the sum.
+pub fn hc_mul_branch_combine_into(
+    ctx: &DeviceContext,
+    a: &HiddenStates,
+    b: &HiddenStates,
+    branches: usize,
+    combine_scale: f32,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure_finite(combine_scale, "combine scale")?;
+    ensure!(
+        branches > 0,
+        "hyper-connection branch count must be positive"
+    );
+    ensure!(
+        a.hidden_dim == b.hidden_dim,
+        "hyper-connection combine reads mismatched streams: {} against {}",
+        a.hidden_dim,
+        b.hidden_dim
+    );
+    ensure!(
+        a.hidden_dim == branches * out.hidden_dim,
+        "hyper-connection combine: {branches} branches of {} do not span a {}-wide stream",
+        out.hidden_dim,
+        a.hidden_dim
+    );
+    ensure!(
+        a.seq_len == b.seq_len && a.seq_len == out.seq_len,
+        "hyper-connection combine row counts disagree: {} / {} / {}",
+        a.seq_len,
+        b.seq_len,
+        out.seq_len
+    );
+    // The shape checks above make `a`'s logical extent `rows * branches *
+    // hidden` and `out`'s `rows * hidden` — exactly the two element counts the
+    // launcher bounds, so this is what keeps the kernel's source index inside
+    // the backing allocations.
+    a.checked_extent("hyper-connection combine gate stream")?;
+    b.checked_extent("hyper-connection combine normed stream")?;
+    out.checked_extent("hyper-connection combine output")?;
+    let branches_i32 = checked_i32(branches, "hyper-connection branch count")?;
+    let rows = checked_i32(a.seq_len, "hyper-connection combine row count")?;
+    let hidden = checked_i32(out.hidden_dim, "hyper-connection combine branch width")?;
+    let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::qwen4_hc_mul_branch_combine_cuda(
+            a_ptr as *const ffi::Half,
+            b_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            rows,
+            hidden,
+            branches_i32,
+            combine_scale,
+            active_cu_stream(ctx),
+        )
+    };
+    launch(result, "mul_branch_combine")
+}
+
+/// Scatter a sublayer output back into the hyper-connection stream:
+///
+/// ```text
+/// out[s, b*H + h] = bf16(hyper[s, b*H + h] + bf16(f32(x[s, h]) * f32(inject[s, b])))
+/// ```
+///
+/// `x` is `[rows, HIDDEN]` (the sublayer's 2560-wide output), `inject`
+/// `[rows, branches]` (the gated injection weights), and `hyper`/`out`
+/// `[rows, branches * HIDDEN]`. The two bf16 roundings are the reference's two
+/// elementwise ops (`out * inject`, then `hyper_input + ...`). `out` may alias
+/// `hyper`: every element reads its own base before writing it.
+pub fn hc_scatter_add_into(
+    ctx: &DeviceContext,
+    x: &HiddenStates,
+    inject: &HiddenStates,
+    hyper: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        x.seq_len == inject.seq_len && x.seq_len == hyper.seq_len && x.seq_len == out.seq_len,
+        "hyper-connection scatter rows differ: x {}, inject {}, hyper {}, out {}",
+        x.seq_len,
+        inject.seq_len,
+        hyper.seq_len,
+        out.seq_len
+    );
+    let branches = inject.hidden_dim;
+    ensure!(
+        branches > 0 && hyper.hidden_dim == x.hidden_dim * branches,
+        "hyper-connection scatter: sublayer {} x {branches} does not span the {}-wide stream",
+        x.hidden_dim,
+        hyper.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == hyper.hidden_dim,
+        "hyper-connection scatter: output is {}-wide, stream is {}-wide",
+        out.hidden_dim,
+        hyper.hidden_dim
+    );
+    x.checked_extent("hyper-connection scatter sublayer output")?;
+    inject.checked_extent("hyper-connection scatter injection weights")?;
+    hyper.checked_extent("hyper-connection scatter stream")?;
+    out.checked_extent("hyper-connection scatter output")?;
+    let rows = checked_i32(x.seq_len, "hyper-connection scatter row count")?;
+    let hidden = checked_i32(x.hidden_dim, "hyper-connection scatter branch width")?;
+    let branches = checked_i32(branches, "hyper-connection scatter branch count")?;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (inject_ptr, _gi) = inject.data.device_ptr(&ctx.stream);
+    let (hyper_ptr, _gh) = hyper.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::qwen4_hc_scatter_cuda(
+            x_ptr as *const ffi::Half,
+            inject_ptr as *const ffi::Half,
+            hyper_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            rows,
+            hidden,
+            branches,
+            active_cu_stream(ctx),
+        )
+    };
+    launch(result, "scatter")
+}
+
+// ── the mix path, composed ────────────────────────────────────────────────
+
+/// Scratch for one hyper-connection mix pass: one buffer per reference step,
+/// so a decode step allocates nothing.
+pub struct HcMixScratch {
+    /// The grouped norm's output, `[rows, branches * hidden]`.
+    pub normed: HiddenStates,
+    /// The rank-`lowrank` bottleneck before and after the SiLU.
+    pub down: HiddenStates,
+    pub bottleneck: HiddenStates,
+    /// The up projection and its sigmoid, `[rows, branches * hidden]`.
+    pub up: HiddenStates,
+    pub gate: HiddenStates,
+    /// The injection head's logits, `[rows, branches]`, when the module has one.
+    pub inject_logits: Option<HiddenStates>,
+}
+
+impl HcMixScratch {
+    /// Allocate the scratch for `rows` tokens of `branches` `hidden`-wide
+    /// branches and a `lowrank` bottleneck.
+    pub fn new(
+        ctx: &DeviceContext,
+        rows: usize,
+        hidden: usize,
+        branches: usize,
+        lowrank: usize,
+        with_inject: bool,
+    ) -> Result<Self> {
+        ensure!(
+            rows > 0 && hidden > 0 && branches > 0 && lowrank > 0,
+            "hyper-connection mix scratch dimensions must be non-zero"
+        );
+        let stream = hidden
+            .checked_mul(branches)
+            .ok_or_else(|| anyhow::anyhow!("hyper-connection stream width overflows usize"))?;
+        Ok(Self {
+            normed: HiddenStates::zeros(ctx, stream, rows)?,
+            down: HiddenStates::zeros(ctx, lowrank, rows)?,
+            bottleneck: HiddenStates::zeros(ctx, lowrank, rows)?,
+            up: HiddenStates::zeros(ctx, stream, rows)?,
+            gate: HiddenStates::zeros(ctx, stream, rows)?,
+            inject_logits: with_inject
+                .then(|| HiddenStates::zeros(ctx, branches, rows))
+                .transpose()?,
+        })
+    }
+}
+
+/// One `Qwen4ExpTextGatedResidual` mix pass, composed from the shared surface:
+///
+/// ```text
+/// n     = grouped (1 + w) RMSNorm(hyper)              // branches groups
+/// g     = silu(down(n) / branches)
+/// gate  = sigmoid(up(g))
+/// mixed = (gate * n).mean(branches)                   // [rows, hidden]
+/// inj   = 2 * sigmoid(inject_weight(n) / branches)    // [rows, branches]
+/// ```
+///
+/// `hyper` is the `[rows, branches * hidden]` stream; `mixed` is `[rows,
+/// hidden]`; `inject_out` is `[rows, branches]` and must be present exactly
+/// when `inject_weight` is. The reference rounds to bf16 at each of these
+/// steps, and each composed op lands its rounding where the reference does.
+/// The per-layer modules pass their injection head; the top-level readout
+/// (`use_combine=False`) passes neither. `branches` is `hc_count`, which must
+/// be a power of two for the folded `1 / branches` scales to be the
+/// reference's exact division.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_mix_into(
+    ctx: &DeviceContext,
+    norm: &DeviceVec,
+    down: &DeviceMatrix,
+    up: &DeviceMatrix,
+    inject_weight: Option<&DeviceMatrix>,
+    hyper: &HiddenStates,
+    branches: usize,
+    rms_eps: f32,
+    scratch: &mut HcMixScratch,
+    mixed: &mut HiddenStates,
+    inject_out: Option<&mut HiddenStates>,
+) -> Result<()> {
+    ensure!(
+        branches > 0 && hyper.hidden_dim.is_multiple_of(branches),
+        "hyper-connection mix: {} branches do not divide a {}-wide stream",
+        branches,
+        hyper.hidden_dim
+    );
+    // The reference divides by `hc_count` in bf16 on both the mix path and the
+    // injection head. Both folds here multiply by `1 / branches` instead; that
+    // is the same value only where the division is exact, i.e. for a
+    // power-of-two count. Anything else would round somewhere the reference
+    // does not, so it is refused rather than served approximately.
+    ensure!(
+        branches.is_power_of_two(),
+        "hyper-connection mix: {branches} branches is not a power of two, so the folded \
+         1/branches scale is not the reference's exact bf16 division"
+    );
+    ensure!(
+        rms_eps.is_finite() && rms_eps > 0.0,
+        "hyper-connection mix: eps {rms_eps} is not positive"
+    );
+    let hidden = hyper.hidden_dim / branches;
+    let rows = hyper.seq_len;
+    let stream = hyper.hidden_dim;
+    ensure!(
+        norm.len == stream,
+        "hyper-connection mix: norm weight is {} wide, stream is {stream}",
+        norm.len
+    );
+    for (what, buf, want) in [
+        ("normed", &scratch.normed, stream),
+        ("up", &scratch.up, stream),
+        ("gate", &scratch.gate, stream),
+        ("mixed", &*mixed, hidden),
+    ] {
+        ensure!(
+            buf.hidden_dim == want && buf.seq_len == rows,
+            "hyper-connection mix: {what} is [{}, {}], need [{rows}, {want}]",
+            buf.seq_len,
+            buf.hidden_dim
+        );
+    }
+    ensure!(
+        scratch.down.hidden_dim == scratch.bottleneck.hidden_dim
+            && scratch.down.seq_len == rows
+            && scratch.bottleneck.seq_len == rows,
+        "hyper-connection mix: bottleneck buffers disagree with {rows} rows"
+    );
+    let lowrank = scratch.down.hidden_dim;
+    let with_inject = inject_weight.is_some();
+    ensure!(
+        with_inject == inject_out.is_some() && with_inject == scratch.inject_logits.is_some(),
+        "hyper-connection mix: the injection head, its output and its logits must agree"
+    );
+    if let Some(out) = inject_out.as_ref() {
+        ensure!(
+            out.hidden_dim == branches && out.seq_len == rows,
+            "hyper-connection mix: injection output is [{}, {}], need [{rows}, {branches}]",
+            out.seq_len,
+            out.hidden_dim
+        );
+    }
+    if let Some(logits) = scratch.inject_logits.as_ref() {
+        ensure!(
+            logits.hidden_dim == branches && logits.seq_len == rows,
+            "hyper-connection mix: injection logits are [{}, {}], need [{rows}, {branches}]",
+            logits.seq_len,
+            logits.hidden_dim
+        );
+    }
+
+    let divisor = 1.0 / branches as f32;
+    rms_norm_grouped_offset_batch_into(ctx, hyper, norm, hidden, rms_eps, &mut scratch.normed)?;
+    gemm_into_checked(ctx, down, &scratch.normed, &mut scratch.down)?;
+    ensure!(
+        scratch.down.hidden_dim == lowrank,
+        "hyper-connection mix: down projection produced {} columns, scratch holds {lowrank}",
+        scratch.down.hidden_dim
+    );
+    hc_silu_scaled_into(ctx, &scratch.down, divisor, &mut scratch.bottleneck)?;
+    gemm_into_checked(ctx, up, &scratch.bottleneck, &mut scratch.up)?;
+    hc_sigmoid_affine_into(ctx, &scratch.up, 1.0, 1.0, &mut scratch.gate)?;
+    hc_mul_branch_combine_into(
+        ctx,
+        &scratch.gate,
+        &scratch.normed,
+        branches,
+        divisor,
+        mixed,
+    )?;
+    if let (Some(weight), Some(logits), Some(out)) =
+        (inject_weight, scratch.inject_logits.as_mut(), inject_out)
+    {
+        gemm_into_checked(ctx, weight, &scratch.normed, logits)?;
+        hc_sigmoid_affine_into(ctx, logits, divisor, 2.0, out)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
