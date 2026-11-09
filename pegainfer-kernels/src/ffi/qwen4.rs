@@ -1,5 +1,6 @@
-// Qwen3.8-Flash-Next (Qwen4 line) QSA token-indexer kernels. Geometry is compiled
-// into `csrc/qwen4/qwen4_qsa_indexer_score.cu`; the entry point takes none.
+// Qwen3.8-Flash-Next (Qwen4 line) kernels. Geometry is compiled into the
+// matching `csrc/qwen4/qwen4_*.cu`; the entry points take only the per-call
+// scalars noted on each.
 
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
@@ -62,6 +63,129 @@ unsafe extern "C" {
         tokens: i32,
         score_cols: i32,
         budget: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
+
+unsafe extern "C" {
+    /// `out = bf16(silu(f32(x) * scale))` over `n` elements — the mix path's
+    /// `silu(down / hc_count)`, with the exact power-of-two division folded
+    /// into `scale`.
+    pub fn qwen4_hc_silu_scaled_cuda(
+        x: *const Half,
+        out: *mut Half,
+        n: i32,
+        scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `out = bf16(gain * f32(bf16(sigmoid(f32(x) * scale))))` over `n`
+    /// elements. `scale = 1, gain = 1` is the mix path's `sigmoid(up)`;
+    /// `scale = 1/hc_count, gain = 2` is the reference's injection weights.
+    pub fn qwen4_hc_sigmoid_affine_cuda(
+        x: *const Half,
+        out: *mut Half,
+        n: i32,
+        scale: f32,
+        gain: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `out[r, c] = bf16(sum_j f32(bf16(a[r, j*hidden+c] * b[r, j*hidden+c]))
+    /// / branches)`, with `a`/`b` row-major `[rows, branches*hidden]` and `out`
+    /// `[rows, hidden]` — the branch combine, the reference's `.mean(-2)`.
+    pub fn qwen4_hc_mul_branch_combine_cuda(
+        a: *const Half,
+        b: *const Half,
+        out: *mut Half,
+        rows: i32,
+        hidden: i32,
+        branches: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Scatter a sublayer output back into the `branches * hidden` stream:
+    /// `out[s, b*hidden + h] = bf16(hyper[s, b*hidden + h] +
+    /// bf16(f32(x[s, h]) * f32(inject[s, b])))`. `out` may alias `hyper`.
+    pub fn qwen4_hc_scatter_cuda(
+        x: *const Half,
+        inject: *const Half,
+        hyper: *const Half,
+        out: *mut Half,
+        rows: i32,
+        hidden: i32,
+        branches: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
+
+unsafe extern "C" {
+    /// fp32 softmax over the router logits of one token row, top-10 in the
+    /// canonical order (descending probability, ascending index inside a tie),
+    /// optional `norm_topk_prob` renormalization, bf16 weights and i32 expert
+    /// ids. `logits` is `[rows, experts]` bf16; `weights` / `ids` are
+    /// `[rows, top_k]`. `renorm` is a 0/1 flag.
+    pub fn qwen4_moe_route_cuda(
+        logits: *const Half,
+        weights: *mut Half,
+        ids: *mut i32,
+        rows: i32,
+        experts: i32,
+        top_k: i32,
+        renorm: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `out = bf16(expert_out + bf16(bf16(sigmoid(gate_logit)) * shared_out))`
+    /// per token — the block sum with the shared expert's learned scalar
+    /// sigmoid gate. `gate_logit` is `[tokens]` bf16; the three matrices are
+    /// `[tokens, hidden]` bf16.
+    pub fn qwen4_moe_shared_combine_cuda(
+        gate_logit: *const Half,
+        expert_out: *const Half,
+        shared_out: *const Half,
+        out: *mut Half,
+        tokens: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
+
+unsafe extern "C" {
+    /// One gate scalar per (row, branch) — the per-branch dot, its double
+    /// rounding around the `1 / sqrt_hidden` divide, the signed sqrt and the
+    /// sigmoid — times `value`, broadcast over the branches that share it.
+    ///
+    /// `key_normed`, `query_normed` and `gated` are the row-major
+    /// `[seq_len, hc_count * hidden]` stream; `value` is `[seq_len, hidden]`.
+    pub fn qwen4_ple_gate_cuda(
+        key_normed: *const Half,
+        query_normed: *const Half,
+        value: *const Half,
+        gated: *mut Half,
+        seq_len: i32,
+        hidden: i32,
+        hc_count: i32,
+        sqrt_hidden: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `out = gated + silu(bf16(dilated causal depthwise conv(conv_in)))`.
+    /// `conv_in`, `gated` and `out` are the row-major
+    /// `[seq_len, hc_count * hidden]` stream, `conv_weight` is
+    /// `[width, 1, conv_kernel]` flattened. The zero initial state of
+    /// `(conv_kernel - 1) * dilation` rows is a bound inside the kernel, not a
+    /// buffer.
+    pub fn qwen4_ple_conv_residual_cuda(
+        conv_in: *const Half,
+        gated: *const Half,
+        conv_weight: *const Half,
+        out: *mut Half,
+        seq_len: i32,
+        hidden: i32,
+        hc_count: i32,
+        conv_kernel: i32,
+        dilation: i32,
         stream: CUstream,
     ) -> CUresult;
 }
