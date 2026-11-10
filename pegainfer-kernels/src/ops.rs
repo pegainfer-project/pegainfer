@@ -204,6 +204,7 @@ pub use linear::gemm_lt_tune;
 pub use linear::gemm_per_token;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
+pub use linear::gemm_rows_span_at_into_checked;
 pub use linear::gemm_rows_span_into_checked;
 pub use linear::gemm_strided_batched_bf16;
 pub use linear::gemm_strided_batched_f32;
@@ -267,7 +268,11 @@ pub use qwen4::qwen4_moe_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_route_into;
 #[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_route_meta_into;
+#[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_shared_branch_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_weighted_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::rms_norm_grouped_offset_batch_into;
 #[cfg(feature = "qwen35")]

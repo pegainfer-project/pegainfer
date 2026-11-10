@@ -643,6 +643,29 @@ impl<'a> StagedWeightLoader<'a> {
         Ok(self.push_slot(data, rows, cols))
     }
 
+    /// A fused expert stack stored as `[experts, rows, cols]`, uploaded as one
+    /// `experts * rows` by `cols` matrix with expert `e` at rows `e * rows..`.
+    pub fn expert_stack(
+        &mut self,
+        name: &str,
+        experts: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<SlotId> {
+        self.ensure_recording()?;
+        let tensor = find_tensor(self.shards, self.weight_map, name)?;
+        let shape = tensor.shape();
+        anyhow::ensure!(
+            shape == [experts, rows, cols],
+            "Tensor '{name}' has shape {shape:?}, config expects [{experts}, {rows}, {cols}]"
+        );
+        let src = tensor_bf16_bytes(&tensor, name)?;
+        let mut data = self.alloc_timed(experts * rows * cols, name)?;
+        let dst_at = staging::prepare(&self.ctx.stream, src, &mut data, 0)?;
+        self.pending.push(PendingUpload::Contiguous { src, dst_at });
+        Ok(self.push_slot(data, experts * rows, cols))
+    }
+
     /// Row-concatenation of `parts`, each a validated row range of its
     /// source tensor; all sources must have exactly `cols` columns.
     pub fn fused_rows(&mut self, cols: usize, parts: &[FusedPart]) -> Result<SlotId> {

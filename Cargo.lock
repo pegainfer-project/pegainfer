@@ -3903,7 +3903,12 @@ name = "pegainfer-qwen4"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cudarc",
+ "half",
+ "log",
+ "pegainfer-core",
  "pegainfer-frontend",
+ "pegainfer-kernels",
  "safetensors",
  "serde",
  "serde_json",

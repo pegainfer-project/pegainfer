@@ -189,3 +189,33 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
+
+unsafe extern "C" {
+    /// Orders the `[rows, top_k]` expert ids by expert: `indptr` (`experts + 1`)
+    /// holds each expert's first slot, `gather_rows` the token of each slot and
+    /// `route_slot` the slot of each (token, pick) pair.
+    pub fn qwen4_moe_route_meta_cuda(
+        ids: *const i32,
+        indptr: *mut i32,
+        gather_rows: *mut i32,
+        route_slot: *mut i32,
+        rows: i32,
+        top_k: i32,
+        experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `out[t] = sum_j w[t, j] * down_out[route_slot[t, j]]`, f32 accumulation,
+    /// one bf16 rounding. `down_out` is `[rows * top_k, hidden]`, `weights`
+    /// `[rows, top_k]`, `out` `[rows, hidden]`.
+    pub fn qwen4_moe_weighted_combine_cuda(
+        down_out: *const Half,
+        weights: *const Half,
+        route_slot: *const i32,
+        out: *mut Half,
+        tokens: i32,
+        top_k: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}

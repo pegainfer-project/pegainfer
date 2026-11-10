@@ -53,6 +53,7 @@ pub(crate) struct TextConfig {
     pub(crate) num_hidden_layers: usize,
     pub(crate) hidden_size: usize,
     pub(crate) vocab_size: usize,
+    pub(crate) rms_norm_eps: f32,
     pub(crate) layer_types: Vec<String>,
     pub(crate) full_attention_interval: usize,
 
@@ -81,7 +82,6 @@ pub(crate) struct TextConfig {
     pub(crate) moe_intermediate_size: usize,
     pub(crate) shared_expert_intermediate_size: usize,
     #[serde(default = "default_norm_topk_prob")]
-    #[cfg_attr(not(test), allow(dead_code, reason = "the router is the first reader"))]
     pub(crate) norm_topk_prob: bool,
 
     pub(crate) hc_count: usize,

@@ -1050,6 +1050,127 @@ pub fn qwen4_moe_combine_into(
     .map_err(|err| anyhow!("Qwen3.8-FN MoE shared combine launch failed: {err}"))
 }
 
+/// Order the router's picks by expert for the expert GEMMs.
+///
+/// `ids` is the router's `[tokens, top_k]` output. `indptr` receives
+/// `experts + 1` slot offsets, `gather_rows` the token of each of the
+/// `tokens * top_k` slots and `route_slot` the slot of each (token, pick) pair,
+/// so expert `e` owns slots `indptr[e]..indptr[e + 1]` in pick order.
+pub fn qwen4_moe_route_meta_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    ids: &CudaSlice<i32>,
+    tokens: usize,
+    indptr: &mut CudaSlice<i32>,
+    gather_rows: &mut CudaSlice<i32>,
+    route_slot: &mut CudaSlice<i32>,
+) -> Result<()> {
+    geometry.validate()?;
+    let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
+        anyhow!(
+            "MoE route meta: {tokens} tokens x top-{} overflows usize",
+            geometry.top_k
+        )
+    })?;
+    ensure!(
+        ids.len() >= pairs && gather_rows.len() >= pairs && route_slot.len() >= pairs,
+        "MoE route meta: ids {} / gather_rows {} / route_slot {} hold fewer than {pairs} entries",
+        ids.len(),
+        gather_rows.len(),
+        route_slot.len()
+    );
+    ensure!(
+        indptr.len() > geometry.experts,
+        "MoE route meta: indptr holds {} i32, needs {}",
+        indptr.len(),
+        geometry.experts + 1
+    );
+    let rows = checked_i32(tokens, "MoE route meta tokens")?;
+    let top_k = checked_i32(geometry.top_k, "MoE route meta top_k")?;
+    let experts = checked_i32(geometry.experts, "MoE route meta experts")?;
+    let (ids_ptr, _ids_guard) = ids.device_ptr(&ctx.stream);
+    let (indptr_ptr, _indptr_guard) = indptr.device_ptr_mut(&ctx.stream);
+    let (gather_ptr, _gather_guard) = gather_rows.device_ptr_mut(&ctx.stream);
+    let (slot_ptr, _slot_guard) = route_slot.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_route_meta_cuda(
+            ids_ptr as *const i32,
+            indptr_ptr as *mut i32,
+            gather_ptr as *mut i32,
+            slot_ptr as *mut i32,
+            rows,
+            top_k,
+            experts,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN MoE route meta launch failed: {err}"))
+}
+
+/// Sum each token's routed expert outputs with its routing weights:
+/// `expert_out[t] = sum_j weights[t, j] * down_out[route_slot[t, j]]`.
+///
+/// `down_out` holds one row per slot (`tokens * top_k` rows of `hidden`), as the
+/// expert GEMMs left them; `weights` is the router's `[tokens, top_k]` output.
+pub fn qwen4_moe_weighted_combine_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    down_out: &HiddenStates,
+    weights: &CudaSlice<bf16>,
+    route_slot: &CudaSlice<i32>,
+    expert_out: &mut HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    let tokens = expert_out.seq_len;
+    let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
+        anyhow!(
+            "MoE combine: {tokens} tokens x top-{} overflows usize",
+            geometry.top_k
+        )
+    })?;
+    ensure!(
+        expert_out.hidden_dim == geometry.hidden && down_out.hidden_dim == geometry.hidden,
+        "MoE weighted combine: expert_out {} / down_out {} columns, the geometry has {}",
+        expert_out.hidden_dim,
+        down_out.hidden_dim,
+        geometry.hidden
+    );
+    ensure!(
+        down_out.seq_len >= pairs && weights.len() >= pairs && route_slot.len() >= pairs,
+        "MoE weighted combine: down_out {} rows / weights {} / route_slot {} hold fewer than {pairs}",
+        down_out.seq_len,
+        weights.len(),
+        route_slot.len()
+    );
+    down_out.checked_extent("MoE weighted combine down_out")?;
+    expert_out.checked_extent("MoE weighted combine expert_out")?;
+    if tokens == 0 {
+        return Ok(());
+    }
+    let tokens_i = checked_i32(tokens, "MoE weighted combine tokens")?;
+    let top_k = checked_i32(geometry.top_k, "MoE weighted combine top_k")?;
+    let hidden = checked_i32(geometry.hidden, "MoE weighted combine hidden")?;
+    let (down_ptr, _down_guard) = down_out.data.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
+    let (slot_ptr, _slot_guard) = route_slot.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = expert_out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_weighted_combine_cuda(
+            down_ptr as *const ffi::Half,
+            weights_ptr as *const ffi::Half,
+            slot_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            tokens_i,
+            top_k,
+            hidden,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN MoE weighted combine launch failed: {err}"))
+}
+
 /// The checkpoint's PLE block geometry. Frozen with the line: `pegainfer-qwen4`
 /// serves one `qwen4_exp` text geometry, and the kernels are compiled for it.
 #[derive(Clone, Copy, Debug, PartialEq)]
