@@ -27,7 +27,10 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 #         --layer 0 --out golden/qwen4-layer0.safetensors
 
 METADATA_KEY = "qwen4_layer_golden"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+# Recorded from the CPU pass as well: the accelerator versus CPU spread of the
+# reference is the floor the engine is held to at these stages.
+CPU_STAGES = ("attn_out", "stream_after_attn", "router_logits", "moe_out", "stream_out")
 PROMPT = (
     "The hyper-connection stream carries four copies of the residual through every "
     "layer, and the mixer reads them back before the head. Routing picks ten of the "
@@ -92,6 +95,13 @@ class Recorder:
             self.output(sublayer.norm, lambda out: {"gdn_normed": out})
             self.output(sublayer, lambda out: {"attn_out": out})
         else:
+            self.output(sublayer.q_proj, lambda out: {"attn_q_proj": out})
+            self.output(sublayer.k_proj, lambda out: {"attn_k_proj": out})
+            self.output(sublayer.v_proj, lambda out: {"attn_v_proj": out})
+            self.output(sublayer.q_norm, lambda out: {"attn_q_normed": out})
+            self.output(sublayer.k_norm, lambda out: {"attn_k_normed": out})
+            self.output(sublayer.indexer, lambda out: {"attn_indexer_mask": out})
+            self.inputs(sublayer.o_proj, lambda args: {"attn_gated": args[0]})
             self.output(sublayer, lambda out: {"attn_out": out[0]})
         self.inputs(layer.mlp_hyper_connection, lambda args: {"stream_after_attn": args[0]})
         self.output(layer.mlp_hyper_connection, lambda out: {"mlp_mixed": out[0], "mlp_inject": out[2]})
@@ -127,14 +137,20 @@ def run(layer: Qwen4ExpTextDecoderLayer, text_config, ids: torch.Tensor, embed: 
     embeds = F.embedding(ids, embed.to(device))
     stream = embeds.repeat(1, 1, text_config.hc_count)
     rotary = Qwen4ExpTextRotaryEmbedding(config=text_config).to(device)
-    positions = torch.arange(ids.shape[1], device=device).view(1, 1, -1).expand(3, 1, -1)
+    tokens = ids.shape[1]
+    positions = torch.arange(tokens, device=device).view(1, 1, -1).expand(3, 1, -1)
     position_embeddings = rotary(embeds, positions)
+    # The additive causal mask the eager attention path reads; the indexer derives
+    # its visible set from it as well.
+    visible = torch.ones(tokens, tokens, dtype=torch.bool, device=device).tril()
+    attention_mask = torch.zeros(tokens, tokens, dtype=embeds.dtype, device=device)
+    attention_mask = attention_mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
     recorder = Recorder(layer)
     with torch.no_grad():
         out = layer(
             stream,
             position_embeddings=position_embeddings,
-            attention_mask=None,
+            attention_mask=attention_mask,
             conv_mask=None,
             past_key_values=None,
             ple_input_ids=ids,
@@ -144,7 +160,7 @@ def run(layer: Qwen4ExpTextDecoderLayer, text_config, ids: torch.Tensor, embed: 
     flat = {}
     for name, value in stages.items():
         value = value.detach()
-        if value.dim() == 3:
+        if value.dim() >= 3:
             value = value.reshape(-1, value.shape[-1])
         flat[name] = value.contiguous().cpu()
     return flat
@@ -161,6 +177,8 @@ def main() -> None:
 
     config = Qwen4ExpConfig.from_pretrained(args.model)
     text_config = config.text_config
+    # The arithmetic reference for attention, with the additive mask built above.
+    text_config._attn_implementation = "eager"
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     ids = tokenizer(PROMPT, return_tensors="pt").input_ids[:, : args.tokens]
     if ids.shape[1] != args.tokens:
@@ -176,13 +194,13 @@ def main() -> None:
 
     cpu_layer = copy.deepcopy(layer).cpu()
     host = run(cpu_layer, text_config, ids, embed, torch.device("cpu"))
-    for name in ("attn_out", "stream_after_attn", "moe_out", "stream_out"):
+    for name in CPU_STAGES:
         diff = (accel[name].float() - host[name].float()).abs()
         print(f"{name}: accelerator vs cpu max {diff.max():.3e} mean {diff.mean():.3e}")
 
     tensors = {"input_ids": ids.reshape(-1).to(torch.int64)}
     tensors.update({name: value for name, value in accel.items()})
-    tensors.update({f"cpu_{name}": host[name] for name in ("attn_out", "stream_after_attn", "moe_out", "stream_out")})
+    tensors.update({f"cpu_{name}": host[name] for name in CPU_STAGES})
     manifest = {
         "format_version": FORMAT_VERSION,
         "layer": args.layer,

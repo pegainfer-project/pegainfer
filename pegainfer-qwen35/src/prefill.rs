@@ -1,8 +1,5 @@
 use anyhow::Context;
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
-use cudarc::driver::DevicePtr;
-use cudarc::driver::DevicePtrMut;
 
 /// Sequence length used for conservative prefill scratch reservation.
 ///
@@ -19,11 +16,11 @@ pub(crate) const SCRATCH_ESTIMATE_SEQ: usize = 20_000;
 /// exceeds the memory reserved at startup. Kept equal to `SCRATCH_ESTIMATE_SEQ`
 /// so the reservation in `weights.rs` covers exactly one chunk.
 pub(crate) const PREFILL_CHUNK_LEN: usize = SCRATCH_ESTIMATE_SEQ;
-const HEAD_DIM: usize = 256;
 
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::ops::GdrChunkwiseScratch35;
+use pegainfer_kernels::ops::attention_prefill_hd256_into;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
@@ -35,7 +32,6 @@ use super::weights::LayerKind;
 use super::weights::LinearAttentionLayer;
 use super::weights::Qwen35Model;
 use super::weights::TransformerBlock35;
-use crate::ffi;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
 
@@ -334,134 +330,33 @@ impl Qwen35Model {
         seq_len: usize,
     ) -> Result<HiddenStates> {
         let c = &self.config;
-        let geom = self.geometry;
-        let num_attention_heads = geom.local_num_attention_heads();
-        let num_key_value_heads = geom.local_num_key_value_heads();
-        let attn_out_dim = geom.local_full_attn_q_dim();
-        let eps = c.rms_norm_eps;
+        let attn_out_dim = self.geometry.local_full_attn_q_dim();
         let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
         let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;
         let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;
-        let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
-
-        let base_pos = kv.base_pos;
         let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
-        let start_pos_cpu: CudaSlice<i32> = self
-            .ctx
-            .stream
-            .clone_htod(&[base_pos as i32])
-            .map_err(|e| anyhow::anyhow!("H2D start_pos failed: {e}"))?;
-        let layout = &kv.layout;
-        let layer_k_off = (*full_idx * layout.layer_stride) as i64;
-        let layer_v_off = layer_k_off + layout.kv_block_len as i64;
-        let stride_page = layout.page_stride as i64;
-
-        // Step 1: QK norm + partial RoPE + direct paged K/V write.
-        unsafe {
-            let (qf_ptr, _) = q_full_batch.data.device_ptr(&self.ctx.stream);
-            let (k_ptr, _) = k_batch.data.device_ptr(&self.ctx.stream);
-            let (v_ptr, _) = v_batch.data.device_ptr(&self.ctx.stream);
-            let (qn_ptr, _) = attn.q_norm.data.device_ptr(&self.ctx.stream);
-            let (kn_ptr, _) = attn.k_norm.data.device_ptr(&self.ctx.stream);
-            let (cos_ptr, _) = self.cos_cache.data.device_ptr(&self.ctx.stream);
-            let (sin_ptr, _) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (qp_ptr, _) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (buf_ptr, _) = kv.buffer.device_ptr(&self.ctx.stream);
-            let (pi_ptr, _) = kv.plan.page_indices_d().device_ptr(&self.ctx.stream);
-            let (sp_ptr, _) = start_pos_cpu.device_ptr(&self.ctx.stream);
-            ffi::prefill_attention_hd256_prep_paged_cuda(
-                qf_ptr as *const ffi::Half,
-                k_ptr as *const ffi::Half,
-                v_ptr as *const ffi::Half,
-                qn_ptr as *const ffi::Half,
-                kn_ptr as *const ffi::Half,
-                cos_ptr as *const ffi::Half,
-                sin_ptr as *const ffi::Half,
-                qp_ptr as *mut ffi::Half,
-                buf_ptr as *mut ffi::Half,
-                layer_k_off,
-                layer_v_off,
-                pi_ptr as *const i32,
-                num_attention_heads as i32,
-                num_key_value_heads as i32,
-                seq_len as i32,
-                sp_ptr as *const i32,
-                c.rotary_dim as i32,
-                eps,
-                layout.page_size as i32,
-                stride_page,
-                self.ctx.stream.cu_stream(),
-            );
-        }
-
-        // Step 2: Batch prefill paged attention (HD=256).
-        let sm_scale = 1.0f32 / f32::sqrt(HEAD_DIM as f32);
-        {
-            let (buf_ptr, _gbuf) = kv.buffer.device_ptr(&self.ctx.stream);
-            let (qp_ptr, _gqp) = q_prepped.data.device_ptr(&self.ctx.stream);
-            let (out_ptr, _go) = attn_out_batch.data.device_ptr_mut(&self.ctx.stream);
-            let (pi_ptr, _gpi) = kv.plan.page_indices_d().device_ptr(&self.ctx.stream);
-            let (pip_ptr, _gpip) = kv.plan.page_indptr_d().device_ptr(&self.ctx.stream);
-            let (lpl_ptr, _glpl) = kv.plan.last_page_len_d().device_ptr(&self.ctx.stream);
-            let (qi_ptr, _gqi) = kv.plan.q_indptr_d().device_ptr(&self.ctx.stream);
-            let (ri_ptr, _gri) = kv.plan.request_indices_d().device_ptr(&self.ctx.stream);
-            let (qti_ptr, _gqti) = kv.plan.qo_tile_indices_d().device_ptr(&self.ctx.stream);
-            let (kti_ptr, _gkti) = kv.plan.kv_tile_indices_d().device_ptr(&self.ctx.stream);
-            let (kcs_ptr, _gkcs) = kv.plan.kv_chunk_size_d().device_ptr(&self.ctx.stream);
-            let (tnr_ptr, _gtnr) = kv.plan.total_num_rows_d().device_ptr(&self.ctx.stream);
-            let result = unsafe {
-                ffi::batch_prefill_paged_cuda_hd256(
-                    qp_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    buf_ptr as *const ffi::Half,
-                    layer_k_off,
-                    layer_v_off,
-                    pi_ptr as *const i32,
-                    pip_ptr as *const i32,
-                    lpl_ptr as *const i32,
-                    qi_ptr as *const i32,
-                    ri_ptr as *const i32,
-                    qti_ptr as *const i32,
-                    kti_ptr as *const i32,
-                    kcs_ptr as *const i32,
-                    tnr_ptr as *const u32,
-                    num_attention_heads as i32,
-                    num_key_value_heads as i32,
-                    HEAD_DIM as i32,
-                    layout.page_size as i32,
-                    seq_len as i32,
-                    kv.plan.batch_size(),
-                    kv.plan.num_tiles(),
-                    stride_page,
-                    sm_scale,
-                    self.ctx.stream.cu_stream(),
-                )
-            };
-            anyhow::ensure!(
-                result == 0,
-                "batch_prefill_paged_cuda_hd256 failed: {result}{}",
-                pegainfer_kernels::ops::ffi_exception_message(result)
-            );
-        }
-
-        // Step 3: Apply gate from q_full_batch.
-        {
-            let (qf_ptr, _gqf) = q_full_batch.data.device_ptr(&self.ctx.stream);
-            let (out_ptr, _go) = attn_out_batch.data.device_ptr_mut(&self.ctx.stream);
-            unsafe {
-                ffi::attention_gate_batch_hd256_cuda(
-                    qf_ptr as *const ffi::Half,
-                    out_ptr as *mut ffi::Half,
-                    num_attention_heads as i32,
-                    seq_len as i32,
-                    self.ctx.stream.cu_stream(),
-                );
-            }
-        }
-
+        let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
+        attention_prefill_hd256_into(
+            &self.ctx,
+            &q_full_batch,
+            &k_batch,
+            &v_batch,
+            &attn.q_norm,
+            &attn.k_norm,
+            &self.cos_cache,
+            &self.sin_cache,
+            kv.buffer,
+            &kv.layout.kernel_layout(),
+            *full_idx,
+            kv.plan,
+            kv.base_pos,
+            c.rotary_dim,
+            c.rms_norm_eps,
+            &mut q_prepped,
+            &mut attn_out_batch,
+        )?;
         *full_idx += 1;
 
-        // O projection (batched)
         let mut projected = ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)?;
         self.all_reduce_hidden(&mut projected)?;
         Ok(projected)

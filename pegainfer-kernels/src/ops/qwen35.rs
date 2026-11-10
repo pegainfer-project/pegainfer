@@ -500,6 +500,185 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     Ok(())
 }
 
+/// Gated full attention over one prompt chunk at head dim 256, the Qwen3.5
+/// shape: `q_full` holds `[q | gate]` per head, `k` and `v` the projections.
+/// `(1 + w)` q/k norm and partial RoPE from `start_pos`, K/V written into the
+/// pool at `layer` over the plan's pages, causal FlashInfer prefill, then the
+/// sigmoid of the gate half on `output`. `q_prepped` keeps the normed and
+/// rotated Q.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q_full: &HiddenStates,
+    k: &HiddenStates,
+    v: &HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    start_pos: usize,
+    rotary_dim: usize,
+    rms_eps: f32,
+    q_prepped: &mut HiddenStates,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        head_dim == 256,
+        "hd256 prefill: the layout has head_dim {head_dim}"
+    );
+    let num_q_heads = output.hidden_dim / head_dim;
+    anyhow::ensure!(
+        num_q_heads * head_dim == output.hidden_dim
+            && q_prepped.hidden_dim == output.hidden_dim
+            && q_full.hidden_dim == 2 * output.hidden_dim
+            && k.hidden_dim == num_kv_heads * head_dim
+            && v.hidden_dim == num_kv_heads * head_dim,
+        "hd256 prefill widths: q_full {} q {} k {} v {} output {} for {num_kv_heads} kv heads",
+        q_full.hidden_dim,
+        q_prepped.hidden_dim,
+        k.hidden_dim,
+        v.hidden_dim,
+        output.hidden_dim
+    );
+    let seq_len = q_full.seq_len;
+    anyhow::ensure!(
+        [
+            k.seq_len,
+            v.seq_len,
+            q_prepped.seq_len,
+            output.seq_len,
+            plan.total_tokens
+        ]
+        .iter()
+        .all(|&rows| rows == seq_len),
+        "hd256 prefill rows: q_full {seq_len} k {} v {} q {} output {} plan {}",
+        k.seq_len,
+        v.seq_len,
+        q_prepped.seq_len,
+        output.seq_len,
+        plan.total_tokens
+    );
+    let PagedGeometry {
+        k_offset_elems: k_offset,
+        v_offset_elems: v_offset,
+        stride_page,
+        ..
+    } = checked_paged_geometry(
+        "hd256 prefill",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+    let start_pos_d: CudaSlice<i32> = ctx.stream.clone_htod(&[crate::ops::checked_i32(
+        start_pos,
+        "hd256 prefill start_pos",
+    )?])?;
+    let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let (qf_ptr, _gqf) = q_full.data.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr(&ctx.stream);
+    let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
+    let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
+    let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
+    let (sin_ptr, _gs) = sin_cache.data.device_ptr(&ctx.stream);
+    let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
+    let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
+    let (sp_ptr, _gsp) = start_pos_d.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+    let stream = crate::tensor::active_cu_stream(ctx);
+
+    unsafe {
+        ffi::prefill_attention_hd256_prep_paged_cuda(
+            qf_ptr as *const ffi::Half,
+            k_ptr as *const ffi::Half,
+            v_ptr as *const ffi::Half,
+            qn_ptr as *const ffi::Half,
+            kn_ptr as *const ffi::Half,
+            cos_ptr as *const ffi::Half,
+            sin_ptr as *const ffi::Half,
+            qp_ptr as *mut ffi::Half,
+            buf_ptr as *mut ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            seq_len as i32,
+            sp_ptr as *const i32,
+            rotary_dim as i32,
+            rms_eps,
+            layout.page_size as i32,
+            stride_page,
+            stream,
+        );
+    }
+    let result = unsafe {
+        ffi::batch_prefill_paged_cuda_hd256(
+            qp_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            buf_ptr as *const ffi::Half,
+            k_offset,
+            v_offset,
+            pi_ptr as *const i32,
+            pip_ptr as *const i32,
+            lpl_ptr as *const i32,
+            qi_ptr as *const i32,
+            ri_ptr as *const i32,
+            qti_ptr as *const i32,
+            kti_ptr as *const i32,
+            kcs_ptr as *const i32,
+            tnr_ptr as *const u32,
+            num_q_heads as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            layout.page_size as i32,
+            seq_len as i32,
+            plan.batch_size(),
+            plan.num_tiles,
+            stride_page,
+            sm_scale,
+            stream,
+        )
+    };
+    if result != 0 {
+        anyhow::bail!(
+            "batch_prefill_paged_cuda_hd256 failed for layer {layer}, seq_len={seq_len}, tiles={}, \
+             qo_heads={num_q_heads}, kv_heads={num_kv_heads}: {result}{}",
+            plan.num_tiles,
+            crate::ops::ffi_exception_message(result)
+        );
+    }
+    unsafe {
+        ffi::attention_gate_batch_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            seq_len as i32,
+            stream,
+        );
+    }
+    Ok(())
+}
+
 /// GDN key head dim baked into the kernels: the decode kernel's tiling and shared
 /// memory layout (`GDR_KEY_DIM` in `gated_delta_rule.cu`) and the chunk-wise
 /// prefill's Triton AOT specialization keys both hardcode it.
