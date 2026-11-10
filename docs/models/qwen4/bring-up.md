@@ -93,7 +93,7 @@ The one-step scale is derived, not tuned: an f32 sum of 2560 bf16 products diffe
 
 **Negative controls** (each asserts its fault lands outside the bound; a control that stays inside fails the test). Worst as a fraction of the bound: fused projection halves swapped 990–1500%, routing weight dropped 2885–2903%, shared branch summed instead of sigmoid-gated 2931–4015%, GELU instead of SiLU 412–556%, shared branch's gate|up swapped 2255–3524%, router without `norm_topk_prob` 5.9e5–6.5e5%. The two order-only faults are asserted bitwise instead, because a few bf16 steps is what they cost: folding in slot order moves 15122–27852 elements, dropping the per-add rounding moves 13065–24468.
 
-**Measured** on the RTX 5060 Laptop (sm_120, CUDA 12.9, 1.2 GHz class clocks; warm, wall clock around 20 launches and one sync — the routed path is not optimized, only recorded):
+**Measured** on the RTX 5060 Laptop (sm_120, CUDA 12.9; warm, wall clock around 20 launches and one sync — the routed path is not optimized, only recorded):
 
 | Tokens | Routes | ms per call | Per route |
 | --- | --- | --- | --- |
