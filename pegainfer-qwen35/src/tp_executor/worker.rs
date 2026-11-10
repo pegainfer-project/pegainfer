@@ -283,11 +283,8 @@ impl TpWorkerPrepared {
         // local value-head/qkv sizes.
         let recurrent_bytes = RecurrentState::allocation_bytes(model.config(), model.geometry);
         let prefill_scratch_tokens = prefill_scratch_tokens(max_prefill_tokens);
-        let prefill_scratch_bytes = GdrChunkwiseScratch35::estimate_bytes(
-            model.config(),
-            model.geometry,
-            prefill_scratch_tokens,
-        );
+        let prefill_scratch_bytes =
+            prefill_scratch_bytes(model.config(), model.geometry, prefill_scratch_tokens);
         // Graph mode pre-allocates one fixed-address slot state per decode
         // bucket position up front; reserve that before sizing per-request
         // (prefill-transient) state capacity. The reserve must track the

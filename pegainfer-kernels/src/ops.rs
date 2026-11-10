@@ -275,6 +275,8 @@ pub use qwen35::GDN_AOT_KEY_HEAD_DIM;
 #[cfg(feature = "qwen35")]
 pub use qwen35::GDN_AOT_VALUE_HEAD_DIM;
 #[cfg(feature = "qwen35")]
+pub use qwen35::GdrChunkwiseScratch35;
+#[cfg(feature = "qwen35")]
 pub use qwen35::LINEAR_CONV_MAX_KERNEL_DIM;
 #[cfg(feature = "qwen35")]
 pub use qwen35::Qwen35DecodeGemm;
@@ -287,7 +289,11 @@ pub use qwen35::Qwen35GdnWorkspace;
 #[cfg(feature = "qwen35")]
 pub use qwen35::conv1d_decode_batch_into;
 #[cfg(feature = "qwen35")]
+pub use qwen35::conv1d_prefill_batch_into;
+#[cfg(feature = "qwen35")]
 pub use qwen35::gated_delta_rule_decode_batch_into;
+#[cfg(feature = "qwen35")]
+pub use qwen35::gated_delta_rule_prefill_chunkwise_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;
 #[cfg(feature = "qwen35")]

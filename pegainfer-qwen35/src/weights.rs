@@ -402,11 +402,9 @@ impl Qwen35Model {
                 max_prefill_len,
                 page_size,
             ),
-            None => super::prefill_buffers::GdrChunkwiseScratch35::estimate_bytes(
-                &config,
-                geometry,
-                max_prefill_len,
-            ),
+            None => {
+                super::prefill_buffers::prefill_scratch_bytes(&config, geometry, max_prefill_len)
+            }
         };
         let recurrent_reserve = STATES_PER_DECODE_SLOT
             * max_batch

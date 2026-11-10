@@ -43,7 +43,7 @@
 - Replaced root `src/ffi.rs` and `src/tensor.rs` with compatibility re-exports.
 - Replaced root `src/ops.rs` with re-exports from `pegainfer-kernels` plus thin root adapters for sampling, paged prefill planning, paged attention layout conversion, and the remaining Qwen3.5 recurrent wrapper.
 - Removed duplicate root `src/ops/{attention,elementwise,embedding,linear,norm,sampling}.rs`.
-- Kept `src/ops/recurrent.rs` in root for now because it depends on Qwen3.5's model-local `GdrChunkwiseScratch35`; moving that would expand Phase 1 beyond Qwen3-4B.
+- Kept `src/ops/recurrent.rs` in root at the time because it depended on Qwen3.5's model-local `GdrChunkwiseScratch35`; the scratch and the GDN prefill wrappers have since moved into the kernels crate next to the decode wrappers, and `pegainfer-qwen35` builds its scratch from them.
 
 ### Step 3: Add kernel index for LLM navigation
 - Added `crates/pegainfer-kernels/KERNELS.md`.
@@ -99,7 +99,7 @@
 
 - **Outcome**: Implemented and validated the crate-first Phase 1 split. Kernel source, Triton source, FlashInfer submodule ownership, CUDA/Triton build script, FFI, kernel ABI tensor helpers, paged-KV layout metadata, and Qwen3-used Rust ops now live under `crates/pegainfer-kernels`. Root `pegainfer` keeps server/model code, `KvPool`, `PagePool`, `SamplingParams`, and thin compatibility adapters. The split passes local format/metadata checks, GPU release build/test-target compilation, release clippy, Qwen3-4B e2e, and the standard Qwen3-4B `bench_serving snapshot`.
 - **Pitfalls encountered**:
-  - Root `src/ops/recurrent.rs` cannot be moved cleanly in this pass because it takes Qwen3.5's `GdrChunkwiseScratch35` type. Moving it would pull hybrid-model scratch ownership into the kernels crate, which is outside the Qwen3-4B Phase 1 scope.
+  - Root `src/ops/recurrent.rs` could not be moved in that pass because it took Qwen3.5's `GdrChunkwiseScratch35` type; that move happened later, once the scratch was sized by dims rather than by the Qwen3.5 config.
   - Initially moved `KvPool`, `PagePool`, and `SamplingParams` into the kernels crate. That was too broad; those belong to runtime policy and have been moved back to root.
   - Local compile verification is blocked by missing `nvcc`, so GPU compile verification should happen on a CUDA build host.
 - **Lessons learned**:

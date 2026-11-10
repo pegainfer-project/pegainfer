@@ -23,11 +23,12 @@ const HEAD_DIM: usize = 256;
 
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::GdrChunkwiseScratch35;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
 use super::flashinfer_gdn::FlashInferGdnChunkResources;
-use super::prefill_buffers::GdrChunkwiseScratch35;
+use super::prefill_buffers::gdr_chunkwise_scratch;
 use super::recurrent_state::RecurrentState;
 use super::weights::FullAttentionLayer;
 use super::weights::LayerKind;
@@ -209,7 +210,7 @@ impl Qwen35Model {
         )?;
 
         let gdn_scratch = match &self.flashinfer_gdn {
-            None => GdnPrefillChunkScratch::Triton(Box::new(GdrChunkwiseScratch35::new(
+            None => GdnPrefillChunkScratch::Triton(Box::new(gdr_chunkwise_scratch(
                 &self.ctx,
                 c,
                 self.geometry,
