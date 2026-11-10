@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher), which have no production caller yet. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher), plus the routed-expert stack and per-token expert computation, none with a production caller yet. Nothing runs — detection succeeds and `launch` refuses, because the text graph is slice B. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-11
 
@@ -69,6 +69,43 @@ Two boundaries the code cannot state. A row's visible list starts at token 0 (th
 
 On the 26-SM sm_120 card, the production 2560-wide group moved from 56.0 to 41.6 µs p50 at 512 tokens (128 tokens: 17.2 to 14.9 µs).
 
+## The routed MoE experts (#1107, slice 1107a)
+
+The block's missing half is in `csrc/qwen4/qwen4_moe_experts.cu` behind three entries: the two fused expert stacks (`Qwen4ExpertLayout` / `Qwen4ExpertStacks`), the per-token expert computation (`qwen4_moe_routed_experts_into`), and the fold that is the reference's `index_add_` half (`qwen4_moe_route_scale_fold_into`).
+
+**Frozen semantics** (`Qwen4ExpTextExperts`, `modeling_qwen4_exp.py:859-895`). Per layer, BF16: `mlp.experts.gate_up_proj` `[512, 1280, 2560]` and `mlp.experts.down_proj` `[512, 2560, 640]`, contiguous, expert outermost, **no `.weight` suffix** — two tensors per layer, and `Qwen4ExpertLayout` refuses a stack whose element count is not exactly theirs. Per route, in the reference's order: `gate, up = F.linear(x, gate_up_proj[e]).chunk(2)` (bf16 store), `h = silu(gate) · up` (activation materialised in bf16 before the product), `y = F.linear(h, down_proj[e])` (bf16 store), `y *= routing_weight` (bf16 store), then `final.index_add_(0, token, y)`. Two properties are contract rather than detail: the per-token accumulation order is **ascending expert index** (the reference loops experts outer; `torch.where`'s slot-major order reaches no token's sum because top-k picks distinct experts), and the accumulator is a **bf16 tensor**, so every add rounds. A port that folds in the router's descending-probability order, or keeps the accumulator in f32, produces different bits — `qwen4_moe_block_parity` measures that (`5241` and `4898` of `7680` elements move on the fold's own case).
+
+**Backend.** One N=1 cuBLAS GEMM per `(token, slot)` route against that route's expert rows, driven by device-resident pointer arrays — DeepSeek-V2-Lite's pattern (`dsv2_lite_moe.cu`), chosen because it needs no grouping pass, no per-expert capacity and no host-visible counts: an empty expert issues no call, a skewed one issues a call per row, and `Qwen4MoeExpertScratch` is sized once at `tokens × top_k` routes. The cost is weight traffic — each expert's rows are read once per route — and it is the reason a grouped backend is the next measurement rather than an assumption: 170 routes move 1.79 GB.
+
+**What the gate measures.** `tests/qwen4_moe_block_parity.rs` compares against an in-test **f64 CPU oracle** that walks the reference's own sequence with its bf16 rounding points (no random-weight fixture: a `randn` fixture pins a port against itself). Four separate comparisons per case — router logits and weights, shared branch, routed experts, combine — because a final-output mismatch attributes to nothing. Cases: decode (1 token), prefill (17 tokens, uneven per-expert counts), skewed routing (12 identical rows, so all 12 route to the same ten experts and the other **502 are empty**), and prefill with the router's picks re-uploaded in **descending expert order** so slot order is the reverse of the fold's. Deviations are measured against each row's largest reference output, which is the scale a cancellation-prone reduction has to be judged on. At the real geometry on the 26-SM sm_120 card:
+
+| Comparison | Bound | Worst (of bound) | Bits differing |
+| --- | --- | --- | --- |
+| router ids | exact | 390 of 390 match | — |
+| router weights | 1/256 | 0 (0%) | 0 of 390 |
+| router logits | 1/64 | 7.0e-3 (45%) | 1888 of 4608 (worst case) |
+| routed experts | 1/32 | 3.6e-3 (11.5%) | 199 of 43520 |
+| shared branch | 1/64 | 4.5e-3 (28.7%) | 314 of 43520 |
+| combine of the device's own halves | 1/64 | 0 (0%) | 0 |
+| composed block output | 1/32 | 6.5e-3 (20.6%) | 726 of 23040 |
+
+The one-step scale is derived, not tuned: an f32 sum of 2560 bf16 products differs from the f64 sum by at most `γ_n · Σ|x·w| ≈ 1.5e-4 Σ|x·w|`, and a random-sign dot cancels by `√n`, so the loudest elements sit ~7.5e-3 from the oracle — just under one bf16 step (`2^-7`). Hence at most one step per store, and the measured worst case uses 0.9 of it. The fold itself is gated **bitwise** (7680 elements, 0 differ) on inputs built so the order is observable.
+
+**Negative controls** (each asserts its fault lands outside the bound; a control that stays inside fails the test). Worst as a fraction of the bound: fused projection halves swapped 990–1500%, routing weight dropped 2885–2903%, shared branch summed instead of sigmoid-gated 2931–4015%, GELU instead of SiLU 412–556%, shared branch's gate|up swapped 2255–3524%, router without `norm_topk_prob` 5.9e5–6.5e5%. The two order-only faults are asserted bitwise instead, because a few bf16 steps is what they cost: folding in slot order moves 15122–27852 elements, dropping the per-add rounding moves 13065–24468.
+
+**Measured** on the RTX 5060 Laptop (sm_120, CUDA 12.9, 1.2 GHz class clocks; warm, wall clock around 20 launches and one sync — the routed path is not optimized, only recorded):
+
+| Tokens | Routes | ms per call | Per route |
+| --- | --- | --- | --- |
+| 1 | 10 | 0.59 | 59 µs |
+| 9 | 90 | 4.20 | 47 µs |
+| 12 | 120 | 5.69 | 47 µs |
+| 17 | 170 | 8.05 | 47 µs |
+
+47 µs per route is `10.5 MB / route` at ~220 GB/s: the path is DRAM-bound on weights, which is exactly what per-route grouping costs. `compute-sanitizer --tool memcheck` over the gate: 0 errors (4 tests, 100 s).
+
+**Not gated** (1107a is single-rank correctness): no EP transport or rank sharding (#1107 Route A/B), no multi-GPU test, no fused MegaMoE (router / top-k / GEMM / activation / fold are five launches per layer), no quantized path, no real-checkpoint golden — the stack is generated in-test, so the gate pins *arithmetic and layout*, not the checkpoint's values — no CUDA-graph capture test, and no sm_89 run (this box is neither support row; the numbers above establish numerics, not a platform result).
+
 ## The n-gram table is derived, not read
 
 `config.json` states none of the table's dimensions; they follow from five fields:
@@ -113,7 +150,7 @@ Still to verify is the reuse on this line's activations. The tensor contract der
 | --- | --- |
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
 | GDN decode reuse, executed | slice B: the wrappers are shared in `pegainfer-kernels::ops` and the contract pins their geometry and tensor names, but nothing has run this line's GDN block against the reference. The model-graph fixture that does so is slice B's M0 exit (#1127); the GDN prefill path and the gated norm composition land with it. |
-| Real-weight goldens for the extracted component kernels | the dump scripts reading `Qwen/Qwen3.8-Flash-Next` at `de4b8e4d` one layer at a time (the checkpoint lives on the cluster; any single layer fits one GPU), and a decoder layer that calls the kernels in production order so each golden has a consumer |
+| Real-weight goldens for the extracted component kernels, including the routed experts | the dump scripts reading `Qwen/Qwen3.8-Flash-Next` at `de4b8e4d` one layer at a time (any single layer fits one GPU), and a decoder layer that calls the kernels in production order so each golden has a consumer |
 | Bookend gate (embedding → mixer → lm_head → argmax) | 1 GPU, three shards (1 + 130 + 131, 5.29 GB, ~2.6 GB of weights on device) and a CPU f64 reference for the mixer. No layer weights needed. |
 | HF golden fixtures (logits + intermediate probes) | the fleet — 360 GB, plus ≥102.4 GB host RAM if the n-gram table is materialized |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |

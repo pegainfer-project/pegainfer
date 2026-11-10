@@ -64,6 +64,7 @@ use pegainfer_kernels::ops::Qwen4MoeExpertScratch;
 use pegainfer_kernels::ops::Qwen4MoeGeometry;
 use pegainfer_kernels::ops::Qwen4SharedBranchScratch;
 use pegainfer_kernels::ops::gemm_into_checked;
+use pegainfer_kernels::ops::gemm_rows_into_checked;
 use pegainfer_kernels::ops::qwen4_moe_combine_into;
 use pegainfer_kernels::ops::qwen4_moe_route_into;
 use pegainfer_kernels::ops::qwen4_moe_route_scale_fold_into;
@@ -133,14 +134,33 @@ fn project(weight: &[bf16], row_offset: usize, rows: usize, cols: usize, x: &[f6
     out
 }
 
+/// A candidate activation, so the controls can state what a port with the wrong
+/// one would compute. The reference's is [`Activation::Silu`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Activation {
+    Silu,
+    /// The GELU tanh approximation the neighbouring lines use — the plausible
+    /// wrong pick when a port inherits its activation from another model.
+    GeluTanh,
+}
+
 /// The reference's `act(gate) * up` over a fused `[2 * intermediate]` row: the
 /// activation is rounded to bf16 before the product, as `torch.silu` on a bf16
 /// tensor materialises it.
-fn gated_activation(gate_up: &[bf16], intermediate: usize) -> Vec<bf16> {
+fn gated_activation(gate_up: &[bf16], intermediate: usize, act: Activation) -> Vec<bf16> {
     assert_eq!(gate_up.len(), 2 * intermediate);
     (0..intermediate)
         .map(|col| {
-            let gate = rounded(silu(f64::from(gate_up[col].to_f32())));
+            let gate = f64::from(gate_up[col].to_f32());
+            let gate = match act {
+                Activation::Silu => rounded(silu(gate)),
+                Activation::GeluTanh => rounded(
+                    0.5 * gate
+                        * (1.0
+                            + (0.797_884_560_802_865_4 * (gate + 0.044_715 * gate * gate * gate))
+                                .tanh()),
+                ),
+            };
             let up = f64::from(gate_up[intermediate + col].to_f32());
             bf16::from_f64(gate * up)
         })
@@ -237,6 +257,7 @@ fn routed_rows_reference(
     hidden: usize,
     intermediate: usize,
     swap_halves: bool,
+    act: Activation,
 ) -> Vec<bf16> {
     assert_eq!(x.len(), tokens * hidden);
     assert_eq!(ids.len(), tokens * top_k);
@@ -255,11 +276,17 @@ fn routed_rows_reference(
             } else {
                 fused
             };
-            let act: Vec<f64> = gated_activation(&fused, intermediate)
+            let activated: Vec<f64> = gated_activation(&fused, intermediate, act)
                 .iter()
                 .map(|value| f64::from(value.to_f32()))
                 .collect();
-            rows.extend(project(down, expert * hidden, hidden, intermediate, &act));
+            rows.extend(project(
+                down,
+                expert * hidden,
+                hidden,
+                intermediate,
+                &activated,
+            ));
         }
     }
     rows
@@ -308,6 +335,7 @@ fn fold_reference(
 
 /// The shared expert's reference: `down(silu(gate(x)) · up(x))`, its own bf16
 /// store at each of the reference's five rounding points.
+#[allow(clippy::too_many_arguments)]
 fn shared_reference(
     x: &[bf16],
     gate: &[bf16],
@@ -316,20 +344,31 @@ fn shared_reference(
     tokens: usize,
     hidden: usize,
     intermediate: usize,
+    swap_halves: bool,
+    act: Activation,
 ) -> Vec<bf16> {
     let mut out = Vec::with_capacity(tokens * hidden);
     for token in 0..tokens {
         let x_row = row_f64(&x[token * hidden..(token + 1) * hidden]);
-        let gate_row = project(gate, 0, intermediate, hidden, &x_row);
-        let up_row = project(up, 0, intermediate, hidden, &x_row);
+        let (gate_row, up_row) = if swap_halves {
+            (
+                project(up, 0, intermediate, hidden, &x_row),
+                project(gate, 0, intermediate, hidden, &x_row),
+            )
+        } else {
+            (
+                project(gate, 0, intermediate, hidden, &x_row),
+                project(up, 0, intermediate, hidden, &x_row),
+            )
+        };
         let mut fused = Vec::with_capacity(2 * intermediate);
         fused.extend_from_slice(&gate_row);
         fused.extend_from_slice(&up_row);
-        let act: Vec<f64> = gated_activation(&fused, intermediate)
+        let activated: Vec<f64> = gated_activation(&fused, intermediate, act)
             .iter()
             .map(|value| f64::from(value.to_f32()))
             .collect();
-        out.extend(project(down, 0, hidden, intermediate, &act));
+        out.extend(project(down, 0, hidden, intermediate, &activated));
     }
     out
 }
@@ -735,6 +774,7 @@ fn the_moe_block_matches_the_four_way_reference() {
             HIDDEN,
             INTERMEDIATE,
             false,
+            Activation::Silu,
         );
         let routed_reference = fold_reference(
             &routed_rows,
@@ -778,6 +818,8 @@ fn the_moe_block_matches_the_four_way_reference() {
             tokens,
             HIDDEN,
             INTERMEDIATE,
+            false,
+            Activation::Silu,
         );
         assert_within(
             "shared branch",
@@ -896,6 +938,7 @@ fn the_moe_block_matches_the_four_way_reference() {
             HIDDEN,
             INTERMEDIATE,
             true,
+            Activation::Silu,
         );
         assert_rejected(
             "control: fused projection halves swapped",
@@ -943,6 +986,51 @@ fn the_moe_block_matches_the_four_way_reference() {
             tokens,
             HIDDEN,
             bounds::COMBINED,
+        );
+        assert_rejected(
+            "control: gelu instead of silu in the routed path",
+            &routed_host,
+            &fold_reference(
+                &routed_rows_reference(
+                    &x,
+                    &host.gate_up,
+                    &host.down,
+                    &ids_host,
+                    tokens,
+                    TOP_K,
+                    HIDDEN,
+                    INTERMEDIATE,
+                    false,
+                    Activation::GeluTanh,
+                ),
+                &weights_host,
+                &ids_host,
+                tokens,
+                TOP_K,
+                HIDDEN,
+                Fold::Reference,
+            ),
+            tokens,
+            HIDDEN,
+            bounds::ROUTED,
+        );
+        assert_rejected(
+            "control: shared branch with gate|up swapped",
+            &shared_host,
+            &shared_reference(
+                &x,
+                &host.shared_gate,
+                &host.shared_up,
+                &host.shared_down,
+                tokens,
+                HIDDEN,
+                INTERMEDIATE,
+                true,
+                Activation::Silu,
+            ),
+            tokens,
+            HIDDEN,
+            bounds::SHARED,
         );
         assert_rejected(
             "control: router without norm_topk_prob",
@@ -1205,18 +1293,77 @@ fn the_routed_path_rejects_a_mismatched_call() {
     };
     geometry.validate().expect("a small-width geometry");
     let routes = tokens * TOP_K;
-    let stacks = Qwen4ExpertStacks::from_host(
+    // Adopted from device buffers — the path a shard loader takes — so both
+    // constructors are exercised on the same bytes.
+    let gate_up_host = noise(0x51EE_D2001, EXPERTS * 2 * intermediate * hidden, 0.5);
+    let down_host = noise(0x51EE_D2002, EXPERTS * hidden * intermediate, 0.5);
+    let stacks = Qwen4ExpertStacks::from_buffers(
         &ctx,
         &geometry,
         intermediate,
-        &noise(0x51EE_D2001, EXPERTS * 2 * intermediate * hidden, 0.5),
-        &noise(0x51EE_D2002, EXPERTS * hidden * intermediate, 0.5),
+        ctx.stream
+            .clone_htod(&gate_up_host)
+            .expect("gate|up stack up"),
+        ctx.stream.clone_htod(&down_host).expect("down stack up"),
     )
     .expect("small stacks");
     assert_eq!(
         stacks.layout().gate_up_len(),
         EXPERTS * 2 * intermediate * hidden
     );
+    assert_eq!(stacks.gate_up_stack().rows, EXPERTS * 2 * intermediate);
+    assert_eq!(stacks.down_stack().rows, EXPERTS * hidden);
+    // The per-expert views are the row ranges the shared offset-GEMM entry
+    // takes, so one expert's fused projection through it must equal the host
+    // reference for *that* expert's rows: this is what pins the stack's expert
+    // stride to the checkpoint's layout rather than to the layout's own
+    // arithmetic.
+    let expert = 5usize;
+    for (name, view, stack, cols, weight_host) in [
+        (
+            "gate|up",
+            stacks.gate_up_view(expert).expect("gate|up view"),
+            stacks.gate_up_stack(),
+            hidden,
+            &gate_up_host,
+        ),
+        (
+            "down",
+            stacks.down_view(expert).expect("down view"),
+            stacks.down_stack(),
+            intermediate,
+            &down_host,
+        ),
+    ] {
+        let probe = noise(0x51EE_D2010 ^ cols as u64, cols, 1.0);
+        let probe_states = upload(&ctx, &probe, cols, 1);
+        let mut projected = HiddenStates::zeros(&ctx, view.rows, 1).expect("projected");
+        gemm_rows_into_checked(
+            &ctx,
+            stack,
+            view.row_offset,
+            view.rows,
+            &probe_states,
+            &mut projected,
+        )
+        .expect("per-expert GEMM");
+        let want = project(
+            weight_host,
+            view.row_offset,
+            view.rows,
+            cols,
+            &row_f64(&probe),
+        );
+        assert_within(
+            &format!("expert {expert} {name} view through the offset GEMM"),
+            &read_back(&ctx, &projected),
+            &want,
+            1,
+            view.rows,
+            bounds::SHARED,
+        );
+    }
+
     let x = noise(0x51EE_D2003, tokens * hidden, 1.0);
     let hidden_states = upload(&ctx, &x, hidden, tokens);
     let mut scratch =
@@ -1281,6 +1428,21 @@ fn the_routed_path_rejects_a_mismatched_call() {
         )
         .is_err(),
         "a down stack with one element too many must be refused"
+    );
+    assert!(
+        Qwen4ExpertStacks::from_buffers(
+            &ctx,
+            &geometry,
+            intermediate,
+            ctx.stream
+                .alloc_zeros::<bf16>(layout.gate_up_len() - 1)
+                .expect("short stack"),
+            ctx.stream
+                .alloc_zeros::<bf16>(layout.down_len())
+                .expect("down stack"),
+        )
+        .is_err(),
+        "a device-resident gate|up stack one element short must be refused"
     );
     let other = Qwen4MoeGeometry {
         hidden: hidden + 1,

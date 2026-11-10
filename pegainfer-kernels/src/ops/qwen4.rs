@@ -1346,6 +1346,12 @@ impl Qwen4ExpertStacks {
     }
 }
 
+/// The largest route batch the routed-expert kernels accept, mirroring
+/// `kMaxRoutes` in `csrc/qwen4/qwen4_moe_experts.cu`. It exists so a caller
+/// learns the limit when it sizes its scratch instead of at a launch; 512 tokens
+/// x top-10 is 5120 routes, four times inside it.
+const MAX_ROUTES: usize = 16384;
+
 /// Caller-owned scratch for [`qwen4_moe_routed_experts_into`]: one row per
 /// `(token, slot)` route for each step of the reference's forward, plus the
 /// device pointer arrays the batched GEMMs read.
@@ -1407,11 +1413,14 @@ impl Qwen4MoeExpertScratch {
         let routes = tokens
             .checked_mul(geometry.top_k)
             .ok_or_else(|| anyhow!("routed expert routes overflow at {tokens} tokens"))?;
-        // The kernels take the route count and per-route extents as i32 and cap
-        // the batch at what cuBLAS accepts; refuse here rather than at a launch.
+        // The kernels take the route count as i32 and cap the batch at what
+        // cuBLAS accepts; refuse here so the limit surfaces where the scratch is
+        // sized rather than at a launch.
         ensure!(
-            i32::try_from(routes).is_ok(),
-            "routed expert route count {routes} does not fit i32"
+            routes <= MAX_ROUTES,
+            "routed expert {tokens} tokens x top-{} is {routes} routes, past the kernels' cap of \
+             {MAX_ROUTES}",
+            geometry.top_k
         );
         let alloc = |name: &str, hidden_dim: usize, rows: usize| {
             HiddenStates::zeros(ctx, hidden_dim, rows)
