@@ -14,12 +14,14 @@
 // x_seq: [num_channels, seq_len] bf16 (column-major: token i at offset i * num_channels)
 // Actually stored as [seq_len * num_channels] row-major (token i starts at i * num_channels)
 // out_seq: [seq_len * num_channels] bf16
-// conv_state: [num_channels, K-1] bf16 (updated with last K-1 values)
+// conv_state: [num_channels, K-1] bf16, read for the first K-1 positions. The
+// state is rewritten by conv1d_prefill_state_kernel in a launch of its own, so
+// no block here can read taps another block has already replaced.
 // ============================================================================
 __global__ void conv1d_prefill_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     const __nv_bfloat16* __restrict__ conv_weight,
-    __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ conv_state,
     __nv_bfloat16* __restrict__ out_seq,
     int num_channels,
     int seq_len,
@@ -58,23 +60,35 @@ __global__ void conv1d_prefill_kernel(
     float sum_bf16 = __bfloat162float(__float2bfloat16(sum));
     float silu_out = sum_bf16 / (1.0f + expf(-sum_bf16));
     out_seq[t * num_channels + c] = __float2bfloat16(silu_out);
+}
 
-    // Last (state_width) tokens update conv_state
-    // Only the last thread for each channel updates state
-    if (t == seq_len - 1) {
-        float old_state[4];
-        for (int i = 0; i < state_width; i++) {
-            old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
-        }
-        for (int i = 0; i < state_width; i++) {
-            int src_t = seq_len - state_width + i;
-            if (src_t >= 0) {
-                conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
-            } else {
-                int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
-                conv_state[c * state_width + i] =
-                    state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
-            }
+// The carried state after a prefill: the last K-1 inputs, taken from the old
+// state when the sequence is shorter than that. One thread per channel reads
+// the old taps before it writes, so the rewrite is ordered within the thread
+// and the conv kernel before it never sees the new taps.
+__global__ void conv1d_prefill_state_kernel(
+    const __nv_bfloat16* __restrict__ x_seq,
+    __nv_bfloat16* __restrict__ conv_state,
+    int num_channels,
+    int seq_len,
+    int kernel_size
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= num_channels) return;
+    int state_width = kernel_size - 1;
+
+    float old_state[4];
+    for (int i = 0; i < state_width; i++) {
+        old_state[i] = __bfloat162float(conv_state[c * state_width + i]);
+    }
+    for (int i = 0; i < state_width; i++) {
+        int src_t = seq_len - state_width + i;
+        if (src_t >= 0) {
+            conv_state[c * state_width + i] = x_seq[src_t * num_channels + c];
+        } else {
+            int state_idx = state_width + src_t;  // maps [-state_width, -1] → [0, state_width-1]
+            conv_state[c * state_width + i] =
+                state_idx >= 0 ? __float2bfloat16(old_state[state_idx]) : __float2bfloat16(0.0f);
         }
     }
 }
@@ -148,6 +162,10 @@ void conv1d_prefill_cuda(
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
         x_seq, conv_weight, conv_state, out_seq, num_channels, seq_len, kernel_size
+    );
+    int state_blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+    conv1d_prefill_state_kernel<<<state_blocks, CONV1D_BLOCK, 0, stream>>>(
+        x_seq, conv_state, num_channels, seq_len, kernel_size
     );
 }
 
