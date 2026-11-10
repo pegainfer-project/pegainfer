@@ -1290,9 +1290,9 @@ fn dflash_finish_publishes_last_sealed_block() {
     let blocks = encoded.len() / 16;
     assert!(blocks >= 8, "the text must span several blocks");
     // `prompt + response` is one token past the boundary, so the final served
-    // step seals a full block and then emits a partial tail. That is the case
-    // a finish publish can recover (the boundary token was forwarded); a turn
-    // ending exactly on the boundary ends on the uncaptured bonus token.
+    // step seals a full block and then emits a partial tail. The exact-boundary
+    // case is covered separately by
+    // `dflash_exact_boundary_matches_one_block_short`.
     let prompt_len = blocks * 16 + 1 - RESPONSE;
     let prompt_tokens = encoded[..prompt_len].to_vec();
 
@@ -1368,6 +1368,172 @@ fn dflash_finish_publishes_last_sealed_block() {
          the finish publish is missing",
         warm_base.num_drafts,
         warm_spec.num_drafts
+    );
+}
+
+/// A turn ending exactly on a block boundary leaves its last token (the verify
+/// bonus) dangling: kvbm stages the block it completes but registers it only
+/// after the next forward. The next turn must therefore match one block short
+/// and still draft; matching the full turn would attend to a row that was never
+/// written.
+#[test]
+fn dflash_exact_boundary_matches_one_block_short() {
+    const RESPONSE: usize = 20;
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(80);
+    let encoded = tokenizer.encode(&text, false).expect("encode failed");
+    let blocks = encoded.len() / 16;
+    assert!(blocks >= 8, "the text must span several blocks");
+    // `prompt + response` lands exactly on a block boundary, so the final token
+    // of the turn is the verify bonus, whose KV was never forwarded.
+    let prompt_len = blocks * 16 - RESPONSE;
+    let prompt_tokens = encoded[..prompt_len].to_vec();
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    let first = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            RESPONSE,
+        ))
+        .expect_finished();
+    assert_eq!(first.tokens.len(), RESPONSE);
+    assert_eq!(first.cached_tokens.unwrap_or(0), 0);
+    let first_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(first_spec.num_drafts > 0);
+
+    let mut second_prompt = prompt_tokens;
+    second_prompt.extend_from_slice(&first.tokens);
+    second_prompt.push(encoded[prompt_len]);
+    let warm_base = first_spec;
+    let second = engine
+        .submit(request(
+            second_prompt,
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            8,
+        ))
+        .expect_finished();
+    assert_eq!(
+        second.cached_tokens.unwrap_or(0),
+        (blocks - 1) * 16,
+        "the bonus-completed block must not be matchable"
+    );
+    let warm_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(
+        warm_spec.num_drafts > warm_base.num_drafts,
+        "a one-block-short match must still draft ({} -> {} drafts)",
+        warm_base.num_drafts,
+        warm_spec.num_drafts
+    );
+}
+
+/// Manual gate for the shared-prefix batch scenario: 64 warm requests on one
+/// 4000-token prefix must finish on a 46 GB card. The draft-state budget bounds
+/// the lane; because the step decision is all-or-nothing, the batch may record
+/// zero draft rounds (documented in `prefix-cache.md`).
+#[test]
+#[ignore = "manual 64-request shared-prefix liveness/memory gate"]
+fn dflash_shared_prefix_batch_stays_bounded() {
+    const PROMPT_TOKENS: usize = 4000;
+    const REQUESTS: usize = 64;
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(500);
+    let mut prompt = tokenizer.encode(&text, false).expect("encode failed");
+    assert!(
+        prompt.len() >= PROMPT_TOKENS,
+        "text only encoded to {} tokens",
+        prompt.len()
+    );
+    prompt.truncate(PROMPT_TOKENS);
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    let seed = engine
+        .submit(request(prompt.clone(), SamplingParams::default(), 16))
+        .expect_finished();
+    assert_eq!(
+        seed.cached_tokens.unwrap_or(0),
+        0,
+        "the seed turn must be cold"
+    );
+    let base = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+
+    let streams: Vec<_> = (0..REQUESTS)
+        .map(|_| {
+            engine.submit(request(
+                prompt.clone(),
+                SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                16,
+            ))
+        })
+        .collect();
+    let mut restored = 0;
+    for (i, stream) in streams.into_iter().enumerate() {
+        let outcome = stream.expect_finished();
+        let cached = outcome.cached_tokens.unwrap_or(0);
+        assert_eq!(outcome.tokens.len(), 16, "request {i} stopped early");
+        if cached > 0 {
+            restored += 1;
+        }
+    }
+    assert!(
+        restored >= REQUESTS / 2,
+        "only {restored}/{REQUESTS} requests hit the shared prefix"
+    );
+    let after = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    eprintln!(
+        "shared prefix batch: {restored}/{REQUESTS} restored, drafts {} -> {}",
+        base.num_drafts, after.num_drafts
     );
 }
 
