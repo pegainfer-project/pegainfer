@@ -52,7 +52,18 @@ impl Qwen3Executor {
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
         );
-        for req in plan.requests {
+        let mut requests = plan.requests.to_vec();
+        for req in &mut requests {
+            if let Some(rkv) = self.request_kvs.get(&req.request_id) {
+                req.capture_hashes = rkv
+                    .assigned_block_hashes()
+                    .into_iter()
+                    .map(|(_, hash)| hash)
+                    .collect();
+                req.sealed_tokens = rkv.kv_position();
+            }
+        }
+        for req in &requests {
             anyhow::ensure!(
                 !req.as_slice().is_empty(),
                 "speculative verify request {:?} has an empty verify span",
@@ -72,8 +83,8 @@ impl Qwen3Executor {
 
         // Reserve KV slots for each request's full K+1 verify span. Roll back
         // every prior reservation if any single one fails — all-or-nothing.
-        let mut scheduled = Vec::with_capacity(plan.requests.len());
-        for req in plan.requests {
+        let mut scheduled = Vec::with_capacity(requests.len());
+        for req in &requests {
             let span_len = req.as_slice().len();
             let rkv = self
                 .request_kvs
@@ -89,14 +100,13 @@ impl Qwen3Executor {
             scheduled.push(req.request_id);
         }
 
-        let kv_views = plan
-            .requests
+        let kv_views = requests
             .iter()
             .map(|req| self.request_kvs[&req.request_id].speculative_view(req.as_slice().len()))
             .collect();
 
         let step = StepCommand::SpeculativeVerify {
-            requests: plan.requests.to_vec(),
+            requests: requests.clone(),
             kv_views,
             sample_seed: plan.sample_seed,
             verify_round,
@@ -119,15 +129,15 @@ impl Qwen3Executor {
                 ));
             }
         };
-        if result.requests.len() != plan.requests.len() {
+        if result.requests.len() != requests.len() {
             self.revert_speculative_schedules(&scheduled);
             return Err(anyhow::anyhow!(
                 "speculative verify returned {} request results for {} requests",
                 result.requests.len(),
-                plan.requests.len()
+                requests.len()
             ));
         }
-        for (req, req_result) in plan.requests.iter().zip(&result.requests) {
+        for (req, req_result) in requests.iter().zip(&result.requests) {
             if req.request_id != req_result.request_id {
                 self.revert_speculative_schedules(&scheduled);
                 return Err(anyhow::anyhow!(
@@ -193,7 +203,7 @@ impl Qwen3Executor {
         }
 
         if let Some(counters) = self.spec_decode_counters.as_mut() {
-            for (req, req_result) in plan.requests.iter().zip(&result.requests) {
+            for (req, req_result) in requests.iter().zip(&result.requests) {
                 let num_draft_tokens = req.as_slice().len().saturating_sub(1);
                 // A load-gated round verifies a one-token span and proposes no
                 // draft; booking it as one would inflate the published draft
@@ -222,9 +232,18 @@ impl Qwen3Executor {
                 req.request_id
             );
         }
-        let step = StepCommand::SpeculativeDraft {
-            requests: plan.requests.to_vec(),
-        };
+        let mut requests = plan.requests.to_vec();
+        for req in &mut requests {
+            if let Some(rkv) = self.request_kvs.get(&req.request_id) {
+                req.capture_hashes = rkv
+                    .assigned_block_hashes()
+                    .into_iter()
+                    .map(|(_, hash)| hash)
+                    .collect();
+                req.sealed_tokens = rkv.kv_position();
+            }
+        }
+        let step = StepCommand::SpeculativeDraft { requests };
         match self.run_step(&step)? {
             WorkerStepOutcome::SpeculativeDraft(result) => Ok(result),
             other => Err(anyhow::anyhow!(

@@ -1,11 +1,12 @@
 //! DFlash prefill-capture eligibility predicates.
 //!
 //! A request can seed the DFlash draft only if its prefill produces clean target
-//! hidden states: no LoRA, no prefix-cache hit, no prompt logprobs, no
-//! completion logprobs. Sampling params are irrelevant here — the prompt's
-//! hidden states are sampling-independent, and sampled-verify (#512) speculates
-//! the full sampling surface, so capture is as valid for a sampled request as
-//! for a greedy one.
+//! hidden states: no LoRA, no prompt logprobs, no completion logprobs. A prefix
+//! hit is fine when the drafter's capture cache restored the matched rows; the
+//! continuity check below requires that state for any non-zero `chunk_start`.
+//! Sampling params are irrelevant here — the prompt's hidden states are
+//! sampling-independent, and sampled-verify (#512) speculates the full sampling
+//! surface, so capture is as valid for a sampled request as for a greedy one.
 
 use super::PrefillStepItem;
 use super::RequestId;
@@ -13,10 +14,7 @@ use super::RequestId;
 /// Whether a prefill produces clean target hidden states to seed a drafter
 /// (DFlash and EAGLE-3 alike).
 pub(super) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
-    req.lora_adapter.is_none()
-        && req.cached_tokens.unwrap_or(0) == 0
-        && req.logprobs.is_none()
-        && req.prompt_logprobs.is_none()
+    req.lora_adapter.is_none() && req.logprobs.is_none() && req.prompt_logprobs.is_none()
 }
 
 /// Eligible AND continuous: either the first chunk, or a later chunk whose

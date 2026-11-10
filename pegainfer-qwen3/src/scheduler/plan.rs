@@ -69,11 +69,12 @@ pub(crate) fn build_next_plan(
     // dedicated prefill step instead of degrading silently.
     let needs_prompt_logprobs = pending.iter().any(|req| req.prompt_logprobs.is_some());
     // Deliberately a loose superset of the real capture eligibility
-    // (`prefill_capture_supported`, which also needs `cached_tokens == 0 && no
-    // prompt logprobs`): over-routing an ineligible request to a dedicated
-    // prefill only costs one fusion, but under-routing a capture-eligible one
-    // into Unified would silently break its readiness. Never tighten this into
-    // the dangerous direction.
+    // (`prefill_capture_supported`, which also needs no prompt logprobs and, for
+    // a non-zero `chunk_start`, a capture state restored by the prefix hit):
+    // over-routing an ineligible request to a dedicated prefill only costs one
+    // fusion, but under-routing a capture-eligible one into Unified would
+    // silently break its readiness. Never tighten this into the dangerous
+    // direction.
     let needs_dflash_capture = speculative
         && pending
             .iter()
@@ -312,6 +313,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,
+                capture_prefix_hashes: Vec::new(),
             }
         })
         .collect()
