@@ -269,9 +269,15 @@ pub(crate) fn load_linear_layer(
         "layer {layer} is not a linear attention layer"
     );
     let g = Geometry::from_config(config);
-    // The routing kernels are compiled for one expert count and top-k; refuse
-    // another before anything is mapped.
+    // The routing kernels are compiled for one expert count and top-k, and the
+    // hyper-connection mix folds `1 / hc_count` into a multiply that is exact
+    // only for a power of two; refuse either before anything is mapped.
     g.moe().validate()?;
+    ensure!(
+        g.hc_count.is_power_of_two(),
+        "hc_count {} is not a power of two, which the hyper-connection mix kernels need",
+        g.hc_count
+    );
     let prefix = format!("{TEXT_PREFIX}layers.{layer}.");
     let (shard_paths, weight_map) = layer_shards(model_dir, &prefix)?;
     let mmaps = mmap_shards(&shard_paths)?;
