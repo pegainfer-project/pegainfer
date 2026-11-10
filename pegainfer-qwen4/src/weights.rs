@@ -16,6 +16,7 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_1d_f32;
 use pegainfer_core::weight_loader::mmap_shards;
+use pegainfer_kernels::ops::Qwen4MoeGeometry;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
@@ -80,6 +81,16 @@ impl Geometry {
     pub fn value_width(&self) -> usize {
         self.value_heads * self.value_dim
     }
+
+    /// The MoE block as the routing kernels see it.
+    pub fn moe(&self) -> Qwen4MoeGeometry {
+        Qwen4MoeGeometry {
+            hidden: self.hidden,
+            experts: self.experts,
+            top_k: self.top_k,
+            shared_intermediate: self.shared_intermediate,
+        }
+    }
 }
 
 pub struct HyperConnection {
@@ -132,10 +143,14 @@ pub(crate) fn load_config(model_dir: &Path) -> Result<Config> {
     Config::from_json(&serde_json::from_slice(&bytes)?)
 }
 
-/// The shards this layer lives in, and the name map into that subset.
+/// The shards this layer lives in, and the name map into that subset. A single
+/// file checkpoint has no index: its one shard is mapped and looked up by name.
 fn layer_shards(model_dir: &Path, prefix: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
     let model_dir = model_dir.to_str().context("model path is not UTF-8")?;
     let (paths, full_map) = load_shard_info(model_dir)?;
+    if full_map.is_empty() {
+        return Ok((paths, full_map));
+    }
     let mut used: Vec<usize> = full_map
         .iter()
         .filter(|(name, _)| name.starts_with(prefix))
@@ -254,6 +269,9 @@ pub(crate) fn load_linear_layer(
         "layer {layer} is not a linear attention layer"
     );
     let g = Geometry::from_config(config);
+    // The routing kernels are compiled for one expert count and top-k; refuse
+    // another before anything is mapped.
+    g.moe().validate()?;
     let prefix = format!("{TEXT_PREFIX}layers.{layer}.");
     let (shard_paths, weight_map) = layer_shards(model_dir, &prefix)?;
     let mmaps = mmap_shards(&shard_paths)?;

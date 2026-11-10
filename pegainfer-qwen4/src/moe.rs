@@ -5,7 +5,6 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use pegainfer_kernels::ops::Qwen4MoeGeometry;
 use pegainfer_kernels::ops::Qwen4SharedBranchScratch;
 use pegainfer_kernels::ops::gather_hidden_tokens_into;
 use pegainfer_kernels::ops::gemm_into_checked;
@@ -41,12 +40,7 @@ pub fn moe_prefill(
 ) -> Result<MoeTrace> {
     let tokens = hidden.seq_len;
     let pairs = tokens * g.top_k;
-    let geometry = Qwen4MoeGeometry {
-        hidden: g.hidden,
-        experts: g.experts,
-        top_k: g.top_k,
-        shared_intermediate: g.shared_intermediate,
-    };
+    let geometry = g.moe();
 
     let mut router_logits = HiddenStates::zeros(ctx, g.experts, tokens)?;
     gemm_into_checked(ctx, &w.router, hidden, &mut router_logits)?;
