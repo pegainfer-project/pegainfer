@@ -218,6 +218,11 @@ fn attention_prefill(
     mixed: &HiddenStates,
 ) -> Result<(AttentionTrace, HiddenStates)> {
     let rows = mixed.seq_len;
+    ensure!(
+        rows <= g.dense_attention_rows(),
+        "the prompt has {rows} tokens; past {} the reference's QSA drops keys and dense attention no longer matches it",
+        g.dense_attention_rows()
+    );
     let covered = rope.cos.len / g.rotary_dim;
     ensure!(
         rows <= covered,

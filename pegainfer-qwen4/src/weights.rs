@@ -39,6 +39,8 @@ pub struct Geometry {
     pub head_dim: usize,
     pub rotary_dim: usize,
     pub rope_theta: f32,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
@@ -64,6 +66,8 @@ impl Geometry {
             head_dim: text.head_dim,
             rotary_dim: config.rotary_dim,
             rope_theta: text.rope_parameters.rope_theta as f32,
+            indexer_budget: text.indexer_budget,
+            indexer_compress_ratio: text.indexer_compress_ratio,
             key_heads: text.linear_num_key_heads,
             value_heads: text.linear_num_value_heads,
             key_dim: text.linear_key_head_dim,
@@ -104,6 +108,14 @@ impl Geometry {
 
     pub fn kv_width(&self) -> usize {
         self.kv_heads * self.head_dim
+    }
+
+    /// The longest prompt whose QSA keeps every causal key: the indexer selects
+    /// at most `budget / ratio` complete blocks of `ratio` keys and always keeps
+    /// the incomplete tail, so up to this many rows dense causal attention is
+    /// the reference and past it the selection starts dropping blocks.
+    pub fn dense_attention_rows(&self) -> usize {
+        self.indexer_budget + self.indexer_compress_ratio - 1
     }
 
     /// The MoE block as the routing kernels see it.
