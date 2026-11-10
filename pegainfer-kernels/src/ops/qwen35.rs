@@ -564,11 +564,17 @@ pub fn attention_prefill_hd256_into(
         output.seq_len,
         plan.total_tokens
     );
+    q_full.checked_extent("hd256 prefill q_full")?;
+    k.checked_extent("hd256 prefill k")?;
+    v.checked_extent("hd256 prefill v")?;
+    q_prepped.checked_extent("hd256 prefill q_prepped")?;
+    output.checked_extent("hd256 prefill output")?;
     let PagedGeometry {
         k_offset_elems: k_offset,
         v_offset_elems: v_offset,
+        page_size,
+        num_pages,
         stride_page,
-        ..
     } = checked_paged_geometry(
         "hd256 prefill",
         layout,
@@ -578,6 +584,17 @@ pub fn attention_prefill_hd256_into(
         num_kv_heads,
         false,
     )?;
+    anyhow::ensure!(
+        plan.max_page_index < num_pages,
+        "hd256 prefill plan references page {} but the pool holds {num_pages} pages; the kernels \
+         compute addresses from page ids with no device-side bounds check",
+        plan.max_page_index
+    );
+    anyhow::ensure!(
+        plan.max_last_page_len <= page_size,
+        "hd256 prefill plan last page length {} exceeds page_size {page_size}",
+        plan.max_last_page_len
+    );
     let start_pos_d: CudaSlice<i32> = ctx.stream.clone_htod(&[crate::ops::checked_i32(
         start_pos,
         "hd256 prefill start_pos",
