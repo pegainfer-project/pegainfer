@@ -243,6 +243,14 @@ pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
 pub use qwen4::PleBlockGeometry;
 #[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4ExpertLayout;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4ExpertStacks;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4ExpertView;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4MoeExpertScratch;
+#[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4MoeGeometry;
 #[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4SharedBranchScratch;
@@ -266,6 +274,10 @@ pub use qwen4::qsa_indexer_select_into;
 pub use qwen4::qwen4_moe_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_route_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_route_scale_fold_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_routed_experts_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_shared_branch_into;
 #[cfg(feature = "qwen4")]

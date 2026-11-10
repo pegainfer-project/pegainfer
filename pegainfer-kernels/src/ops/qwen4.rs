@@ -31,6 +31,8 @@
 //! RMSNorms are calls to the grouped entry point above, on the stream in
 //! place. Frozen semantics: `csrc/qwen4/qwen4_ple_block.cu`.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::ensure;
@@ -43,8 +45,10 @@ use half::bf16;
 
 use crate::ffi;
 use crate::ops::checked_i32;
+use crate::ops::ffi_status_detail;
 use crate::ops::gemm_into_checked;
 use crate::ops::silu_mul_batch_into;
+use crate::ops::silu_mul_fused_batch_into;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -1048,6 +1052,690 @@ pub fn qwen4_moe_combine_into(
     }
     .result()
     .map_err(|err| anyhow!("Qwen3.8-FN MoE shared combine launch failed: {err}"))
+}
+
+// ── the routed experts ────────────────────────────────────────────────────
+
+/// One expert's row range inside a fused stack, as [`Qwen4ExpertLayout`] reports
+/// it: `(row_offset, rows, cols)` in the flattened stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4ExpertView {
+    /// First row of the expert's range in the flattened stack.
+    pub row_offset: usize,
+    /// Rows the range spans: `2 * intermediate` in the fused gate|up stack,
+    /// `hidden` in the down stack.
+    pub rows: usize,
+    /// Columns: `hidden` in the fused gate|up stack, `intermediate` in down.
+    pub cols: usize,
+}
+
+/// How one layer's two fused expert stacks flatten into rows.
+///
+/// The checkpoint stores `mlp.experts.gate_up_proj` `[experts, 2*intermediate,
+/// hidden]` and `mlp.experts.down_proj` `[experts, hidden, intermediate]`, both
+/// contiguous, with the expert as the **outermost** axis and **no `.weight`
+/// suffix** — two tensors per layer, not 1536. Flattened row-major that is
+/// `experts * 2*intermediate` rows of `hidden` and `experts * hidden` rows of
+/// `intermediate`, so an expert's weights are a contiguous row range and every
+/// per-expert entry point on the shared GEMM surface (`gemm_rows_into_checked`)
+/// takes them without a copy. `pegainfer-qwen4`'s manifest derives the same two
+/// headers (`ExpectedShape::ExpertStack`); this type is the device-side half of
+/// that contract, and it refuses anything the flattened view cannot express.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4ExpertLayout {
+    experts: usize,
+    hidden: usize,
+    intermediate: usize,
+    gate_up_len: usize,
+    down_len: usize,
+}
+
+impl Qwen4ExpertLayout {
+    /// Validate a MoE geometry and the routed-expert width, and derive both
+    /// stacks' flattened shapes. Device-free: a caller holding only a config can
+    /// check the layout without a device, and the lengths this returns are the
+    /// two allocations a loader has to find.
+    pub fn new(geometry: &Qwen4MoeGeometry, intermediate: usize) -> Result<Self> {
+        geometry.validate()?;
+        ensure!(
+            intermediate > 0,
+            "routed expert intermediate width must be non-zero"
+        );
+        // cuBLAS takes each expert's own extents, and the kernels take the
+        // expert and token strides, as i32. Both are checked here so no launch
+        // can see a truncated extent.
+        let gate_up_rows = intermediate.checked_mul(2).ok_or_else(|| {
+            anyhow!("routed expert fused gate|up rows overflow at intermediate {intermediate}")
+        })?;
+        for (what, value) in [
+            ("routed expert intermediate", intermediate),
+            ("routed expert hidden", geometry.hidden),
+            ("routed expert fused gate|up rows", gate_up_rows),
+        ] {
+            ensure!(
+                i32::try_from(value).is_ok(),
+                "{what} {value} does not fit i32"
+            );
+        }
+        let gate_up_len = geometry
+            .experts
+            .checked_mul(gate_up_rows)
+            .and_then(|rows| rows.checked_mul(geometry.hidden))
+            .ok_or_else(|| anyhow!("routed expert fused gate|up stack overflows usize"))?;
+        let down_len = geometry
+            .experts
+            .checked_mul(geometry.hidden)
+            .and_then(|rows| rows.checked_mul(intermediate))
+            .ok_or_else(|| anyhow!("routed expert down stack overflows usize"))?;
+        // The kernels compute offsets in 64-bit arithmetic; this is the bound
+        // the host-side allocation has to satisfy anyway.
+        for (what, value) in [
+            ("fused gate|up stack", gate_up_len),
+            ("down stack", down_len),
+        ] {
+            ensure!(
+                isize::try_from(value).is_ok(),
+                "routed expert {what} of {value} bf16 elements is not addressable"
+            );
+        }
+        Ok(Self {
+            experts: geometry.experts,
+            hidden: geometry.hidden,
+            intermediate,
+            gate_up_len,
+            down_len,
+        })
+    }
+
+    /// `num_experts`: the stack's outermost axis.
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+
+    /// `hidden_size`: the fused stack's column count, the down stack's row count
+    /// per expert.
+    pub fn hidden(&self) -> usize {
+        self.hidden
+    }
+
+    /// `moe_intermediate_size`: one expert's activation width.
+    pub fn intermediate(&self) -> usize {
+        self.intermediate
+    }
+
+    /// Rows one expert occupies in the fused gate|up stack: `2 * intermediate`,
+    /// gate first.
+    pub fn gate_up_rows(&self) -> usize {
+        2 * self.intermediate
+    }
+
+    /// Elements in the flattened fused gate|up stack.
+    pub fn gate_up_len(&self) -> usize {
+        self.gate_up_len
+    }
+
+    /// Elements in the flattened down stack.
+    pub fn down_len(&self) -> usize {
+        self.down_len
+    }
+
+    /// The fused gate|up rows of one expert: `[2 * intermediate, hidden]`,
+    /// the first `intermediate` rows gate and the rest up.
+    pub fn gate_up_of(&self, expert: usize) -> Result<Qwen4ExpertView> {
+        ensure!(
+            expert < self.experts,
+            "routed expert {expert} is outside the stack's {} experts",
+            self.experts
+        );
+        Ok(Qwen4ExpertView {
+            row_offset: expert * self.gate_up_rows(),
+            rows: self.gate_up_rows(),
+            cols: self.hidden,
+        })
+    }
+
+    /// The down rows of one expert: `[hidden, intermediate]`.
+    pub fn down_of(&self, expert: usize) -> Result<Qwen4ExpertView> {
+        ensure!(
+            expert < self.experts,
+            "routed expert {expert} is outside the stack's {} experts",
+            self.experts
+        );
+        Ok(Qwen4ExpertView {
+            row_offset: expert * self.hidden,
+            rows: self.hidden,
+            cols: self.intermediate,
+        })
+    }
+}
+
+/// One layer's two fused routed-expert stacks, resident on the device.
+///
+/// The stacks are stored as the checkpoint's bytes: the expert axis is outer and
+/// each expert's rows are contiguous, so nothing is copied or transposed to
+/// serve a per-expert GEMM. [`Self::from_host`] is the test path; the shard
+/// reader is slice B's loader, which can hand its own buffers to
+/// [`Self::from_buffers`] instead of materialising a host copy.
+pub struct Qwen4ExpertStacks {
+    layout: Qwen4ExpertLayout,
+    gate_up: DeviceMatrix,
+    down: DeviceMatrix,
+}
+
+impl Qwen4ExpertStacks {
+    /// Upload both stacks from host bytes, in the checkpoint's own layout.
+    ///
+    /// `gate_up` is `[experts, 2*intermediate, hidden]` and `down` is
+    /// `[experts, hidden, intermediate]`, both flattened row-major. The lengths
+    /// are part of the contract: a stack one expert short, or with the fused
+    /// halves swapped in shape, is refused rather than uploaded.
+    pub fn from_host(
+        ctx: &DeviceContext,
+        geometry: &Qwen4MoeGeometry,
+        intermediate: usize,
+        gate_up: &[bf16],
+        down: &[bf16],
+    ) -> Result<Self> {
+        let layout = Qwen4ExpertLayout::new(geometry, intermediate)?;
+        ensure!(
+            gate_up.len() == layout.gate_up_len(),
+            "fused gate|up stack holds {} bf16, the geometry needs {} \
+             ({} experts x {} rows x {})",
+            gate_up.len(),
+            layout.gate_up_len(),
+            layout.experts(),
+            layout.gate_up_rows(),
+            layout.hidden()
+        );
+        ensure!(
+            down.len() == layout.down_len(),
+            "down stack holds {} bf16, the geometry needs {} ({} experts x {} x {})",
+            down.len(),
+            layout.down_len(),
+            layout.experts(),
+            layout.hidden(),
+            layout.intermediate()
+        );
+        let gate_up = DeviceMatrix::from_host(
+            ctx,
+            gate_up,
+            layout.experts() * layout.gate_up_rows(),
+            layout.hidden(),
+        )?;
+        let down = DeviceMatrix::from_host(
+            ctx,
+            down,
+            layout.experts() * layout.hidden(),
+            layout.intermediate(),
+        )?;
+        Ok(Self {
+            layout,
+            gate_up,
+            down,
+        })
+    }
+
+    /// Adopt two device-resident stacks, checking their shapes against the
+    /// geometry. This is the loader's entry: no host copy, no re-upload.
+    pub fn from_buffers(
+        ctx: &DeviceContext,
+        geometry: &Qwen4MoeGeometry,
+        intermediate: usize,
+        gate_up: CudaSlice<bf16>,
+        down: CudaSlice<bf16>,
+    ) -> Result<Self> {
+        let layout = Qwen4ExpertLayout::new(geometry, intermediate)?;
+        ensure!(
+            gate_up.len() == layout.gate_up_len(),
+            "fused gate|up stack allocates {} bf16, the geometry needs {}",
+            gate_up.len(),
+            layout.gate_up_len()
+        );
+        ensure!(
+            down.len() == layout.down_len(),
+            "down stack allocates {} bf16, the geometry needs {}",
+            down.len(),
+            layout.down_len()
+        );
+        for (what, buffer) in [("fused gate|up", &gate_up), ("down", &down)] {
+            ensure!(
+                Arc::ptr_eq(buffer.stream(), &ctx.stream),
+                "routed expert {what} stack belongs to another device context"
+            );
+        }
+        Ok(Self {
+            layout,
+            gate_up: DeviceMatrix {
+                data: gate_up,
+                rows: layout.experts() * layout.gate_up_rows(),
+                cols: layout.hidden(),
+            },
+            down: DeviceMatrix {
+                data: down,
+                rows: layout.experts() * layout.hidden(),
+                cols: layout.intermediate(),
+            },
+        })
+    }
+
+    /// The layout the two buffers were checked against.
+    pub fn layout(&self) -> Qwen4ExpertLayout {
+        self.layout
+    }
+
+    /// The fused gate|up stack, flattened: `[experts * 2*intermediate, hidden]`.
+    /// A per-expert GEMM can take a row range of it through
+    /// [`crate::ops::gemm_rows_into_checked`].
+    pub fn gate_up_stack(&self) -> &DeviceMatrix {
+        &self.gate_up
+    }
+
+    /// The down stack, flattened: `[experts * hidden, intermediate]`.
+    pub fn down_stack(&self) -> &DeviceMatrix {
+        &self.down
+    }
+
+    /// One expert's gate|up rows.
+    pub fn gate_up_view(&self, expert: usize) -> Result<Qwen4ExpertView> {
+        self.layout.gate_up_of(expert)
+    }
+
+    /// One expert's down rows.
+    pub fn down_view(&self, expert: usize) -> Result<Qwen4ExpertView> {
+        self.layout.down_of(expert)
+    }
+}
+
+/// Caller-owned scratch for [`qwen4_moe_routed_experts_into`]: one row per
+/// `(token, slot)` route for each step of the reference's forward, plus the
+/// device pointer arrays the batched GEMMs read.
+///
+/// The capacity is `tokens * top_k` routes, fixed at construction, so a serving
+/// loop allocates nothing per step — the property a CUDA Graph capture needs and
+/// the reason the backend keeps no per-expert capacity at all.
+pub struct Qwen4MoeExpertScratch {
+    tokens: usize,
+    layout: Qwen4ExpertLayout,
+    gate_up_pointers: Qwen4RoutePointers,
+    down_pointers: Qwen4RoutePointers,
+    /// The fused gate|up projection's output, `[routes, 2 * intermediate]`.
+    gate_up: HiddenStates,
+    /// `silu(gate) * up`, `[routes, intermediate]`.
+    activation: HiddenStates,
+    /// The down projection's output, `[routes, hidden]`.
+    rows: HiddenStates,
+}
+
+/// The three pointer arrays one batched GEMM reads: `(weights, inputs,
+/// outputs)`, one entry per route, all device-resident.
+struct Qwen4RoutePointers {
+    weights: CudaSlice<u64>,
+    inputs: CudaSlice<u64>,
+    outputs: CudaSlice<u64>,
+}
+
+impl Qwen4RoutePointers {
+    fn new(ctx: &DeviceContext, routes: usize) -> Result<Self> {
+        let alloc = |name: &str| {
+            ctx.stream
+                .alloc_zeros::<u64>(routes)
+                .map_err(|err| anyhow!("routed expert {name} pointer array: {err}"))
+        };
+        Ok(Self {
+            weights: alloc("weight")?,
+            inputs: alloc("input")?,
+            outputs: alloc("output")?,
+        })
+    }
+}
+
+impl Qwen4MoeExpertScratch {
+    /// Allocate the scratch for `tokens` tokens' worth of routes. `tokens` must
+    /// be positive: an empty step issues no expert work, so it needs no scratch
+    /// and [`qwen4_moe_routed_experts_into`] returns before reading any.
+    pub fn new(
+        ctx: &DeviceContext,
+        geometry: &Qwen4MoeGeometry,
+        intermediate: usize,
+        tokens: usize,
+    ) -> Result<Self> {
+        let layout = Qwen4ExpertLayout::new(geometry, intermediate)?;
+        ensure!(
+            tokens > 0,
+            "routed expert scratch needs at least one token; an empty step has no expert work"
+        );
+        let routes = tokens
+            .checked_mul(geometry.top_k)
+            .ok_or_else(|| anyhow!("routed expert routes overflow at {tokens} tokens"))?;
+        // The kernels take the route count and per-route extents as i32 and cap
+        // the batch at what cuBLAS accepts; refuse here rather than at a launch.
+        ensure!(
+            i32::try_from(routes).is_ok(),
+            "routed expert route count {routes} does not fit i32"
+        );
+        let alloc = |name: &str, hidden_dim: usize, rows: usize| {
+            HiddenStates::zeros(ctx, hidden_dim, rows)
+                .map_err(|err| anyhow!("routed expert {name}: {err}"))
+        };
+        Ok(Self {
+            tokens,
+            layout,
+            gate_up_pointers: Qwen4RoutePointers::new(ctx, routes)?,
+            down_pointers: Qwen4RoutePointers::new(ctx, routes)?,
+            gate_up: alloc("gate|up output", layout.gate_up_rows(), routes)?,
+            activation: alloc("activation", layout.intermediate(), routes)?,
+            rows: alloc("down output", layout.hidden(), routes)?,
+        })
+    }
+
+    /// The token count this scratch was allocated for.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// The per-route rows this scratch holds: `tokens * top_k`.
+    pub fn routes(&self) -> usize {
+        self.rows.seq_len
+    }
+}
+
+/// Compute one layer's routed-expert output in bf16:
+/// `routed[token] = Σ_{experts ascending} bf16(y_e · w)`, the reference's fold.
+///
+/// `hidden` is the block's `[tokens, hidden]` input, `weights`/`ids` the routing
+/// kernel's `[tokens * top_k]` bf16 weights and i32 expert ids (route
+/// `token * top_k + slot`), `stacks` the layer's two fused expert stacks, and
+/// `routed` the `[tokens, hidden]` output. The four rounding points and the
+/// accumulation order are the reference's — see `csrc/qwen4/qwen4_moe_experts.cu`
+/// for the sequence and `tests/qwen4_moe_block_parity.rs` for the gate.
+///
+/// Backend: one N=1 cuBLAS GEMM per route against the route's own expert rows,
+/// driven by device-resident pointer arrays, with the grouping state the
+/// alternative needs absent by construction — an empty expert issues no call, a
+/// skewed one issues a call per row, and no host ever learns the counts. The
+/// cost is weight traffic (each expert's rows are read once per route), recorded
+/// in `docs/models/qwen4/bring-up.md`; a grouped backend is measured against
+/// this one rather than assumed better.
+///
+/// Nothing here allocates or synchronises, so a decode step is capturable.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_moe_routed_experts_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    stacks: &Qwen4ExpertStacks,
+    hidden: &HiddenStates,
+    weights: &CudaSlice<bf16>,
+    ids: &CudaSlice<i32>,
+    scratch: &mut Qwen4MoeExpertScratch,
+    routed: &mut HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    let layout = stacks.layout();
+    ensure!(
+        layout.experts() == geometry.experts && layout.hidden() == geometry.hidden,
+        "routed expert stacks are laid out for {} experts of {} columns, the geometry has {} of {}",
+        layout.experts(),
+        layout.hidden(),
+        geometry.experts,
+        geometry.hidden
+    );
+    ensure!(
+        hidden.hidden_dim == geometry.hidden,
+        "routed expert input carries {} columns, the geometry has {}",
+        hidden.hidden_dim,
+        geometry.hidden
+    );
+    let tokens = hidden.seq_len;
+    ensure!(
+        routed.hidden_dim == geometry.hidden && routed.seq_len == tokens,
+        "routed expert output is {}x{}, needs {tokens}x{}",
+        routed.seq_len,
+        routed.hidden_dim,
+        geometry.hidden
+    );
+    hidden.checked_extent("routed expert input")?;
+    routed.checked_extent("routed expert output")?;
+    let routes = tokens
+        .checked_mul(geometry.top_k)
+        .ok_or_else(|| anyhow!("routed expert routes overflow at {tokens} tokens"))?;
+    ensure!(
+        weights.len() >= routes,
+        "routed expert weights hold {} bf16, need {routes} for {tokens} tokens x top-{}",
+        weights.len(),
+        geometry.top_k
+    );
+    ensure!(
+        ids.len() >= routes,
+        "routed expert ids hold {} i32, need {routes}",
+        ids.len()
+    );
+    if tokens == 0 {
+        return Ok(());
+    }
+    ensure!(
+        scratch.tokens == tokens && scratch.layout == layout,
+        "routed expert scratch holds {} tokens of a {:?} layout, the call has {tokens} of {layout:?}",
+        scratch.tokens,
+        scratch.layout
+    );
+    for (what, stream) in [
+        ("input", hidden.data.stream()),
+        ("weights", weights.stream()),
+        ("ids", ids.stream()),
+        ("routed output", routed.data.stream()),
+    ] {
+        ensure!(
+            Arc::ptr_eq(stream, &ctx.stream),
+            "routed expert {what} belongs to another device context"
+        );
+    }
+
+    let routes_i32 = checked_i32(routes, "routed expert routes")?;
+    let top_k = checked_i32(geometry.top_k, "routed expert top_k")?;
+    let experts = checked_i32(geometry.experts, "routed expert experts")?;
+    let hidden_dim = checked_i32(geometry.hidden, "routed expert hidden")?;
+    let intermediate = checked_i32(layout.intermediate(), "routed expert intermediate")?;
+    let gate_up_rows = checked_i32(layout.gate_up_rows(), "routed expert gate|up rows")?;
+    let stream = active_cu_stream(ctx);
+
+    // 1. Resolve every route's expert and token into the two pointer arrays and
+    //    range-check the ids on the device.
+    {
+        let (ids_ptr, _ids_guard) = ids.device_ptr(&ctx.stream);
+        let (hidden_ptr, _hidden_guard) = hidden.data.device_ptr(&ctx.stream);
+        let (gate_up_ptr, _gu_guard) = stacks.gate_up.data.device_ptr(&ctx.stream);
+        let (down_ptr, _down_guard) = stacks.down.data.device_ptr(&ctx.stream);
+        let (proj_ptr, _proj_guard) = scratch.gate_up.data.device_ptr_mut(&ctx.stream);
+        let (act_ptr, _act_guard) = scratch.activation.data.device_ptr_mut(&ctx.stream);
+        let (rows_ptr, _rows_guard) = scratch.rows.data.device_ptr_mut(&ctx.stream);
+        let (a_gu, _a_gu) = scratch.gate_up_pointers.weights.device_ptr_mut(&ctx.stream);
+        let (x_gu, _x_gu) = scratch.gate_up_pointers.inputs.device_ptr_mut(&ctx.stream);
+        let (y_gu, _y_gu) = scratch.gate_up_pointers.outputs.device_ptr_mut(&ctx.stream);
+        let (a_d, _a_d) = scratch.down_pointers.weights.device_ptr_mut(&ctx.stream);
+        let (x_d, _x_d) = scratch.down_pointers.inputs.device_ptr_mut(&ctx.stream);
+        let (y_d, _y_d) = scratch.down_pointers.outputs.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::qwen4_moe_route_pointers_cuda(
+                ids_ptr as *const i32,
+                hidden_ptr as *const ffi::Half,
+                gate_up_ptr as *const ffi::Half,
+                down_ptr as *const ffi::Half,
+                proj_ptr as *mut ffi::Half,
+                act_ptr as *mut ffi::Half,
+                rows_ptr as *mut ffi::Half,
+                a_gu as *mut *const ffi::Half,
+                x_gu as *mut *const ffi::Half,
+                y_gu as *mut *mut ffi::Half,
+                a_d as *mut *const ffi::Half,
+                x_d as *mut *const ffi::Half,
+                y_d as *mut *mut ffi::Half,
+                routes_i32,
+                top_k,
+                experts,
+                hidden_dim,
+                intermediate,
+                stream,
+            )
+        }
+        .result()
+        .map_err(|err| anyhow!("routed expert pointer assembly launch failed: {err}"))?;
+    }
+
+    // 2. `gate, up = F.linear(x, gate_up_proj[e])`: one batched GEMM over the
+    //    routes, each against its own expert's rows, output bf16.
+    pointer_gemm_into(
+        ctx,
+        &scratch.gate_up_pointers,
+        &scratch.gate_up.data,
+        gate_up_rows,
+        hidden_dim,
+        routes_i32,
+    )?;
+
+    // 3. `h = silu(gate) * up`: the shared entry point, which rounds the
+    //    activation to bf16 before the product exactly as the reference does.
+    silu_mul_fused_batch_into(ctx, &scratch.gate_up, &mut scratch.activation)?;
+
+    // 4. `y = F.linear(h, down_proj[e])`, same batched shape.
+    pointer_gemm_into(
+        ctx,
+        &scratch.down_pointers,
+        &scratch.rows.data,
+        hidden_dim,
+        intermediate,
+        routes_i32,
+    )?;
+
+    // 5. Scale by the routing weight and fold in ascending expert index.
+    qwen4_moe_route_scale_fold_into(ctx, geometry, &scratch.rows, weights, ids, routed)
+}
+
+/// Fold one route batch into per-token outputs:
+/// `out[token] = Σ_{experts ascending} bf16(bf16(rows[route] · w[route]))`.
+///
+/// This is the reference's `final_hidden_states.index_add_` half — the routing
+/// scale rounds to bf16 first, and the accumulator rounds once per contribution
+/// because the reference's accumulator is a bf16 tensor, not because this
+/// implementation chose to. Contributions are visited in **ascending expert
+/// index** (the reference's expert loop is outer), which is not slot order:
+/// `tests/qwen4_moe_block_parity.rs` shows a case where the two differ bit for
+/// bit. Ids outside `[0, experts)` fail the token closed with a NaN row.
+///
+/// `rows` is `[tokens * top_k, hidden]` indexed by route (`token * top_k +
+/// slot`), `weights`/`ids` that route array, and `out` `[tokens, hidden]`. Any
+/// per-route backend produces `rows`, so this stage is public on its own.
+pub fn qwen4_moe_route_scale_fold_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    rows: &HiddenStates,
+    weights: &CudaSlice<bf16>,
+    ids: &CudaSlice<i32>,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    ensure!(
+        rows.hidden_dim == geometry.hidden,
+        "routed fold rows carry {} columns, the geometry has {}",
+        rows.hidden_dim,
+        geometry.hidden
+    );
+    ensure!(
+        rows.seq_len.is_multiple_of(geometry.top_k),
+        "routed fold holds {} rows, which is not a whole number of top-{} picks",
+        rows.seq_len,
+        geometry.top_k
+    );
+    let tokens = rows.seq_len / geometry.top_k;
+    ensure!(
+        out.hidden_dim == geometry.hidden && out.seq_len == tokens,
+        "routed fold output is {}x{}, needs {tokens}x{}",
+        out.seq_len,
+        out.hidden_dim,
+        geometry.hidden
+    );
+    ensure!(
+        weights.len() >= rows.seq_len,
+        "routed fold weights hold {} bf16, need {} rows",
+        weights.len(),
+        rows.seq_len
+    );
+    ensure!(
+        ids.len() >= rows.seq_len,
+        "routed fold ids hold {} i32, need {} rows",
+        ids.len(),
+        rows.seq_len
+    );
+    rows.checked_extent("routed fold rows")?;
+    out.checked_extent("routed fold output")?;
+    if tokens == 0 {
+        return Ok(());
+    }
+    let tokens = checked_i32(tokens, "routed fold tokens")?;
+    let top_k = checked_i32(geometry.top_k, "routed fold top_k")?;
+    let experts = checked_i32(geometry.experts, "routed fold experts")?;
+    let hidden = checked_i32(geometry.hidden, "routed fold hidden")?;
+
+    let (rows_ptr, _rows_guard) = rows.data.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
+    let (ids_ptr, _ids_guard) = ids.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_route_scale_fold_cuda(
+            rows_ptr as *const ffi::Half,
+            weights_ptr as *const ffi::Half,
+            ids_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            tokens,
+            top_k,
+            experts,
+            hidden,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("routed expert fold launch failed: {err}"))
+}
+
+/// One batched pointer GEMM over `routes` N=1 problems, into `rows`' backing.
+fn pointer_gemm_into(
+    ctx: &DeviceContext,
+    pointers: &Qwen4RoutePointers,
+    rows: &CudaSlice<bf16>,
+    m: i32,
+    k: i32,
+    routes: i32,
+) -> Result<()> {
+    let (weights, _weights_guard) = pointers.weights.device_ptr(&ctx.stream);
+    let (inputs, _inputs_guard) = pointers.inputs.device_ptr(&ctx.stream);
+    let (outputs, _outputs_guard) = pointers.outputs.device_ptr(&ctx.stream);
+    ensure!(
+        rows.len() >= rows_span(m, routes),
+        "routed expert GEMM output holds {} bf16, needs {}",
+        rows.len(),
+        rows_span(m, routes)
+    );
+    let status = unsafe {
+        ffi::qwen4_moe_pointer_gemm_cuda(
+            weights as *const *const core::ffi::c_void,
+            inputs as *const *const core::ffi::c_void,
+            outputs as *const *mut core::ffi::c_void,
+            m,
+            k,
+            routes,
+            active_cu_stream(ctx),
+        )
+    };
+    ensure!(
+        status == 0,
+        "routed expert pointer GEMM failed: {}, m={m}, k={k}, routes={routes}",
+        ffi_status_detail(status)
+    );
+    Ok(())
+}
+
+/// Elements the routed expert output rows must hold: `routes * m`.
+fn rows_span(m: i32, routes: i32) -> usize {
+    (m.max(0) as usize).saturating_mul(routes.max(0) as usize)
 }
 
 /// The checkpoint's PLE block geometry. Frozen with the line: `pegainfer-qwen4`

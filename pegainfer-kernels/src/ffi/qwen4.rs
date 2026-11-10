@@ -152,6 +152,68 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    /// Resolve one batch of `(token, slot)` routes into the pointer arrays the
+    /// routed-expert GEMMs consume. `ids` is the routing kernel's `[routes]`
+    /// i32 output (`route = token * top_k + slot`), `hidden` is `[tokens,
+    /// hidden]`, the two stacks are the fused `[experts, ...]` tensors, and
+    /// `gate_up` / `activation` / `rows` are the batch's own scratch rows.
+    ///
+    /// An id outside `[0, experts)` is replaced by expert 0 so the formed
+    /// pointer stays inside the stack; the fold writes NaN for that token.
+    pub fn qwen4_moe_route_pointers_cuda(
+        ids: *const i32,
+        hidden: *const Half,
+        gate_up_weights: *const Half,
+        down_weights: *const Half,
+        gate_up: *mut Half,
+        activation: *mut Half,
+        rows: *mut Half,
+        a_gate_up: *mut *const Half,
+        x_gate_up: *mut *const Half,
+        y_gate_up: *mut *mut Half,
+        a_down: *mut *const Half,
+        x_down: *mut *const Half,
+        y_down: *mut *mut Half,
+        routes: i32,
+        top_k: i32,
+        experts: i32,
+        hidden_dim: i32,
+        intermediate: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// One batched bf16 GEMM over device-resident pointers: route `r` computes
+    /// `y[r] = w[r] @ x[r]` with `w` row-major `[m, k]`, `x` `[k]`, `y` `[m]`,
+    /// f32 accumulation into a bf16 store. Returns a cublas/cuda status, not a
+    /// `CUresult`.
+    pub fn qwen4_moe_pointer_gemm_cuda(
+        weights: *const *const core::ffi::c_void,
+        inputs: *const *const core::ffi::c_void,
+        outputs: *const *mut core::ffi::c_void,
+        m: i32,
+        k: i32,
+        routes: i32,
+        stream: CUstream,
+    ) -> std::os::raw::c_int;
+
+    /// Fold one route batch into per-token outputs in the reference's order:
+    /// ascending expert index, a bf16 rounding after every add, the routing
+    /// scale rounded to bf16 first. `rows` is `[tokens * top_k, hidden]`, the
+    /// weights and ids `[tokens * top_k]`, `out` `[tokens, hidden]`.
+    pub fn qwen4_moe_route_scale_fold_cuda(
+        rows: *const Half,
+        weights: *const Half,
+        ids: *const i32,
+        out: *mut Half,
+        tokens: i32,
+        top_k: i32,
+        experts: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+}
+
+unsafe extern "C" {
     /// One gate scalar per (row, branch) — the per-branch dot, its double
     /// rounding around the `1 / sqrt_hidden` divide, the signed sqrt and the
     /// sigmoid — times `value`, broadcast over the branches that share it.
