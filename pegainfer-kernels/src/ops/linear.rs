@@ -498,6 +498,57 @@ pub fn gemm_rows_span_into_checked(
     )
 }
 
+/// Row-range GEMM over a token span of `x`, written into a token span of `out`:
+/// `Y[out_row0..out_row0+span] = W[row_offset..row_offset+num_rows, :] @ X[x_row0..x_row0+span]`.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_rows_span_at_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    row_offset: usize,
+    num_rows: usize,
+    x: &HiddenStates,
+    x_row0: usize,
+    out: &mut HiddenStates,
+    out_row0: usize,
+    span: usize,
+) -> Result<()> {
+    assert!(row_offset + num_rows <= weight.rows);
+    assert_eq!(weight.cols, x.hidden_dim);
+    assert_eq!(out.hidden_dim, num_rows);
+    assert!(
+        x_row0 + span <= x.seq_len,
+        "x span [{x_row0}, {x_row0}+{span}) exceeds x.seq_len {}",
+        x.seq_len
+    );
+    assert!(
+        out_row0 + span <= out.seq_len,
+        "out span [{out_row0}, {out_row0}+{span}) exceeds out.seq_len {}",
+        out.seq_len
+    );
+    if span == 0 {
+        return Ok(());
+    }
+
+    let elem = std::mem::size_of::<half::bf16>();
+    let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
+    let w_sub = w_ptr + (row_offset * weight.cols * elem) as u64;
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let x_sub = x_ptr + (x_row0 * x.hidden_dim * elem) as u64;
+    let (y_ptr, _gy) = out.data.device_ptr_mut(&ctx.stream);
+    let y_sub = y_ptr + (out_row0 * out.hidden_dim * elem) as u64;
+
+    launch_gemm(
+        w_sub as *const ffi::Half,
+        x_sub as *const ffi::Half,
+        y_sub as *mut ffi::Half,
+        num_rows,
+        span,
+        weight.cols,
+        span == 1,
+        ctx,
+    )
+}
+
 /// Matrix-vector multiplication: y = A @ x (via cuBLAS GEMM with N=1)
 /// A: (M, K) row-major, x: (K,), y: (M,)
 pub fn gemv(ctx: &DeviceContext, a: &DeviceMatrix, x: &DeviceVec, y: &mut DeviceVec) -> Result<()> {

@@ -2,7 +2,7 @@ use criterion::BenchmarkId;
 use criterion::Criterion;
 use criterion::Throughput;
 use pegainfer_core::tensor::DeviceContext;
-use pegainfer_qwen35::prefill_buffers::GdrChunkwiseScratch35;
+use pegainfer_kernels::ops::GdrChunkwiseScratch35;
 use pegainfer_qwen35::runtime_ops as ops;
 
 use super::common::QWEN35_4B_LINEAR_K_DIM;
