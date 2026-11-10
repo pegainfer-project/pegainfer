@@ -282,8 +282,8 @@ jobs:
                "extra_packages": "-p pegainfer-kernels", "feature": "deepseek-v2-lite", "cuda_sm": "80",
                "needs_triton": false, "triton_python": "", "needs_nccl": false},
               {"key": "qwen4", "model_name": "Qwen4", "package": "pegainfer-qwen4",
-               "extra_packages": "-p pegainfer-kernels", "feature": "pegainfer-kernels/qwen4", "cuda_sm": "80",
-               "needs_triton": false, "triton_python": "", "needs_nccl": false}
+               "extra_packages": "-p pegainfer-kernels", "feature": "pegainfer-qwen4/qwen4", "cuda_sm": "80",
+               "needs_triton": true, "triton_python": "python", "needs_nccl": false}
             ]
         run: |
           set -euo pipefail
