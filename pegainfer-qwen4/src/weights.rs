@@ -34,6 +34,13 @@ pub struct Geometry {
     pub hidden: usize,
     pub hc_count: usize,
     pub hc_lowrank: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub rotary_dim: usize,
+    pub rope_theta: f32,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
@@ -54,6 +61,13 @@ impl Geometry {
             hidden: text.hidden_size,
             hc_count: text.hc_count,
             hc_lowrank: text.hc_lowrank,
+            heads: text.num_attention_heads,
+            kv_heads: text.num_key_value_heads,
+            head_dim: text.head_dim,
+            rotary_dim: config.rotary_dim,
+            rope_theta: text.rope_parameters.rope_theta as f32,
+            indexer_budget: text.indexer_budget,
+            indexer_compress_ratio: text.indexer_compress_ratio,
             key_heads: text.linear_num_key_heads,
             value_heads: text.linear_num_value_heads,
             key_dim: text.linear_key_head_dim,
@@ -80,6 +94,28 @@ impl Geometry {
 
     pub fn value_width(&self) -> usize {
         self.value_heads * self.value_dim
+    }
+
+    /// Width of the attention output, `o_proj`'s input.
+    pub fn attn_width(&self) -> usize {
+        self.heads * self.head_dim
+    }
+
+    /// Width of the `q_proj` output: `[q | gate]` per head.
+    pub fn q_width(&self) -> usize {
+        2 * self.attn_width()
+    }
+
+    pub fn kv_width(&self) -> usize {
+        self.kv_heads * self.head_dim
+    }
+
+    /// The longest prompt whose QSA keeps every causal key: the indexer selects
+    /// at most `budget / ratio` complete blocks of `ratio` keys and always keeps
+    /// the incomplete tail, so up to this many rows dense causal attention is
+    /// the reference and past it the selection starts dropping blocks.
+    pub fn dense_attention_rows(&self) -> usize {
+        self.indexer_budget + self.indexer_compress_ratio - 1
     }
 
     /// The MoE block as the routing kernels see it.
@@ -114,6 +150,22 @@ pub struct GatedDeltaNet {
     pub out_proj: DeviceMatrix,
 }
 
+pub struct FullAttention {
+    /// `[q | gate]` per head, so twice the attention width tall.
+    pub q_proj: DeviceMatrix,
+    pub k_proj: DeviceMatrix,
+    pub v_proj: DeviceMatrix,
+    pub o_proj: DeviceMatrix,
+    /// The checkpoint's `w`; the kernels add the 1.
+    pub q_norm: DeviceVec,
+    pub k_norm: DeviceVec,
+}
+
+pub enum Mixer {
+    Linear(GatedDeltaNet),
+    Full(FullAttention),
+}
+
 pub struct MoeBlock {
     pub router: DeviceMatrix,
     pub shared_gate_proj: DeviceMatrix,
@@ -126,9 +178,9 @@ pub struct MoeBlock {
     pub down: DeviceMatrix,
 }
 
-pub struct LinearLayer {
+pub struct DecoderLayer {
     pub attn_hc: HyperConnection,
-    pub gdn: GatedDeltaNet,
+    pub mixer: Mixer,
     pub mlp_hc: HyperConnection,
     pub moe: MoeBlock,
 }
@@ -252,21 +304,186 @@ fn take_hc(loader: &mut StagedWeightLoader, slots: &HcSlots) -> HyperConnection 
     }
 }
 
-/// Load one `linear_attention` decoder layer. Only the shards holding that layer
-/// are mapped, so a checkpoint cut down to those shards loads too.
+struct GdnSlots {
+    in_proj_qkv: SlotId,
+    in_proj_z: SlotId,
+    in_proj_b: SlotId,
+    in_proj_a: SlotId,
+    dt_bias: VecSlotId,
+    out_proj: SlotId,
+}
+
+fn record_gdn(loader: &mut StagedWeightLoader, prefix: &str, g: &Geometry) -> Result<GdnSlots> {
+    Ok(GdnSlots {
+        in_proj_qkv: loader.matrix(
+            &format!("{prefix}.in_proj_qkv.weight"),
+            g.qkv_width(),
+            g.hidden,
+        )?,
+        in_proj_z: loader.matrix(
+            &format!("{prefix}.in_proj_z.weight"),
+            g.value_width(),
+            g.hidden,
+        )?,
+        in_proj_b: loader.matrix(
+            &format!("{prefix}.in_proj_b.weight"),
+            g.value_heads,
+            g.hidden,
+        )?,
+        in_proj_a: loader.matrix(
+            &format!("{prefix}.in_proj_a.weight"),
+            g.value_heads,
+            g.hidden,
+        )?,
+        dt_bias: loader.vector(&format!("{prefix}.dt_bias"), g.value_heads)?,
+        out_proj: loader.matrix(
+            &format!("{prefix}.out_proj.weight"),
+            g.hidden,
+            g.value_width(),
+        )?,
+    })
+}
+
+/// The staged slots plus the three tensors the kernels read outside the bf16
+/// matrix path (the conv taps as one vector, `A_log` and the norm weight in f32).
+fn take_gdn(
+    ctx: &DeviceContext,
+    loader: &mut StagedWeightLoader,
+    slots: &GdnSlots,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    prefix: &str,
+) -> Result<GatedDeltaNet> {
+    Ok(GatedDeltaNet {
+        in_proj_qkv: loader.take(slots.in_proj_qkv),
+        in_proj_z: loader.take(slots.in_proj_z),
+        in_proj_b: loader.take(slots.in_proj_b),
+        in_proj_a: loader.take(slots.in_proj_a),
+        conv_weight: load_tensor_1d(ctx, shards, weight_map, &format!("{prefix}.conv1d.weight"))?,
+        dt_bias: loader.take_vec(slots.dt_bias),
+        a_log: load_tensor_1d_f32(ctx, shards, weight_map, &format!("{prefix}.A_log"))?,
+        norm_weight: load_tensor_1d_f32(ctx, shards, weight_map, &format!("{prefix}.norm.weight"))?,
+        out_proj: loader.take(slots.out_proj),
+    })
+}
+
+struct AttentionSlots {
+    q_proj: SlotId,
+    k_proj: SlotId,
+    v_proj: SlotId,
+    o_proj: SlotId,
+    q_norm: VecSlotId,
+    k_norm: VecSlotId,
+}
+
+fn record_attention(
+    loader: &mut StagedWeightLoader,
+    prefix: &str,
+    g: &Geometry,
+) -> Result<AttentionSlots> {
+    Ok(AttentionSlots {
+        q_proj: loader.matrix(&format!("{prefix}.q_proj.weight"), g.q_width(), g.hidden)?,
+        k_proj: loader.matrix(&format!("{prefix}.k_proj.weight"), g.kv_width(), g.hidden)?,
+        v_proj: loader.matrix(&format!("{prefix}.v_proj.weight"), g.kv_width(), g.hidden)?,
+        o_proj: loader.matrix(&format!("{prefix}.o_proj.weight"), g.hidden, g.attn_width())?,
+        q_norm: loader.vector(&format!("{prefix}.q_norm.weight"), g.head_dim)?,
+        k_norm: loader.vector(&format!("{prefix}.k_norm.weight"), g.head_dim)?,
+    })
+}
+
+fn take_attention(loader: &mut StagedWeightLoader, slots: &AttentionSlots) -> FullAttention {
+    FullAttention {
+        q_proj: loader.take(slots.q_proj),
+        k_proj: loader.take(slots.k_proj),
+        v_proj: loader.take(slots.v_proj),
+        o_proj: loader.take(slots.o_proj),
+        q_norm: loader.take_vec(slots.q_norm),
+        k_norm: loader.take_vec(slots.k_norm),
+    }
+}
+
+enum MixerSlots {
+    Linear(GdnSlots),
+    Full(AttentionSlots),
+}
+
+struct MoeSlots {
+    router: SlotId,
+    shared_gate_proj: SlotId,
+    shared_up_proj: SlotId,
+    shared_down_proj: SlotId,
+    shared_gate: SlotId,
+    gate_up: SlotId,
+    down: SlotId,
+}
+
+fn record_moe(loader: &mut StagedWeightLoader, prefix: &str, g: &Geometry) -> Result<MoeSlots> {
+    Ok(MoeSlots {
+        router: loader.matrix(&format!("{prefix}.gate.weight"), g.experts, g.hidden)?,
+        shared_gate_proj: loader.matrix(
+            &format!("{prefix}.shared_expert.gate_proj.weight"),
+            g.shared_intermediate,
+            g.hidden,
+        )?,
+        shared_up_proj: loader.matrix(
+            &format!("{prefix}.shared_expert.up_proj.weight"),
+            g.shared_intermediate,
+            g.hidden,
+        )?,
+        shared_down_proj: loader.matrix(
+            &format!("{prefix}.shared_expert.down_proj.weight"),
+            g.hidden,
+            g.shared_intermediate,
+        )?,
+        shared_gate: loader.matrix(&format!("{prefix}.shared_expert_gate.weight"), 1, g.hidden)?,
+        gate_up: loader.expert_stack(
+            &format!("{prefix}.experts.gate_up_proj"),
+            g.experts,
+            2 * g.moe_intermediate,
+            g.hidden,
+        )?,
+        down: loader.expert_stack(
+            &format!("{prefix}.experts.down_proj"),
+            g.experts,
+            g.hidden,
+            g.moe_intermediate,
+        )?,
+    })
+}
+
+fn take_moe(loader: &mut StagedWeightLoader, slots: &MoeSlots) -> MoeBlock {
+    MoeBlock {
+        router: loader.take(slots.router),
+        shared_gate_proj: loader.take(slots.shared_gate_proj),
+        shared_up_proj: loader.take(slots.shared_up_proj),
+        shared_down_proj: loader.take(slots.shared_down_proj),
+        shared_gate: loader.take(slots.shared_gate),
+        gate_up: loader.take(slots.gate_up),
+        down: loader.take(slots.down),
+    }
+}
+
+/// Load one decoder layer. Only the shards holding that layer are mapped, so a
+/// checkpoint cut down to those shards loads too.
 #[cfg_attr(
     not(test),
     allow(dead_code, reason = "the model line is the next caller")
 )]
-pub(crate) fn load_linear_layer(
+pub(crate) fn load_layer(
     ctx: &DeviceContext,
     model_dir: &Path,
     config: &Config,
     layer: usize,
-) -> Result<LinearLayer> {
+) -> Result<DecoderLayer> {
+    let kind = *config.layer_kinds.get(layer).with_context(|| {
+        format!(
+            "layer {layer} is past the model's {} layers",
+            config.layer_kinds.len()
+        )
+    })?;
     ensure!(
-        config.layer_kinds.get(layer) == Some(&LayerKind::LinearAttention),
-        "layer {layer} is not a linear attention layer"
+        layer != config.ple_layer,
+        "layer {layer} carries the PLE block, which nothing loads yet"
     );
     let g = Geometry::from_config(config);
     // The routing kernels are compiled for one expert count and top-k, and the
@@ -283,105 +500,52 @@ pub(crate) fn load_linear_layer(
     let mmaps = mmap_shards(&shard_paths)?;
     let shards = deserialize_shards(&mmaps)?;
     check_layer_contract(config, &prefix, &shards, &weight_map)?;
-    let name = |suffix: &str| format!("{prefix}{suffix}");
 
     let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
-    let attn_hc = record_hc(&mut loader, &name("attn_hyper_connection"), &g, true)?;
-    let mlp_hc = record_hc(&mut loader, &name("mlp_hyper_connection"), &g, true)?;
-    let in_proj_qkv = loader.matrix(
-        &name("linear_attn.in_proj_qkv.weight"),
-        g.qkv_width(),
-        g.hidden,
+    let attn_hc = record_hc(
+        &mut loader,
+        &format!("{prefix}attn_hyper_connection"),
+        &g,
+        true,
     )?;
-    let in_proj_z = loader.matrix(
-        &name("linear_attn.in_proj_z.weight"),
-        g.value_width(),
-        g.hidden,
+    let mlp_hc = record_hc(
+        &mut loader,
+        &format!("{prefix}mlp_hyper_connection"),
+        &g,
+        true,
     )?;
-    let in_proj_b = loader.matrix(
-        &name("linear_attn.in_proj_b.weight"),
-        g.value_heads,
-        g.hidden,
-    )?;
-    let in_proj_a = loader.matrix(
-        &name("linear_attn.in_proj_a.weight"),
-        g.value_heads,
-        g.hidden,
-    )?;
-    let dt_bias = loader.vector(&name("linear_attn.dt_bias"), g.value_heads)?;
-    let out_proj = loader.matrix(
-        &name("linear_attn.out_proj.weight"),
-        g.hidden,
-        g.value_width(),
-    )?;
-    let router = loader.matrix(&name("mlp.gate.weight"), g.experts, g.hidden)?;
-    let shared_gate_proj = loader.matrix(
-        &name("mlp.shared_expert.gate_proj.weight"),
-        g.shared_intermediate,
-        g.hidden,
-    )?;
-    let shared_up_proj = loader.matrix(
-        &name("mlp.shared_expert.up_proj.weight"),
-        g.shared_intermediate,
-        g.hidden,
-    )?;
-    let shared_down_proj = loader.matrix(
-        &name("mlp.shared_expert.down_proj.weight"),
-        g.hidden,
-        g.shared_intermediate,
-    )?;
-    let shared_gate = loader.matrix(&name("mlp.shared_expert_gate.weight"), 1, g.hidden)?;
-    let gate_up = loader.expert_stack(
-        &name("mlp.experts.gate_up_proj"),
-        g.experts,
-        2 * g.moe_intermediate,
-        g.hidden,
-    )?;
-    let down = loader.expert_stack(
-        &name("mlp.experts.down_proj"),
-        g.experts,
-        g.hidden,
-        g.moe_intermediate,
-    )?;
+    let mixer = match kind {
+        LayerKind::LinearAttention => MixerSlots::Linear(record_gdn(
+            &mut loader,
+            &format!("{prefix}linear_attn"),
+            &g,
+        )?),
+        LayerKind::FullAttention => MixerSlots::Full(record_attention(
+            &mut loader,
+            &format!("{prefix}self_attn"),
+            &g,
+        )?),
+    };
+    let moe = record_moe(&mut loader, &format!("{prefix}mlp"), &g)?;
     loader.finish()?;
 
-    let attn_hc = take_hc(&mut loader, &attn_hc);
-    let mlp_hc = take_hc(&mut loader, &mlp_hc);
-    let gdn = GatedDeltaNet {
-        in_proj_qkv: loader.take(in_proj_qkv),
-        in_proj_z: loader.take(in_proj_z),
-        in_proj_b: loader.take(in_proj_b),
-        in_proj_a: loader.take(in_proj_a),
-        conv_weight: load_tensor_1d(
+    let mixer = match mixer {
+        MixerSlots::Linear(slots) => Mixer::Linear(take_gdn(
             ctx,
+            &mut loader,
+            &slots,
             &shards,
             &weight_map,
-            &name("linear_attn.conv1d.weight"),
-        )?,
-        dt_bias: loader.take_vec(dt_bias),
-        a_log: load_tensor_1d_f32(ctx, &shards, &weight_map, &name("linear_attn.A_log"))?,
-        norm_weight: load_tensor_1d_f32(
-            ctx,
-            &shards,
-            &weight_map,
-            &name("linear_attn.norm.weight"),
-        )?,
-        out_proj: loader.take(out_proj),
+            &format!("{prefix}linear_attn"),
+        )?),
+        MixerSlots::Full(slots) => Mixer::Full(take_attention(&mut loader, &slots)),
     };
-    let moe = MoeBlock {
-        router: loader.take(router),
-        shared_gate_proj: loader.take(shared_gate_proj),
-        shared_up_proj: loader.take(shared_up_proj),
-        shared_down_proj: loader.take(shared_down_proj),
-        shared_gate: loader.take(shared_gate),
-        gate_up: loader.take(gate_up),
-        down: loader.take(down),
+    let layer = DecoderLayer {
+        attn_hc: take_hc(&mut loader, &attn_hc),
+        mixer,
+        mlp_hc: take_hc(&mut loader, &mlp_hc),
+        moe: take_moe(&mut loader, &moe),
     };
     ctx.sync()?;
-    Ok(LinearLayer {
-        attn_hc,
-        gdn,
-        mlp_hc,
-        moe,
-    })
+    Ok(layer)
 }

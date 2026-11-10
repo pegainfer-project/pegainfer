@@ -15,15 +15,15 @@ use pegainfer_kernels::tensor::HiddenStates;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 
-use super::linear_layer_prefill;
+use super::AttentionTrace;
+use super::MixerTrace;
+use super::Rope;
+use super::layer_prefill;
 use crate::weights::Geometry;
 use crate::weights::load_config;
-use crate::weights::load_linear_layer;
+use crate::weights::load_layer;
 
 const METADATA_KEY: &str = "qwen4_layer_golden";
-/// A routing difference counts as a tie when the reference's own logits separate
-/// the two experts by at most this many bf16 steps.
-const TIE_STEPS: f32 = 2.0;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
@@ -100,6 +100,54 @@ fn bf16_step(x: f32) -> f32 {
     bf16::from_bits(at.to_bits() + 1).to_f32() - at.to_f32()
 }
 
+/// One stage as the engine computed it and as the reference recorded it.
+fn stage<'a>(
+    ctx: &DeviceContext,
+    golden: &SafeTensors,
+    name: &'a str,
+    ours: &HiddenStates,
+) -> Result<(&'a str, Vec<f32>, Vec<f32>)> {
+    Ok((name, ours.to_host(ctx)?, floats(golden, name)?.1))
+}
+
+/// The dims the partial RoPE leaves alone, out of `[rows * heads, head_dim]`.
+fn unrotated(values: &[f32], g: &Geometry) -> Vec<f32> {
+    values
+        .chunks_exact(g.head_dim)
+        .flat_map(|head| head[g.rotary_dim..].iter().copied())
+        .collect()
+}
+
+/// K as the prep kernel wrote it into the scratch pool, back in `[rows * kv_heads, head_dim]`.
+fn pool_k(ctx: &DeviceContext, t: &AttentionTrace, g: &Geometry, rows: usize) -> Result<Vec<f32>> {
+    let pool: Vec<bf16> = ctx.stream.clone_dtoh(&t.kv)?;
+    ctx.sync()?;
+    let width = g.kv_width();
+    let mut k = Vec::with_capacity(rows * width);
+    for pos in 0..rows {
+        let row =
+            (pos / t.layout.page_size) * t.layout.page_stride + (pos % t.layout.page_size) * width;
+        k.extend(pool[row..row + width].iter().map(|x| x.to_f32()));
+    }
+    Ok(k)
+}
+
+/// The reference's indexer mask is additive, zero where a key is kept. Dense
+/// attention stands in for it only while every causal key is kept.
+fn ensure_dense(golden: &SafeTensors, rows: usize) -> Result<()> {
+    let (shape, mask) = floats(golden, "attn_indexer_mask")?;
+    ensure!(shape == [rows, rows], "attn_indexer_mask is {shape:?}");
+    let dropped = (0..rows)
+        .flat_map(|i| (0..=i).map(move |j| i * rows + j))
+        .filter(|&at| mask[at] != 0.0)
+        .count();
+    ensure!(
+        dropped == 0,
+        "the reference's indexer dropped {dropped} causal keys, so dense attention is not the reference for this prompt"
+    );
+    Ok(())
+}
+
 #[test]
 fn layer_matches_the_reference() -> Result<()> {
     let (Some(model), Some(golden_path)) = (
@@ -126,7 +174,7 @@ fn layer_matches_the_reference() -> Result<()> {
     let config = load_config(&model)?;
     let g = Geometry::from_config(&config);
     let ctx = DeviceContext::new()?;
-    let weights = load_linear_layer(&ctx, &model, &config, layer)?;
+    let weights = load_layer(&ctx, &model, &config, layer)?;
 
     let (shape, stream_in) = floats(&golden, "stream_in")?;
     ensure!(
@@ -136,68 +184,121 @@ fn layer_matches_the_reference() -> Result<()> {
     let rows = shape[0];
     let host: Vec<bf16> = stream_in.iter().map(|&x| bf16::from_f32(x)).collect();
     let input = HiddenStates::from_host(&ctx, &host, g.stream_width(), rows)?;
-    let trace = linear_layer_prefill(&ctx, &g, &weights, &input)?;
+    let rope = Rope::new(&ctx, &g, rows)?;
+    let trace = layer_prefill(&ctx, &g, &weights, &rope, &input)?;
     ctx.sync()?;
 
-    let stages: [(&str, &HiddenStates); 18] = [
-        ("attn_mixed", &trace.attn_mixed),
-        ("attn_inject", &trace.attn_inject),
-        ("gdn_qkv", &trace.gdn_qkv),
-        ("gdn_z", &trace.gdn_z),
-        ("gdn_b", &trace.gdn_b),
-        ("gdn_a", &trace.gdn_a),
-        ("gdn_core", &trace.gdn_core),
-        ("gdn_normed", &trace.gdn_normed),
-        ("attn_out", &trace.attn_out),
-        ("stream_after_attn", &trace.stream_after_attn),
-        ("mlp_mixed", &trace.mlp_mixed),
-        ("mlp_inject", &trace.mlp_inject),
-        ("router_logits", &trace.moe.router_logits),
-        ("shared_gate_logit", &trace.moe.shared_gate_logit),
-        ("shared_out", &trace.moe.shared_out),
-        ("expert_out", &trace.moe.expert_out),
-        ("moe_out", &trace.moe.out),
-        ("stream_out", &trace.stream_out),
+    let mut stages = vec![
+        stage(&ctx, &golden, "attn_mixed", &trace.attn_mixed)?,
+        stage(&ctx, &golden, "attn_inject", &trace.attn_inject)?,
     ];
+    match &trace.mixer {
+        MixerTrace::Linear(t) => stages.extend([
+            stage(&ctx, &golden, "gdn_qkv", &t.qkv)?,
+            stage(&ctx, &golden, "gdn_z", &t.z)?,
+            stage(&ctx, &golden, "gdn_b", &t.b)?,
+            stage(&ctx, &golden, "gdn_a", &t.a)?,
+            stage(&ctx, &golden, "gdn_core", &t.core)?,
+            stage(&ctx, &golden, "gdn_normed", &t.normed)?,
+        ]),
+        MixerTrace::Full(t) => {
+            ensure_dense(&golden, rows)?;
+            stages.extend([
+                stage(&ctx, &golden, "attn_q_proj", &t.q_proj)?,
+                stage(&ctx, &golden, "attn_k_proj", &t.k_proj)?,
+                stage(&ctx, &golden, "attn_v_proj", &t.v_proj)?,
+                (
+                    "q_norm_unrotated",
+                    unrotated(&t.q_prepped.to_host(&ctx)?, &g),
+                    unrotated(&floats(&golden, "attn_q_normed")?.1, &g),
+                ),
+                (
+                    "k_norm_unrotated",
+                    unrotated(&pool_k(&ctx, t, &g, rows)?, &g),
+                    unrotated(&floats(&golden, "attn_k_normed")?.1, &g),
+                ),
+                stage(&ctx, &golden, "attn_gated", &t.gated)?,
+            ]);
+        }
+    }
+    stages.extend([
+        stage(&ctx, &golden, "attn_out", &trace.attn_out)?,
+        stage(&ctx, &golden, "stream_after_attn", &trace.stream_after_attn)?,
+        stage(&ctx, &golden, "mlp_mixed", &trace.mlp_mixed)?,
+        stage(&ctx, &golden, "mlp_inject", &trace.mlp_inject)?,
+        stage(&ctx, &golden, "router_logits", &trace.moe.router_logits)?,
+        stage(
+            &ctx,
+            &golden,
+            "shared_gate_logit",
+            &trace.moe.shared_gate_logit,
+        )?,
+        stage(&ctx, &golden, "shared_out", &trace.moe.shared_out)?,
+        stage(&ctx, &golden, "expert_out", &trace.moe.expert_out)?,
+        stage(&ctx, &golden, "moe_out", &trace.moe.out)?,
+        stage(&ctx, &golden, "stream_out", &trace.stream_out)?,
+    ]);
     eprintln!("qwen4 layer {layer} gate: {rows} tokens, max |ours - reference| per stage");
     let mut measured = Vec::new();
-    for (name, ours) in stages {
-        let (_, reference) = floats(&golden, name)?;
-        let d = diff(&ours.to_host(&ctx)?, &reference);
+    for (name, ours, reference) in &stages {
+        let d = diff(ours, reference);
         eprintln!(
             "  {name:>18}: max {:.3e}  mean {:.3e}  (reference max {:.3e})",
             d.max_abs, d.mean_abs, d.max_ref
         );
-        measured.push((name, d));
+        measured.push((*name, d));
     }
 
-    // Picks may differ where the reference's own logits tie; anything wider is a
-    // routing fault.
+    // The picks must be a top-k of this engine's own logits, and the logits are
+    // held to the reference's floor below, so a pick that differs from the
+    // reference's can only sit where the reference's own gap is inside that
+    // floor. The gaps are printed for reading.
     let (_, logits_ref) = floats(&golden, "router_logits")?;
-    let picks = ints(&golden, "selected_experts")?;
-    let ours: Vec<i32> = ctx.stream.clone_dtoh(&trace.moe.selected_experts)?;
+    let picks_ref = ints(&golden, "selected_experts")?;
+    let logits_ours = trace.moe.router_logits.to_host(&ctx)?;
+    let picks_ours: Vec<i32> = ctx.stream.clone_dtoh(&trace.moe.selected_experts)?;
     ctx.sync()?;
     let mut differing = 0usize;
-    let mut widest = 0f32;
     for token in 0..rows {
         let pairs = token * g.top_k..(token + 1) * g.top_k;
-        let reference: BTreeSet<i64> = picks[pairs.clone()].iter().copied().collect();
-        let mine: BTreeSet<i64> = ours[pairs].iter().map(|&e| i64::from(e)).collect();
+        let experts = token * g.experts..(token + 1) * g.experts;
+        let mine: BTreeSet<usize> = picks_ours[pairs.clone()]
+            .iter()
+            .map(|&e| e as usize)
+            .collect();
+        ensure!(
+            mine.len() == g.top_k,
+            "token {token}: the picks repeat an expert"
+        );
+        let logits = &logits_ours[experts.clone()];
+        let lowest_kept = mine
+            .iter()
+            .map(|&e| logits[e])
+            .fold(f32::INFINITY, f32::min);
+        let highest_dropped = (0..g.experts)
+            .filter(|e| !mine.contains(e))
+            .map(|e| logits[e])
+            .fold(f32::NEG_INFINITY, f32::max);
+        ensure!(
+            lowest_kept >= highest_dropped,
+            "token {token}: the picks are not a top {} of the engine's own logits (kept {lowest_kept}, dropped {highest_dropped})",
+            g.top_k
+        );
+        let reference: BTreeSet<usize> = picks_ref[pairs].iter().map(|&e| e as usize).collect();
         if reference == mine {
             continue;
         }
         differing += 1;
-        let logits = &logits_ref[token * g.experts..(token + 1) * g.experts];
+        let logits = &logits_ref[experts];
         let kept = reference
             .iter()
-            .map(|&e| logits[e as usize])
+            .map(|&e| logits[e])
             .fold(f32::INFINITY, f32::min);
         let swapped_in = mine
             .difference(&reference)
-            .map(|&e| logits[e as usize])
+            .map(|&e| logits[e])
             .fold(f32::NEG_INFINITY, f32::max);
         let steps = (kept - swapped_in) / bf16_step(kept.abs().max(swapped_in.abs()));
-        widest = widest.max(steps);
         eprintln!(
             "  token {token}: picks differ, the reference's logits are {steps:.2} bf16 steps apart"
         );
@@ -218,7 +319,13 @@ fn layer_matches_the_reference() -> Result<()> {
 
     // The recorded reference ran once on the accelerator and once on the CPU; that
     // spread is the floor a bf16 port cannot be held below.
-    for name in ["attn_out", "stream_after_attn", "moe_out", "stream_out"] {
+    for name in [
+        "attn_out",
+        "stream_after_attn",
+        "router_logits",
+        "moe_out",
+        "stream_out",
+    ] {
         let (_, accel) = floats(&golden, name)?;
         let (_, cpu) = floats(&golden, &format!("cpu_{name}"))?;
         let floor = diff(&accel, &cpu).max_abs;
@@ -234,9 +341,5 @@ fn layer_matches_the_reference() -> Result<()> {
             ours.max_abs
         );
     }
-    ensure!(
-        widest <= TIE_STEPS,
-        "a routing difference is not a tie: the reference's logits are {widest:.2} bf16 steps apart"
-    );
     Ok(())
 }
