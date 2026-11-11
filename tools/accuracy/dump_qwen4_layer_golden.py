@@ -154,21 +154,26 @@ def run(layer: Qwen4ExpTextDecoderLayer, text_config, ids: torch.Tensor, embed: 
     ids = ids.to(device)
     embed = embed.to(device)
     rotary = Qwen4ExpTextRotaryEmbedding(config=text_config).to(device)
-    # A linear attention layer always runs on a cache, so its recurrent state is
-    # recorded whether or not steps follow; the prefill arithmetic is the same.
-    cache = DynamicCache(config=text_config) if layer.layer_type == "linear_attention" else None
+    # The layer always runs on a cache: the prefill arithmetic is the same, a
+    # linear attention layer's recurrent state gets recorded, and the steps
+    # that follow read the prefill's K/V or state from it.
+    cache = DynamicCache(config=text_config)
     recorder = Recorder(layer)
 
     def forward(token_ids: torch.Tensor, start: int):
         embeds = F.embedding(token_ids, embed)
         stream = embeds.repeat(1, 1, text_config.hc_count)
         tokens = token_ids.shape[1]
-        positions = torch.arange(start, start + tokens, device=device).view(1, 1, -1).expand(3, 1, -1)
+        kv_len = start + tokens
+        # Every position so far: attention slices the current rows out of the
+        # tables, the indexer reads the keys' positions from them.
+        positions = torch.arange(kv_len, device=device).view(1, 1, -1).expand(3, 1, -1)
         position_embeddings = rotary(embeds, positions)
-        # The additive causal mask the eager attention path reads; the indexer
-        # derives its visible set from it as well.
-        visible = torch.ones(tokens, tokens, dtype=torch.bool, device=device).tril()
-        attention_mask = torch.zeros(tokens, tokens, dtype=embeds.dtype, device=device)
+        # The additive mask the eager attention path reads, causal from `start`;
+        # the indexer derives its visible set from it as well.
+        query_positions = torch.arange(start, kv_len, device=device)[:, None]
+        visible = torch.arange(kv_len, device=device)[None, :] <= query_positions
+        attention_mask = torch.zeros(tokens, kv_len, dtype=embeds.dtype, device=device)
         attention_mask = attention_mask.masked_fill(~visible, torch.finfo(embeds.dtype).min)[None, None]
         with torch.no_grad():
             out = layer(
@@ -180,7 +185,7 @@ def run(layer: Qwen4ExpTextDecoderLayer, text_config, ids: torch.Tensor, embed: 
                 ple_input_ids=token_ids,
             )
         stages = {"stream_in": stream, **recorder.take(), "stream_out": out}
-        if cache is not None:
+        if layer.layer_type == "linear_attention":
             # The cache updates this tensor in place, so each pass keeps its own copy.
             stages["gdn_state"] = cache.layers[layer.linear_attn.layer_idx].recurrent_states[0].clone()
         return stages
@@ -216,8 +221,6 @@ def main() -> None:
     text_config = config.text_config
     # The arithmetic reference for attention, with the additive mask built above.
     text_config._attn_implementation = "eager"
-    if args.decode and text_config.layer_types[args.layer] != "linear_attention":
-        raise SystemExit("decode steps are recorded for linear attention layers only")
     if not 0 <= args.decode < args.tokens:
         raise SystemExit(f"--decode {args.decode} must leave at least one prompt token of the {args.tokens}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
