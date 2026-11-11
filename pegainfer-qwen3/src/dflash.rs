@@ -473,7 +473,7 @@ impl DFlashDraftModel {
             start_pos + token_count,
             state.max_cache_len
         );
-        if let Some(pool) = pool.as_ref() {
+        if let Some(pool) = pool.as_deref() {
             anyhow::ensure!(
                 pool.k.len() == self.layers.len(),
                 "DFlash draft KV pool has {} layers, drafter has {}",
@@ -486,6 +486,20 @@ impl DFlashDraftModel {
                 "DFlash materialize needs {needed_pages} target pages, got {}",
                 page_indices.len()
             );
+            let block = pool.block_size;
+            for i in 0..token_count {
+                let position = start_pos + i;
+                let page = page_indices[position / block];
+                anyhow::ensure!(
+                    page >= 0 && (page as usize) < pool.total_blocks,
+                    "DFlash materialize page {page} out of range {}",
+                    pool.total_blocks
+                );
+                scratch.locs_host[i] = (page as usize * block + position % block) as i32;
+            }
+            let mut locs_dst = scratch.locs.slice_mut(..token_count);
+            ctx.stream
+                .memcpy_htod(&scratch.locs_host[..token_count], &mut locs_dst)?;
         }
 
         scratch.capture_rows.seq_len = token_count;
@@ -571,31 +585,12 @@ impl DFlashDraftModel {
 
             if let Some(pool) = pool.as_mut() {
                 let pool: &mut DFlashDraftKvPool = pool;
-                let block = pool.block_size;
-                for i in 0..token_count {
-                    let position = start_pos + i;
-                    let page = page_indices[position / block];
-                    anyhow::ensure!(
-                        page >= 0 && (page as usize) < pool.total_blocks,
-                        "DFlash materialize page {page} out of range {}",
-                        pool.total_blocks
-                    );
-                    scratch.locs_host[i] = (page as usize * block + position % block) as i32;
-                }
-                let mut locs_dst = scratch.locs.slice_mut(..token_count);
-                ctx.stream
-                    .memcpy_htod(&scratch.locs_host[..token_count], &mut locs_dst)?;
                 pegainfer_kernels::ops::draft_kv_scatter_into(
                     ctx,
-                    &scratch.k,
-                    &mut pool.k[layer_idx],
-                    &scratch.locs,
-                    token_count,
-                )?;
-                pegainfer_kernels::ops::draft_kv_scatter_into(
-                    ctx,
-                    &scratch.v,
-                    &mut pool.v[layer_idx],
+                    &mut [
+                        (&scratch.k, &mut pool.k[layer_idx]),
+                        (&scratch.v, &mut pool.v[layer_idx]),
+                    ],
                     &scratch.locs,
                     token_count,
                 )?;
@@ -625,21 +620,14 @@ impl DFlashDraftModel {
             "DFlash restore tokens {tokens} exceed max cache {}",
             state.max_cache_len
         );
-        for (layer_idx, cache) in state.layers.iter_mut().enumerate() {
-            pegainfer_kernels::ops::draft_kv_gather_into(
-                ctx,
-                &pool.k[layer_idx],
-                &mut cache.k,
-                locs,
-                tokens,
-            )?;
-            pegainfer_kernels::ops::draft_kv_gather_into(
-                ctx,
-                &pool.v[layer_idx],
-                &mut cache.v,
-                locs,
-                tokens,
-            )?;
+        {
+            let mut pairs: Vec<(&HiddenStates, &mut HiddenStates)> =
+                Vec::with_capacity(2 * state.layers.len());
+            for (layer_idx, cache) in state.layers.iter_mut().enumerate() {
+                pairs.push((&pool.k[layer_idx], &mut cache.k));
+                pairs.push((&pool.v[layer_idx], &mut cache.v));
+            }
+            pegainfer_kernels::ops::draft_kv_gather_into(ctx, &mut pairs, locs, tokens)?;
         }
         state.committed_len = tokens;
         Ok(())
