@@ -31,6 +31,7 @@ const TEXT_PREFIX: &str = "model.language_model.";
 /// The widths one layer's forward needs, taken from the validated config.
 #[derive(Clone, Copy, Debug)]
 pub struct Geometry {
+    pub vocab: usize,
     pub hidden: usize,
     pub hc_count: usize,
     pub hc_lowrank: usize,
@@ -58,6 +59,7 @@ impl Geometry {
     pub(crate) fn from_config(config: &Config) -> Self {
         let text = &config.text;
         Self {
+            vocab: text.vocab_size,
             hidden: text.hidden_size,
             hc_count: text.hc_count,
             hc_lowrank: text.hc_lowrank,
@@ -195,9 +197,13 @@ pub(crate) fn load_config(model_dir: &Path) -> Result<Config> {
     Config::from_json(&serde_json::from_slice(&bytes)?)
 }
 
-/// The shards this layer lives in, and the name map into that subset. A single
-/// file checkpoint has no index: its one shard is mapped and looked up by name.
-fn layer_shards(model_dir: &Path, prefix: &str) -> Result<(Vec<String>, HashMap<String, usize>)> {
+/// The shards the tensors `keep` selects live in, and the name map into that
+/// subset. A single file checkpoint has no index: its one shard is mapped and
+/// looked up by name.
+fn shards_for(
+    model_dir: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(Vec<String>, HashMap<String, usize>)> {
     let model_dir = model_dir.to_str().context("model path is not UTF-8")?;
     let (paths, full_map) = load_shard_info(model_dir)?;
     if full_map.is_empty() {
@@ -205,18 +211,18 @@ fn layer_shards(model_dir: &Path, prefix: &str) -> Result<(Vec<String>, HashMap<
     }
     let mut used: Vec<usize> = full_map
         .iter()
-        .filter(|(name, _)| name.starts_with(prefix))
+        .filter(|(name, _)| keep(name))
         .map(|(_, &shard)| shard)
         .collect();
     used.sort_unstable();
     used.dedup();
     ensure!(
         !used.is_empty(),
-        "no tensor under {prefix} in the checkpoint index"
+        "none of the tensors asked for is in the checkpoint index"
     );
     let subset = full_map
         .iter()
-        .filter(|(name, _)| name.starts_with(prefix))
+        .filter(|(name, _)| keep(name))
         .map(|(name, shard)| {
             (
                 name.clone(),
@@ -496,7 +502,7 @@ pub(crate) fn load_layer(
         g.hc_count
     );
     let prefix = format!("{TEXT_PREFIX}layers.{layer}.");
-    let (shard_paths, weight_map) = layer_shards(model_dir, &prefix)?;
+    let (shard_paths, weight_map) = shards_for(model_dir, |name| name.starts_with(&prefix))?;
     let mmaps = mmap_shards(&shard_paths)?;
     let shards = deserialize_shards(&mmaps)?;
     check_layer_contract(config, &prefix, &shards, &weight_map)?;
@@ -548,4 +554,48 @@ pub(crate) fn load_layer(
     };
     ctx.sync()?;
     Ok(layer)
+}
+
+/// What surrounds the layers: the token embedding, the top-level mixer that
+/// reads the stream out (there is no final norm) and the untied head.
+pub struct Bookends {
+    pub embed: DeviceMatrix,
+    pub mixer: HyperConnection,
+    pub lm_head: DeviceMatrix,
+}
+
+const MIXER_PREFIX: &str = "model.language_model.hyper_connection_mixer";
+const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
+const HEAD_NAME: &str = "lm_head.weight";
+
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the model line is the next caller")
+)]
+pub(crate) fn load_bookends(
+    ctx: &DeviceContext,
+    model_dir: &Path,
+    config: &Config,
+) -> Result<Bookends> {
+    let g = Geometry::from_config(config);
+    let (shard_paths, weight_map) = shards_for(model_dir, |name| {
+        name == EMBED_NAME || name == HEAD_NAME || name.starts_with(MIXER_PREFIX)
+    })?;
+    let mmaps = mmap_shards(&shard_paths)?;
+    let shards = deserialize_shards(&mmaps)?;
+    for prefix in [EMBED_NAME, HEAD_NAME, MIXER_PREFIX] {
+        check_layer_contract(config, prefix, &shards, &weight_map)?;
+    }
+    let mut loader = StagedWeightLoader::new(ctx, &shards, &weight_map)?;
+    let embed = loader.matrix(EMBED_NAME, g.vocab, g.hidden)?;
+    let mixer = record_hc(&mut loader, MIXER_PREFIX, &g, false)?;
+    let lm_head = loader.matrix(HEAD_NAME, g.vocab, g.hidden)?;
+    loader.finish()?;
+    let bookends = Bookends {
+        embed: loader.take(embed),
+        mixer: take_hc(&mut loader, &mixer),
+        lm_head: loader.take(lm_head),
+    };
+    ctx.sync()?;
+    Ok(bookends)
 }

@@ -10,6 +10,8 @@ mod config;
 pub mod layer;
 #[cfg(any(feature = "qwen4", test))]
 mod manifest;
+#[cfg(feature = "qwen4")]
+pub mod model;
 pub mod model_line;
 #[cfg(feature = "qwen4")]
 pub mod moe;

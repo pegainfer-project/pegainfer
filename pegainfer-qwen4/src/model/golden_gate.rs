@@ -1,8 +1,9 @@
-//! Holds one layer against the reference recorded by
-//! `tools/accuracy/dump_qwen4_layer_golden.py` on the checkpoint's own weights:
-//! the prompt in prefill and, when the golden carries them, decode steps on the
-//! carried state. Needs `PEGAINFER_QWEN4_MODEL_PATH` (the checkpoint, or the
-//! shards of that layer plus the index) and `PEGAINFER_QWEN4_LAYER_GOLDEN`.
+//! Holds a chain of layers with the bookends around them against the reference
+//! recorded by `tools/accuracy/dump_qwen4_layer_golden.py` on the checkpoint's
+//! own weights: the prompt in prefill and, when the golden carries them, decode
+//! steps on the carried state. Needs `PEGAINFER_QWEN4_MODEL_PATH` (the
+//! checkpoint, or the shards of those layers and the bookends plus the index)
+//! and `PEGAINFER_QWEN4_LAYER_GOLDEN`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,16 +18,15 @@ use pegainfer_kernels::tensor::HiddenStates;
 use safetensors::Dtype;
 use safetensors::SafeTensors;
 
-use super::KvScratch;
-use super::LayerTrace;
-use super::MixerState;
-use super::MixerTrace;
-use super::Rope;
-use super::layer_decode;
-use super::layer_prefill;
+use super::Forward;
+use super::Model;
+use super::ModelState;
+use crate::layer::KvScratch;
+use crate::layer::LayerTrace;
+use crate::layer::MixerState;
+use crate::layer::MixerTrace;
 use crate::weights::Geometry;
 use crate::weights::load_config;
-use crate::weights::load_layer;
 
 const METADATA_KEY: &str = "qwen4_layer_golden";
 
@@ -110,6 +110,28 @@ fn bf16_step(x: f32) -> f32 {
     bf16::from_bits(at.to_bits() + 1).to_f32() - at.to_f32()
 }
 
+fn print_diff(name: &str, d: &Diff) {
+    eprintln!(
+        "  {name:>30}: max {:.3e}  mean {:.3e}  (reference max {:.3e})",
+        d.max_abs, d.mean_abs, d.max_ref
+    );
+}
+
+/// The stages the reference also recorded on the CPU are held to four times its
+/// own accelerator versus CPU spread, the floor a bf16 port cannot sit below.
+fn hold_floor(golden: &SafeTensors, name: &str, ours: &Diff) -> Result<()> {
+    let (_, accel) = floats(golden, name)?;
+    let (_, cpu) = floats(golden, &format!("cpu_{name}"))?;
+    let floor = diff(&accel, &cpu).max_abs;
+    eprintln!("  {name:>30}: reference accelerator vs cpu floor {floor:.3e}");
+    ensure!(
+        ours.max_abs <= 4.0 * floor.max(1e-3),
+        "{name}: max |ours - reference| {:.3e} exceeds four times the reference's own floor {floor:.3e}",
+        ours.max_abs
+    );
+    Ok(())
+}
+
 /// One stage as the engine computed it and as the reference recorded it.
 fn stage(
     ctx: &DeviceContext,
@@ -162,11 +184,10 @@ fn ensure_dense(golden: &SafeTensors, name: &str, rows: usize, kv_len: usize) ->
     Ok(())
 }
 
-/// One forward against the reference's stages under `prefix`: every stage is
-/// printed, the picks must be a top-k of the engine's own logits, and the
-/// stages the reference also recorded on the CPU are held to four times its
-/// own accelerator versus CPU spread, the floor a bf16 port cannot sit below.
-fn hold(
+/// One layer's forward against the reference's stages under `prefix`: every
+/// stage is printed, the picks must be a top-k of the engine's own logits, and
+/// the floored stages are held.
+fn hold_layer(
     ctx: &DeviceContext,
     golden: &SafeTensors,
     g: &Geometry,
@@ -249,10 +270,7 @@ fn hold(
     let mut measured = Vec::new();
     for (stage, ours, reference) in &stages {
         let d = diff(ours, reference);
-        eprintln!(
-            "  {stage:>26}: max {:.3e}  mean {:.3e}  (reference max {:.3e})",
-            d.max_abs, d.mean_abs, d.max_ref
-        );
+        print_diff(stage, &d);
         measured.push((stage.as_str(), d));
     }
 
@@ -326,27 +344,88 @@ fn hold(
 
     for stage in held {
         let full = name(stage);
-        let (_, accel) = floats(golden, &full)?;
-        let (_, cpu) = floats(golden, &format!("cpu_{full}"))?;
-        let floor = diff(&accel, &cpu).max_abs;
         let ours = &measured
             .iter()
             .find(|(measured, _)| *measured == full)
             .expect("measured")
             .1;
-        eprintln!("  {full:>26}: reference accelerator vs cpu floor {floor:.3e}");
-        ensure!(
-            ours.max_abs <= 4.0 * floor.max(1e-3),
-            "{full}: max |ours - reference| {:.3e} exceeds four times the reference's own floor {floor:.3e}",
-            ours.max_abs
-        );
+        hold_floor(golden, &full, ours)?;
     }
     Ok(())
 }
 
+/// One pass of the model against the reference under `prefix`: the embedding
+/// stream must match exactly, every layer is held, and the logits the head
+/// produces are held to the reference's own floor. The argmax agreement is
+/// printed with the reference's own gap where it disagrees.
+fn hold_pass(
+    ctx: &DeviceContext,
+    golden: &SafeTensors,
+    model: &Model,
+    layers: &[usize],
+    prefix: &str,
+    forward: &Forward,
+    state: &ModelState,
+) -> Result<()> {
+    let g = &model.g;
+    let (_, stream_ref) = floats(golden, &format!("{prefix}stream_in"))?;
+    let stream_diff = diff(&forward.stream_in.to_host(ctx)?, &stream_ref);
+    print_diff(&format!("{prefix}stream_in"), &stream_diff);
+    ensure!(
+        stream_diff.max_abs == 0.0,
+        "the embedding stream differs from the reference by {:.3e}",
+        stream_diff.max_abs
+    );
+    for ((layer, trace), mixer) in layers.iter().zip(&forward.layers).zip(&state.layers) {
+        hold_layer(
+            ctx,
+            golden,
+            g,
+            &format!("{prefix}layer{layer}_"),
+            trace,
+            mixer,
+        )?;
+    }
+    let (_, mixed_ref) = floats(golden, &format!("{prefix}mixed"))?;
+    print_diff(
+        &format!("{prefix}mixed"),
+        &diff(&forward.mixed.to_host(ctx)?, &mixed_ref),
+    );
+    let name = format!("{prefix}logits");
+    let (_, logits_ref) = floats(golden, &name)?;
+    let logits_ours = forward.logits.to_host(ctx)?;
+    let logits_diff = diff(&logits_ours, &logits_ref);
+    print_diff(&name, &logits_diff);
+    let rows = forward.logits.seq_len;
+    let mut agree = 0usize;
+    for token in 0..rows {
+        let span = token * g.vocab..(token + 1) * g.vocab;
+        let top = |values: &[f32]| {
+            values
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+                    if v > best.1 { (i, v) } else { best }
+                })
+        };
+        let (ours, _) = top(&logits_ours[span.clone()]);
+        let (theirs, best) = top(&logits_ref[span.clone()]);
+        if ours == theirs {
+            agree += 1;
+        } else {
+            let gap = (best - logits_ref[span.start + ours]) / bf16_step(best.abs());
+            eprintln!(
+                "  token {token}: argmax {ours} against the reference's {theirs}, whose logits are {gap:.2} bf16 steps apart"
+            );
+        }
+    }
+    eprintln!("  argmax agrees on {agree}/{rows} tokens");
+    hold_floor(golden, &name, &logits_diff)
+}
+
 #[test]
-fn layer_matches_the_reference() -> Result<()> {
-    let (Some(model), Some(golden_path)) = (
+fn model_matches_the_reference() -> Result<()> {
+    let (Some(model_dir), Some(golden_path)) = (
         env_path("PEGAINFER_QWEN4_MODEL_PATH"),
         env_path("PEGAINFER_QWEN4_LAYER_GOLDEN"),
     ) else {
@@ -363,47 +442,46 @@ fn layer_matches_the_reference() -> Result<()> {
             .and_then(|m| m.get(METADATA_KEY))
             .context("golden carries no manifest")?,
     )?;
-    let layer = manifest["layer"]
-        .as_u64()
-        .context("manifest has no layer")? as usize;
+    let layers: Vec<usize> = manifest["layers"]
+        .as_array()
+        .context("manifest has no layers")?
+        .iter()
+        .map(|v| v.as_u64().map(|v| v as usize).context("layer index"))
+        .collect::<Result<_>>()?;
     let decode_steps = manifest["decode_steps"].as_u64().unwrap_or(0) as usize;
+    let ids: Vec<u32> = ints(&golden, "input_ids")?
+        .iter()
+        .map(|&id| u32::try_from(id).context("token id"))
+        .collect::<Result<_>>()?;
+    let prefill = ids.len() - decode_steps;
 
-    let config = load_config(&model)?;
-    let g = Geometry::from_config(&config);
+    let config = load_config(&model_dir)?;
     let ctx = DeviceContext::new()?;
-    let weights = load_layer(&ctx, &model, &config, layer)?;
+    let model = Model::load(&ctx, &model_dir, &config, &layers, ids.len())?;
+    let mut state = model.new_state(&ctx, ids.len())?;
 
-    let (shape, stream_in) = floats(&golden, "stream_in")?;
-    ensure!(
-        shape.len() == 2 && shape[1] == g.stream_width(),
-        "stream_in is {shape:?}"
-    );
-    let rows = shape[0];
-    let host: Vec<bf16> = stream_in.iter().map(|&x| bf16::from_f32(x)).collect();
-    let input = HiddenStates::from_host(&ctx, &host, g.stream_width(), rows)?;
-    let rope = Rope::new(&ctx, &g, rows + decode_steps)?;
-    let mut state = MixerState::new(&ctx, &g, &weights.mixer, rows + decode_steps)?;
-    let trace = layer_prefill(&ctx, &g, &weights, &rope, &mut state, &input)?;
+    let forward = model.prefill(&ctx, &ids[..prefill], &mut state)?;
     ctx.sync()?;
-    eprintln!("qwen4 layer {layer} gate: {rows} prompt tokens, max |ours - reference| per stage");
-    hold(&ctx, &golden, &g, "", &trace, &state)?;
-
-    for step in 0..decode_steps {
-        let prefix = format!("decode{step}_");
-        let (shape, row) = floats(&golden, &format!("{prefix}stream_in"))?;
-        ensure!(
-            shape == [1, g.stream_width()],
-            "{prefix}stream_in is {shape:?}"
-        );
-        let host: Vec<bf16> = row.iter().map(|&x| bf16::from_f32(x)).collect();
-        let input = HiddenStates::from_host(&ctx, &host, g.stream_width(), 1)?;
-        let trace = layer_decode(&ctx, &g, &weights, &rope, &mut state, &input)?;
+    eprintln!(
+        "qwen4 layers {layers:?} gate: {prefill} prompt tokens, max |ours - reference| per stage"
+    );
+    hold_pass(&ctx, &golden, &model, &layers, "", &forward, &state)?;
+    for (step, &id) in ids[prefill..].iter().enumerate() {
+        let forward = model.decode(&ctx, id, &mut state)?;
         ctx.sync()?;
         eprintln!(
-            "qwen4 layer {layer} gate: decode step {step} at position {}",
-            rows + step
+            "qwen4 layers {layers:?} gate: decode step {step} at position {}",
+            prefill + step
         );
-        hold(&ctx, &golden, &g, &prefix, &trace, &state)?;
+        hold_pass(
+            &ctx,
+            &golden,
+            &model,
+            &layers,
+            &format!("decode{step}_"),
+            &forward,
+            &state,
+        )?;
     }
     Ok(())
 }

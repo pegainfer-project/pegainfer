@@ -39,9 +39,6 @@ use crate::weights::Geometry;
 use crate::weights::HyperConnection;
 use crate::weights::Mixer;
 
-#[cfg(test)]
-mod golden_gate;
-
 /// Tokens per page of the attention layers' K/V, the size every FlashInfer
 /// caller in the tree uses.
 const KV_PAGE: usize = 16;
