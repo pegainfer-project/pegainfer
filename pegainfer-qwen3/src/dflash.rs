@@ -13,15 +13,15 @@ use crate::dspark::MarkovScratch;
 use crate::weights::Qwen3Model;
 use crate::weights::TransformerBlock;
 
-mod capture_cache;
 mod conv;
+mod draft_kv_pool;
 mod loading;
 mod reservation;
 mod selector;
 
-pub(crate) use capture_cache::DFlashCaptureCache;
 use conv::ConvScratch;
 use conv::LayerConvs;
+pub(crate) use draft_kv_pool::DFlashDraftKvPool;
 pub(crate) use reservation::DFlashMemoryReservation;
 use selector::SelectorHead;
 use selector::SelectorScratch;
@@ -52,48 +52,15 @@ pub(crate) struct DFlashDraftModel {
 
 pub(crate) struct DFlashRequestState {
     layers: Vec<DFlashLayerCache>,
-    pending_context: DFlashPendingContext,
-    /// Projected target context for the current draft round. Computed once from
-    /// `pending_context` and read by every layer's tail concat, so it lives with
-    /// the request (the batched scratch only holds one request's varlen tail).
-    context: DFlashContextScratch,
-    committed_len: usize,
+    /// Draft K/V rows already materialized into `layers` (and mirrored into the
+    /// paged pool) at positions `[0, committed_len)`.
+    pub(crate) committed_len: usize,
     max_cache_len: usize,
-    /// Committed target tokens whose hidden rows are in the capture history
-    /// (restored prefix + rows captured by this request).
-    captured_len: usize,
-    /// KV blocks already consumed from the capture history: published to the
-    /// prefix capture cache, or skipped because the request has more blocks
-    /// than the cache has slots (it can never be restored whole).
-    published_blocks: usize,
-    /// Rows of the partially-filled block that follows `published_blocks`:
-    /// prefill's tail plus the accepted rows appended by each verify round.
-    seal: HiddenStates,
-    seal_len: usize,
-    /// True while `pending_context` is the whole captured prompt (the first
-    /// draft round consumes it); false once verify rounds feed it in pieces.
-    pending_is_history: bool,
 }
 
 struct DFlashLayerCache {
     k: HiddenStates,
     v: HiddenStates,
-}
-
-struct DFlashPendingContext {
-    buffer: HiddenStates,
-    len: usize,
-    capacity: usize,
-}
-
-/// Per-request projected context. The fc projection + hidden_norm turn the
-/// captured target hidden context into draft hidden space once per draft round;
-/// every layer's tail concat reads `context_hidden`, so it must persist across
-/// the layer loop and therefore lives in the request (not the shared scratch).
-struct DFlashContextScratch {
-    max_context_len: usize,
-    context_projected: HiddenStates,
-    context_hidden: HiddenStates,
 }
 
 /// Lane-level batched draft scratch, allocated once for the whole decode batch.
@@ -131,135 +98,49 @@ pub(crate) struct DFlashBatchScratch {
     conv: Option<ConvScratch>,
 }
 
+/// Lane-level scratch for materializing a step's target context into draft K/V.
+/// One instance serves the whole lane: prefill chunks and verify spans reuse it.
+pub(crate) struct DFlashKvMaterializeScratch {
+    capture_rows: HiddenStates,
+    ctx_projected: HiddenStates,
+    ctx_hidden: HiddenStates,
+    q: HiddenStates,
+    k: HiddenStates,
+    v: HiddenStates,
+    locs: CudaSlice<i32>,
+    locs_host: Vec<i32>,
+    max_rows: usize,
+}
+
+impl DFlashKvMaterializeScratch {
+    pub(crate) fn new(ctx: &DeviceContext, config: &DFlashConfig, max_rows: usize) -> Result<Self> {
+        anyhow::ensure!(max_rows > 0, "DFlash materialize scratch needs rows");
+        let capture_dim = config.hidden_size * config.target_layer_ids.len();
+        let q_dim = config.num_attention_heads * config.head_dim;
+        let kv_dim = config.num_key_value_heads * config.head_dim;
+        Ok(Self {
+            capture_rows: HiddenStates::zeros(ctx, capture_dim, max_rows)?,
+            ctx_projected: HiddenStates::zeros(ctx, config.hidden_size, max_rows)?,
+            ctx_hidden: HiddenStates::zeros(ctx, config.hidden_size, max_rows)?,
+            q: HiddenStates::zeros(ctx, q_dim, max_rows)?,
+            k: HiddenStates::zeros(ctx, kv_dim, max_rows)?,
+            v: HiddenStates::zeros(ctx, kv_dim, max_rows)?,
+            locs: ctx.stream.alloc_zeros(max_rows)?,
+            locs_host: vec![0; max_rows],
+            max_rows,
+        })
+    }
+
+    pub(crate) fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+}
+
 impl DFlashRequestState {
     /// Token lifetime this request's buffers were sized for; the lane charges
     /// its draft-state budget per this token count.
     pub(crate) fn max_cache_len(&self) -> usize {
         self.max_cache_len
-    }
-
-    pub(crate) fn pending_context_len(&self) -> Option<usize> {
-        (self.pending_context.len > 0).then_some(self.pending_context.len)
-    }
-
-    /// The prefill chunk capture is now the pending history; the first draft
-    /// round will build the draft KV from it.
-    pub(crate) fn note_prefill_capture(&mut self) {
-        self.captured_len = self.pending_context.len;
-        self.pending_is_history = true;
-    }
-}
-
-impl DFlashPendingContext {
-    fn new(ctx: &DeviceContext, hidden_dim: usize, capacity: usize) -> Result<Self> {
-        anyhow::ensure!(
-            capacity > 0,
-            "DFlash pending context capacity must be non-zero"
-        );
-        let mut buffer = HiddenStates::zeros(ctx, hidden_dim, capacity)?;
-        buffer.seq_len = 0;
-        Ok(Self {
-            buffer,
-            len: 0,
-            capacity,
-        })
-    }
-
-    fn append_from(
-        &mut self,
-        ctx: &DeviceContext,
-        src: &HiddenStates,
-        src_token_offset: usize,
-        token_count: usize,
-        max_capacity: usize,
-    ) -> Result<()> {
-        let required_len = self
-            .len
-            .checked_add(token_count)
-            .context("DFlash pending context length overflow")?;
-        anyhow::ensure!(
-            required_len <= max_capacity,
-            "DFlash pending context length {} exceeds request capacity {}",
-            required_len,
-            max_capacity
-        );
-        self.ensure_capacity(ctx, required_len, max_capacity)?;
-        self.buffer.seq_len = self.capacity;
-        ops::copy_hidden_token_range_into(
-            ctx,
-            src,
-            src_token_offset,
-            &mut self.buffer,
-            self.len,
-            token_count,
-        )?;
-        self.len = required_len;
-        self.buffer.seq_len = self.len;
-        Ok(())
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        required_len: usize,
-        max_capacity: usize,
-    ) -> Result<()> {
-        if required_len <= self.capacity {
-            return Ok(());
-        }
-        let doubled = self
-            .capacity
-            .checked_mul(2)
-            .context("DFlash pending context capacity overflow")?;
-        let new_capacity = required_len.max(doubled).min(max_capacity);
-        anyhow::ensure!(
-            new_capacity >= required_len,
-            "DFlash pending context capacity {} cannot fit {} tokens",
-            new_capacity,
-            required_len
-        );
-        let mut next = HiddenStates::zeros(ctx, self.buffer.hidden_dim, new_capacity)?;
-        if self.len > 0 {
-            self.buffer.seq_len = self.capacity;
-            ops::copy_hidden_token_range_into(ctx, &self.buffer, 0, &mut next, 0, self.len)?;
-        }
-        next.seq_len = self.len;
-        self.buffer = next;
-        self.capacity = new_capacity;
-        Ok(())
-    }
-
-    fn activate_for_read(&mut self) {
-        self.buffer.seq_len = self.len;
-    }
-
-    fn clear(&mut self) {
-        self.len = 0;
-        self.buffer.seq_len = 0;
-    }
-}
-
-impl DFlashContextScratch {
-    fn new(ctx: &DeviceContext, hidden_size: usize, max_context_len: usize) -> Result<Self> {
-        Ok(Self {
-            max_context_len,
-            context_projected: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-            context_hidden: HiddenStates::zeros(ctx, hidden_size, max_context_len)?,
-        })
-    }
-
-    fn ensure_capacity(
-        &mut self,
-        ctx: &DeviceContext,
-        hidden_size: usize,
-        context_len: usize,
-    ) -> Result<()> {
-        if context_len > self.max_context_len {
-            *self = Self::new(ctx, hidden_size, context_len)?;
-        }
-        self.context_projected.seq_len = context_len;
-        self.context_hidden.seq_len = context_len;
-        Ok(())
     }
 }
 
@@ -495,11 +376,37 @@ impl DFlashDraftModel {
         DFlashBatchScratch::new(ctx, &self.config, max_decode_batch_size)
     }
 
+    pub(crate) fn new_draft_kv_pool(
+        &self,
+        ctx: &DeviceContext,
+        total_blocks: usize,
+        block_size: usize,
+    ) -> Result<DFlashDraftKvPool> {
+        DFlashDraftKvPool::new(
+            ctx,
+            self.layers.len(),
+            self.kv_dim(),
+            total_blocks,
+            block_size,
+        )
+    }
+
+    pub(crate) fn new_materialize_scratch(
+        &self,
+        ctx: &DeviceContext,
+        max_rows: usize,
+    ) -> Result<DFlashKvMaterializeScratch> {
+        DFlashKvMaterializeScratch::new(ctx, &self.config, max_rows)
+    }
+
+    pub(crate) fn kv_dim(&self) -> usize {
+        self.config.num_key_value_heads * self.config.head_dim
+    }
+
     pub(crate) fn new_request_state(
         &self,
         ctx: &DeviceContext,
         max_cache_len: usize,
-        prefix_block_size: usize,
     ) -> Result<DFlashRequestState> {
         anyhow::ensure!(
             max_cache_len <= self.config.max_position_embeddings,
@@ -517,35 +424,35 @@ impl DFlashDraftModel {
         }
         Ok(DFlashRequestState {
             layers,
-            pending_context: DFlashPendingContext::new(
-                ctx,
-                self.context_feature_dim(),
-                self.config.block_size.min(max_cache_len),
-            )?,
-            context: DFlashContextScratch::new(
-                ctx,
-                self.config.hidden_size,
-                self.config.block_size,
-            )?,
             committed_len: 0,
             max_cache_len,
-            captured_len: 0,
-            published_blocks: 0,
-            seal: HiddenStates::zeros(ctx, self.context_feature_dim(), prefix_block_size * 2)?,
-            seal_len: 0,
-            pending_is_history: false,
         })
     }
 
-    pub(crate) fn append_pending_context(
+    /// Materialize one step's target context rows into draft K/V at their
+    /// absolute positions. The rows are written both into the request's dense
+    /// draft K/V buffer (the draft attention's mirror) and into the paged pool
+    /// at the target block slots, so a later prefix hit can restore them without
+    /// re-projecting the target hidden.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn materialize_context_kv(
         &self,
         ctx: &DeviceContext,
         state: &mut DFlashRequestState,
         captured_hidden: &HiddenStates,
         token_offset: usize,
         token_count: usize,
+        start_pos: usize,
+        page_indices: &[i32],
+        mut pool: Option<&mut DFlashDraftKvPool>,
+        scratch: &mut DFlashKvMaterializeScratch,
     ) -> Result<()> {
-        anyhow::ensure!(token_count > 0, "DFlash context append needs tokens");
+        anyhow::ensure!(token_count > 0, "DFlash materialize needs tokens");
+        anyhow::ensure!(
+            token_count <= scratch.max_rows(),
+            "DFlash materialize rows {token_count} exceed scratch {}",
+            scratch.max_rows()
+        );
         anyhow::ensure!(
             captured_hidden.hidden_dim == self.context_feature_dim(),
             "DFlash captured hidden dim {} does not match expected {}",
@@ -554,211 +461,175 @@ impl DFlashDraftModel {
         );
         anyhow::ensure!(
             token_offset + token_count <= captured_hidden.seq_len,
-            "DFlash captured hidden token range exceeds source"
-        );
-        let required_committed_len = state
-            .committed_len
-            .checked_add(state.pending_context.len)
-            .and_then(|len| len.checked_add(token_count))
-            .and_then(|len| len.checked_add(self.block_size()))
-            .context("DFlash pending context cache length overflow")?;
-        anyhow::ensure!(
-            required_committed_len <= state.max_cache_len,
-            "DFlash pending context would exceed cache: committed={}, pending={}, append={}, block={}, max={}",
-            state.committed_len,
-            state.pending_context.len,
-            token_count,
-            self.block_size(),
-            state.max_cache_len
-        );
-        state.pending_context.append_from(
-            ctx,
-            captured_hidden,
-            token_offset,
-            token_count,
-            state.max_cache_len,
-        )?;
-        Ok(())
-    }
-
-    /// Seed a request's pending context from cached prefix blocks. The draft KV
-    /// is rebuilt from these rows by the first draft round, exactly as it is
-    /// from a cold prefill's capture.
-    pub(crate) fn append_restored_context(
-        ctx: &DeviceContext,
-        state: &mut DFlashRequestState,
-        cache: &DFlashCaptureCache,
-        slots: &[usize],
-    ) -> Result<()> {
-        let block = cache.block_size();
-        let total = slots
-            .len()
-            .checked_mul(block)
-            .context("DFlash restored context length overflow")?;
-        anyhow::ensure!(
-            total + block <= state.max_cache_len,
-            "DFlash restored context {} + block {} exceeds max cache {}",
-            total,
-            block,
-            state.max_cache_len
-        );
-        state
-            .pending_context
-            .ensure_capacity(ctx, total, state.max_cache_len)?;
-        // `copy_block` bounds-checks against `seq_len`, which is the logical
-        // extent here, so expose the whole allocation while filling it.
-        state.pending_context.buffer.seq_len = state.pending_context.capacity;
-        for (i, slot) in slots.iter().enumerate() {
-            cache.copy_block(ctx, *slot, &mut state.pending_context.buffer, i * block)?;
-        }
-        state.pending_context.len = total;
-        state.pending_context.buffer.seq_len = total;
-        state.captured_len = total;
-        state.published_blocks = slots.len();
-        state.pending_is_history = true;
-        Ok(())
-    }
-
-    /// Append the accepted verify rows to the partial block's seal buffer.
-    pub(crate) fn append_seal_rows(
-        ctx: &DeviceContext,
-        state: &mut DFlashRequestState,
-        captured_hidden: &HiddenStates,
-        token_offset: usize,
-        token_count: usize,
-    ) -> Result<()> {
-        if token_count == 0 || state.seal.seq_len == 0 {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            captured_hidden.seq_len >= token_offset + token_count,
-            "DFlash seal source range [{}, {}) exceeds captured rows {}",
+            "DFlash materialize source range [{}, {}) exceeds seq_len {}",
             token_offset,
             token_offset + token_count,
             captured_hidden.seq_len
         );
         anyhow::ensure!(
-            state.seal_len + token_count <= state.seal.seq_len,
-            "DFlash seal buffer overflow: {} + {} > {}",
-            state.seal_len,
-            token_count,
-            state.seal.seq_len
+            start_pos + token_count <= state.max_cache_len,
+            "DFlash materialize destination [{}, {}) exceeds max cache {}",
+            start_pos,
+            start_pos + token_count,
+            state.max_cache_len
         );
-        debug_assert_eq!(
-            state.seal_len,
-            state.captured_len - state.published_blocks * (state.seal.seq_len / 2),
-            "DFlash capture seal/ledger drift"
-        );
+        if let Some(pool) = pool.as_deref() {
+            anyhow::ensure!(
+                pool.k.len() == self.layers.len(),
+                "DFlash draft KV pool has {} layers, drafter has {}",
+                pool.k.len(),
+                self.layers.len()
+            );
+            let needed_pages = (start_pos + token_count).div_ceil(pool.block_size);
+            anyhow::ensure!(
+                page_indices.len() >= needed_pages,
+                "DFlash materialize needs {needed_pages} target pages, got {}",
+                page_indices.len()
+            );
+            let block = pool.block_size;
+            for i in 0..token_count {
+                let position = start_pos + i;
+                let page = page_indices[position / block];
+                anyhow::ensure!(
+                    page >= 0 && (page as usize) < pool.total_blocks,
+                    "DFlash materialize page {page} out of range {}",
+                    pool.total_blocks
+                );
+                scratch.locs_host[i] = (page as usize * block + position % block) as i32;
+            }
+            let mut locs_dst = scratch.locs.slice_mut(..token_count);
+            ctx.stream
+                .memcpy_htod(&scratch.locs_host[..token_count], &mut locs_dst)?;
+        }
+
+        scratch.capture_rows.seq_len = token_count;
         ops::copy_hidden_token_range_into(
             ctx,
             captured_hidden,
             token_offset,
-            &mut state.seal,
-            state.seal_len,
+            &mut scratch.capture_rows,
+            0,
             token_count,
         )?;
-        state.seal_len += token_count;
-        state.captured_len += token_count;
-        state.pending_is_history = false;
+        scratch.ctx_projected.seq_len = token_count;
+        ops::gemm_into(
+            ctx,
+            &self.fc,
+            &scratch.capture_rows,
+            &mut scratch.ctx_projected,
+        );
+        scratch.ctx_hidden.seq_len = token_count;
+        ops::rms_norm_batch_into(
+            ctx,
+            &scratch.ctx_projected,
+            &self.hidden_norm,
+            self.config.rms_norm_eps,
+            &mut scratch.ctx_hidden,
+        );
+
+        let q_dim = self.config.num_attention_heads * self.config.head_dim;
+        let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            scratch.k.seq_len = token_count;
+            scratch.v.seq_len = token_count;
+            ops::gemm_rows_into(
+                ctx,
+                &layer.attention.qkv_proj,
+                q_dim,
+                kv_dim,
+                &scratch.ctx_hidden,
+                &mut scratch.k,
+            );
+            ops::gemm_rows_into(
+                ctx,
+                &layer.attention.qkv_proj,
+                q_dim + kv_dim,
+                kv_dim,
+                &scratch.ctx_hidden,
+                &mut scratch.v,
+            );
+            scratch.q.seq_len = token_count;
+            ops::dflash_qk_norm_rope_into(
+                ctx,
+                &mut scratch.q,
+                0,
+                token_count,
+                &mut scratch.k,
+                &layer.attention.q_norm,
+                &layer.attention.k_norm,
+                &self.cos_cache,
+                &self.sin_cache,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                start_pos,
+                start_pos,
+                self.config.rms_norm_eps,
+            )?;
+            ops::copy_hidden_token_range_into(
+                ctx,
+                &scratch.k,
+                0,
+                &mut state.layers[layer_idx].k,
+                start_pos,
+                token_count,
+            )?;
+            ops::copy_hidden_token_range_into(
+                ctx,
+                &scratch.v,
+                0,
+                &mut state.layers[layer_idx].v,
+                start_pos,
+                token_count,
+            )?;
+
+            if let Some(pool) = pool.as_mut() {
+                let pool: &mut DFlashDraftKvPool = pool;
+                pegainfer_kernels::ops::draft_kv_scatter_into(
+                    ctx,
+                    &mut [
+                        (&scratch.k, &mut pool.k[layer_idx]),
+                        (&scratch.v, &mut pool.v[layer_idx]),
+                    ],
+                    &scratch.locs,
+                    token_count,
+                )?;
+            }
+        }
         Ok(())
     }
 
-    /// Publish every fully captured, committed KV block to the prefix cache.
-    /// `hashes` is the request's full assigned-block list in order; the first
-    /// `published_blocks` entries are already published (a restored prefix).
-    pub(crate) fn publish_prefix_captures(
+    /// Gather a matched prefix's draft K/V out of the paged pool into the
+    /// request's dense mirror. The caller has already verified that every block
+    /// is tagged with the matched content.
+    pub(crate) fn gather_restored_kv(
         ctx: &DeviceContext,
         state: &mut DFlashRequestState,
-        cache: &mut DFlashCaptureCache,
-        hashes: &[[u8; 16]],
-        sealed_tokens: usize,
-        shift: &mut HiddenStates,
+        pool: &DFlashDraftKvPool,
+        locs: &CudaSlice<i32>,
+        tokens: usize,
     ) -> Result<()> {
-        let block = cache.block_size();
-        let target_blocks = state.captured_len.min(sealed_tokens) / block;
-        if target_blocks > state.published_blocks {
-            anyhow::ensure!(
-                hashes.len() >= target_blocks,
-                "DFlash capture publish needs {} block hashes, got {}",
-                target_blocks,
-                hashes.len()
-            );
-        }
-        // A prefix longer than the cache can never be restored whole (the
-        // all-or-nothing lookup needs every block), and inserting it would
-        // evict every other conversation on the way to evicting its own head.
-        // Keep draining the seal so it cannot overflow, but store nothing.
-        log::debug!(
-            "Qwen3 DFlash capture publish: request_blocks={} target_blocks={} published={} \
-             captured={} sealed={} seal_len={} cache_slots={}",
-            hashes.len(),
-            target_blocks,
-            state.published_blocks,
-            state.captured_len,
-            sealed_tokens,
-            state.seal_len,
-            cache.slot_count()
+        anyhow::ensure!(
+            pool.k.len() == state.layers.len(),
+            "DFlash restore pool/drafter layer mismatch: {} vs {}",
+            pool.k.len(),
+            state.layers.len()
         );
-        let can_publish = hashes.len() <= cache.slot_count();
-        if !can_publish {
-            log::debug!(
-                "Qwen3 DFlash capture publish skipped: request has {} blocks, cache has {} slots \
-                 (the budget caps the longest restorable prefix)",
-                hashes.len(),
-                cache.slot_count()
-            );
+        anyhow::ensure!(
+            tokens <= state.max_cache_len,
+            "DFlash restore tokens {tokens} exceed max cache {}",
+            state.max_cache_len
+        );
+        {
+            let mut pairs: Vec<(&HiddenStates, &mut HiddenStates)> =
+                Vec::with_capacity(2 * state.layers.len());
+            for (layer_idx, cache) in state.layers.iter_mut().enumerate() {
+                pairs.push((&pool.k[layer_idx], &mut cache.k));
+                pairs.push((&pool.v[layer_idx], &mut cache.v));
+            }
+            pegainfer_kernels::ops::draft_kv_gather_into(ctx, &mut pairs, locs, tokens)?;
         }
-
-        if state.pending_is_history {
-            // Publish from the full prompt capture, then keep the partial tail
-            // for the verify rounds. This must also run when no block is full
-            // yet (a short prompt): the tail is the seed for later verifies.
-            if can_publish {
-                for (i, hash) in hashes
-                    .iter()
-                    .enumerate()
-                    .take(target_blocks)
-                    .skip(state.published_blocks)
-                {
-                    let _ = cache.insert(ctx, *hash, &state.pending_context.buffer, i * block)?;
-                }
-            }
-            let tail_start = target_blocks * block;
-            let tail_len = state.captured_len - tail_start;
-            state.seal_len = tail_len;
-            if tail_len > 0 {
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &state.pending_context.buffer,
-                    tail_start,
-                    &mut state.seal,
-                    0,
-                    tail_len,
-                )?;
-            }
-            state.pending_is_history = false;
-        } else if target_blocks > state.published_blocks {
-            let start = state.published_blocks;
-            if can_publish {
-                for (i, hash) in hashes.iter().enumerate().take(target_blocks).skip(start) {
-                    let _ = cache.insert(ctx, *hash, &state.seal, (i - start) * block)?;
-                }
-            }
-            let consumed = (target_blocks - start) * block;
-            let remaining = state.seal_len - consumed;
-            if remaining > 0 {
-                anyhow::ensure!(
-                    shift.seq_len >= remaining,
-                    "DFlash seal shift buffer too small: {} < {}",
-                    shift.seq_len,
-                    remaining
-                );
-                ops::copy_hidden_token_range_into(ctx, &state.seal, consumed, shift, 0, remaining)?;
-                ops::copy_hidden_token_range_into(ctx, shift, 0, &mut state.seal, 0, remaining)?;
-            }
-            state.seal_len = remaining;
-        }
-        state.published_blocks = target_blocks;
+        state.committed_len = tokens;
         Ok(())
     }
 
@@ -795,25 +666,16 @@ impl DFlashDraftModel {
         let block_size = self.block_size();
         let batch_block_rows = active_batch * block_size;
 
-        // Each request's committed context length for this round; advancing
-        // `committed_len` is deferred until after the layer loop (the rope start
-        // positions and KV write offsets read the pre-advance value).
-        let mut context_lens = Vec::with_capacity(active_batch);
-        for (i, state) in states.iter().enumerate() {
-            let Some(context_len) = state.pending_context_len() else {
-                anyhow::bail!(
-                    "DFlash draft requested before target hidden context is available (request slot {i})"
-                );
-            };
-            let tail_len = context_len + block_size;
+        // The prefix K/V is already materialized by the prefill/verify path;
+        // this round only appends the in-fill block at `committed_len`.
+        for state in states.iter() {
             anyhow::ensure!(
-                state.committed_len + tail_len <= state.max_cache_len,
-                "DFlash draft cache overflow: committed={}, tail={}, max={}",
+                state.committed_len + block_size <= state.max_cache_len,
+                "DFlash draft cache overflow: committed={}, block={}, max={}",
                 state.committed_len,
-                tail_len,
+                block_size,
                 state.max_cache_len
             );
-            context_lens.push(context_len);
         }
 
         scratch.activate_dense(batch_block_rows);
@@ -833,18 +695,6 @@ impl DFlashDraftModel {
             &mut token_ids_dst,
         )?;
         target.get_embeddings_batch_into(&scratch.token_ids_d, &mut scratch.hidden)?;
-
-        // Per-request context projection: varlen (each request's committed
-        // prefix differs), persisted in the request so every layer can read it.
-        for (i, state) in states.iter_mut().enumerate() {
-            let context_len = context_lens[i];
-            state
-                .context
-                .ensure_capacity(ctx, self.config.hidden_size, context_len)?;
-            state.pending_context.activate_for_read();
-            self.project_context_into(ctx, &state.pending_context.buffer, &mut state.context);
-            state.pending_context.clear();
-        }
 
         let hidden_size = self.config.hidden_size;
         let q_dim = self.config.num_attention_heads * self.config.head_dim;
@@ -887,26 +737,17 @@ impl DFlashDraftModel {
             // single-request prefill. Each request slices its `block_size` rows at
             // offset `i * block_size` of the batched `normed`/`q_batch`/`attn_output`.
             for (i, state) in states.iter_mut().enumerate() {
-                let context_len = context_lens[i];
-                let tail_len = context_len + block_size;
                 let row_offset = i * block_size;
-                scratch.ensure_tail_capacity(ctx, &self.config, tail_len)?;
+                scratch.ensure_tail_capacity(ctx, &self.config, block_size)?;
 
-                // tail_input = [context_hidden(context_len) | normed_block(block_size)].
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &state.context.context_hidden,
-                    0,
-                    &mut scratch.tail_input,
-                    0,
-                    context_len,
-                )?;
+                // The prefix K/V is already in `state.layers`; the tail is just
+                // this request's in-fill block, starting at its current token.
                 ops::copy_hidden_token_range_into(
                     ctx,
                     &scratch.normed,
                     row_offset,
                     &mut scratch.tail_input,
-                    context_len,
+                    0,
                     block_size,
                 )?;
 
@@ -940,7 +781,7 @@ impl DFlashDraftModel {
                     self.config.num_attention_heads,
                     self.config.num_key_value_heads,
                     self.config.head_dim,
-                    state.committed_len + context_len,
+                    state.committed_len,
                     state.committed_len,
                     self.config.rms_norm_eps,
                 )?;
@@ -952,7 +793,7 @@ impl DFlashDraftModel {
                     0,
                     &mut cache.k,
                     state.committed_len,
-                    tail_len,
+                    block_size,
                 )?;
                 ops::copy_hidden_token_range_into(
                     ctx,
@@ -960,15 +801,14 @@ impl DFlashDraftModel {
                     0,
                     &mut cache.v,
                     state.committed_len,
-                    tail_len,
+                    block_size,
                 )?;
                 // The trained mask keeps W target-context tokens before the
                 // anchor and the entire noncausal draft block for every query.
-                let prefix = state.committed_len + context_len;
                 let kv_start = self
                     .config
                     .sliding_window
-                    .map_or(0, |window| prefix.saturating_sub(window));
+                    .map_or(0, |window| state.committed_len.saturating_sub(window));
                 pegainfer_kernels::ops::single_prefill_nhd_noncausal_range_into(
                     ctx,
                     &scratch.q_batch,
@@ -980,7 +820,7 @@ impl DFlashDraftModel {
                     self.config.num_attention_heads,
                     self.config.num_key_value_heads,
                     self.config.head_dim,
-                    kv_start..state.committed_len + tail_len,
+                    kv_start..state.committed_len + block_size,
                 )?;
             }
 
@@ -1053,9 +893,6 @@ impl DFlashDraftModel {
             std::mem::swap(&mut scratch.hidden, &mut scratch.hidden_out);
         }
 
-        for (i, state) in states.iter_mut().enumerate() {
-            state.committed_len += context_lens[i];
-        }
         self.compute_logits_into(target, scratch)?;
         Ok(&scratch.logits)
     }
@@ -1193,27 +1030,6 @@ impl DFlashDraftModel {
         self.config.hidden_size * self.target_layer_ids().len()
     }
 
-    fn project_context_into(
-        &self,
-        ctx: &DeviceContext,
-        context_features: &HiddenStates,
-        context: &mut DFlashContextScratch,
-    ) {
-        ops::gemm_into(
-            ctx,
-            &self.fc,
-            context_features,
-            &mut context.context_projected,
-        );
-        ops::rms_norm_batch_into(
-            ctx,
-            &context.context_projected,
-            &self.hidden_norm,
-            self.config.rms_norm_eps,
-            &mut context.context_hidden,
-        );
-    }
-
     fn compute_logits_into(
         &self,
         target: &Qwen3Model,
@@ -1268,45 +1084,30 @@ mod tests {
         // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
         let reservation = super::DFlashMemoryReservation::from_config(
-            &dflash, /*max_decode_batch*/ 256, 0, 0,
+            &dflash, /*max_decode_batch*/ 256, 1024,
         )
         .expect("reservation sizing");
         assert_eq!(
             reservation.kv_bytes_per_token, 65_536,
-            "draft KV(20480) + scratch-ctx(19456) + pending(25600) per token"
+            "conservative draft term: pool + mirror + tail + retired capture buffers"
         );
         assert_eq!(
-            reservation.request_state_bytes_per_token, 56_320,
-            "request-owned draft KV(20480) + scratch-ctx(10240) + pending(25600) per token"
+            reservation.request_state_bytes_per_token, 20_480,
+            "per-request dense draft K/V mirror only; the paged pool is shared"
         );
         // Weights (~1.1 GiB) dominate the fixed term at batch=1; the block-sized
         // per-request scratch (~6.5 MiB, logits-heavy) plus the one-block KV/tail
         // headroom (~0.5 MiB) add across the decode batch.
-        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1, 0, 0)
+        let fixed_batch1 = super::DFlashMemoryReservation::from_config(&dflash, 1, 1024)
             .expect("reservation sizing")
             .fixed_bytes;
-        // The capture cache is a fixed term; the budget passes through unshaped
-        // so a knob typo cannot silently under-reserve it. Enabling it also
-        // allocates one partial-block seal per request plus the lane's shift
-        // buffer, both of which must be reserved.
-        let with_capture =
-            super::DFlashMemoryReservation::from_config(&dflash, 1, 128 * 1024 * 1024, 16)
-                .expect("reservation sizing")
-                .fixed_bytes;
-        let capture_dim = dflash.hidden_size * dflash.target_layer_ids.len();
-        let seal_bytes = capture_dim * 2 * 16 * 2; // two KV blocks of bf16 rows
-        assert_eq!(
-            with_capture - fixed_batch1,
-            128 * 1024 * 1024 + 2 * seal_bytes,
-            "capture cache + per-request seal + lane shift must be reserved"
+        assert!(
+            (1_150_000_000..1_280_000_000).contains(&fixed_batch1),
+            "draft weights ~1.1GiB + materialize scratch, got {fixed_batch1}"
         );
         assert!(
-            (1_150_000_000..1_220_000_000).contains(&fixed_batch1),
-            "draft weights ~1.1GiB, got {fixed_batch1}"
-        );
-        assert!(
-            (2_900_000_000..3_000_000_000).contains(&reservation.fixed_bytes),
-            "weights + 256 * (~6.5MiB scratch + ~0.5MiB block headroom), got {}",
+            (2_900_000_000..3_120_000_000).contains(&reservation.fixed_bytes),
+            "weights + 256 * (~6.5MiB scratch + ~0.5MiB block headroom) + materialize, got {}",
             reservation.fixed_bytes
         );
     }

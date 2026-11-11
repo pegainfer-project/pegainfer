@@ -2,12 +2,14 @@
 //!
 //! This lives on the worker thread next to the target model because the draft
 //! rollout reads the target's embeddings/head and its captured hidden states.
-//! The draft/verify boundary stays a pure token span — the hidden states are
-//! private to this lane (`pending_context`), never crossing to the scheduler.
+//! The draft/verify boundary stays a pure token span — the target hidden rows
+//! are private to this lane and materialize into draft K/V before the scheduler
+//! can match the block.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
+use cudarc::driver::CudaSlice;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::sampler::SamplingParams;
@@ -21,8 +23,9 @@ use super::RequestId;
 use super::dflash_prefill::dflash_prefill_can_capture;
 use super::dflash_prefill::should_capture_dflash_prefill_context;
 use crate::dflash::DFlashBatchScratch;
-use crate::dflash::DFlashCaptureCache;
+use crate::dflash::DFlashDraftKvPool;
 use crate::dflash::DFlashDraftModel;
+use crate::dflash::DFlashKvMaterializeScratch;
 use crate::dflash::DFlashRequestState;
 use crate::speculative::DraftRequestResult;
 use crate::speculative::DraftResult;
@@ -62,21 +65,26 @@ pub(super) struct DFlashLaneState {
     /// never the raw env values.
     hedge_cap: usize,
     hedge_branch_positions: Vec<usize>,
-    /// Target hidden-row cache for sealed prefix KV blocks. `None` when the
-    /// capture-cache budget is zero, which keeps the prefix cache off while a
-    /// drafter is loaded.
-    capture_cache: Option<DFlashCaptureCache>,
-    /// KV block size (the prefix cache's 16-token block), not the draft block.
-    prefix_block_size: usize,
+    /// Draft K/V addressed by the target KV's block IDs. It shares the target
+    /// radix cache's lifetime: every registered block was materialized before
+    /// it became matchable. `None` with `--no-prefix-cache` (no match can
+    /// consume it; the request mirror is still materialized for the draft).
+    draft_pool: Option<DFlashDraftKvPool>,
+    /// Lane-level scratch for materializing a step's target context.
+    materialize: DFlashKvMaterializeScratch,
+    /// Target KV page size and pool block count.
+    page_size: usize,
+    total_blocks: usize,
+    /// Locations for gathering a restored prefix out of the pool.
+    restore_locs: CudaSlice<i32>,
+    restore_locs_host: Vec<i32>,
     /// Bytes the KV reservation set aside for request-owned draft state. Shared
     /// prefix blocks are billed once by the pool, but each request still owns
-    /// its own draft KV/context/pending buffers, so the lane must bound the sum
-    /// or a shared-prefix batch allocates far past the reservation.
+    /// its own dense draft K/V mirror, so the lane must bound the sum or a
+    /// shared-prefix batch allocates far past the reservation.
     draft_state_budget_bytes: usize,
     /// Per-token charge for one request's draft state.
     draft_state_bytes_per_token: usize,
-    /// One-block scratch used to compact the seal buffer after a publish.
-    seal_shift: HiddenStates,
 }
 
 impl DFlashLaneState {
@@ -84,8 +92,10 @@ impl DFlashLaneState {
         ctx: &DeviceContext,
         model: DFlashDraftModel,
         max_decode_batch_size: usize,
-        prefix_block_size: usize,
-        capture_cache_bytes: usize,
+        page_size: usize,
+        total_blocks: usize,
+        max_prefill_tokens: usize,
+        prefix_cache: bool,
         draft_state_budget_bytes: usize,
         draft_state_bytes_per_token: usize,
     ) -> Result<Self> {
@@ -122,20 +132,21 @@ impl DFlashLaneState {
             log::info!("spec hedge auto: self-pricing controller on (C in 0..={max_chains})");
             super::auto_hedge::AutoHedge::new(max_chains)
         });
-        let capture_cache = DFlashCaptureCache::new(
-            ctx,
-            model.context_feature_dim(),
-            prefix_block_size,
-            capture_cache_bytes,
-        )?;
-        if let Some(cache) = &capture_cache {
+        let draft_pool = if prefix_cache {
+            let pool = model.new_draft_kv_pool(ctx, total_blocks, page_size)?;
             log::info!(
-                "Qwen3 DFlash capture cache: {} slots x {} tokens ({} MiB budget)",
-                cache.slot_count(),
-                prefix_block_size,
-                capture_cache_bytes / (1024 * 1024)
+                "Qwen3 DFlash draft KV pool: {} layers x {} slots x {} dim ({} MiB)",
+                pool.k.len(),
+                pool.slots(),
+                model.kv_dim(),
+                pool.slots() * model.kv_dim() * 2 * pool.k.len() * 2 / (1024 * 1024)
             );
-        }
+            Some(pool)
+        } else {
+            None
+        };
+        let materialize_rows = max_prefill_tokens.max(model.block_size() + 1);
+        let materialize = model.new_materialize_scratch(ctx, materialize_rows)?;
         if draft_state_budget_bytes > 0 {
             log::info!(
                 "Qwen3 DFlash draft state budget: {} MiB ({} B/token per request)",
@@ -143,8 +154,8 @@ impl DFlashLaneState {
                 draft_state_bytes_per_token
             );
         }
-        let seal_shift =
-            HiddenStates::zeros(ctx, model.context_feature_dim(), prefix_block_size * 2)?;
+        let restore_rows = model.max_position_embeddings();
+        let restore_locs = ctx.stream.alloc_zeros(restore_rows)?;
         Ok(Self {
             model,
             requests: HashMap::new(),
@@ -158,11 +169,14 @@ impl DFlashLaneState {
             round_chains: 0,
             hedge_cap,
             hedge_branch_positions,
-            capture_cache,
-            prefix_block_size,
+            draft_pool,
+            materialize,
+            page_size,
+            total_blocks,
+            restore_locs,
+            restore_locs_host: vec![0; restore_rows],
             draft_state_budget_bytes,
             draft_state_bytes_per_token,
-            seal_shift,
         })
     }
 
@@ -186,37 +200,39 @@ impl DFlashLaneState {
         used.saturating_add(needed) <= self.draft_state_budget_bytes
     }
 
-    pub(super) fn capture_cache_enabled(&self) -> bool {
-        self.capture_cache.is_some()
-    }
-
-    /// Seed drafter state from prefix-cached capture rows. A miss leaves the
-    /// request without a drafter (it can still serve from the KV hit and
-    /// plain-decode); the caller must not assume every hit restored.
+    /// Copy a matched prefix's draft K/V out of the paged pool. The executor
+    /// has already checked every page's content tag; an empty page list is the
+    /// fallback (target KV hit, no draft state).
     pub(super) fn restore_prefix_captures(
         &mut self,
         ctx: &DeviceContext,
         requests: &[PrefillStepItem],
     ) -> Result<()> {
-        if self.capture_cache.is_none() {
+        let Some(draft_pool) = self.draft_pool.as_ref() else {
             return Ok(());
-        }
+        };
         for req in requests {
-            if req.capture_prefix_hashes.is_empty()
+            if req.capture_prefix_pages.is_empty()
                 || self.requests.contains_key(&req.request_id)
                 || !super::dflash_prefill::prefill_capture_supported(req)
             {
                 continue;
             }
+            let block = self.page_size;
+            let pages = &req.capture_prefix_pages;
+            let cached = pages.len() * block;
             anyhow::ensure!(
-                req.capture_prefix_hashes.len() * self.prefix_block_size
-                    == req.cached_tokens.unwrap_or(0),
-                "DFlash prefix capture hashes ({} blocks x {}) disagree with cached_tokens {} \
-                 for {:?}",
-                req.capture_prefix_hashes.len(),
-                self.prefix_block_size,
+                cached == req.cached_tokens.unwrap_or(0),
+                "DFlash restore pages ({} x {}) disagree with cached_tokens {} for {:?}",
+                pages.len(),
+                block,
                 req.cached_tokens.unwrap_or(0),
                 req.request_id
+            );
+            anyhow::ensure!(
+                cached <= self.restore_locs_host.len(),
+                "DFlash restore tokens {cached} exceed restore scratch {}",
+                self.restore_locs_host.len()
             );
             let max_cache_len =
                 (req.prompt_tokens.len() + req.max_output_tokens + self.model.block_size())
@@ -229,27 +245,29 @@ impl DFlashLaneState {
                 );
                 continue;
             }
-            let cache = self
-                .capture_cache
-                .as_mut()
-                .expect("capture cache checked above");
-            let Some(slots) = cache.lookup(&req.capture_prefix_hashes) else {
-                log::debug!(
-                    "Qwen3 DFlash prefix capture miss for {:?}: {} cached tokens not restored; \
-                     the request will not draft",
-                    req.request_id,
-                    req.cached_tokens.unwrap_or(0)
+            for (i, page) in pages.iter().enumerate() {
+                anyhow::ensure!(
+                    *page >= 0 && (*page as usize) < self.total_blocks,
+                    "DFlash restore page {page} out of range {}",
+                    self.total_blocks
                 );
-                continue;
-            };
-            let mut state =
-                self.model
-                    .new_request_state(ctx, max_cache_len, self.prefix_block_size)?;
-            if let Err(error) =
-                DFlashDraftModel::append_restored_context(ctx, &mut state, cache, &slots)
-            {
+                for j in 0..block {
+                    self.restore_locs_host[i * block + j] = (*page as usize * block + j) as i32;
+                }
+            }
+            let mut locs_dst = self.restore_locs.slice_mut(..cached);
+            ctx.stream
+                .memcpy_htod(&self.restore_locs_host[..cached], &mut locs_dst)?;
+            let mut state = self.model.new_request_state(ctx, max_cache_len)?;
+            if let Err(error) = DFlashDraftModel::gather_restored_kv(
+                ctx,
+                &mut state,
+                draft_pool,
+                &self.restore_locs,
+                cached,
+            ) {
                 log::warn!(
-                    "Qwen3 DFlash prefix capture restore failed for {:?}: {error}",
+                    "Qwen3 DFlash prefix draft KV restore failed for {:?}: {error}",
                     req.request_id
                 );
                 continue;
@@ -257,30 +275,6 @@ impl DFlashLaneState {
             self.requests.insert(req.request_id, state);
         }
         Ok(())
-    }
-
-    /// Publish every fully captured, committed block for one request.
-    pub(super) fn publish_captures(
-        &mut self,
-        ctx: &DeviceContext,
-        request_id: RequestId,
-        hashes: &[[u8; 16]],
-        sealed_tokens: usize,
-    ) -> Result<()> {
-        let Some(cache) = self.capture_cache.as_mut() else {
-            return Ok(());
-        };
-        let Some(state) = self.requests.get_mut(&request_id) else {
-            return Ok(());
-        };
-        DFlashDraftModel::publish_prefix_captures(
-            ctx,
-            state,
-            cache,
-            hashes,
-            sealed_tokens,
-            &mut self.seal_shift,
-        )
     }
 }
 
@@ -304,23 +298,6 @@ impl LocalQwen3Lane {
         Ok(())
     }
 
-    /// Publish captures for the blocks the previous step committed. Called on
-    /// the verify path before its forward, mirroring the draft path's publish.
-    pub(super) fn publish_dflash_captures(&mut self, requests: &[VerifyStepItem]) -> Result<()> {
-        let ctx = self.model.device_ctx().clone();
-        if let Some(dflash) = self.dflash.as_mut() {
-            for req in requests {
-                dflash.publish_captures(
-                    &ctx,
-                    req.request_id,
-                    &req.capture_hashes,
-                    req.sealed_tokens,
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn should_capture_dflash_prefill_context(
         &self,
         requests: &[PrefillStepItem],
@@ -333,11 +310,13 @@ impl LocalQwen3Lane {
         })
     }
 
-    /// Fold target hidden states captured during prefill into each eligible
-    /// request's pending context. Returns the requests that now have context.
+    /// Materialize each eligible request's prefill chunk into draft K/V. The
+    /// rows go to both the request mirror and the paged pool at the target's
+    /// block slots. Returns the requests that now have a full draft state.
     pub(super) fn record_prefill_dflash_context(
         &mut self,
         requests: &[PrefillStepItem],
+        kv_views: &[pegainfer_kv_cache::KvView],
         capture_requested: bool,
         captured_hidden: Option<&HiddenStates>,
     ) -> Result<Vec<RequestId>> {
@@ -352,6 +331,12 @@ impl LocalQwen3Lane {
             capture_requested,
             "DFlash prefill hidden states were returned without a capture request"
         );
+        anyhow::ensure!(
+            requests.len() == kv_views.len(),
+            "DFlash prefill has {} requests but {} KV views",
+            requests.len(),
+            kv_views.len()
+        );
         let Some(dflash) = self.dflash.as_mut() else {
             anyhow::bail!("DFlash prefill context record requested without DFlash");
         };
@@ -365,13 +350,9 @@ impl LocalQwen3Lane {
         let ctx = self.model.device_ctx().clone();
         let mut captured_requests = Vec::new();
         let mut token_offset = 0usize;
-        for req in requests {
-            let pending_exists = dflash.requests.contains_key(&req.request_id);
-            if dflash_prefill_can_capture(req, pending_exists) {
-                // Admission already caps the request at `draft.max_pos - block_size`
-                // (see `max_context_tokens`), so this `.min` is a defensive floor:
-                // it keeps the draft KV alloc within the draft's max positions even
-                // if a caller bypasses admission.
+        for (i, req) in requests.iter().enumerate() {
+            let state_exists = dflash.requests.contains_key(&req.request_id);
+            if dflash_prefill_can_capture(req, state_exists) {
                 let max_cache_len =
                     (req.prompt_tokens.len() + req.max_output_tokens + dflash.model.block_size())
                         .min(dflash.model.max_position_embeddings());
@@ -384,30 +365,37 @@ impl LocalQwen3Lane {
                     token_offset += req.chunk_tokens;
                     continue;
                 }
-                let mut state = match existing {
-                    Some(state) => state,
-                    None => dflash.model.new_request_state(
-                        &ctx,
-                        max_cache_len,
-                        dflash.prefix_block_size,
-                    )?,
+                let mut state = if let Some(state) = existing {
+                    state
+                } else {
+                    anyhow::ensure!(
+                        req.chunk_start == 0,
+                        "DFlash prefill chunk for {:?} starts at {} without a restored state",
+                        req.request_id,
+                        req.chunk_start
+                    );
+                    dflash.model.new_request_state(&ctx, max_cache_len)?
                 };
-                let pending_len = state.pending_context_len().unwrap_or(0);
                 anyhow::ensure!(
-                    pending_len == req.chunk_start,
-                    "DFlash prefill context for {:?} is discontinuous: pending={}, chunk_start={}",
+                    state.committed_len == req.chunk_start,
+                    "DFlash prefill context for {:?} is discontinuous: committed={}, chunk_start={}",
                     req.request_id,
-                    pending_len,
+                    state.committed_len,
                     req.chunk_start
                 );
-                dflash.model.append_pending_context(
+                let start_pos = state.committed_len;
+                dflash.model.materialize_context_kv(
                     &ctx,
                     &mut state,
                     captured_hidden,
                     token_offset,
                     req.chunk_tokens,
+                    start_pos,
+                    kv_views[i].page_indices(),
+                    dflash.draft_pool.as_mut(),
+                    &mut dflash.materialize,
                 )?;
-                state.note_prefill_capture();
+                state.committed_len += req.chunk_tokens;
                 dflash.requests.insert(req.request_id, state);
                 captured_requests.push(req.request_id);
             } else {
@@ -418,12 +406,14 @@ impl LocalQwen3Lane {
         Ok(captured_requests)
     }
 
-    /// Seed the next draft round from a verify step: append the target hidden
-    /// states for the *accepted* span positions to each request's pending
-    /// context, and keep the cumulative acceptance trace at debug level.
+    /// Materialize the accepted verify rows' target hidden into draft K/V and
+    /// keep the cumulative acceptance trace at debug level. The verifier
+    /// forwarded the anchor plus the accepted drafts; the newly sampled bonus
+    /// stays dangling and is materialized by the next step.
     pub(super) fn record_verify_dflash_context(
         &mut self,
         requests: &[VerifyStepItem],
+        kv_views: &[pegainfer_kv_cache::KvView],
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
         verify_round: u64,
@@ -432,6 +422,12 @@ impl LocalQwen3Lane {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
         };
+        anyhow::ensure!(
+            requests.len() == kv_views.len(),
+            "DFlash verify has {} requests but {} KV views",
+            requests.len(),
+            kv_views.len()
+        );
         let Some(dflash) = self.dflash.as_mut() else {
             anyhow::bail!("DFlash verify context record requested without DFlash");
         };
@@ -450,7 +446,7 @@ impl LocalQwen3Lane {
         );
         let ctx = self.model.device_ctx().clone();
         let mut token_offset = 0usize;
-        for (req, result) in requests.iter().zip(results) {
+        for (i, (req, result)) in requests.iter().zip(results).enumerate() {
             anyhow::ensure!(
                 req.request_id == result.request_id,
                 "DFlash verify result {:?} does not match request {:?}",
@@ -460,23 +456,21 @@ impl LocalQwen3Lane {
             let mut state = dflash.requests.remove(&req.request_id).ok_or_else(|| {
                 anyhow::anyhow!("missing DFlash state after verify for {:?}", req.request_id)
             })?;
-            // Only the accepted prefix's target hidden states are valid context
-            // for the next draft; rejected drafts had the wrong continuation.
-            dflash.model.append_pending_context(
+            let accepted = result.accepted_tokens.len();
+            let start_pos = state.committed_len;
+            dflash.model.materialize_context_kv(
                 &ctx,
                 &mut state,
                 captured_hidden,
                 token_offset,
-                result.accepted_tokens.len(),
+                accepted,
+                start_pos,
+                kv_views[i].page_indices(),
+                dflash.draft_pool.as_mut(),
+                &mut dflash.materialize,
             )?;
-            DFlashDraftModel::append_seal_rows(
-                &ctx,
-                &mut state,
-                captured_hidden,
-                token_offset,
-                result.accepted_tokens.len(),
-            )?;
-            let context_len = state.pending_context_len().unwrap_or(0);
+            state.committed_len += accepted;
+            let committed_len = state.committed_len;
             dflash.requests.insert(req.request_id, state);
             dflash.verified_draft_tokens += req.token_ids.len().saturating_sub(1);
             dflash.accepted_draft_tokens += result.matched_draft_tokens;
@@ -493,8 +487,8 @@ impl LocalQwen3Lane {
                 result.matched_draft_tokens,
                 verified_draft,
                 u8::from(gated),
-                result.accepted_tokens.len(),
-                context_len,
+                accepted,
+                committed_len,
                 rate,
             );
             token_offset += req.token_ids.len();
@@ -523,19 +517,6 @@ impl LocalQwen3Lane {
             !requests.is_empty(),
             "DFlash draft requested without active requests"
         );
-        // Publish the blocks the previous step committed before this round
-        // consumes the capture history.
-        let ctx = self.model.device_ctx().clone();
-        if let Some(dflash) = self.dflash.as_mut() {
-            for req in requests {
-                dflash.publish_captures(
-                    &ctx,
-                    req.request_id,
-                    &req.capture_hashes,
-                    req.sealed_tokens,
-                )?;
-            }
-        }
         // Take the lane out of `self` so the draft forward (which borrows
         // `dflash.model`/`dflash.scratch`) and the argmax (which borrows
         // `self.sample_scratch`) don't collide on a `self` borrow.
@@ -785,35 +766,10 @@ impl LocalQwen3Lane {
         Ok(DraftResult { requests: result? })
     }
 
-    pub(super) fn drop_dflash_request(
-        &mut self,
-        request_id: RequestId,
-        capture: Option<(Vec<[u8; 16]>, usize)>,
-    ) {
-        let ctx = self.model.device_ctx().clone();
-        let Some(dflash) = self.dflash.as_mut() else {
-            return;
-        };
-        // A retired request has no next draft/verify step to publish on, so
-        // drain its final sealed blocks here. A publish failure must not wedge
-        // retirement; the request is already gone from the scheduler's view.
-        if let Some((hashes, sealed_tokens)) = &capture {
-            log::debug!(
-                "Qwen3 DFlash drop publish for {:?}: {} hashes, {} sealed tokens",
-                request_id,
-                hashes.len(),
-                sealed_tokens
-            );
+    pub(super) fn drop_dflash_request(&mut self, request_id: RequestId) {
+        if let Some(dflash) = self.dflash.as_mut() {
+            dflash.requests.remove(&request_id);
         }
-        if let Some((hashes, sealed_tokens)) = capture
-            && let Err(error) = dflash.publish_captures(&ctx, request_id, &hashes, sealed_tokens)
-        {
-            log::warn!(
-                "Qwen3 DFlash capture publish on finish failed for {:?}: {error}",
-                request_id
-            );
-        }
-        dflash.requests.remove(&request_id);
     }
 }
 

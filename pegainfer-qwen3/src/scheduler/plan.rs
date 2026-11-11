@@ -313,7 +313,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,
-                capture_prefix_hashes: Vec::new(),
+                capture_prefix_pages: Vec::new(),
             }
         })
         .collect()

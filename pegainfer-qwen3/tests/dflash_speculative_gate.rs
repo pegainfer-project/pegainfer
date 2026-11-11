@@ -113,7 +113,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         offload: Qwen3OffloadOptions::disabled(),
         // The legacy gates request the prefix cache off on both arms so they
         // take the same cold prefill path. The joint APC+spec gate below leaves
-        // it on (the drafter's capture cache restores a warm hit).
+        // it on (the paged draft K/V pool restores a warm hit).
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
         memory: Qwen3MemoryOptions::new(
@@ -1195,7 +1195,7 @@ fn dflash_warm_prefix_keeps_drafting() {
         .expect("failed to start speculative engine"),
     );
 
-    // Cold run: fills both the KV prefix cache and the drafter capture cache.
+    // Cold run: fills the target KV prefix cache and the paged draft K/V pool.
     // Metrics before the first served step expose no counters yet; the delta
     // from zero is still the cold run's own contribution.
     let cold_base = engine.metrics().spec_decode.unwrap_or_default();
@@ -1371,6 +1371,82 @@ fn dflash_finish_publishes_last_sealed_block() {
     );
 }
 
+/// A prefill-only turn (max_tokens=1) never runs a verify round. Its prompt
+/// blocks must still be tagged when they are registered, or the next turn's
+/// prefix hit cannot restore draft K/V and plainly decodes.
+#[test]
+fn dflash_prefill_only_turn_warms_prefix() {
+    common::harness::init_capture_logging();
+    let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(80);
+    let encoded = tokenizer.encode(&text, false).expect("encode failed");
+    let prompt_len = (encoded.len() / 16) * 16;
+    assert!(prompt_len > 4 * 16, "the prompt must span several blocks");
+    let prompt_tokens = encoded[..prompt_len].to_vec();
+
+    let engine = EngineHarness::new(
+        pegainfer_qwen3::launch(
+            Path::new(&model_path),
+            launch_options_with_prefix_cache(Some(draft_path.into())),
+        )
+        .expect("failed to start speculative engine"),
+    );
+
+    let first = engine
+        .submit(request(
+            prompt_tokens.clone(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            1,
+        ))
+        .expect_finished();
+    assert_eq!(first.tokens.len(), 1);
+    assert_eq!(first.cached_tokens.unwrap_or(0), 0);
+    let first_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+
+    let mut second_prompt = prompt_tokens;
+    second_prompt.extend_from_slice(&first.tokens);
+    second_prompt.push(encoded[prompt_len]);
+    let warm_base = first_spec;
+    let second = engine
+        .submit(request(
+            second_prompt,
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            8,
+        ))
+        .expect_finished();
+    assert_eq!(
+        second.cached_tokens.unwrap_or(0),
+        prompt_len,
+        "the prefill-only turn's prompt blocks were not matchable"
+    );
+    let warm_spec = engine
+        .metrics()
+        .spec_decode
+        .expect("drafter must be loaded");
+    assert!(
+        warm_spec.num_drafts > warm_base.num_drafts,
+        "the warm turn did not draft ({} -> {} drafts)",
+        warm_base.num_drafts,
+        warm_spec.num_drafts
+    );
+}
+
 /// A turn ending exactly on a block boundary leaves its last token (the verify
 /// bonus) dangling: kvbm stages the block it completes but registers it only
 /// after the next forward. The next turn must therefore match one block short
@@ -1455,9 +1531,9 @@ fn dflash_exact_boundary_matches_one_block_short() {
 }
 
 /// Manual gate for the shared-prefix batch scenario: 64 warm requests on one
-/// 4000-token prefix must finish on a 46 GB card. The draft-state budget bounds
-/// the lane; because the step decision is all-or-nothing, the batch may record
-/// zero draft rounds (documented in `prefix-cache.md`).
+/// 4000-token prefix must finish on a 46 GB card and should speculate. The
+/// draft-state budget bounds the lane; a batch larger than its ceiling falls
+/// back to zero draft rounds (documented in `prefix-cache.md`).
 #[test]
 #[ignore = "manual 64-request shared-prefix liveness/memory gate"]
 fn dflash_shared_prefix_batch_stays_bounded() {
@@ -1531,36 +1607,23 @@ fn dflash_shared_prefix_batch_stays_bounded() {
         .metrics()
         .spec_decode
         .expect("drafter must be loaded");
+    assert!(
+        after.num_drafts > base.num_drafts,
+        "64 shared-prefix requests did not speculate ({} -> {})",
+        base.num_drafts,
+        after.num_drafts
+    );
     eprintln!(
         "shared prefix batch: {restored}/{REQUESTS} restored, drafts {} -> {}",
         base.num_drafts, after.num_drafts
     );
 }
 
-/// A capture-cache miss must fall back to plain decode, not fail or seed a
-/// shifted draft context. Run in a child so the 1 MiB budget (two blocks, far
-/// less than the prompt) is read at engine start.
+/// A prefix whose blocks were registered without a drafter state (a logprob
+/// request does not capture) has no draft-KV tag. A later normal request keeps
+/// the target KV hit but must plain-decode instead of reading stale pool rows.
 #[test]
-fn dflash_capture_cache_miss_falls_back_to_plain_decode() {
-    const CHILD: &str = "dflash_capture_cache_miss_falls_back_to_plain_decode";
-    const MARKER: &str = "PEGAINFER_CAPTURE_MISS_CHILD";
-    if std::env::var_os(MARKER).is_none() {
-        if target_path_or_skip().is_none() || draft_path_or_skip().is_none() {
-            return;
-        }
-        // Hold the in-process GPU lock while the child runs so another test in
-        // this binary cannot load a second engine concurrently.
-        let _gpu = GPU
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stderr = run_child_gate(
-            CHILD,
-            &[("PEGAINFER_SPEC_CAPTURE_CACHE_MB", "1"), (MARKER, "1")],
-        );
-        eprintln!("{stderr}");
-        return;
-    }
-
+fn dflash_untagged_prefix_falls_back_to_plain_decode() {
     common::harness::init_capture_logging();
     let (Some(model_path), Some(draft_path)) = (target_path_or_skip(), draft_path_or_skip()) else {
         return;
@@ -1586,21 +1649,13 @@ fn dflash_capture_cache_miss_falls_back_to_plain_decode() {
         .expect("failed to start speculative engine"),
     );
 
-    // 1 MiB holds two 16-token blocks, far less than this prompt's ~22. A
-    // request longer than the cache is not published at all (inserting it
-    // would evict its own head and every other conversation), so the warm
-    // restore's all-or-nothing lookup misses.
-    let cold = engine
-        .submit(request(
-            prompt_tokens.clone(),
-            SamplingParams::default(),
-            32,
-        ))
-        .expect_finished();
+    let mut seed = request(prompt_tokens.clone(), SamplingParams::default(), 32);
+    seed.logprobs = Some(1);
+    let cold = engine.submit(seed).expect_finished();
     assert_eq!(
         cold.cached_tokens.unwrap_or(0),
         0,
-        "the first (cache-filling) run must be cold"
+        "the seed run must be cold"
     );
     let before = engine
         .metrics()
@@ -1626,11 +1681,11 @@ fn dflash_capture_cache_miss_falls_back_to_plain_decode() {
         .expect("drafter must be loaded");
     assert_eq!(
         after.num_drafts, before.num_drafts,
-        "a capture-cache miss must fall back to plain decode (drafts {} -> {})",
+        "an untagged prefix must plain-decode (drafts {} -> {})",
         before.num_drafts, after.num_drafts
     );
     eprintln!(
-        "capture miss fallback: cached_tokens={warm_cached} drafts={}->{}",
+        "untagged prefix fallback: cached_tokens={warm_cached} drafts={}->{}",
         before.num_drafts, after.num_drafts
     );
 }

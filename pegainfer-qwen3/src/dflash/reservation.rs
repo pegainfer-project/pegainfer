@@ -47,24 +47,17 @@ impl DFlashMemoryReservation {
         draft_path: &str,
         logits_rows: usize,
         max_decode_batch_size: usize,
-        capture_cache_bytes: usize,
-        prefix_block_size: usize,
+        max_prefill_tokens: usize,
     ) -> Result<Self> {
         let mut config = DFlashConfig::from_file(draft_path)?;
         config.logits_rows = logits_rows;
-        Self::from_config(
-            &config,
-            max_decode_batch_size,
-            capture_cache_bytes,
-            prefix_block_size,
-        )
+        Self::from_config(&config, max_decode_batch_size, max_prefill_tokens)
     }
 
     pub(crate) fn from_config(
         config: &DFlashConfig,
         max_decode_batch_size: usize,
-        capture_cache_bytes: usize,
-        prefix_block_size: usize,
+        max_prefill_tokens: usize,
     ) -> Result<Self> {
         const BF16: usize = 2;
         let hidden = config.hidden_size;
@@ -86,10 +79,16 @@ impl DFlashMemoryReservation {
             BF16,
         ])?;
         let pending = sizing::product(&[hidden, capture_layers, BF16])?; // context_feature_dim
+        // Conservative per-token term: it covers the paged draft KV pool
+        // (draft_kv), the per-request mirror (draft_kv), the shared tail scratch,
+        // and the (now unused) capture/context buffers. The stage-2 pool is
+        // addressed by target block IDs and shares the target radix cache's
+        // lifetime; a later pass can tighten this term once the lane-level
+        // materialize scratch is billed explicitly.
         let kv_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, tail_scratch, pending])?;
-        // Per-request state only; the shared tail scratch is not owned by a
-        // request and is allocated once for the lane.
-        let request_state_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, pending])?;
+        // Per-request state is just the dense draft K/V mirror; the paged pool
+        // is shared by every request.
+        let request_state_bytes_per_token = draft_kv;
 
         // Lane-level batched dense scratch: every dense buffer is sized for the
         // whole decode batch (`max_batch * block_size` rows), allocated once.
@@ -160,6 +159,19 @@ impl DFlashMemoryReservation {
             0
         };
 
+        // Lane-level materialize scratch: captured rows, the fused context, a
+        // dummy query window, one layer's K/V, and the slot index list. Sized
+        // for the largest prefill chunk (or one draft block), allocated once.
+        let materialize_rows = max_prefill_tokens.max(config.block_size.saturating_add(1));
+        let capture_dim = sizing::product(&[hidden, capture_layers])?;
+        let materialize = sizing::sum(&[
+            sizing::product(&[capture_dim, materialize_rows, BF16])?,
+            sizing::product(&[2 * hidden, materialize_rows, BF16])?,
+            sizing::product(&[q_dim, materialize_rows, BF16])?,
+            sizing::product(&[2 * kv_dim, materialize_rows, BF16])?,
+            sizing::product(&[materialize_rows, 4])?,
+        ])?;
+
         // DSpark Markov head: weights (2 × vocab × rank) + sample scratch (the
         // per-step bias is the dominant term). Zero for plain DFlash drafters.
         let markov = MarkovHead::reservation_bytes(config, max_decode_batch_size)?;
@@ -172,18 +184,6 @@ impl DFlashMemoryReservation {
         } else {
             0
         };
-        // Per-request partial-block seal (2 KV blocks of captured rows) plus
-        // the lane's one-block shift buffer. Zero when the capture cache is off
-        // (`prefix_block_size == 0`), so `--no-prefix-cache` does not reserve
-        // state it never allocates.
-        let seal_bytes = sizing::product(&[
-            hidden,
-            capture_layers,
-            sizing::product(&[2, prefix_block_size])?,
-            BF16,
-        ])?;
-        let seal_total = sizing::product(&[seal_bytes, max_decode_batch_size.saturating_add(1)])?;
-
         Ok(Self {
             kv_bytes_per_token,
             request_state_bytes_per_token,
@@ -191,12 +191,11 @@ impl DFlashMemoryReservation {
                 weights,
                 scratch_total,
                 block_headroom,
+                materialize,
                 markov,
                 native,
                 selector,
                 sampling,
-                capture_cache_bytes,
-                seal_total,
             ])?,
             block_size: config.block_size,
             uses_markov_head: config.uses_markov_head(),

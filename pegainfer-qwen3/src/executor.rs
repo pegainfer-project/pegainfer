@@ -126,9 +126,10 @@ pub struct PrefillStepItem {
     pub(crate) chunk_start: usize,
     /// Prompt tokens forwarded this step. Set by the executor.
     pub(crate) chunk_tokens: usize,
-    /// Lineage hashes of the blocks the prefix cache matched, in order. The
-    /// worker restores the drafter's captured hidden rows from them.
-    pub(crate) capture_prefix_hashes: Vec<[u8; 16]>,
+    /// Target page IDs of the matched blocks whose draft K/V is resident and
+    /// content-tagged. Empty means no drafter restore (plain decode); the
+    /// target KV hit itself is unaffected.
+    pub(crate) capture_prefix_pages: Vec<i32>,
 }
 
 impl PrefillStepItem {
@@ -154,7 +155,7 @@ impl PrefillStepItem {
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
-            capture_prefix_hashes: Vec::new(),
+            capture_prefix_pages: Vec::new(),
         }
     }
 
@@ -296,9 +297,9 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            // A prefix hit carries the target's captured hidden rows in the
-            // capture cache; seed the drafter before deciding eligibility so a
-            // warm request captures (and drafts) exactly like a cold one.
+            // A prefix hit already has the matched blocks' draft K/V in the
+            // paged pool; seed the request mirror before deciding eligibility
+            // so a warm request drafts exactly like a cold one.
             lane.restore_dflash_prefix_captures(requests)?;
             // When a drafter is loaded, capture target hidden states for eligible
             // requests so they can seed the draft model after prefill finishes.
@@ -325,6 +326,7 @@ fn execute_step_on_lane(
             } else {
                 lane.record_prefill_dflash_context(
                     requests,
+                    kv_views,
                     capture_requested,
                     captured_hidden.as_ref(),
                 )?
@@ -1065,6 +1067,11 @@ pub struct Qwen3Executor {
     /// Per-token bytes one request's draft state owns; charged against
     /// `draft_state_budget_bytes`.
     draft_request_state_bytes_per_token: usize,
+    /// Per target block: the SequenceHash whose draft K/V rows are in the paged
+    /// draft pool. `None` means the block was never materialized.
+    draft_kv_tags: Vec<Option<[u8; 16]>>,
+    /// Requests whose DFlash state exists and whose draft K/V was materialized.
+    draft_state_requests: HashSet<RequestId>,
     /// Draft model metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DraftMeta>,
@@ -1295,6 +1302,8 @@ impl Qwen3Executor {
             async_prefill: None,
             draft_state_budget_bytes,
             draft_request_state_bytes_per_token: dflash_request_state_bytes_per_token,
+            draft_kv_tags: vec![None; total_blocks],
+            draft_state_requests: HashSet::new(),
             speculative: None,
             spec_decode_counters: None,
             draft_ready_requests: HashSet::new(),
@@ -1344,7 +1353,6 @@ impl Qwen3Executor {
             dflash_draft_path.map(DraftModel::DFlash),
             memory_options,
             crate::DecodeOverlap::Off,
-            true,
         )
     }
 
@@ -1363,7 +1371,6 @@ impl Qwen3Executor {
         draft: Option<DraftModel<'_>>,
         memory_options: Qwen3MemoryOptions,
         decode_overlap: crate::DecodeOverlap,
-        capture_cache_enabled: bool,
     ) -> Result<Self> {
         let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
@@ -1423,20 +1430,8 @@ impl Qwen3Executor {
             // config: fixed bytes (weights + block scratch) via the margin, and
             // pool-scaling per-token bytes folded into the block budget.
             let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
-            // `--no-prefix-cache` must not reserve (or later allocate) the
-            // drafter capture cache: the prefix match that would consume it is
-            // off. The lane re-derives the same decision from
-            // `prefix_cache_requested` before it loads.
-            let capture_cache_bytes = if capture_cache_enabled {
-                crate::spec_env::capture_cache_bytes()
-            } else {
-                0
-            };
-            let capture_prefix_block_size = if capture_cache_bytes > 0 {
-                memory_options.page_size
-            } else {
-                0
-            };
+            // The draft K/V lives in a paged pool addressed by the target's
+            // block IDs; there is no separate side-cache budget.
             let (
                 draft_kv_bytes_per_token,
                 draft_request_state_bytes_per_token,
@@ -1447,8 +1442,7 @@ impl Qwen3Executor {
                         path,
                         model.config().logits_rows,
                         max_verify_batch,
-                        capture_cache_bytes,
-                        capture_prefix_block_size,
+                        max_prefill_tokens,
                     )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
@@ -1740,6 +1734,8 @@ impl Qwen3Executor {
             async_prefill: None,
             draft_state_budget_bytes: 0,
             draft_request_state_bytes_per_token: 0,
+            draft_kv_tags: Vec::new(),
+            draft_state_requests: HashSet::new(),
             speculative: None,
             spec_decode_counters: None,
             draft_ready_requests: HashSet::new(),
@@ -1798,18 +1794,15 @@ impl Qwen3Executor {
     }
 
     /// Whether prefix reuse is actually in effect. A loaded drafter keeps it on
-    /// when its capture cache can restore the matched hidden rows (DFlash /
-    /// DSpark with a non-zero `PEGAINFER_SPEC_CAPTURE_CACHE_MB`); EAGLE-3 and a
-    /// zero-budget drafter still force it off. The capture cache is a fixed
-    /// term in the draft reservation; the draft's own KV is still billed per
-    /// pool block, which is not a per-request bound once blocks are shared
-    /// (TODO #1238).
+    /// when it can restore its state from the target's block IDs (DFlash /
+    /// DSpark materialize draft K/V into a paged pool addressed by those IDs);
+    /// EAGLE-3 still forces it off.
     fn prefix_cache_enabled(&self) -> bool {
         self.prefix_cache_requested
             && self
                 .speculative
                 .as_ref()
-                .is_none_or(|meta| meta.capture_cache)
+                .is_none_or(|meta| meta.supports_prefix_cache)
     }
 
     /// Whether a completed request should leave its registered GPU blocks in
@@ -1891,10 +1884,9 @@ impl Qwen3Executor {
     /// lane.
     ///
     /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
-    /// is incompatible with KV offload. DFlash keeps the prefix cache on when
-    /// its capture cache is enabled (the hit restores the captured rows);
-    /// EAGLE-3 and a zero capture-cache budget disable it, because a hit skips
-    /// the forward that would produce the drafter's hidden state.
+    /// is incompatible with KV offload. DFlash keeps the prefix cache on: a hit
+    /// restores its draft K/V from the target's block IDs. EAGLE-3 disables it,
+    /// because a hit skips the forward that would produce its hidden state.
     pub(crate) fn load_draft_model(&mut self, draft: DraftModel<'_>) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
@@ -1930,7 +1922,7 @@ impl Qwen3Executor {
             }
         };
         let counters = SpecDecodeCounters::new(meta.num_spec_tokens)?;
-        if !meta.capture_cache {
+        if !meta.supports_prefix_cache {
             self.set_prefix_cache_enabled(false);
         }
         self.spec_decode_counters = Some(counters);
@@ -2051,12 +2043,26 @@ impl Qwen3Executor {
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
                 let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
                 req.cached_tokens = Some(matched);
-                req.capture_prefix_hashes = rkv
-                    .assigned_block_hashes()
-                    .into_iter()
-                    .take(matched / self.metadata.block_size)
-                    .map(|(_, hash)| hash)
-                    .collect();
+                // A matched block is restorable only when the draft pool holds
+                // its rows for this exact content. A block produced without a
+                // drafter state (ineligible request) has no tag; a reused block
+                // has a different content tag. Either way the request keeps its
+                // target KV hit and plain-decodes.
+                let matched_blocks = matched / self.metadata.block_size;
+                let mut pages = Vec::with_capacity(matched_blocks);
+                let mut restorable = true;
+                for (page, hash) in rkv.assigned_block_hashes().into_iter().take(matched_blocks) {
+                    let tagged = page >= 0
+                        && self.draft_kv_tags.get(page as usize).and_then(|tag| *tag) == Some(hash);
+                    if !tagged {
+                        restorable = false;
+                        break;
+                    }
+                    pages.push(page);
+                }
+                if restorable {
+                    req.capture_prefix_pages = pages;
+                }
                 // What the connector restored is not a local hit. Only the
                 // blocks a load committed onto the probe (held past its GPU
                 // hit) crossed the connector; anything else in the match was
@@ -2121,6 +2127,32 @@ impl Qwen3Executor {
             rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
         } else {
             rkv.apply_prefill_chunk(self.kv_mgr.pool())
+        }?;
+        self.tag_draft_blocks(result.request_id);
+        Ok(())
+    }
+
+    /// Tag every registered block of a request that has a DFlash state. The
+    /// block's draft K/V rows were materialized before the apply, so a later
+    /// prefix match can trust the pool for exactly this content hash.
+    fn tag_draft_blocks(&mut self, request_id: RequestId) {
+        if !self.prefix_cache_enabled()
+            || !self.draft_state_requests.contains(&request_id)
+            || self.draft_kv_tags.is_empty()
+        {
+            return;
+        }
+        let blocks = self
+            .request_kvs
+            .get(&request_id)
+            .map(pegainfer_kv_cache::RequestKv::assigned_block_hashes)
+            .unwrap_or_default();
+        for (page, hash) in blocks {
+            if page >= 0
+                && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
+            {
+                *tag = Some(hash);
+            }
         }
     }
 
@@ -2618,25 +2650,6 @@ impl ModelExecutor for Qwen3Executor {
         // RAII frees any parked prefetch's reserved/held blocks.
         let retain_completed_kv = self.retains_completed_kv_blocks();
         let mut removed = self.request_kvs.remove(&request_id);
-        // The blocks sealed by the last served step never reached a publish:
-        // `publish_prefix_captures` runs at the *start* of the next draft or
-        // verify, and this request will not have one. Hand the lane the final
-        // hashes and KV position so it can drain the seal into the capture
-        // cache before the state is dropped; otherwise the next turn misses
-        // whenever the last step crossed a block boundary.
-        let capture = if self.speculative.is_some() {
-            removed.as_ref().map(|rkv| {
-                (
-                    rkv.assigned_block_hashes()
-                        .into_iter()
-                        .map(|(_, hash)| hash)
-                        .collect::<Vec<_>>(),
-                    rkv.kv_position(),
-                )
-            })
-        } else {
-            None
-        };
         if let Some(rkv) = removed.as_mut()
             && !retain_completed_kv
         {
@@ -2666,7 +2679,8 @@ impl ModelExecutor for Qwen3Executor {
         self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
             self.draft_ready_requests.remove(&request_id);
-            self.primary.drop_draft_request(request_id, capture)?;
+            self.draft_state_requests.remove(&request_id);
+            self.primary.drop_draft_request(request_id)?;
         }
         Ok(())
     }
@@ -2905,6 +2919,13 @@ impl ModelExecutor for Qwen3Executor {
                 ));
             }
         };
+        // The lane created these states during the forward. Insert them before
+        // the apply so the post-apply tag pass can mark the blocks this chunk
+        // just materialized (a prefill-only turn never gets a later verify to
+        // catch up).
+        for &request_id in &result.draft_context_captured_requests {
+            self.draft_state_requests.insert(request_id);
+        }
         for req_result in &result.requests {
             self.apply_prefill_result(req_result)?;
         }
@@ -2919,14 +2940,16 @@ impl ModelExecutor for Qwen3Executor {
                 match dflash_prefill_action(captured, req_result.completed) {
                     DFlashPrefillAction::MarkReady => {
                         self.draft_ready_requests.insert(req_result.request_id);
+                        self.draft_state_requests.insert(req_result.request_id);
                     }
                     DFlashPrefillAction::KeepPending => {
                         self.draft_ready_requests.remove(&req_result.request_id);
+                        self.draft_state_requests.insert(req_result.request_id);
                     }
                     DFlashPrefillAction::Drop => {
                         self.draft_ready_requests.remove(&req_result.request_id);
-                        self.primary
-                            .drop_draft_request(req_result.request_id, None)?;
+                        self.draft_state_requests.remove(&req_result.request_id);
+                        self.primary.drop_draft_request(req_result.request_id)?;
                     }
                 }
             }
@@ -2999,8 +3022,8 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             for req_result in &result.requests {
                 if self.draft_ready_requests.remove(&req_result.request_id) {
-                    self.primary
-                        .drop_draft_request(req_result.request_id, None)?;
+                    self.draft_state_requests.remove(&req_result.request_id);
+                    self.primary.drop_draft_request(req_result.request_id)?;
                 }
             }
         }
@@ -3125,8 +3148,8 @@ impl ModelExecutor for Qwen3Executor {
                 if self.speculative.is_some() {
                     for req_result in &result.decode_requests {
                         if self.draft_ready_requests.remove(&req_result.request_id) {
-                            self.primary
-                                .drop_draft_request(req_result.request_id, None)?;
+                            self.draft_state_requests.remove(&req_result.request_id);
+                            self.primary.drop_draft_request(req_result.request_id)?;
                         }
                     }
                 }
@@ -3525,10 +3548,10 @@ struct DraftMeta {
     max_position_embeddings: usize,
     /// See [`ModelExecutor::max_draft_batch`].
     max_draft_batch: Option<usize>,
-    /// Whether the drafter's capture cache makes prefix reuse safe. Only
-    /// DFlash/DSpark have one; EAGLE-3 and a zero cache budget keep the
-    /// prefix cache off.
-    capture_cache: bool,
+    /// Whether this drafter's state can be restored on a target prefix hit.
+    /// DFlash/DSpark materialize draft K/V keyed by the target's block IDs;
+    /// EAGLE-3 still keeps the prefix cache off with a drafter.
+    supports_prefix_cache: bool,
 }
 
 struct LocalQwen3Lane {
@@ -3740,7 +3763,7 @@ impl LocalQwen3Lane {
     fn load_dflash(
         &mut self,
         draft_path: &str,
-        capture_cache: bool,
+        prefix_cache: bool,
         draft_state_budget_bytes: usize,
         draft_request_state_bytes_per_token: usize,
     ) -> Result<DraftMeta> {
@@ -3755,29 +3778,21 @@ impl LocalQwen3Lane {
             num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
             max_draft_batch: None,
-            capture_cache: false,
+            supports_prefix_cache: false,
         };
         let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
-        let capture_cache_bytes = if capture_cache {
-            crate::spec_env::capture_cache_bytes()
-        } else {
-            0
-        };
-        let prefix_block_size = if capture_cache_bytes > 0 {
-            self.layout.page_size
-        } else {
-            0
-        };
         let lane = DFlashLaneState::new(
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
-            prefix_block_size,
-            capture_cache_bytes,
+            self.layout.page_size,
+            self.total_blocks,
+            self.max_prefill_tokens,
+            prefix_cache,
             draft_state_budget_bytes,
             draft_request_state_bytes_per_token,
         )?;
-        meta.capture_cache = lane.capture_cache_enabled();
+        meta.supports_prefix_cache = true;
         self.dflash = Some(lane);
         Ok(meta)
     }
@@ -4163,6 +4178,7 @@ impl LocalQwen3Lane {
         bufs.captured_hidden_mut().seq_len = a_total_rows;
         self.record_verify_dflash_context(
             &final_requests,
+            kv_views,
             &final_results,
             Some(bufs.captured_hidden()),
             verify_round,
@@ -4219,9 +4235,6 @@ impl LocalQwen3Lane {
         verify_round: u64,
         gated: bool,
     ) -> Result<VerifyResult> {
-        // Publish the blocks the previous step committed before this verify
-        // consumes the capture history.
-        self.publish_dflash_captures(requests)?;
         // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
         // for DSpark (anchor-first), shortened by a `PEGAINFER_SPEC_MAX_DRAFTS`
         // trim; the EAGLE-3 chain plus its anchor. The graph buffers + replay
@@ -4356,6 +4369,7 @@ impl LocalQwen3Lane {
             } else {
                 self.record_verify_dflash_context(
                     requests,
+                    kv_views,
                     &request_results,
                     Some(bufs.captured_hidden()),
                     verify_round,
@@ -4521,8 +4535,9 @@ enum WorkerCommand {
     /// thread because it reads the co-located target model).
     LoadDflash {
         draft_path: String,
-        /// Allocate the prefix capture cache. False with `--no-prefix-cache`.
-        capture_cache: bool,
+        /// Allocate the paged draft K/V pool. False with `--no-prefix-cache`
+        /// (the request mirror is still materialized for the draft forward).
+        prefix_cache: bool,
         /// Bytes reserved for request-owned draft state (see
         /// `Qwen3Executor::draft_state_budget_bytes`).
         draft_state_budget_bytes: usize,
@@ -4536,11 +4551,8 @@ enum WorkerCommand {
     },
     /// Drop a request's draft state (request retired, or it fell back to a
     /// plain decode that advanced the sequence outside the speculative path).
-    /// On retirement, `capture` carries the request's final block hashes and KV
-    /// position so the lane can publish the seal before discarding it.
     DropDraft {
         request_id: RequestId,
-        capture: Option<(Vec<[u8; 16]>, usize)>,
         resp: channel::Sender<Result<()>>,
     },
     /// Startup-only (TP + CUDA Graph): one phase of the decode-graph
@@ -4682,14 +4694,14 @@ impl RankWorker {
                                 }
                                 WorkerCommand::LoadDflash {
                                     draft_path,
-                                    capture_cache,
+                                    prefix_cache,
                                     draft_state_budget_bytes,
                                     draft_request_state_bytes_per_token,
                                     resp,
                                 } => {
                                     let result = lane.load_dflash(
                                         &draft_path,
-                                        capture_cache,
+                                        prefix_cache,
                                         draft_state_budget_bytes,
                                         draft_request_state_bytes_per_token,
                                     );
@@ -4699,12 +4711,8 @@ impl RankWorker {
                                     let result = lane.load_eagle3(&draft_path);
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::DropDraft {
-                                    request_id,
-                                    capture,
-                                    resp,
-                                } => {
-                                    lane.drop_dflash_request(request_id, capture);
+                                WorkerCommand::DropDraft { request_id, resp } => {
+                                    lane.drop_dflash_request(request_id);
                                     lane.drop_eagle3_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
@@ -4796,7 +4804,7 @@ impl RankWorker {
     fn load_dflash(
         &self,
         draft_path: String,
-        capture_cache: bool,
+        prefix_cache: bool,
         draft_state_budget_bytes: usize,
         draft_request_state_bytes_per_token: usize,
     ) -> Result<DraftMeta> {
@@ -4804,7 +4812,7 @@ impl RankWorker {
         self.tx
             .send(WorkerCommand::LoadDflash {
                 draft_path,
-                capture_cache,
+                prefix_cache,
                 draft_state_budget_bytes,
                 draft_request_state_bytes_per_token,
                 resp: resp_tx,
@@ -4830,19 +4838,12 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("worker dropped load_eagle3 response"))?
     }
 
-    /// Drop a request's draft state. On retirement `capture` carries the final
-    /// block hashes + KV position so the lane can publish first. Blocks until
-    /// the worker acknowledges.
-    fn drop_draft_request(
-        &self,
-        request_id: RequestId,
-        capture: Option<(Vec<[u8; 16]>, usize)>,
-    ) -> Result<()> {
+    /// Drop a request's draft state. Blocks until the worker acknowledges.
+    fn drop_draft_request(&self, request_id: RequestId) -> Result<()> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::DropDraft {
                 request_id,
-                capture,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on drop_draft"))?;
