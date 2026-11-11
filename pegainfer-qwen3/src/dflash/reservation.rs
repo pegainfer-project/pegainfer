@@ -70,14 +70,9 @@ impl DFlashMemoryReservation {
         // DFlashLayerCache k+v
         let draft_kv = sizing::product(&[config.num_hidden_layers, 2, kv_dim, BF16])?;
         // Scratch split by what it tracks: `context_*` grows with the committed
-        // prefix; `tail_*` (tail_input + k_tail + v_tail) grows with the in-fill
-        // tail, which is one block past the prefix.
+        // prefix; `tail_input` grows with the in-fill tail, one block past it.
         let context_scratch = sizing::product(&[2, hidden, BF16])?; // context_projected + context_hidden
-        // tail_input + k_tail + v_tail
-        let tail_scratch = sizing::product(&[
-            sizing::sum(&[hidden, sizing::product(&[2, kv_dim])?])?,
-            BF16,
-        ])?;
+        let tail_scratch = sizing::product(&[hidden, BF16])?;
         let pending = sizing::product(&[hidden, capture_layers, BF16])?; // context_feature_dim
         // Conservative per-token term: it covers the paged draft KV pool
         // (draft_kv), the per-request mirror (draft_kv), the shared tail scratch,

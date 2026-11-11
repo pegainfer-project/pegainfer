@@ -6,6 +6,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
+use pegainfer_kernels::ops::gemm_rows_span_at_into_checked;
 
 use crate::config::DFlashConfig;
 use crate::dspark::MarkovHead;
@@ -68,10 +69,8 @@ struct DFlashLayerCache {
 /// Dense buffers (`hidden`, `normed`, `q_batch`, `attn_output`, the MLP buffers,
 /// and `logits`) hold `max_batch * block_size` rows so the GEMM / rms_norm /
 /// silu / add / logits / embedding ops run ONCE over the batched buffer. The
-/// varlen tail buffers (`tail_input`, `k_tail`, `v_tail`) stay sized for a single
-/// request and are reused inside the per-request loop, because their ops (tail
-/// concat, k/v GEMMs, rope, KV copy, attention) still loop per request — Step 2
-/// will batch those via CUDA-kernel changes.
+/// varlen `tail_input` stays sized for a single request and is reused inside the
+/// per-request loop. K/V projections write directly into each request's cache.
 pub(crate) struct DFlashBatchScratch {
     max_batch_block_rows: usize,
     max_tail_len: usize,
@@ -90,8 +89,6 @@ pub(crate) struct DFlashBatchScratch {
     logits: HiddenStates,
     // Shared single-request varlen tail scratch (reused inside the per-request loop).
     tail_input: HiddenStates,
-    k_tail: HiddenStates,
-    v_tail: HiddenStates,
     // DSpark Markov sample-loop scratch; `None` for plain DFlash drafters.
     markov: Option<MarkovScratch>,
     selector: Option<SelectorScratch>,
@@ -163,7 +160,6 @@ impl DFlashBatchScratch {
         let block_size = config.block_size;
         let hidden_size = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
-        let kv_dim = config.num_key_value_heads * config.head_dim;
         let inter_dim = config.intermediate_size;
         // Dense buffers span the whole decode batch so the dense ops run once.
         let batch_rows = block_size * max_decode_batch_size;
@@ -188,8 +184,6 @@ impl DFlashBatchScratch {
             logits_normed: HiddenStates::zeros(ctx, hidden_size, batch_rows)?,
             logits: HiddenStates::zeros(ctx, config.logits_rows, batch_rows)?,
             tail_input: HiddenStates::zeros(ctx, hidden_size, tail_capacity)?,
-            k_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
-            v_tail: HiddenStates::zeros(ctx, kv_dim, tail_capacity)?,
             conv: config
                 .conv
                 .as_ref()
@@ -242,7 +236,7 @@ impl DFlashBatchScratch {
         self.logits.seq_len = batch_block_rows;
     }
 
-    /// Size the shared varlen tail buffers for one request's `tail_len =
+    /// Size the shared varlen tail input for one request's `tail_len =
     /// context_len + block_size`, growing the allocation if needed.
     fn ensure_tail_capacity(
         &mut self,
@@ -252,15 +246,10 @@ impl DFlashBatchScratch {
     ) -> Result<()> {
         if tail_len > self.max_tail_len {
             let hidden_size = config.hidden_size;
-            let kv_dim = config.num_key_value_heads * config.head_dim;
             self.tail_input = HiddenStates::zeros(ctx, hidden_size, tail_len)?;
-            self.k_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
-            self.v_tail = HiddenStates::zeros(ctx, kv_dim, tail_len)?;
             self.max_tail_len = tail_len;
         }
         self.tail_input.seq_len = tail_len;
-        self.k_tail.seq_len = tail_len;
-        self.v_tail.seq_len = tail_len;
         Ok(())
     }
 }
@@ -555,6 +544,8 @@ impl DFlashDraftModel {
                 0,
                 token_count,
                 &mut scratch.k,
+                0,
+                token_count,
                 &layer.attention.q_norm,
                 &layer.attention.k_norm,
                 &self.cos_cache,
@@ -638,9 +629,9 @@ impl DFlashDraftModel {
     /// The *dense* ops (embedding, rms_norm, q / o / gate_up / down GEMMs, silu,
     /// add, fused_add_rms_norm, logits) run ONCE over an `active_batch *
     /// block_size` batched buffer. The *varlen* ops (context projection, tail
-    /// concat, k/v GEMMs, rope, KV copy, attention) still loop per request,
+    /// concat, k/v GEMMs, rope, attention) still loop per request,
     /// slicing each request's `block_size` rows at offset `i * block_size` in the
-    /// batched buffers — those are Step 2/3's job to batch via CUDA-kernel changes.
+    /// batched buffers. K/V projections write directly into the request's cache.
     ///
     /// Returns the batched logits (`active_batch * block_size` rows): request `i`
     /// owns rows `[i * block_size, (i + 1) * block_size)`.
@@ -702,7 +693,6 @@ impl DFlashDraftModel {
         let inter_dim = self.config.intermediate_size;
         debug_assert_eq!(scratch.hidden.hidden_dim, hidden_size);
         debug_assert_eq!(scratch.q_batch.hidden_dim, q_dim);
-        debug_assert_eq!(scratch.k_tail.hidden_dim, kv_dim);
         debug_assert_eq!(scratch.gate_out.hidden_dim, inter_dim);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -733,7 +723,7 @@ impl DFlashDraftModel {
                 &mut scratch.q_batch,
             );
 
-            // Per-request varlen attention: tail concat, k/v GEMMs, rope, KV copy,
+            // Per-request varlen attention: tail concat, k/v GEMMs, rope,
             // single-request prefill. Each request slices its `block_size` rows at
             // offset `i * block_size` of the batched `normed`/`q_batch`/`attn_output`.
             for (i, state) in states.iter_mut().enumerate() {
@@ -751,29 +741,38 @@ impl DFlashDraftModel {
                     block_size,
                 )?;
 
-                ops::gemm_rows_into(
+                let cache = &mut state.layers[layer_idx];
+                gemm_rows_span_at_into_checked(
                     ctx,
                     &layer.attention.qkv_proj,
                     q_dim,
                     kv_dim,
                     &scratch.tail_input,
-                    &mut scratch.k_tail,
-                );
-                ops::gemm_rows_into(
+                    0,
+                    &mut cache.k,
+                    state.committed_len,
+                    block_size,
+                )?;
+                gemm_rows_span_at_into_checked(
                     ctx,
                     &layer.attention.qkv_proj,
                     q_dim + kv_dim,
                     kv_dim,
                     &scratch.tail_input,
-                    &mut scratch.v_tail,
-                );
+                    0,
+                    &mut cache.v,
+                    state.committed_len,
+                    block_size,
+                )?;
 
                 ops::dflash_qk_norm_rope_into(
                     ctx,
                     &mut scratch.q_batch,
                     row_offset,
                     block_size,
-                    &mut scratch.k_tail,
+                    &mut cache.k,
+                    state.committed_len,
+                    block_size,
                     &layer.attention.q_norm,
                     &layer.attention.k_norm,
                     &self.cos_cache,
@@ -786,23 +785,6 @@ impl DFlashDraftModel {
                     self.config.rms_norm_eps,
                 )?;
 
-                let cache = &mut state.layers[layer_idx];
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &scratch.k_tail,
-                    0,
-                    &mut cache.k,
-                    state.committed_len,
-                    block_size,
-                )?;
-                ops::copy_hidden_token_range_into(
-                    ctx,
-                    &scratch.v_tail,
-                    0,
-                    &mut cache.v,
-                    state.committed_len,
-                    block_size,
-                )?;
                 // The trained mask keeps W target-context tokens before the
                 // anchor and the entire noncausal draft block for every query.
                 let kv_start = self
@@ -1080,15 +1062,15 @@ mod tests {
         assert_eq!(dflash.target_layer_ids, vec![1, 9, 17, 25, 33]);
 
         // Pin the memory reservation the KV budget bills against. The per-token
-        // term (draft KV 5*2*1024*2 + scratch-context (3*2560+2*1024)*2 + pending
-        // 2560*5*2) drives the ~12% block haircut; a layer-count or geometry
+        // term (draft KV 5*2*1024*2 + scratch-context 3*2560*2 + pending
+        // 2560*5*2) reduces the target block budget; a layer-count or geometry
         // regression here would silently over/under-reserve and risk OOM.
         let reservation = super::DFlashMemoryReservation::from_config(
             &dflash, /*max_decode_batch*/ 256, 1024,
         )
         .expect("reservation sizing");
         assert_eq!(
-            reservation.kv_bytes_per_token, 65_536,
+            reservation.kv_bytes_per_token, 61_440,
             "conservative draft term: pool + mirror + tail + retired capture buffers"
         );
         assert_eq!(
