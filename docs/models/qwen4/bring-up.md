@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher). Behind the model crate's own `qwen4` feature, layer 0 (`linear_attention`) and layer 3 (the first attention layer, dense up to the QSA budget) now run in prefill on the checkpoint's weights and land within the reference's own bf16 noise floor (the two layer gates below). `launch` still refuses: the step, attention decode and the PLE layer are next. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher). Behind the model crate's own `qwen4` feature, layer 0 (`linear_attention`) and layer 3 (the first attention layer, dense up to the QSA budget) now run in prefill on the checkpoint's weights, and layer 0 also decodes token by token on its carried conv and recurrent state; all of it lands within the reference's own bf16 noise floor (the layer gates below). `launch` still refuses: the step, attention decode and the PLE layer are next. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-11
 
@@ -112,6 +112,7 @@ On one sm_89 card against a reference recorded on the same card:
 | `router_logits` | 6.2e-2 | 6.2e-2 |
 | `moe_out` | 7.8e-3 | 7.8e-3 |
 | `stream_out` | 3.9e-3 | 5.9e-3 |
+| `gdn_state` (the recurrent state the prompt leaves) | 1.0e-2 | 7.5e-3 |
 
 One of the 32 tokens swaps one expert; the reference's logits for the two are one bf16 step apart. The same script on a GH200 gives floors of 1.2e-2 on `attn_out` and 9.3e-3 on `stream_out`, and the reference itself routes one token differently across the two cards (167 against 166 experts hit), so the tie is in the data.
 
@@ -141,7 +142,18 @@ The 36 `linear_attention` layers run Qwen3.5's Gated DeltaNet kernels, because t
 
 The three kernel limits (`GDN_AOT_KEY_HEAD_DIM`, `GDN_AOT_VALUE_HEAD_DIM`, `LINEAR_CONV_MAX_KERNEL_DIM`) are defined next to the wrappers. This line's `src/config.rs` keeps a CPU-only mirror of them, so its config tests need no device, until slice B adds the device dependency.
 
-The prefill half is verified on this line's activations: layer 0's GDN block, chunkwise path plus the sigmoid gated norm and `out_proj`, lands within the reference's own floor (the gate above). The decode step on a carried state is still unverified; it has to cover several steps from a nonzero state (so `(v - k·s)` is live) against the `transformers` recurrence.
+Both halves are verified on this line's activations. Prefill: layer 0's GDN block, chunkwise path plus the sigmoid gated norm and `out_proj`, lands within the reference's own floor (the gate above), and so does the recurrent state it leaves (`gdn_state` in the table). Decode: `layer::layer_decode` runs one token through the layer on a `MixerState::Linear` (the conv taps and the `[48, 128, 128]` f32 state, the layout the kernels and the reference share), through the decode wrappers with one pointer per request, the form the step will batch. The reference for it is the same script with `--decode 8`: a 24 token prefill on the layer's cache, then the last 8 prompt tokens one at a time through `causal_conv1d_update` and the fp32 recurrence, every stage and the state recorded per step on both devices. The gate replays the steps on the state its own prefill left and holds each step like a prefill. Max over the 8 steps on the same sm_89 card:
+
+| Stage | max difference | reference's own floor |
+| --- | --- | --- |
+| `gdn_state` | 1.5e-2 | 1.4e-2 |
+| `attn_out` | 3.9e-3 | 3.9e-3 |
+| `stream_after_attn` | 9.8e-4 | 4.9e-4 |
+| `router_logits` | 6.2e-2 | 6.2e-2 |
+| `moe_out` | 3.9e-3 | 3.9e-3 |
+| `stream_out` | 3.9e-3 | 3.9e-3 |
+
+One of the 8 steps picks a different expert set, with the reference's logits for the pair inside its own spread. The recorded state is cloned per pass on purpose: the cache rewrites it in place, and on the CPU `.cpu()` does not copy, so without the clone every recorded step aliases the final state.
 
 ## Traps
 
@@ -158,7 +170,6 @@ The prefill half is verified on this line's activations: layer 0's GDN block, ch
 | Criterion | Blocked on |
 | --- | --- |
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
-| GDN decode step on a carried state | the decode wrappers are shared and the prefill half is gated on layer 0; nothing drives the decode step for this line yet |
 | Layer 1 on the checkpoint's weights | the PLE layer needs the n-gram rows gathered from the table shards on the host |
 | Attention decode | the layer 3 gate covers prefill only; FlashInfer's batch decode dispatches a compiled group list that lacks 12, and QSA past the dense range needs the indexer's selection in the attention kernel |
 | Routed experts beyond correctness | one GEMM pair per expert and one host sync per layer; the pointer batched form for decode and a grouped GEMM for prefill |
