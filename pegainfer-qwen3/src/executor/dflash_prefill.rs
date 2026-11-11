@@ -2,8 +2,9 @@
 //!
 //! A request can seed the DFlash draft only if its prefill produces clean target
 //! hidden states: no LoRA, no prompt logprobs, no completion logprobs. A prefix
-//! hit is fine when the drafter's capture cache restored the matched rows; the
-//! continuity check below requires that state for any non-zero `chunk_start`.
+//! hit is fine when the drafter's paged K/V was restored for the matched block
+//! IDs; the continuity check below requires that state for any non-zero
+//! `chunk_start`.
 //! Sampling params are irrelevant here — the prompt's hidden states are
 //! sampling-independent, and sampled-verify (#512) speculates the full sampling
 //! surface, so capture is as valid for a sampled request as for a greedy one.

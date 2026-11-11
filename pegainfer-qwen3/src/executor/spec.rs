@@ -52,17 +52,7 @@ impl Qwen3Executor {
             self.speculative.is_some(),
             "speculative verification requested but no draft model is loaded"
         );
-        let mut requests = plan.requests.to_vec();
-        for req in &mut requests {
-            if let Some(rkv) = self.request_kvs.get(&req.request_id) {
-                req.capture_hashes = rkv
-                    .assigned_block_hashes()
-                    .into_iter()
-                    .map(|(_, hash)| hash)
-                    .collect();
-                req.sealed_tokens = rkv.kv_position();
-            }
-        }
+        let requests = plan.requests.to_vec();
         for req in &requests {
             anyhow::ensure!(
                 !req.as_slice().is_empty(),
@@ -199,6 +189,9 @@ impl Qwen3Executor {
             applied.push(req_result.request_id);
         }
         for req_result in &result.requests {
+            self.tag_draft_blocks(req_result.request_id);
+        }
+        for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
         }
 
@@ -232,17 +225,7 @@ impl Qwen3Executor {
                 req.request_id
             );
         }
-        let mut requests = plan.requests.to_vec();
-        for req in &mut requests {
-            if let Some(rkv) = self.request_kvs.get(&req.request_id) {
-                req.capture_hashes = rkv
-                    .assigned_block_hashes()
-                    .into_iter()
-                    .map(|(_, hash)| hash)
-                    .collect();
-                req.sealed_tokens = rkv.kv_position();
-            }
-        }
+        let requests = plan.requests.to_vec();
         let step = StepCommand::SpeculativeDraft { requests };
         match self.run_step(&step)? {
             WorkerStepOutcome::SpeculativeDraft(result) => Ok(result),

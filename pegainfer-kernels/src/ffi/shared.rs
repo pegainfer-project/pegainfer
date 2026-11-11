@@ -1030,4 +1030,22 @@ unsafe extern "C" {
         vocab: i32,
         stream: CUstream,
     ) -> i32;
+
+    pub fn draft_kv_scatter_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        locs: *const i32,
+        rows: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn draft_kv_gather_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        locs: *const i32,
+        rows: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
