@@ -15,8 +15,8 @@ use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
 use crate::config::Config;
+use crate::layer::LayerState;
 use crate::layer::LayerTrace;
-use crate::layer::MixerState;
 use crate::layer::Rope;
 use crate::layer::layer_decode;
 use crate::layer::layer_prefill;
@@ -39,7 +39,7 @@ pub struct Model {
 
 /// One sequence's state across the loaded layers.
 pub struct ModelState {
-    pub layers: Vec<MixerState>,
+    pub layers: Vec<LayerState>,
 }
 
 /// Everything one pass produced, kept for the reference gate.
@@ -86,7 +86,7 @@ impl Model {
         let layers = self
             .layers
             .iter()
-            .map(|(_, layer)| MixerState::new(ctx, &self.g, &layer.mixer, capacity))
+            .map(|(_, layer)| LayerState::new(ctx, &self.g, layer, capacity))
             .collect::<Result<Vec<_>>>()?;
         Ok(ModelState { layers })
     }
@@ -140,9 +140,12 @@ impl Model {
         Ok((mixed, logits))
     }
 
+    /// `ids` are the tokens `stream_in` embeds: the whole prompt, or the one
+    /// token of a decode step. Only the n-gram block reads them.
     fn forward(
         &self,
         ctx: &DeviceContext,
+        ids: &[u32],
         stream_in: HiddenStates,
         state: &mut ModelState,
         decode: bool,
@@ -154,12 +157,12 @@ impl Model {
             self.layers.len()
         );
         let mut traces: Vec<LayerTrace> = Vec::with_capacity(self.layers.len());
-        for ((_, layer), mixer) in self.layers.iter().zip(&mut state.layers) {
+        for ((_, layer), layer_state) in self.layers.iter().zip(&mut state.layers) {
             let input = traces.last().map_or(&stream_in, |t| &t.stream_out);
             let trace = if decode {
-                layer_decode(ctx, &self.g, layer, &self.rope, mixer, input)?
+                layer_decode(ctx, &self.g, layer, &self.rope, layer_state, ids[0], input)?
             } else {
-                layer_prefill(ctx, &self.g, layer, &self.rope, mixer, input)?
+                layer_prefill(ctx, &self.g, layer, &self.rope, layer_state, ids, input)?
             };
             traces.push(trace);
         }
@@ -181,12 +184,12 @@ impl Model {
         state: &mut ModelState,
     ) -> Result<Forward> {
         let stream = self.embed(ctx, ids)?;
-        self.forward(ctx, stream, state, false)
+        self.forward(ctx, ids, stream, state, false)
     }
 
     /// One more token on the carried state.
     pub fn decode(&self, ctx: &DeviceContext, id: u32, state: &mut ModelState) -> Result<Forward> {
         let stream = self.embed(ctx, &[id])?;
-        self.forward(ctx, stream, state, true)
+        self.forward(ctx, &[id], stream, state, true)
     }
 }
