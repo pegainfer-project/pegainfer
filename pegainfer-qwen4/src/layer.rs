@@ -76,11 +76,13 @@ pub struct GdnState {
     pub recurrent: CudaSlice<f32>,
 }
 
-/// One prompt's K/V in the one layer paged format the hd256 prefill reads.
+/// One sequence's K/V in the one layer paged format the hd256 prefill reads.
 pub struct KvScratch {
     pub pool: CudaSlice<bf16>,
     pub layout: PagedKvLayout,
     pub capacity: usize,
+    /// Tokens written so far; the next token lands at this position.
+    pub len: usize,
 }
 
 /// The token mixer's state, zeroed, sized for one sequence.
@@ -105,6 +107,7 @@ impl MixerState {
                     pool: ctx.stream.alloc_zeros(pages * layout.page_stride)?,
                     layout,
                     capacity,
+                    len: 0,
                 })
             }
         })
@@ -281,11 +284,6 @@ fn gdn_decode(
     state: &mut GdnState,
     mixed: &HiddenStates,
 ) -> Result<(GdnTrace, HiddenStates)> {
-    ensure!(
-        mixed.seq_len == 1,
-        "decode takes one token, got {}",
-        mixed.seq_len
-    );
     let (qkv, z_proj, b_proj, a_proj) = gdn_project(ctx, g, w, mixed)?;
     let conv_ptrs: CudaSlice<u64> = {
         let (ptr, _guard) = state.conv.data.device_ptr_mut(&ctx.stream);
@@ -334,11 +332,14 @@ fn gdn_decode(
     ))
 }
 
-/// Gated full attention over the whole prompt, dense and causal: the reference
-/// is QSA, whose selection keeps every causal key while the visible prefix fits
-/// its budget, so this equals it up to that length and no further. Returns the
-/// stages and the `o_proj` output.
-fn attention_prefill(
+/// Gated full attention for `rows` new tokens appended at `kv.len`, dense and
+/// causal over everything in the scratch: the reference is QSA, whose
+/// selection keeps every causal key while the visible prefix fits its budget,
+/// so this equals it up to that length and no further. A whole prompt and a
+/// single decode token take the same path: the hd256 prefill entry over a plan
+/// that starts at `kv.len`, the route Qwen3.5 takes for a GQA group the batch
+/// decode kernels do not compile. Returns the stages and the `o_proj` output.
+fn attention_rows(
     ctx: &DeviceContext,
     g: &Geometry,
     w: &FullAttention,
@@ -347,20 +348,22 @@ fn attention_prefill(
     mixed: &HiddenStates,
 ) -> Result<(AttentionTrace, HiddenStates)> {
     let rows = mixed.seq_len;
+    let start = kv.len;
+    let kv_len = start + rows;
     ensure!(
-        rows <= g.dense_attention_rows(),
-        "the prompt has {rows} tokens; past {} the reference's QSA drops keys and dense attention no longer matches it",
+        kv_len <= g.dense_attention_rows(),
+        "the sequence reaches {kv_len} tokens; past {} the reference's QSA drops keys and dense attention no longer matches it",
         g.dense_attention_rows()
     );
     ensure!(
-        rows <= kv.capacity,
-        "the K/V scratch holds {} tokens, the prompt has {rows}",
+        kv_len <= kv.capacity,
+        "the K/V scratch holds {} tokens, the sequence reaches {kv_len}",
         kv.capacity
     );
     let covered = rope.cos.len / g.rotary_dim;
     ensure!(
-        rows <= covered,
-        "the RoPE table covers {covered} positions, the prompt has {rows}"
+        kv_len <= covered,
+        "the RoPE table covers {covered} positions, the sequence reaches {kv_len}"
     );
     let mut q_proj = HiddenStates::zeros(ctx, g.q_width(), rows)?;
     gemm_into_checked(ctx, &w.q_proj, mixed, &mut q_proj)?;
@@ -369,13 +372,13 @@ fn attention_prefill(
     let mut v_proj = HiddenStates::zeros(ctx, g.kv_width(), rows)?;
     gemm_into_checked(ctx, &w.v_proj, mixed, &mut v_proj)?;
 
-    let pages = rows.div_ceil(KV_PAGE);
+    let pages = kv_len.div_ceil(KV_PAGE);
     let page_ids: Vec<i32> = (0..pages).map(i32::try_from).collect::<Result<_, _>>()?;
     let plan = PrefillPagedPlan::new_with_cta_tile_q(
         ctx,
         &page_ids,
-        rows - KV_PAGE * (pages - 1),
-        0,
+        kv_len - KV_PAGE * (pages - 1),
+        start,
         rows,
         g.heads,
         g.kv_heads,
@@ -397,12 +400,13 @@ fn attention_prefill(
         &kv.layout,
         0,
         &plan,
-        0,
+        start,
         g.rotary_dim,
         g.rms_eps,
         &mut q_prepped,
         &mut gated,
     )?;
+    kv.len = kv_len;
     let mut out = HiddenStates::zeros(ctx, g.hidden, rows)?;
     gemm_into_checked(ctx, &w.o_proj, &gated, &mut out)?;
     Ok((
@@ -488,7 +492,12 @@ pub fn layer_prefill(
             (MixerTrace::Linear(trace), out)
         }
         (Mixer::Full(attn), MixerState::Full(kv)) => {
-            let (trace, out) = attention_prefill(ctx, g, attn, rope, kv, &attn_mixed)?;
+            ensure!(
+                kv.len == 0,
+                "the K/V scratch already holds {} tokens",
+                kv.len
+            );
+            let (trace, out) = attention_rows(ctx, g, attn, rope, kv, &attn_mixed)?;
             (MixerTrace::Full(trace), out)
         }
         _ => bail!("the mixer state was built for the other layer kind"),
@@ -505,24 +514,31 @@ pub fn layer_prefill(
     )
 }
 
-/// One token through the layer on the carried state. Attention decode is not
-/// wired yet: the batch decode kernels dispatch a compiled GQA group list that
-/// lacks this line's 12.
+/// One token through the layer on the carried state.
 pub fn layer_decode(
     ctx: &DeviceContext,
     g: &Geometry,
     w: &DecoderLayer,
+    rope: &Rope,
     state: &mut MixerState,
     stream_in: &HiddenStates,
 ) -> Result<LayerTrace> {
     check_stream(g, stream_in)?;
+    ensure!(
+        stream_in.seq_len == 1,
+        "decode takes one token, got {}",
+        stream_in.seq_len
+    );
     let (attn_mixed, attn_inject) = mix(ctx, g, &w.attn_hc, stream_in)?;
     let (mixer, attn_out) = match (&w.mixer, state) {
         (Mixer::Linear(gdn), MixerState::Linear(state)) => {
             let (trace, out) = gdn_decode(ctx, g, gdn, state, &attn_mixed)?;
             (MixerTrace::Linear(trace), out)
         }
-        (Mixer::Full(_), MixerState::Full(_)) => bail!("attention decode is not wired yet"),
+        (Mixer::Full(attn), MixerState::Full(kv)) => {
+            let (trace, out) = attention_rows(ctx, g, attn, rope, kv, &attn_mixed)?;
+            (MixerTrace::Full(trace), out)
+        }
         _ => bail!("the mixer state was built for the other layer kind"),
     };
     finish_layer(

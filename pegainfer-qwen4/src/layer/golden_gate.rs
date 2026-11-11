@@ -129,13 +129,14 @@ fn unrotated(values: &[f32], g: &Geometry) -> Vec<f32> {
         .collect()
 }
 
-/// K as the prep kernel wrote it into the scratch pool, back in `[rows * kv_heads, head_dim]`.
+/// K of the last `rows` positions as the prep kernel wrote it into the scratch
+/// pool, back in `[rows * kv_heads, head_dim]`.
 fn pool_k(ctx: &DeviceContext, kv: &KvScratch, g: &Geometry, rows: usize) -> Result<Vec<f32>> {
     let pool: Vec<bf16> = ctx.stream.clone_dtoh(&kv.pool)?;
     ctx.sync()?;
     let width = g.kv_width();
     let mut k = Vec::with_capacity(rows * width);
-    for pos in 0..rows {
+    for pos in kv.len - rows..kv.len {
         let row = (pos / kv.layout.page_size) * kv.layout.page_stride
             + (pos % kv.layout.page_size) * width;
         k.extend(pool[row..row + width].iter().map(|x| x.to_f32()));
@@ -143,13 +144,15 @@ fn pool_k(ctx: &DeviceContext, kv: &KvScratch, g: &Geometry, rows: usize) -> Res
     Ok(k)
 }
 
-/// The reference's indexer mask is additive, zero where a key is kept. Dense
-/// attention stands in for it only while every causal key is kept.
-fn ensure_dense(golden: &SafeTensors, rows: usize) -> Result<()> {
-    let (shape, mask) = floats(golden, "attn_indexer_mask")?;
-    ensure!(shape == [rows, rows], "attn_indexer_mask is {shape:?}");
+/// The reference's indexer mask is additive, zero where a key is kept, one row
+/// per query over every key so far. Dense attention stands in for it only while
+/// every causal key is kept.
+fn ensure_dense(golden: &SafeTensors, name: &str, rows: usize, kv_len: usize) -> Result<()> {
+    let (shape, mask) = floats(golden, name)?;
+    ensure!(shape == [rows, kv_len], "{name} is {shape:?}");
+    let first = kv_len - rows;
     let dropped = (0..rows)
-        .flat_map(|i| (0..=i).map(move |j| i * rows + j))
+        .flat_map(|i| (0..=first + i).map(move |j| i * kv_len + j))
         .filter(|&at| mask[at] != 0.0)
         .count();
     ensure!(
@@ -201,7 +204,7 @@ fn hold(
             held.push("gdn_state");
         }
         (MixerTrace::Full(t), MixerState::Full(kv)) => {
-            ensure_dense(golden, rows)?;
+            ensure_dense(golden, &name("attn_indexer_mask"), rows, kv.len)?;
             stages.extend([
                 stage(ctx, golden, name("attn_q_proj"), &t.q_proj)?,
                 stage(ctx, golden, name("attn_k_proj"), &t.k_proj)?,
@@ -379,7 +382,7 @@ fn layer_matches_the_reference() -> Result<()> {
     let host: Vec<bf16> = stream_in.iter().map(|&x| bf16::from_f32(x)).collect();
     let input = HiddenStates::from_host(&ctx, &host, g.stream_width(), rows)?;
     let rope = Rope::new(&ctx, &g, rows + decode_steps)?;
-    let mut state = MixerState::new(&ctx, &g, &weights.mixer, rows)?;
+    let mut state = MixerState::new(&ctx, &g, &weights.mixer, rows + decode_steps)?;
     let trace = layer_prefill(&ctx, &g, &weights, &rope, &mut state, &input)?;
     ctx.sync()?;
     eprintln!("qwen4 layer {layer} gate: {rows} prompt tokens, max |ours - reference| per stage");
@@ -394,7 +397,7 @@ fn layer_matches_the_reference() -> Result<()> {
         );
         let host: Vec<bf16> = row.iter().map(|&x| bf16::from_f32(x)).collect();
         let input = HiddenStates::from_host(&ctx, &host, g.stream_width(), 1)?;
-        let trace = layer_decode(&ctx, &g, &weights, &mut state, &input)?;
+        let trace = layer_decode(&ctx, &g, &weights, &rope, &mut state, &input)?;
         ctx.sync()?;
         eprintln!(
             "qwen4 layer {layer} gate: decode step {step} at position {}",
