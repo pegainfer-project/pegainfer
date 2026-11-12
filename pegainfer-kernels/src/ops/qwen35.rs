@@ -754,6 +754,12 @@ pub fn attention_decode_via_prefill_hd256_into(
         q_prepped.seq_len,
         output.seq_len
     );
+    anyhow::ensure!(
+        plan.total_tokens == batch && plan.batch_size() as usize == batch,
+        "hd256 decode plan: {} rows over {} requests for a batch of {batch}",
+        plan.total_tokens,
+        plan.batch_size()
+    );
     q_full.checked_extent("hd256 decode q_full")?;
     k.checked_extent("hd256 decode k")?;
     v.checked_extent("hd256 decode v")?;
