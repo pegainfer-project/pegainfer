@@ -48,7 +48,7 @@ use crate::weights::Qwen3Model;
 
 mod auto_hedge;
 mod dflash_lane;
-mod dflash_prefill;
+pub(crate) mod dflash_prefill;
 mod dflash_sampling;
 mod eagle3_lane;
 mod logprobs;
@@ -1072,6 +1072,10 @@ pub struct Qwen3Executor {
     draft_kv_tags: Vec<Option<[u8; 16]>>,
     /// Requests whose DFlash state exists and whose draft K/V was materialized.
     draft_state_requests: HashSet<RequestId>,
+    /// Per request, how many of its assigned blocks already carry their draft
+    /// K/V tag. The assigned list is append-only for a live sequence, so a step
+    /// tags only the tail it just registered instead of walking the prefix.
+    draft_kv_tag_cursor: HashMap<RequestId, usize>,
     /// Draft model metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DraftMeta>,
@@ -1304,6 +1308,7 @@ impl Qwen3Executor {
             draft_request_state_bytes_per_token: dflash_request_state_bytes_per_token,
             draft_kv_tags: vec![None; total_blocks],
             draft_state_requests: HashSet::new(),
+            draft_kv_tag_cursor: HashMap::new(),
             speculative: None,
             spec_decode_counters: None,
             draft_ready_requests: HashSet::new(),
@@ -1736,6 +1741,7 @@ impl Qwen3Executor {
             draft_request_state_bytes_per_token: 0,
             draft_kv_tags: Vec::new(),
             draft_state_requests: HashSet::new(),
+            draft_kv_tag_cursor: HashMap::new(),
             speculative: None,
             spec_decode_counters: None,
             draft_ready_requests: HashSet::new(),
@@ -2132,7 +2138,7 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    /// Tag every registered block of a request that has a DFlash state. The
+    /// Tag the blocks a request registered since the previous pass. The
     /// block's draft K/V rows were materialized before the apply, so a later
     /// prefix match can trust the pool for exactly this content hash.
     fn tag_draft_blocks(&mut self, request_id: RequestId) {
@@ -2142,18 +2148,23 @@ impl Qwen3Executor {
         {
             return;
         }
-        let blocks = self
-            .request_kvs
+        let Some(rkv) = self.request_kvs.get(&request_id) else {
+            return;
+        };
+        let cursor = self
+            .draft_kv_tag_cursor
             .get(&request_id)
-            .map(pegainfer_kv_cache::RequestKv::assigned_block_hashes)
-            .unwrap_or_default();
-        for (page, hash) in blocks {
+            .copied()
+            .unwrap_or(0);
+        let (tail, assigned) = rkv.assigned_block_hashes_from(cursor);
+        for (page, hash) in tail {
             if page >= 0
                 && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
             {
                 *tag = Some(hash);
             }
         }
+        self.draft_kv_tag_cursor.insert(request_id, assigned);
     }
 
     // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
@@ -2680,6 +2691,7 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             self.draft_ready_requests.remove(&request_id);
             self.draft_state_requests.remove(&request_id);
+            self.draft_kv_tag_cursor.remove(&request_id);
             self.primary.drop_draft_request(request_id)?;
         }
         Ok(())
@@ -2949,6 +2961,7 @@ impl ModelExecutor for Qwen3Executor {
                     DFlashPrefillAction::Drop => {
                         self.draft_ready_requests.remove(&req_result.request_id);
                         self.draft_state_requests.remove(&req_result.request_id);
+                        self.draft_kv_tag_cursor.remove(&req_result.request_id);
                         self.primary.drop_draft_request(req_result.request_id)?;
                     }
                 }
@@ -3023,6 +3036,7 @@ impl ModelExecutor for Qwen3Executor {
             for req_result in &result.requests {
                 if self.draft_ready_requests.remove(&req_result.request_id) {
                     self.draft_state_requests.remove(&req_result.request_id);
+                    self.draft_kv_tag_cursor.remove(&req_result.request_id);
                     self.primary.drop_draft_request(req_result.request_id)?;
                 }
             }
@@ -3073,6 +3087,21 @@ impl ModelExecutor for Qwen3Executor {
                     .iter()
                     .all(|request| request.lora_adapter.is_none()),
             "LoRA prefill does not support decode-overlap"
+        );
+        // The fused forward captures no target hidden context, so a request the
+        // drafter could capture must never ride it: the request would never
+        // become draft-ready and its drafter would silently no-op for the rest
+        // of the conversation. The scheduler routes these to a dedicated
+        // prefill (a loose superset in `build_next_plan`); this is the
+        // executor's strict, fail-closed side of the same contract.
+        let stranded = dflash_prefill::capture_requests_in_unified(
+            self.speculative.is_some(),
+            plan.prefill_requests,
+        );
+        anyhow::ensure!(
+            stranded.is_empty(),
+            "capture-eligible prefill reached the unified step for {stranded:?}; \
+             route it to a dedicated prefill"
         );
 
         // 1. Create RequestKvs for prefill requests (first chunk only), clamp
@@ -3149,6 +3178,7 @@ impl ModelExecutor for Qwen3Executor {
                     for req_result in &result.decode_requests {
                         if self.draft_ready_requests.remove(&req_result.request_id) {
                             self.draft_state_requests.remove(&req_result.request_id);
+                            self.draft_kv_tag_cursor.remove(&req_result.request_id);
                             self.primary.drop_draft_request(req_result.request_id)?;
                         }
                     }

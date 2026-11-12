@@ -597,12 +597,29 @@ impl RequestKv {
     /// the first [`prefix_matched_blocks`](Self::prefix_matched_blocks) entries
     /// are GPU-hit reuse (already resident) and are normally skipped.
     pub fn assigned_block_hashes(&self) -> Vec<(i32, [u8; 16])> {
-        self.seq
-            .inner()
-            .assignments()
-            .assigned_iter()
-            .map(|(&id, block)| (id as i32, sequence_hash_bytes(&block.sequence_hash())))
-            .collect()
+        self.assigned_block_hashes_from(0).0
+    }
+
+    /// Content hashes of the assigned blocks from `start` (positional insert
+    /// order) to the tail, plus the total assigned count.
+    ///
+    /// `start` is a caller-held cursor: blocks below it were returned by an
+    /// earlier call and are unchanged, because a live sequence only ever
+    /// appends assigned blocks (a speculative rollback drops *unassigned*
+    /// ones). An oversized cursor is clamped, so a caller that lost track
+    /// retags the whole list instead of reading past the end.
+    pub fn assigned_block_hashes_from(&self, start: usize) -> (Vec<(i32, [u8; 16])>, usize) {
+        let assignments = self.seq.inner().assignments();
+        let count = assignments.assigned_count();
+        let start = start.min(count);
+        let mut out = Vec::with_capacity(count - start);
+        for index in start..count {
+            let (&id, block) = assignments
+                .get_assigned(index)
+                .expect("assigned index below the assigned count");
+            out.push((id as i32, sequence_hash_bytes(&block.sequence_hash())));
+        }
+        (out, count)
     }
 
     /// Strong pins for every block currently assigned to this request, aligned
@@ -669,6 +686,43 @@ mod tests {
             ha[0],
             "salt (lora) must scope the prefix cache"
         );
+    }
+
+    /// The draft-tag pass holds a cursor into this list, so the method must
+    /// return exactly the blocks assigned since that cursor and the new cursor
+    /// value — no re-walk, no off-by-one at the tail, and a clamp (not a
+    /// panic) when the caller's cursor is stale.
+    #[test]
+    fn assigned_block_hashes_from_returns_the_untagged_tail() {
+        let pool = BlockPool::new(16, 16).unwrap();
+        let prompt: Vec<u32> = (0..48).collect();
+        let mut request = pool.new_request(prompt, 4, None);
+
+        request.schedule_prefill(32, &pool).expect("schedule chunk");
+        request.apply_prefill_chunk(&pool).expect("apply chunk");
+        let (first, cursor) = request.assigned_block_hashes_from(0);
+        assert_eq!(cursor, 2);
+        assert_eq!(first, request.assigned_block_hashes());
+
+        // Nothing new: a cursor at the end returns an empty tail.
+        let (tail, unchanged) = request.assigned_block_hashes_from(cursor);
+        assert!(tail.is_empty());
+        assert_eq!(unchanged, cursor);
+
+        request.schedule_prefill(16, &pool).expect("schedule tail");
+        request.apply_prefill(42, &pool).expect("apply tail");
+        let (tail, cursor) = request.assigned_block_hashes_from(unchanged);
+        let all = request.assigned_block_hashes();
+        assert_eq!(all.len(), 3);
+        assert_eq!(cursor, 3);
+        assert_eq!(tail, all[2..], "only the newly assigned block comes back");
+
+        // A cursor past the end is clamped, not a panic.
+        let (tail, cursor) = request.assigned_block_hashes_from(99);
+        assert!(tail.is_empty());
+        assert_eq!(cursor, 3);
+
+        request.release().expect("release");
     }
 
     #[test]

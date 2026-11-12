@@ -14,7 +14,7 @@ use super::RequestId;
 
 /// Whether a prefill produces clean target hidden states to seed a drafter
 /// (DFlash and EAGLE-3 alike).
-pub(super) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
+pub(crate) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
     req.lora_adapter.is_none() && req.logprobs.is_none() && req.prompt_logprobs.is_none()
 }
 
@@ -25,6 +25,26 @@ pub(super) fn dflash_prefill_can_capture(
     pending_state_exists: bool,
 ) -> bool {
     prefill_capture_supported(req) && (req.chunk_start == 0 || pending_state_exists)
+}
+
+/// Requests that must not ride a unified prefill step. The fused forward
+/// captures no target hidden context, so under speculation an eligible request
+/// that took that path would never become draft-ready and its drafter would
+/// silently no-op for the rest of the conversation. The scheduler routes these
+/// to a dedicated prefill with a deliberately loose superset
+/// (`scheduler/plan.rs`); this is the strict, fail-closed side of that rule.
+pub(super) fn capture_requests_in_unified(
+    speculative: bool,
+    requests: &[PrefillStepItem],
+) -> Vec<RequestId> {
+    if !speculative {
+        return Vec::new();
+    }
+    requests
+        .iter()
+        .filter(|req| prefill_capture_supported(req))
+        .map(|req| req.request_id)
+        .collect()
 }
 
 /// Capture hidden states during this prefill step iff any request is eligible.
@@ -63,6 +83,47 @@ pub(super) fn dflash_prefill_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(id: u64) -> PrefillStepItem {
+        PrefillStepItem::new(
+            RequestId::new(id),
+            vec![1, 2, 3],
+            8,
+            pegainfer_frontend::sampler::SamplingParams::default(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn unified_refuses_capture_eligible_prefills_only_under_speculation() {
+        let eligible = request(1);
+        assert!(
+            capture_requests_in_unified(false, std::slice::from_ref(&eligible)).is_empty(),
+            "without a drafter the fused path is fine"
+        );
+        assert_eq!(
+            capture_requests_in_unified(true, std::slice::from_ref(&eligible)),
+            vec![eligible.request_id],
+            "a capture-eligible request under speculation must be refused"
+        );
+
+        // LoRA and logprob requests produce no clean capture, so a dedicated
+        // prefill would drop them too; the fused path may keep them.
+        let mut lora = request(2);
+        lora.lora_adapter = Some("adapter".to_string());
+        let mut logprobs = request(3);
+        logprobs.logprobs = Some(0);
+        let mut prompt_logprobs = request(4);
+        prompt_logprobs.prompt_logprobs = Some(0);
+        for ineligible in [lora, logprobs, prompt_logprobs] {
+            assert!(
+                capture_requests_in_unified(true, std::slice::from_ref(&ineligible)).is_empty(),
+                "{:?} is not capture-eligible",
+                ineligible.request_id
+            );
+        }
+    }
 
     #[test]
     fn prefill_action_table() {
