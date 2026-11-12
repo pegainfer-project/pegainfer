@@ -96,6 +96,8 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn add_inplace_cuda(acc: *mut Half, b: *const Half, n: i32, stream: CUstream) -> CUresult;
+
     pub fn advance_decode_metadata_cuda(
         positions: *mut i32,
         local_last: *mut i32,

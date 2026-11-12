@@ -105,6 +105,7 @@ pub use dflash2::dflash2_select_into;
 pub use dflash2_conv::dflash2_grouped_conv_into;
 pub use elementwise::SuppressIds;
 pub use elementwise::add_batch;
+pub use elementwise::add_batch_inplace;
 pub use elementwise::add_batch_into;
 pub use elementwise::add_into;
 pub use elementwise::add_scaled_bf16_into;

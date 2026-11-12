@@ -13,6 +13,7 @@ use pegainfer_kernels::ops::Qwen35GdnGeometry;
 use pegainfer_kernels::ops::Qwen35GdnWorkspace;
 
 use crate::config::Config35;
+use crate::config::LocalGeometry;
 use crate::prefill_buffers::GdnPrepareScratch35;
 
 pub(crate) struct FlashInferGdnChunkResources {
@@ -22,10 +23,12 @@ pub(crate) struct FlashInferGdnChunkResources {
 }
 
 impl FlashInferGdnChunkResources {
-    /// One chunk's persistent buffers and maximum live layer temporaries, plus
-    /// bounded paged-attention metadata. Module allocations already happened.
+    /// One chunk's persistent buffers, the pass-wide buffer set and the launch
+    /// workspace, plus bounded paged-attention metadata. Module allocations
+    /// already happened.
     pub(crate) fn estimate_bytes(
         config: &Config35,
+        local_geometry: LocalGeometry,
         backend: &Qwen35GdnAot,
         tokens: usize,
         page_size: usize,
@@ -37,20 +40,8 @@ impl FlashInferGdnChunkResources {
             * size_of::<half::bf16>();
         let gates = tokens * geometry.h_v * 2 * size_of::<f32>();
 
-        let hidden = config.hidden_size;
-        let full_q = config.num_attention_heads * config.head_dim;
-        let full_kv = config.num_key_value_heads * config.head_dim;
-        let linear_qkv = (geometry.h_q + geometry.h_k + geometry.h_v) * geometry.head_dim;
-        let linear_z = config.linear_attn_z_dim();
-        // Both attention paths retain input hidden + normed + projected output.
-        let full_attention = 3 * hidden + 4 * full_q + 2 * full_kv;
-        let linear_attention = 3 * hidden + 2 * linear_qkv + 2 * linear_z + 2 * geometry.h_v;
-        // At the final residual: input hidden, attention result, hidden+attention,
-        // MLP normed input, MLP output and new residual output all remain live.
-        // The fused gate/up and activated intermediate also survive until return.
-        let mlp = 6 * hidden + 3 * config.intermediate_size;
-        let layer_peak =
-            tokens * full_attention.max(linear_attention).max(mlp) * size_of::<half::bf16>();
+        let pass_buffers =
+            super::prefill::PrefillPassBuffers::estimate_bytes(config, local_geometry, tokens);
 
         // PrefillPagedPlan owns a page list, batch indices and positions (T each),
         // three tile arrays, and seven scalar/indptr elements. Bound page count
@@ -66,7 +57,7 @@ impl FlashInferGdnChunkResources {
             + gates
             + 2 * size_of::<i64>() // cu_seqlens for one sequence
             + backend.workspace_bytes()
-            + layer_peak
+            + pass_buffers
             + plan_metadata
             + token_ids
             + attention_start_position

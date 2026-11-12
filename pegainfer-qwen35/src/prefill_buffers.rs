@@ -69,11 +69,8 @@ pub(crate) fn gdr_chunkwise_scratch(
 ///
 /// Accounts for:
 /// 1. GDR chunkwise scratch (persists across all linear attention layers)
-/// 2. Per-layer transient peak — max of full-attention or MLP intermediates,
-///    plus shared hidden-state buffers (temporaries freed between layers)
-///
-/// Direct-paged prefill writes full-attention K/V into the paged pool, so
-/// HND KVCache staging buffers are no longer part of the prefill scratch.
+/// 2. The pass-wide buffer set (`PrefillPassBuffers`): one buffer per role,
+///    every one of them alive for the whole chunk across all layers
 pub(crate) fn prefill_scratch_bytes(
     config: &Config35,
     geometry: LocalGeometry,
@@ -105,25 +102,8 @@ pub(crate) fn prefill_scratch_bytes(
         f32_elems * 4 + bf16_elems * 2
     };
 
-    // 2. Per-layer transient peak (all bf16 = 2 bytes).
-    //    Attention and MLP temps don't coexist — MLP runs after attention.
-    let hidden_dim = config.hidden_size;
-    let intermediate = geometry.local_intermediate_size();
-
-    // Shared: hidden_batch + normed + hidden_plus_attn + normed_for_mlp
-    let shared_layer = hidden_dim * seq * 4;
-
-    // Full attention: q_full(with gate) + k + v + attn_out + q_prepped
-    let full_qkv = geometry.local_full_attn_gated_q_dim();
-    let full_kv = geometry.local_full_attn_kv_dim();
-    let full_out = geometry.local_full_attn_q_dim();
-    let full_attn_temps = (full_qkv + full_kv * 2 + full_out * 2) * seq;
-
-    // MLP: gate_up_out + act_out (same peak footprint as separate gate/up)
-    let mlp_temps = intermediate * seq * 3;
-
-    let peak_layer = shared_layer + full_attn_temps.max(mlp_temps);
-    let per_layer_bytes = peak_layer * 2; // bf16
-
-    gdr_bytes + per_layer_bytes
+    // 2. Pass-wide buffers: the full-attention, linear-attention, MLP and
+    //    hidden-state roles are all allocated before the first layer and
+    //    released after the last, so they coexist for the whole chunk.
+    gdr_bytes + super::prefill::PrefillPassBuffers::estimate_bytes(config, geometry, seq)
 }

@@ -50,6 +50,36 @@ pub fn add_batch_into(
     Ok(())
 }
 
+/// Batched element-wise add in place: `acc += b` (same shape HiddenStates).
+///
+/// The residual chain of a prefill pass alternates between two hidden-state
+/// buffers, so the second residual cannot borrow its accumulator as both source
+/// and destination.
+pub fn add_batch_inplace(
+    ctx: &DeviceContext,
+    acc: &mut HiddenStates,
+    b: &HiddenStates,
+) -> Result<()> {
+    assert_eq!(acc.hidden_dim, b.hidden_dim);
+    assert_eq!(acc.seq_len, b.seq_len);
+
+    let n = acc.hidden_dim * acc.seq_len;
+    let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
+    let (acc_ptr, _gacc) = acc.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::add_inplace_cuda(
+            acc_ptr as *mut ffi::Half,
+            b_ptr as *const ffi::Half,
+            n as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    result.result()?;
+
+    Ok(())
+}
+
 /// Advance the per-row decode tables written by a regular graph replay.
 pub fn advance_decode_metadata(
     ctx: &DeviceContext,

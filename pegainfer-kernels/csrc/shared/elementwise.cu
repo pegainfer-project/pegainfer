@@ -23,6 +23,21 @@ __global__ void add_kernel(
   }
 }
 
+// In-place residual add: acc = acc + b (bf16, computed in f32). `acc` is one
+// read-write pointer, so it carries no __restrict__ alias promise.
+__global__ void add_inplace_kernel(
+    __nv_bfloat16 *acc,
+    const __nv_bfloat16 *__restrict__ b,
+    int n) {
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < n;
+       idx += gridDim.x * blockDim.x) {
+    float va = __bfloat162float(acc[idx]);
+    float vb = __bfloat162float(b[idx]);
+    acc[idx] = __float2bfloat16(va + vb);
+  }
+}
+
 __global__ void add_scaled_bf16_kernel(
     const __nv_bfloat16 *__restrict__ routed,
     float scale,
@@ -538,6 +553,15 @@ CUresult add_cuda(
   int block = 256;
   int grid = (n + block - 1) / block;
   add_kernel<<<grid, block, 0, stream>>>(a, b, out, n);
+  return map_cuda_error(cudaGetLastError());
+}
+
+CUresult add_inplace_cuda(
+    __nv_bfloat16 *acc, const __nv_bfloat16 *b,
+    int n, cudaStream_t stream) {
+  int block = 256;
+  int grid = (n + block - 1) / block;
+  add_inplace_kernel<<<grid, block, 0, stream>>>(acc, b, n);
   return map_cuda_error(cudaGetLastError());
 }
 

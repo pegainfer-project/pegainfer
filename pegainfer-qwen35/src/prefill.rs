@@ -1,5 +1,8 @@
+use std::mem::size_of;
+
 use anyhow::Context;
 use anyhow::Result;
+use half::bf16;
 
 /// Sequence length used for conservative prefill scratch reservation.
 ///
@@ -32,6 +35,8 @@ use super::weights::LayerKind;
 use super::weights::LinearAttentionLayer;
 use super::weights::Qwen35Model;
 use super::weights::TransformerBlock35;
+use crate::config::Config35;
+use crate::config::LocalGeometry;
 use crate::ops;
 use crate::ops::PrefillPagedPlan;
 
@@ -60,6 +65,64 @@ fn checked_prefill_end_pos(
         "Qwen3.5 prefill requested end_pos={end_pos}, beyond max_position_embeddings={max_position_embeddings}"
     );
     Ok(end_pos)
+}
+
+/// Device buffers one prefill pass allocates once and reuses for every layer.
+///
+/// Layers of the same kind need the same tensor shapes, so one buffer per role
+/// replaces the per-layer allocation of every intermediate tensor. A 1024-token
+/// pass previously issued roughly 460 `cudaMallocAsync` calls, one per
+/// intermediate tensor of every layer; the pass now issues one per role.
+pub(crate) struct PrefillPassBuffers {
+    normed: HiddenStates,
+    q: HiddenStates,
+    k: HiddenStates,
+    v: HiddenStates,
+    q_prepped: HiddenStates,
+    attn_out: HiddenStates,
+    qkv: HiddenStates,
+    z: HiddenStates,
+    b: HiddenStates,
+    a: HiddenStates,
+    conv: HiddenStates,
+    gdr: HiddenStates,
+    normed_out: HiddenStates,
+    gate_up: HiddenStates,
+    act: HiddenStates,
+    projected: HiddenStates,
+}
+
+impl PrefillPassBuffers {
+    /// Bytes one pass-wide buffer set holds for a `seq_len`-token chunk.
+    ///
+    /// Every role is allocated once and lives for the whole pass, so the full
+    /// attention, linear attention and MLP buffers all exist at the same time.
+    /// The two hidden blocks the chunk loop ping-pongs are counted here too;
+    /// `prefill_last_hidden` allocates them next to this set.
+    pub(crate) fn estimate_bytes(
+        config: &Config35,
+        geometry: LocalGeometry,
+        seq_len: usize,
+    ) -> usize {
+        let hidden = config.hidden_size;
+        let intermediate = geometry.local_intermediate_size();
+        let value_heads = geometry.local_linear_num_value_heads();
+        let q_dim = geometry.local_full_attn_q_dim();
+        let kv_dim = geometry.local_full_attn_kv_dim();
+        let qkv_dim = geometry.local_linear_qkv_dim();
+        let z_dim = geometry.local_linear_z_dim();
+
+        let full_attn = geometry.local_full_attn_gated_q_dim() // q
+            + 2 * kv_dim // k, v
+            + 2 * q_dim; // q_prepped, attn_out
+        let linear = 2 * qkv_dim // qkv, conv
+            + 3 * z_dim // z, gdr, normed_out
+            + 2 * value_heads; // b, a
+        let mlp = 3 * intermediate; // gate_up twice, act once
+        let hidden_roles = 4 * hidden; // normed, projected, two ping-pong blocks
+
+        (full_attn + linear + mlp + hidden_roles) * seq_len * size_of::<bf16>()
+    }
 }
 
 impl Qwen35Model {
@@ -102,7 +165,14 @@ impl Qwen35Model {
             // Free the previous chunk's hidden states before allocating the next
             // chunk's scratch so peak memory stays within one chunk's reservation.
             drop(hidden_batch.take());
-            let (chunk_hidden, chunk_scratch) = self.prepare_prefill_chunk(chunk)?;
+            let chunk_len = chunk.len();
+            let mut chunk_hidden =
+                HiddenStates::zeros(&self.ctx, self.config.hidden_size, chunk_len)?;
+            self.embed_prefill_chunk(chunk, &mut chunk_hidden)?;
+            let mut chunk_next =
+                HiddenStates::zeros(&self.ctx, self.config.hidden_size, chunk_len)?;
+            let mut chunk_scratch = self.gdn_prefill_chunk_scratch(chunk_len)?;
+            let mut pass_buffers = self.prefill_pass_buffers(chunk_len)?;
             let chunk_end = base_pos + offset + chunk.len();
             let page_count = chunk_end.div_ceil(page_size);
             let chunk_view = KvView::new(
@@ -133,12 +203,15 @@ impl Qwen35Model {
                 plan: &plan,
                 base_pos: base_pos + offset,
             };
-            hidden_batch = Some(self.prefill_chunk_forward(
-                chunk_hidden,
-                chunk_scratch,
+            self.prefill_chunk_forward(
+                &mut chunk_hidden,
+                &mut chunk_next,
+                &mut pass_buffers,
+                &mut chunk_scratch,
                 &access,
                 recurrent,
-            )?);
+            )?;
+            hidden_batch = Some(chunk_hidden);
             offset += chunk.len();
         }
         // `seq_len > 0` guarantees at least one chunk produced hidden states.
@@ -180,32 +253,51 @@ impl Qwen35Model {
         Ok(logits)
     }
 
-    fn prepare_prefill_chunk(
-        &self,
-        token_ids: &[u32],
-    ) -> Result<(HiddenStates, GdnPrefillChunkScratch)> {
-        let seq_len = token_ids.len();
+    /// Allocate the pass-wide buffers for one chunk of `seq_len` tokens.
+    ///
+    /// Every layer of the same kind uses the same shapes, so the pass owns one
+    /// buffer per role instead of allocating each intermediate tensor per layer.
+    fn prefill_pass_buffers(&self, seq_len: usize) -> Result<PrefillPassBuffers> {
+        let ctx = &self.ctx;
+        let geom = self.geometry;
+        let hidden = self.config.hidden_size;
+        let intermediate = geom.local_intermediate_size();
+        let value_heads = geom.local_linear_num_value_heads();
+        let q_dim = geom.local_full_attn_q_dim();
+        let kv_dim = geom.local_full_attn_kv_dim();
+        let qkv_dim = geom.local_linear_qkv_dim();
+        let z_dim = geom.local_linear_z_dim();
+        Ok(PrefillPassBuffers {
+            normed: HiddenStates::zeros(ctx, hidden, seq_len)?,
+            q: HiddenStates::zeros(ctx, geom.local_full_attn_gated_q_dim(), seq_len)?,
+            k: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
+            v: HiddenStates::zeros(ctx, kv_dim, seq_len)?,
+            q_prepped: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            attn_out: HiddenStates::zeros(ctx, q_dim, seq_len)?,
+            qkv: HiddenStates::zeros(ctx, qkv_dim, seq_len)?,
+            z: HiddenStates::zeros(ctx, z_dim, seq_len)?,
+            b: HiddenStates::zeros(ctx, value_heads, seq_len)?,
+            a: HiddenStates::zeros(ctx, value_heads, seq_len)?,
+            conv: HiddenStates::zeros(ctx, qkv_dim, seq_len)?,
+            gdr: HiddenStates::zeros(ctx, z_dim, seq_len)?,
+            normed_out: HiddenStates::zeros(ctx, z_dim, seq_len)?,
+            gate_up: HiddenStates::zeros(ctx, 2 * intermediate, seq_len)?,
+            act: HiddenStates::zeros(ctx, intermediate, seq_len)?,
+            projected: HiddenStates::zeros(ctx, hidden, seq_len)?,
+        })
+    }
+
+    /// Allocate the GDN scratch for one chunk of `seq_len` tokens.
+    ///
+    /// The pass length is bounded by `PREFILL_CHUNK_LEN`, so one scratch serves
+    /// every layer of the chunk.
+    fn gdn_prefill_chunk_scratch(&self, seq_len: usize) -> Result<GdnPrefillChunkScratch> {
         anyhow::ensure!(
             seq_len > 0 && seq_len <= PREFILL_CHUNK_LEN,
             "prefill chunk length {seq_len} out of range 1..={PREFILL_CHUNK_LEN}"
         );
         let c = &self.config;
-
-        // Embeddings for this chunk.
-        let token_ids_gpu = self
-            .ctx
-            .stream
-            .clone_htod(token_ids)
-            .map_err(|e| anyhow::anyhow!("H2D copy failed: {e}"))?;
-        let mut hidden_batch = HiddenStates::zeros(&self.ctx, c.hidden_size, seq_len)?;
-        ops::embedding_batch(
-            &self.ctx,
-            &self.embed_tokens,
-            &token_ids_gpu,
-            &mut hidden_batch,
-        )?;
-
-        let gdn_scratch = match &self.flashinfer_gdn {
+        Ok(match &self.flashinfer_gdn {
             None => GdnPrefillChunkScratch::Triton(Box::new(gdr_chunkwise_scratch(
                 &self.ctx,
                 c,
@@ -215,132 +307,154 @@ impl Qwen35Model {
             Some(backend) => GdnPrefillChunkScratch::FlashInfer(Box::new(
                 FlashInferGdnChunkResources::new(&self.ctx, backend, seq_len)?,
             )),
-        };
-        Ok((hidden_batch, gdn_scratch))
+        })
     }
 
+    /// Embed one prefill chunk into a caller-allocated buffer.
+    fn embed_prefill_chunk(&self, token_ids: &[u32], hidden: &mut HiddenStates) -> Result<()> {
+        let token_ids_gpu = self
+            .ctx
+            .stream
+            .clone_htod(token_ids)
+            .map_err(|e| anyhow::anyhow!("H2D copy failed: {e}"))?;
+        ops::embedding_batch(&self.ctx, &self.embed_tokens, &token_ids_gpu, hidden)
+    }
+
+    /// Run the layer stack of one chunk.
+    ///
+    /// The hidden state alternates between two caller-owned buffers because every
+    /// layer adds two residuals; it is in `hidden` again when this returns.
+    #[allow(clippy::too_many_arguments)]
     fn prefill_chunk_forward(
         &self,
-        mut hidden_batch: HiddenStates,
-        mut gdn_scratch: GdnPrefillChunkScratch,
+        hidden: &mut HiddenStates,
+        next: &mut HiddenStates,
+        buffers: &mut PrefillPassBuffers,
+        gdn_scratch: &mut GdnPrefillChunkScratch,
         kv: &PrefillKvAccess<'_>,
         recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
-        let seq_len = hidden_batch.seq_len;
-        // Process layers
+    ) -> Result<()> {
+        let seq_len = hidden.seq_len;
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
+        let mut input_is_hidden = true;
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden_batch = self.prefill_layer(
-                layer_idx,
+        for layer in &self.layers {
+            let (input, output) = if input_is_hidden {
+                (&*hidden, &mut *next)
+            } else {
+                (&*next, &mut *hidden)
+            };
+            self.prefill_layer(
                 layer,
-                &hidden_batch,
-                &mut gdn_scratch,
+                input,
+                output,
+                buffers,
+                gdn_scratch,
                 &mut linear_idx,
                 &mut full_idx,
                 kv,
                 recurrent,
             )?;
+            input_is_hidden = !input_is_hidden;
+        }
+        if !input_is_hidden {
+            std::mem::swap(hidden, next);
         }
 
         // Advance recurrent token count for the next chunk / decode step; the
         // paged KV position is committed by the caller.
         recurrent.seq_len += seq_len;
 
-        Ok(hidden_batch)
+        Ok(())
     }
 
-    /// Process one layer during prefill. Returns updated hidden_batch.
+    /// Process one layer during prefill.
+    ///
+    /// Reads `input`, writes `input + attention + mlp` into `output`, and reuses
+    /// the pass buffers for every intermediate tensor.
     #[allow(clippy::too_many_arguments)]
     fn prefill_layer(
         &self,
-        _layer_idx: usize,
         layer: &TransformerBlock35,
-        hidden_batch: &HiddenStates,
+        input: &HiddenStates,
+        output: &mut HiddenStates,
+        buffers: &mut PrefillPassBuffers,
         gdn_scratch: &mut GdnPrefillChunkScratch,
         linear_idx: &mut usize,
         full_idx: &mut usize,
         kv: &PrefillKvAccess<'_>,
         recurrent: &mut RecurrentState,
-    ) -> Result<HiddenStates> {
-        let c = &self.config;
-        let eps = c.rms_norm_eps;
-        let seq_len = hidden_batch.seq_len;
+    ) -> Result<()> {
+        let eps = self.config.rms_norm_eps;
+        debug_assert_eq!(buffers.normed.seq_len, input.seq_len);
 
-        // 1. Input layernorm — per-token (no batched offset norm kernel yet)
-        // Use standard batched norm and add the offset correction manually
-        // Actually we need the (1+w) variant. Process token by token for now.
-        let mut normed_batch =
-            self.batched_rms_norm_offset(hidden_batch, &layer.input_layernorm, eps)?;
+        // 1. Input layernorm (1+weight offset, batched per token)
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            input,
+            &layer.input_layernorm,
+            eps,
+            &mut buffers.normed,
+        )?;
 
-        // 2. Attention / Linear attention — per-token for correctness
-        let geom = self.geometry;
-        let attn_out_dim = match &layer.attn {
-            LayerKind::FullAttention(_) => geom.local_full_attn_q_dim(),
-            LayerKind::LinearAttention(_) => geom.local_linear_z_dim(),
-        };
+        // 2. Attention / linear attention, projected into `buffers.projected`.
+        match &layer.attn {
+            LayerKind::FullAttention(attn) => {
+                self.prefill_full_attention(attn, buffers, full_idx, kv)?;
+            }
+            LayerKind::LinearAttention(attn) => {
+                self.prefill_linear_attention(attn, buffers, linear_idx, recurrent, gdn_scratch)?;
+            }
+        }
 
-        // Batch project, then per-token attention/recurrent
-        let attn_results = match &layer.attn {
-            LayerKind::FullAttention(attn) => self.prefill_full_attention(
-                attn,
-                &normed_batch,
-                full_idx,
-                kv,
-                attn_out_dim,
-                seq_len,
-            )?,
-            LayerKind::LinearAttention(attn) => self.prefill_linear_attention(
-                attn,
-                &normed_batch,
-                linear_idx,
-                recurrent,
-                gdn_scratch,
-                seq_len,
-            )?,
-        };
+        // 3. Residual, then post-attention layernorm into `buffers.normed`.
+        ops::add_batch_into(&self.ctx, input, &buffers.projected, output)?;
+        ops::rms_norm_batch_offset_into(
+            &self.ctx,
+            output,
+            &layer.post_attention_layernorm,
+            eps,
+            &mut buffers.normed,
+        )?;
 
-        // 3. Residual + post-attention layernorm
-        let hidden_plus_attn = ops::add_batch(&self.ctx, hidden_batch, &attn_results)?;
+        // 4. MLP into `buffers.projected`.
+        ops::gemm_into_checked(
+            &self.ctx,
+            &layer.mlp.gate_up_proj,
+            &buffers.normed,
+            &mut buffers.gate_up,
+        )?;
+        ops::silu_mul_fused_batch_into(&self.ctx, &buffers.gate_up, &mut buffers.act)?;
+        ops::gemm_into_checked(
+            &self.ctx,
+            &layer.mlp.down_proj,
+            &buffers.act,
+            &mut buffers.projected,
+        )?;
+        self.all_reduce_hidden(&mut buffers.projected)?;
 
-        // Post-attention layernorm (1+weight offset, batched per-token)
-        normed_batch =
-            self.batched_rms_norm_offset(&hidden_plus_attn, &layer.post_attention_layernorm, eps)?;
-
-        // 4. MLP (batched)
-        let gate_up_out = ops::gemm(&self.ctx, &layer.mlp.gate_up_proj, &normed_batch)?;
-        let mut act_out = HiddenStates::zeros(&self.ctx, geom.local_intermediate_size(), seq_len)?;
-        ops::silu_mul_fused_batch_into(&self.ctx, &gate_up_out, &mut act_out)?;
-        let mut mlp_out = ops::gemm(&self.ctx, &layer.mlp.down_proj, &act_out)?;
-        self.all_reduce_hidden(&mut mlp_out)?;
-
-        // 5. Residual
-        ops::add_batch(&self.ctx, &hidden_plus_attn, &mlp_out)
+        // 5. Residual: `output` is the accumulator and also its own addend.
+        ops::add_batch_inplace(&self.ctx, output, &buffers.projected)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn prefill_full_attention(
         &self,
         attn: &FullAttentionLayer,
-        normed_batch: &HiddenStates,
+        buffers: &mut PrefillPassBuffers,
         full_idx: &mut usize,
         kv: &PrefillKvAccess<'_>,
-        _attn_out_dim: usize,
-        seq_len: usize,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let c = &self.config;
-        let attn_out_dim = self.geometry.local_full_attn_q_dim();
-        let q_full_batch = ops::gemm(&self.ctx, &attn.q_proj, normed_batch)?;
-        let k_batch = ops::gemm(&self.ctx, &attn.k_proj, normed_batch)?;
-        let v_batch = ops::gemm(&self.ctx, &attn.v_proj, normed_batch)?;
-        let mut q_prepped = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
-        let mut attn_out_batch = HiddenStates::zeros(&self.ctx, attn_out_dim, seq_len)?;
+        ops::gemm_into_checked(&self.ctx, &attn.q_proj, &buffers.normed, &mut buffers.q)?;
+        ops::gemm_into_checked(&self.ctx, &attn.k_proj, &buffers.normed, &mut buffers.k)?;
+        ops::gemm_into_checked(&self.ctx, &attn.v_proj, &buffers.normed, &mut buffers.v)?;
+
         attention_prefill_hd256_into(
             &self.ctx,
-            &q_full_batch,
-            &k_batch,
-            &v_batch,
+            &buffers.q,
+            &buffers.k,
+            &buffers.v,
             &attn.q_norm,
             &attn.k_norm,
             &self.cos_cache,
@@ -352,25 +466,28 @@ impl Qwen35Model {
             kv.base_pos,
             c.rotary_dim,
             c.rms_norm_eps,
-            &mut q_prepped,
-            &mut attn_out_batch,
+            &mut buffers.q_prepped,
+            &mut buffers.attn_out,
         )?;
         *full_idx += 1;
 
-        let mut projected = ops::gemm(&self.ctx, &attn.o_proj, &attn_out_batch)?;
-        self.all_reduce_hidden(&mut projected)?;
-        Ok(projected)
+        ops::gemm_into_checked(
+            &self.ctx,
+            &attn.o_proj,
+            &buffers.attn_out,
+            &mut buffers.projected,
+        )?;
+        self.all_reduce_hidden(&mut buffers.projected)
     }
 
     fn prefill_linear_attention(
         &self,
         attn: &LinearAttentionLayer,
-        normed_batch: &HiddenStates,
+        buffers: &mut PrefillPassBuffers,
         linear_idx: &mut usize,
         recurrent: &mut RecurrentState,
         gdn_scratch: &mut GdnPrefillChunkScratch,
-        seq_len: usize,
-    ) -> Result<HiddenStates> {
+    ) -> Result<()> {
         let c = &self.config;
         let geom = self.geometry;
 
@@ -381,128 +498,112 @@ impl Qwen35Model {
         let z_dim = geom.local_linear_z_dim();
         let value_heads = geom.local_linear_num_value_heads();
 
-        let mut qkv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
-        ops::gemm_rows_into(
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &attn.in_proj_qkvz,
             0,
             qkv_dim,
-            normed_batch,
-            &mut qkv_batch,
-        );
-        let mut z_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        ops::gemm_rows_into(
+            &buffers.normed,
+            &mut buffers.qkv,
+        )?;
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &attn.in_proj_qkvz,
             qkv_dim,
             z_dim,
-            normed_batch,
-            &mut z_batch,
-        );
-        let mut b_batch = HiddenStates::zeros(&self.ctx, value_heads, seq_len)?;
-        ops::gemm_rows_into(
+            &buffers.normed,
+            &mut buffers.z,
+        )?;
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &attn.in_proj_ba,
             0,
             value_heads,
-            normed_batch,
-            &mut b_batch,
-        );
-        let mut a_batch = HiddenStates::zeros(&self.ctx, value_heads, seq_len)?;
-        ops::gemm_rows_into(
+            &buffers.normed,
+            &mut buffers.b,
+        )?;
+        ops::gemm_rows_into_checked(
             &self.ctx,
             &attn.in_proj_ba,
             value_heads,
             value_heads,
-            normed_batch,
-            &mut a_batch,
-        );
+            &buffers.normed,
+            &mut buffers.a,
+        )?;
 
         let layer_state = &mut recurrent.layers[*linear_idx];
 
-        let mut qkv_conv_batch = HiddenStates::zeros(&self.ctx, qkv_dim, seq_len)?;
         ops::conv1d_prefill_batch_into(
             &self.ctx,
-            &qkv_batch,
+            &buffers.qkv,
             &attn.conv1d_weight,
             &mut layer_state.conv_state,
-            &mut qkv_conv_batch,
+            &mut buffers.conv,
             c.linear_conv_kernel_dim,
         );
 
-        let mut normed_out_batch = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-        {
-            let mut triton_output;
-            let gdr_output = match gdn_scratch {
-                GdnPrefillChunkScratch::Triton(scratch) => {
-                    triton_output = HiddenStates::zeros(&self.ctx, z_dim, seq_len)?;
-                    ops::gated_delta_rule_prefill_chunkwise_into(
-                        &self.ctx,
-                        &qkv_conv_batch,
-                        &b_batch,
-                        &a_batch,
-                        &attn.dt_bias,
-                        &attn.a_log,
-                        &mut layer_state.state,
-                        scratch,
-                        &mut triton_output,
-                        geom.local_linear_num_key_heads(),
-                        geom.local_linear_num_value_heads(),
-                        c.linear_key_head_dim,
-                        c.linear_value_head_dim,
-                    )?;
-                    &triton_output
-                }
-                GdnPrefillChunkScratch::FlashInfer(resources) => {
-                    ops::gated_delta_rule_prefill_native_prepare_into(
-                        &self.ctx,
-                        &qkv_conv_batch,
-                        &b_batch,
-                        &a_batch,
-                        &attn.dt_bias,
-                        &attn.a_log,
-                        &mut resources.prepare,
-                    )?;
-                    resources.launch_in_place(
-                        &self.ctx,
-                        self.flashinfer_gdn
-                            .as_ref()
-                            .context("FlashInfer GDN was not selected when loading this model")?,
-                        &mut layer_state.state,
-                    )?;
-                    &resources.output
-                }
-            };
-            ops::rms_norm_gated_batch_into(
-                &self.ctx,
-                gdr_output,
-                &attn.norm_weight,
-                &z_batch,
-                &mut normed_out_batch,
-                geom.local_linear_num_value_heads(),
-                c.linear_value_head_dim,
-                c.rms_norm_eps,
-                ops::GatedNormActivation::Silu,
-            );
-        }
+        let gdr_output = match gdn_scratch {
+            GdnPrefillChunkScratch::Triton(scratch) => {
+                ops::gated_delta_rule_prefill_chunkwise_into(
+                    &self.ctx,
+                    &buffers.conv,
+                    &buffers.b,
+                    &buffers.a,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut layer_state.state,
+                    scratch,
+                    &mut buffers.gdr,
+                    geom.local_linear_num_key_heads(),
+                    geom.local_linear_num_value_heads(),
+                    c.linear_key_head_dim,
+                    c.linear_value_head_dim,
+                )?;
+                &buffers.gdr
+            }
+            GdnPrefillChunkScratch::FlashInfer(resources) => {
+                ops::gated_delta_rule_prefill_native_prepare_into(
+                    &self.ctx,
+                    &buffers.conv,
+                    &buffers.b,
+                    &buffers.a,
+                    &attn.dt_bias,
+                    &attn.a_log,
+                    &mut resources.prepare,
+                )?;
+                resources.launch_in_place(
+                    &self.ctx,
+                    self.flashinfer_gdn
+                        .as_ref()
+                        .context("FlashInfer GDN was not selected when loading this model")?,
+                    &mut layer_state.state,
+                )?;
+                &resources.output
+            }
+        };
+
+        ops::rms_norm_gated_batch_into(
+            &self.ctx,
+            gdr_output,
+            &attn.norm_weight,
+            &buffers.z,
+            &mut buffers.normed_out,
+            geom.local_linear_num_value_heads(),
+            c.linear_value_head_dim,
+            c.rms_norm_eps,
+            ops::GatedNormActivation::Silu,
+        );
 
         *linear_idx += 1;
 
-        // Output projection (batched)
-        let mut projected = ops::gemm(&self.ctx, &attn.out_proj, &normed_out_batch)?;
-        self.all_reduce_hidden(&mut projected)?;
-        Ok(projected)
-    }
-
-    fn batched_rms_norm_offset(
-        &self,
-        x: &HiddenStates,
-        weight: &DeviceVec,
-        eps: f32,
-    ) -> Result<HiddenStates> {
-        let mut out = HiddenStates::zeros(&self.ctx, x.hidden_dim, x.seq_len)?;
-        ops::rms_norm_batch_offset_into(&self.ctx, x, weight, eps, &mut out)?;
-        Ok(out)
+        // Output projection into the layer's output slot.
+        ops::gemm_into_checked(
+            &self.ctx,
+            &attn.out_proj,
+            &buffers.normed_out,
+            &mut buffers.projected,
+        )?;
+        self.all_reduce_hidden(&mut buffers.projected)
     }
 }
 
