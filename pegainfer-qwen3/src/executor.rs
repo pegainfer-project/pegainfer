@@ -2138,7 +2138,7 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    /// Tag every registered block of a request that has a DFlash state. The
+    /// Tag the blocks a request registered since the previous pass. The
     /// block's draft K/V rows were materialized before the apply, so a later
     /// prefix match can trust the pool for exactly this content hash.
     fn tag_draft_blocks(&mut self, request_id: RequestId) {
