@@ -48,7 +48,7 @@ use crate::weights::Qwen3Model;
 
 mod auto_hedge;
 mod dflash_lane;
-mod dflash_prefill;
+pub(crate) mod dflash_prefill;
 mod dflash_sampling;
 mod eagle3_lane;
 mod logprobs;

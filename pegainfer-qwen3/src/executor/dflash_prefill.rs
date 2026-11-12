@@ -14,7 +14,7 @@ use super::RequestId;
 
 /// Whether a prefill produces clean target hidden states to seed a drafter
 /// (DFlash and EAGLE-3 alike).
-pub(super) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
+pub(crate) fn prefill_capture_supported(req: &PrefillStepItem) -> bool {
     req.lora_adapter.is_none() && req.logprobs.is_none() && req.prompt_logprobs.is_none()
 }
 

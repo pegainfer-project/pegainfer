@@ -597,12 +597,7 @@ impl RequestKv {
     /// the first [`prefix_matched_blocks`](Self::prefix_matched_blocks) entries
     /// are GPU-hit reuse (already resident) and are normally skipped.
     pub fn assigned_block_hashes(&self) -> Vec<(i32, [u8; 16])> {
-        self.seq
-            .inner()
-            .assignments()
-            .assigned_iter()
-            .map(|(&id, block)| (id as i32, sequence_hash_bytes(&block.sequence_hash())))
-            .collect()
+        self.assigned_block_hashes_from(0).0
     }
 
     /// Content hashes of the assigned blocks from `start` (positional insert

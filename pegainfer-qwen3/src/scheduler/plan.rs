@@ -352,7 +352,9 @@ mod tests {
     use pegainfer_frontend::sampler::SamplingParams;
 
     use super::*;
+    use crate::executor::PrefillStepItem;
     use crate::executor::RequestId;
+    use crate::executor::dflash_prefill::prefill_capture_supported;
     use crate::scheduler::test_support::FakeExecutor;
 
     fn pending() -> PendingRequest {
@@ -572,5 +574,51 @@ mod tests {
             ),
             "spec + active + LoRA pending (never speculates, no capture) can use unified"
         );
+    }
+
+    /// `execute_unified` refuses a capture-eligible request, so the scheduler
+    /// must never route one there under speculation. Pair the routing with the
+    /// executor's strict predicate (not a copy of it) so either side drifting
+    /// opens a hole this test closes.
+    #[test]
+    fn spec_routing_keeps_capture_eligible_requests_out_of_unified() {
+        let shapes: [(Option<&str>, Option<usize>, Option<usize>); 4] = [
+            (None, None, None),
+            (Some("adapter"), None, None),
+            (None, Some(0), None),
+            (None, None, Some(0)),
+        ];
+        for (lora, logprobs, prompt_logprobs) in shapes {
+            let mut req = pending();
+            req.lora_adapter = lora.map(str::to_string);
+            req.logprobs = logprobs;
+            req.prompt_logprobs = prompt_logprobs;
+
+            let eligible = prefill_capture_supported(
+                &PrefillStepItem::new(
+                    req.request_id,
+                    req.prompt_tokens.clone(),
+                    req.max_tokens,
+                    SamplingParams::default(),
+                    logprobs,
+                    prompt_logprobs,
+                )
+                .with_lora_adapter(lora.map(str::to_string)),
+            );
+            let plan = build_next_plan(true, vec![req], true).expect("spec plan");
+            if eligible {
+                assert!(
+                    matches!(plan, ExecutionPlan::Prefill { .. }),
+                    "a capture-eligible request under speculation must take a dedicated \
+                     prefill ({lora:?} {logprobs:?} {prompt_logprobs:?})"
+                );
+            } else if prompt_logprobs.is_none() {
+                assert!(
+                    matches!(plan, ExecutionPlan::Unified { .. }),
+                    "a capture-ineligible request without all-position logits may fuse \
+                     ({lora:?} {logprobs:?})"
+                );
+            }
+        }
     }
 }
