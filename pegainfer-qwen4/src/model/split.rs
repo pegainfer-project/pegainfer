@@ -14,12 +14,15 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use half::bf16;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
+use pegainfer_sample::LogprobRequest;
 use pegainfer_sample::SampleScratch;
 use pegainfer_sample::select_batch;
+use pegainfer_sample::token_logprobs_batch;
 
 use super::Model;
 use super::ModelState;
@@ -38,17 +41,23 @@ pub enum Readout {
 }
 
 /// One row's params and request local step per sequence, and a fresh seed
-/// for the call, as `pegainfer_sample::select_batch` takes them.
+/// for the call, as `pegainfer_sample::select_batch` takes them, and per
+/// sequence how many top logprobs to report with its token, if any.
 #[derive(Clone, Debug)]
 pub struct Sampling {
     pub params: Vec<SamplingParams>,
     pub steps: Vec<u64>,
     pub seed: u64,
+    pub logprobs: Vec<Option<usize>>,
 }
 
 pub enum Output {
     Stream(Vec<bf16>),
-    Tokens(Vec<u32>),
+    /// One token per sequence, and its logprob where the sequence asked.
+    Tokens {
+        ids: Vec<u32>,
+        logprobs: Vec<Option<TokenLogprob>>,
+    },
 }
 
 #[derive(Clone)]
@@ -121,7 +130,7 @@ impl Stage {
                     .as_mut()
                     .context("only the last card picks tokens")?;
                 let params: Vec<&SamplingParams> = sampling.params.iter().collect();
-                let tokens = select_batch(
+                let ids = select_batch(
                     ctx,
                     &logits,
                     &params,
@@ -129,7 +138,23 @@ impl Stage {
                     sampling.seed,
                     scratch,
                 )?;
-                Ok(Output::Tokens(tokens))
+                // From the raw logits, as vLLM reports them by default.
+                let wanted: Vec<LogprobRequest> = sampling
+                    .logprobs
+                    .iter()
+                    .zip(&ids)
+                    .enumerate()
+                    .filter_map(|(row, (top_k, &picked))| {
+                        top_k.map(|top_k| LogprobRequest { row, picked, top_k })
+                    })
+                    .collect();
+                let mut scored = token_logprobs_batch(ctx, &logits, &wanted)?.into_iter();
+                let logprobs = sampling
+                    .logprobs
+                    .iter()
+                    .map(|top_k| top_k.and_then(|_| scored.next()))
+                    .collect();
+                Ok(Output::Tokens { ids, logprobs })
             }
         }
     }
@@ -257,7 +282,7 @@ impl SplitModel {
             }
             match output {
                 Output::Stream(host) => stream = Some(host),
-                Output::Tokens(_) => {
+                Output::Tokens { .. } => {
                     bail!("card {} picked tokens before the last card", stage.device)
                 }
             }
