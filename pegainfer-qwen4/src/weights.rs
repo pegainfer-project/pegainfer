@@ -662,12 +662,7 @@ impl NgramRows {
         let mut shards = Vec::with_capacity(table.shards);
         for shard in 0..table.shards {
             let name = format!("{shard_prefix}{shard}.weight");
-            let &map = weight_map
-                .get(&name)
-                .with_context(|| format!("{name} is not in the checkpoint index"))?;
-            let view = views[map]
-                .tensor(&name)
-                .with_context(|| format!("reading {name}"))?;
+            let view = find_tensor(&views, &weight_map, &name)?;
             ensure!(
                 view.dtype() == Dtype::BF16
                     && view.shape() == [table.rows_per_shard, table.head_dim],
@@ -677,8 +672,12 @@ impl NgramRows {
                 table.rows_per_shard,
                 table.head_dim
             );
-            let offset = view.data().as_ptr() as usize - maps[map].as_ptr() as usize;
-            shards.push((map, offset));
+            let start = view.data().as_ptr();
+            let map = maps
+                .iter()
+                .position(|mapped| mapped.as_ptr_range().contains(&start))
+                .expect("a tensor view lies in the file it was read from");
+            shards.push((map, start as usize - maps[map].as_ptr() as usize));
         }
         Ok(Self {
             maps,
