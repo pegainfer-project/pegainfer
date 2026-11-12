@@ -2517,6 +2517,7 @@ fn main() {
             || stem == "glm52_topk"
             || stem == "local_kv_fp8"
             || stem == "qwen4_grouped_rmsnorm"
+            || stem == "qwen4_moe_grouped"
         {
             for dir in &flashinfer.cccl {
                 nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
