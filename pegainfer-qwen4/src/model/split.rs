@@ -136,6 +136,10 @@ impl SplitModel {
             devices.len(),
             layers.len()
         );
+        ensure!(
+            layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "layers must be loaded in increasing order, got {layers:?}"
+        );
         let vocab = Geometry::from_config(&load_config(model_dir)?).vocab;
         let (base, extra) = (layers.len() / devices.len(), layers.len() % devices.len());
         let mut start = 0;
@@ -210,6 +214,15 @@ impl SplitModel {
     }
 }
 
+/// Destroys the cuBLAS handles a card's worker thread created.
+struct CublasThreadGuard;
+
+impl Drop for CublasThreadGuard {
+    fn drop(&mut self) {
+        unsafe { pegainfer_kernels::ffi::cublas_destroy() };
+    }
+}
+
 /// Start one card's worker; the receiver reports whether its part loaded.
 fn spawn_stage(
     model_dir: PathBuf,
@@ -225,6 +238,8 @@ fn spawn_stage(
     let join = std::thread::Builder::new()
         .name(format!("qwen4-card{device}"))
         .spawn(move || {
+            // Declared first, so it drops after the part has released the card.
+            let _cublas = CublasThreadGuard;
             // The context binds this thread to the card and gives it its own
             // cuBLAS handle, so the part loads and runs here.
             let load = || -> Result<Stage> {
