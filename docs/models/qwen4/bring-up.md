@@ -1,6 +1,6 @@
 # Qwen4 bring-up
 
-> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher). Behind the model crate's own `qwen4` feature, layer 0 (`linear_attention`), layer 1 (the n-gram layer, its 102.4 GB table read row by row from the mapped shards on the host) and layer 3 (the first attention layer, dense up to the QSA budget) now run in prefill on the checkpoint's weights and decode token by token on their carried state (conv and recurrent state for GDN, the paged K/V for attention, the last tokens and block inputs for the n-gram block); all of it lands within the reference's own bf16 noise floor, and `model::Model` chains any loaded subset of layers between the embedding stream and the readout (mixer and untied head). The model gate below holds every layer on the reference's own input through all 48 layers on one GH200, one layer resident at a time, and the engine's own 48 layer chain picks the reference's argmax except at near ties. `launch` still refuses: the step and serving across four cards are next. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
+> **TL;DR:** `Qwen/Qwen3.8-Flash-Next`, the first checkpoint of the Qwen4 architecture preview, is a **new line** (`qwen4_exp`), not a Qwen3.5 variant — its `model_type` differs, so the Qwen3.5 probe refuses it by construction. Frozen at revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`. Landed so far: an identity probe and one typed config validation that pins *structure rather than widths* and derives what `config.json` leaves implicit, plus a tensor manifest that derives **exactly** the checkpoint's 1294 text tensors, tested against a snapshot of every shard header and not yet called at runtime. All of the model crate is CPU-only; its first device code lives beside it in `pegainfer-kernels` behind that crate's own `qwen4` feature — the QSA token indexer's block-scoring and block-selection kernels, gated against a committed reference golden, plus the component kernels extracted from the five brick PRs #1151 to #1155 (hyper-connection mix, MoE routing and shared-expert combine, the PLE block and its n-gram hasher). Behind the model crate's own `qwen4` feature, layer 0 (`linear_attention`), layer 1 (the n-gram layer, its 102.4 GB table read row by row from the mapped shards on the host) and layer 3 (the first attention layer, dense up to the QSA budget) now run in prefill on the checkpoint's weights and decode token by token on their carried state (conv and recurrent state for GDN, the paged K/V for attention, the last tokens and block inputs for the n-gram block); all of it lands within the reference's own bf16 noise floor, and `model::Model` chains any loaded subset of layers between the embedding stream and the readout (mixer and untied head). The model gate below holds every layer on the reference's own input through all 48 layers on one GH200, one layer resident at a time, and the engine's own 48 layer chain picks the reference's argmax except at near ties. Decode runs several sequences as one batch, one slot each, and the gate holds every row against its own reference. `launch` still refuses: the step and serving across four cards are next. Four facts this line must not get wrong, all measured rather than assumed: the embedding is **untied**; there is **no final-norm tensor** (the readout is the hyper-connection mixer); `ple_layer_ids: [2]` is **1-indexed**, so the n-gram block lives on `layers.1`; and `output_gate_type: "sigmoid"` is a **live** field selecting the GDN gated-norm activation — the inverse of the Qwen3.8-27B lesson, where the same field name is inert.
 >
 > **Last touched:** 2026-11
 
@@ -95,7 +95,7 @@ The reference is `tools/accuracy/dump_qwen4_layer_golden.py`: it reads the named
 
 The engine side is `weights::load_layer` (maps only the shards that hold the layer, checks that layer's slice of the tensor contract, uploads through the shared staged loader with the new `expert_stack` record for the fused `[512, 1280, 2560]` and `[512, 2560, 640]` stacks), `layer::layer_prefill` (hyper-connection mix, the GDN block on the qwen35 prefill wrappers that now live in `pegainfer_kernels::ops`, the scatter, the second mix, the MoE block, the second scatter) and `moe::moe_prefill` (router, a route metadata kernel that orders the picks by expert, one cuBLAS GEMM pair per expert over its slot range through `gemm_rows_span_at_into_checked`, the fused SiLU, a weighted combine kernel, the shared branch and the block sum). The routed experts are a correctness first design: about a thousand launches and one host sync per layer at 2k tokens. Decode wants the pointer batched form and prefill a grouped GEMM; both are follow-ups.
 
-The gate is `model::golden_gate`, run with `PEGAINFER_QWEN4_MODEL_PATH` and `PEGAINFER_QWEN4_LAYER_GOLDEN` set. It loads the layers the golden names with the bookends around them, requires the embedding stream to match exactly, prints the max and mean difference per stage of every layer, holds five stages per layer (the attention output, the stream after it, the router logits, the block output, the stream out) and the logits to four times the reference's own floor, and requires every token's picks to be a top 10 of the engine's own logits. Picks that differ from the reference's are printed with the reference's own gap in bf16 steps; with the logits inside the floor, such a swap can only sit where that gap is inside the floor too.
+The gate is `model::golden_gate`, run with `PEGAINFER_QWEN4_MODEL_PATH` and `PEGAINFER_QWEN4_LAYER_GOLDEN` set. It loads the layers the golden names with the bookends around them, requires the embedding stream to match exactly, prints the max and mean difference per stage of every layer, holds five stages per layer (the attention output, the stream after it, the router logits, the block output, the stream out) and the logits to four times the reference's own floor (the largest it shows on that stage over the sequence, as [Several sequences in one decode step](#several-sequences-in-one-decode-step) measures), and requires every token's picks to be a top 10 of the engine's own logits. Picks that differ from the reference's are printed with the reference's own gap in bf16 steps; with the logits inside the floor, such a swap can only sit where that gap is inside the floor too.
 
 ```
 python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next --layers 0 --out golden/qwen4-layers0.safetensors
@@ -136,7 +136,7 @@ On the same sm_89 card, 32 tokens:
 
 Five of the 32 tokens pick a different expert set; the reference's own logits for each swapped pair are 0 to 3 bf16 steps apart, inside its own accelerator versus CPU spread on the logits. That is why the gate holds the logits to the floor and the picks to the engine's own logits rather than to a fixed tie width: layer 0's one swap sat one step apart, and this layer's noisier input (its `stream_after_attn` floor is sixteen times layer 0's) moves the gap to three.
 
-Decode takes the same path. FlashInfer's batch decode dispatches a compiled GQA group list that lacks this line's 12, and its prefill kernel takes the group at run time, so one token is a plan that starts at the K/V scratch's current length with one query row through the same `attention_prefill_hd256_into` call: the prep writes the token's K/V into its page and the causal prefill over the whole scratch is the decode. That is the route Qwen3.5 takes for the groups its decode kernels do not compile, one request per launch. The reference with `--decode 8` runs the layer on a `DynamicCache` (the sparse attention layer maps to its indexed cache layer) with the mask and the position tables covering every key so far. Max over the 8 steps after a 24 token prefill on the same sm_89 card:
+Decode takes FlashInfer's prefill kernel too. Its batch decode dispatches a compiled GQA group list that lacks this line's 12, and its prefill kernel takes the group at run time, so a decode step is `attention_decode_via_prefill_hd256_into`: the q/k norm and partial RoPE at each request's position, the token's K/V written into its page, the causal prefill with one query row per request over that request's pages, then the sigmoid gate. That is the route Qwen3.5 takes for the groups its decode kernels do not compile. The reference with `--decode 8` runs the layer on a `DynamicCache` (the sparse attention layer maps to its indexed cache layer) with the mask and the position tables covering every key so far. Max over the 8 steps after a 24 token prefill on the same sm_89 card:
 
 | Stage | max difference | reference's own floor |
 | --- | --- | --- |
@@ -152,7 +152,7 @@ One of the 8 steps picks a different expert set, with the reference's logits for
 
 ## The model around the layers
 
-`model::Model` is what surrounds the layers: `embed` repeats each token's embedding `hc_count` times into the stream (one `embedding_batch` gather with every id repeated, since `[rows, hc_count × hidden]` and `[hc_count × rows, hidden]` are the same bytes), any subset of the decoder layers in checkpoint order, and `readout`, the top-level mixer (`hc_mix_into` with no injection head, there is no final norm) followed by the untied head. `Model::prefill` and `Model::decode` walk the loaded layers on a `ModelState` (one `LayerState` per layer: the mixer's state, plus the n-gram block's on layer 1) and return every layer's trace with the mixed row and the logits. The subset is what one card can hold against the reference; serving loads all 48.
+`model::Model` is what surrounds the layers: `embed` repeats each token's embedding `hc_count` times into the stream (one `embedding_batch` gather with every id repeated, since `[rows, hc_count × hidden]` and `[hc_count × rows, hidden]` are the same bytes), any subset of the decoder layers in checkpoint order, and `readout`, the top-level mixer (`hc_mix_into` with no injection head, there is no final norm) followed by the untied head. `Model::prefill` walks one prompt through the loaded layers in its slot of a `ModelState` (one `LayerState` per layer, holding the mixer's state, plus the n-gram block's on layer 1, for every slot), `Model::decode` one token in each of a batch of slots, and both return every layer's trace with the mixed row and the logits. The subset is what one card can hold against the reference; serving loads all 48.
 
 The gate (`model::golden_gate`, the one gate for this line) holds the embedding stream exactly and every loaded layer stage by stage on the reference's own input for it: each pass feeds a layer the stream the reference fed it (the embedding stream for the first, the previous loaded layer's output after that), and the dump script feeds its CPU pass the same way, so every floor is that layer's own. The head is held on the reference's last stream. The engine's own chain through the loaded layers runs beside them (`Model::prefill` and `Model::decode` in the resident driver), and its logits and argmax agreement are printed with the reference's own gap where they disagree; they are not held, for the reason the next section measures. The chain the box can run is layers 0 and 3 with the bookends, a 24 token prefill then 8 decode steps:
 
@@ -183,19 +183,63 @@ Each layer reads the reference's input because a chain compounds. Held on its ow
 
 A token that picks another expert set than the reference runs other experts, so its routed output has nothing to match: `moe_out` and `stream_out` are held on the tokens whose sets agree. The flip itself is bounded by the router logits hold, since two experts that trade places differ in the reference's logits by at most twice the engine's distance from it. Before this rule the chain of layers 0, 1 and 3 stopped on such a flip at layer 3's decode step 5, with the router logits at the reference's own floor.
 
-All 48 layers, a 24 token prefill then 8 decode steps, each stage's distance over its floor (the floor clamped at 1e-3):
+All 48 layers, a 24 token prefill then 8 decode steps, each held stage of each pass over the floor it is held to (the largest the reference shows on that stage over the sequence, which the next section explains):
 
 | Stage | held | median | p99 | max |
 | --- | --- | --- | --- | --- |
 | `ple_out` | 9 | 0 | 0 | 0 |
-| `attn_out` | 432 | 1.0 | 2.4 | 3.9 |
-| `stream_after_attn` | 432 | 0.98 | 2.0 | 2.3 |
-| `router_logits` | 432 | 1.0 | 2.0 | 2.0 |
-| `moe_out` | 432 | 0.49 | 1.8 | 2.0 |
-| `stream_out` | 432 | 0.98 | 2.0 | 2.0 |
-| `gdn_state` | 324 | 0.57 | 1.1 | 1.5 |
+| `attn_out` | 432 | 0.32 | 1.0 | 1.3 |
+| `stream_after_attn` | 432 | 0.06 | 0.50 | 1.0 |
+| `router_logits` | 432 | 0.50 | 1.0 | 1.0 |
+| `moe_out` | 432 | 0.05 | 0.58 | 1.0 |
+| `stream_out` | 432 | 0.07 | 0.50 | 1.0 |
+| `gdn_state` | 324 | 0.45 | 1.1 | 1.1 |
 
-The largest, 3.9, is one bf16 step (3.9e-3) at a stage whose CPU floor fell under the clamp; the next is 2.8. 48 of the 1536 token routings pick a different expert set. The head on the reference's last stream lands within 6.3e-2 in prefill (floor 1.25e-1) and matches bit for bit in all 8 decode steps, argmax 24 of 24 and 8 of 8. The engine's own chain through all 48 layers lands within 1.7 of the reference's logits in prefill and 1.8 in decode, at logit magnitudes up to 22, and picks the reference's argmax on 21 of 24 prompt tokens and 7 of 8 steps; each disagreement sits at a tie or one to two bf16 steps in the reference's own logits. The reference's own CPU chain sits up to 2.2 from its accelerator chain on the same logits.
+48 of the 1536 token routings pick a different expert set. The head on the reference's last stream lands within 6.3e-2 in prefill (floor 1.25e-1) and matches bit for bit in all 8 decode steps, argmax 24 of 24 and 8 of 8. The engine's own chain through all 48 layers lands within 1.7 of the reference's logits in prefill and 1.8 in decode, at logit magnitudes up to 22, and picks the reference's argmax on 21 of 24 prompt tokens and 7 of 8 steps; each disagreement sits at a tie or one to two bf16 steps in the reference's own logits. The reference's own CPU chain sits up to 2.2 from its accelerator chain on the same logits.
+
+## Several sequences in one decode step
+
+A `ModelState` holds several sequences, one per slot. Each attention layer keeps every slot's K/V in one paged pool (`layer::KvPool`, slot `s` owning the pages from `s × ⌈capacity / 16⌉`), so one plan covers a batch; the GDN conv and recurrent states and the n-gram block's carried tokens and rows are kept per slot. `Model::prefill` runs one prompt in its slot. `Model::decode` takes one token for each of a batch of slots and runs them as the rows of one forward: the hyper-connection mixes, every projection, the MoE block and the readout work row by row, the GDN decode kernels take one state pointer per row, the n-gram block gathers and projects the batch's rows together and runs its block per slot on that slot's carried rows, and attention goes through `attention_decode_via_prefill_hd256_into` with one query row per slot. One sequence per step takes the same path: on every golden above, every stage prints the number it printed before this path existed.
+
+The gate takes several goldens joined like `PATH`. Each is one sequence in its own slot: the prompts are prefilled one at a time, and each decode step stacks the reference's input rows of every sequence that still has a step into one batch and holds each row against its own golden. Two shorter sequences come from the same prompt, 15 tokens then 6 steps (the decode crosses the first page boundary) and 1 token then 8 steps:
+
+```
+python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next --layers all --tokens 21 --decode 6 --out golden/qwen4-all-t21-decode6.safetensors
+python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next --layers all --tokens 9 --decode 8 --out golden/qwen4-all-t9-decode8.safetensors
+PEGAINFER_QWEN4_GATE_STREAMED=1 PEGAINFER_QWEN4_MODEL_PATH=/data/models/Qwen3.8-Flash-Next \
+  PEGAINFER_QWEN4_LAYER_GOLDEN=golden/qwen4-all-decode8.safetensors:golden/qwen4-all-t21-decode6.safetensors:golden/qwen4-all-t9-decode8.safetensors \
+  cargo test --release --locked -p pegainfer-qwen4 --features qwen4 --lib model::golden_gate -- --nocapture --test-threads=1
+```
+
+Each held stage is held to four times the largest floor the reference shows on it over the sequence, prefill and every decode step, and a bf16 stage's floor in a pass is at least one bf16 step of its largest value. Held pass by pass against that pass's floor alone, two of these three sequences fail with one sequence per step: the 15 token one's layer 3 attention output in decode step 2 sits at 1.4e-2 against a line of 8.3e-3, where the same layer's prefill floor is 1.2e-2, and the 1 token one's layer 31 attention output in decode step 6 at 9.3e-3 against 7.8e-3. A pass's spread is one draw, and a draw can come out near nothing: on the 1 token prompt the reference's two devices agree bit for bit on layer 3's router logits, and the recurrent state's spread shrinks with the decay (layer 0's sat 2.4e-2 apart at decode step 3 and 3.4e-3 apart at step 5) while the distance it is held against carries every earlier step. Holding every pass to the sequence's largest floor is the same as holding our largest distance over the sequence to four times the reference's largest.
+
+A row decoded in a batch sits a bf16 step or two from where it sits alone. The reference decodes one row at a time, so with one sequence per step the engine's GEMMs run the reference's shapes and many stages match it bit for bit; a batch of three runs other shapes, for which cuBLAS picks other kernels. A row that read another slot's state would sit far outside that. Each of three mutations stops the batch of three through layers 0 and 3 at its first decode step on the sm_89 card:
+
+| Mutation | stops at | ours | line |
+| --- | --- | --- | --- |
+| the first two slots trade K/V pages | `decode0_layer3_attn_out` | 1.1e-1 | 1.6e-2 |
+| the GDN state pointers in reverse order | `decode0_layer0_attn_out` | 5.5e-1 | 3.1e-2 |
+| every new token one position early | `decode0_layer3_attn_out` | 4.2e-2 | 1.6e-2 |
+
+The batch of three through layers 0 and 3 on that card and through layers 0, 1 and 3 on a GH200 passes in both drivers, which print the same line for every stage. All 48 layers, the three sequences as one batch on one GH200 (226 s streamed; 97 of the 2976 token routings pick a different expert set):
+
+| Stage | held | median | p99 | max |
+| --- | --- | --- | --- | --- |
+| `ple_out` | 25 | 0 | 0 | 0 |
+| `attn_out` | 1200 | 0.40 | 1.7 | 2.4 |
+| `stream_after_attn` | 1200 | 0.06 | 0.50 | 1.0 |
+| `router_logits` | 1200 | 0.50 | 1.0 | 1.0 |
+| `moe_out` | 1200 | 0.06 | 0.80 | 2.0 |
+| `stream_out` | 1200 | 0.08 | 0.50 | 1.0 |
+| `gdn_state` | 900 | 0.48 | 1.3 | 1.9 |
+
+| Sequence | head on the reference's stream, prefill and decode | the engine's own chain, prefill and decode | its argmax, prefill and decode |
+| --- | --- | --- | --- |
+| 24 tokens, 8 steps | 6.3e-2, 0 | 1.7, 1.8 | 21 of 24, 7 of 8 |
+| 15 tokens, 6 steps | 0, 0 | 1.5, 1.6 | 13 of 15, 5 of 6 |
+| 1 token, 8 steps | 0, 0 | 7.8e-2, 1.1 | 1 of 1, 6 of 8 |
+
+The head matches the reference's argmax everywhere. Every disagreement of the engine's own chain sits at a tie or one to two bf16 steps in the reference's own logits; the 15 token sequence alone picks 6 of 6 steps, and in the batch its step 4 lands one step the other way.
 
 ## Layer 1 and the n-gram table
 
@@ -228,7 +272,7 @@ The 36 `linear_attention` layers run Qwen3.5's Gated DeltaNet kernels, because t
 
 The three kernel limits (`GDN_AOT_KEY_HEAD_DIM`, `GDN_AOT_VALUE_HEAD_DIM`, `LINEAR_CONV_MAX_KERNEL_DIM`) are defined next to the wrappers. This line's `src/config.rs` keeps a CPU-only mirror of them, so its config tests need no device, until slice B adds the device dependency.
 
-Both halves are verified on this line's activations. Prefill: layer 0's GDN block, chunkwise path plus the sigmoid gated norm and `out_proj`, lands within the reference's own floor (the gate above), and so does the recurrent state it leaves (`gdn_state` in the table). Decode: `layer::layer_decode` runs one token through the layer on a `MixerState::Linear` (the conv taps and the `[48, 128, 128]` f32 state, the layout the kernels and the reference share), through the decode wrappers with one pointer per request, the form the step will batch. The reference for it is the same script with `--decode 8`: a 24 token prefill on the layer's cache, then the last 8 prompt tokens one at a time through `causal_conv1d_update` and the fp32 recurrence, every stage and the state recorded per step on both devices. The gate replays the steps on the state its own prefill left and holds each step like a prefill. Max over the 8 steps on the same sm_89 card:
+Both halves are verified on this line's activations. Prefill: layer 0's GDN block, chunkwise path plus the sigmoid gated norm and `out_proj`, lands within the reference's own floor (the gate above), and so does the recurrent state it leaves (`gdn_state` in the table). Decode: `layer::layer_decode` runs one token through the layer on a `MixerState::Linear` (the conv taps and the `[48, 128, 128]` f32 state, the layout the kernels and the reference share), through the decode wrappers with one pointer per request, which the batched step fills with one per slot. The reference for it is the same script with `--decode 8`: a 24 token prefill on the layer's cache, then the last 8 prompt tokens one at a time through `causal_conv1d_update` and the fp32 recurrence, every stage and the state recorded per step on both devices. The gate replays the steps on the state its own prefill left and holds each step like a prefill. Max over the 8 steps on the same sm_89 card:
 
 | Stage | max difference | reference's own floor |
 | --- | --- | --- |
@@ -256,7 +300,7 @@ One of the 8 steps picks a different expert set, with the reference's logits for
 | Criterion | Blocked on |
 | --- | --- |
 | Tensor manifest enforced before the first H2D | slice B's loader, which must classify the headers it maps before any upload |
-| Attention decode for a batch | one request per launch through the prefill entry is what the layer 3 decode gate covers; a batched step wants GQA group 12 in FlashInfer's compiled decode list or the decode via prefill batch wrapper, and QSA past the dense range needs the indexer's selection in the attention kernel |
+| A captured decode step | the batched step allocates its buffers and builds its plan on every call; capture wants fixed buffers and a plan refilled in place, attention runs FlashInfer's prefill kernel because the compiled decode list has no GQA group 12, and QSA past the dense range needs the indexer's selection in the attention kernel |
 | Routed experts beyond correctness | one GEMM pair per expert and one host sync per layer; the pointer batched form for decode and a grouped GEMM for prefill |
 | Serving all 48 layers | 234 GiB of bf16 text weights do not fit one card: EP4 across four GH200s, with the step on top |
 | Tokenizer / chat-template ID fixtures | transformers **5.16.0+** — the checkpoint's own tokenizer is `Qwen2Tokenizer`, which is older, but fixtures are compared against the reference implementation; nothing in the tree commits token-ID fixtures today |
