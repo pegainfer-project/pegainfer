@@ -139,10 +139,10 @@ fn route_meta_is_bit_identical_to_the_sequential_kernel() {
         return;
     };
     let g = geometry(256);
-    // Below the tiled threshold both sides run the sequential kernel; the
-    // larger cases are the tiled ones. 32/64/200/2048 tokens are 320/640/2000/
-    // 20480 pairs, i.e. 2, 3, 8 and 80 chunks of the tiled path.
-    for tokens in [1usize, 3, 10, 32, 64, 200, 2048] {
+    // Below the tiled threshold both sides run the sequential kernel; 25 and 26
+    // tokens straddle it (250/260 pairs), and 32/64/200/2048 tokens are
+    // 320/640/2000/20480 pairs, i.e. 2, 3, 8 and 80 chunks of the tiled path.
+    for tokens in [1usize, 3, 10, 25, 26, 32, 64, 200, 2048] {
         let pairs = tokens * TOP_K;
         let ids = ctx.stream.clone_htod(&ids_data(tokens, 11)).unwrap();
         let mut want = (
@@ -317,7 +317,7 @@ fn per_expert(
 
 /// `max|diff| / max|want|`: one bf16 quantum is at most `2^-7` of the magnitude
 /// it rounds, so the bound is two quanta — one for a rounding flip, one of
-/// margin. Measured at the real geometry: 5.6e-3, i.e. 0.36 of the bound.
+/// margin.
 const MAX_ABS_REL: f32 = 1.0 / 64.0;
 /// `||diff||_2 / ||want||_2`: the accumulated f32 noise of two different
 /// summation orders over `K` terms, `~K * eps_f32 ~ 1.5e-4` in the worst case;

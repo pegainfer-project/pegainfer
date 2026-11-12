@@ -891,6 +891,10 @@ const ROUTE_TILED_MIN_PAIRS: usize = 256;
 /// 1.5x at 32 and 2.1x at 64, so 64 keeps the decode-sized batches on the
 /// scalar kernel with margin.
 const COMBINE_VEC_MIN_TOKENS: usize = 64;
+/// Above this the vectorized combine's `grid.y` (the token axis) would pass the
+/// runtime's 65535-block cap; the scalar kernel has no such bound, so longer
+/// prompts stay on it.
+const COMBINE_VEC_MAX_TOKENS: usize = 65535;
 /// bf16 elements per thread in the vectorized combine.
 const COMBINE_VEC: usize = 8;
 
@@ -1227,9 +1231,9 @@ pub fn qwen4_moe_combine_into(
 ///
 /// Dispatches between two kernels that produce the same output bit for bit:
 /// below [`ROUTE_TILED_MIN_PAIRS`] pairs the single-CTA sequential kernel, whose
-/// three launches are cheaper than the walk it saves when there are few pairs,
-/// above it the tiled histogram/scan/placement path, whose work grows with the
-/// pair count rather than with `experts * pairs`. `scratch` is only read on the
+/// one launch beats the tiled path's three when there are few pairs, above it
+/// the tiled histogram/scan/placement path, whose work grows with the pair
+/// count rather than with `experts * pairs`. `scratch` is only read on the
 /// tiled path.
 pub fn qwen4_moe_route_meta_into(
     ctx: &DeviceContext,
@@ -1364,10 +1368,10 @@ fn launch_route_meta_sequential(
 }
 
 /// The routed-expert combine, dispatched on token count: the bf16x8 2D-grid
-/// kernel above [`COMBINE_VEC_MIN_TOKENS`] tokens (and when `hidden` is a
-/// multiple of 8), the scalar grid-stride kernel below it. Both accumulate in
-/// f32 over the same `j` order and round each element once, so the choice
-/// changes throughput, not output.
+/// kernel from [`COMBINE_VEC_MIN_TOKENS`] to [`COMBINE_VEC_MAX_TOKENS`] tokens
+/// (and when `hidden` is a multiple of 8), the scalar grid-stride kernel outside
+/// that range. Both accumulate in f32 over the same `j` order and round each
+/// element once, so the choice changes throughput, not output.
 pub fn qwen4_moe_weighted_combine_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
@@ -1378,7 +1382,9 @@ pub fn qwen4_moe_weighted_combine_into(
 ) -> Result<()> {
     let tokens = expert_out.seq_len;
     check_weighted_combine(geometry, tokens, down_out, weights, route_slot, expert_out)?;
-    if tokens >= COMBINE_VEC_MIN_TOKENS && geometry.hidden.is_multiple_of(COMBINE_VEC) {
+    if (COMBINE_VEC_MIN_TOKENS..=COMBINE_VEC_MAX_TOKENS).contains(&tokens)
+        && geometry.hidden.is_multiple_of(COMBINE_VEC)
+    {
         launch_weighted_combine_vector(ctx, geometry, down_out, weights, route_slot, expert_out)
     } else {
         launch_weighted_combine_scalar(ctx, geometry, down_out, weights, route_slot, expert_out)

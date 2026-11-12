@@ -10,11 +10,12 @@
 // Local replica, not the vendored entry: FlashInfer's
 // `group_gemm::CutlassSegmentGEMMRun` (include/flashinfer/gemm/group_gemm.cuh)
 // hardcodes `threadblock_count = 4`, which would run 512 groups on four CTAs.
-// The kernel below is that header's GemmKernel instantiation — Sm80 tag, 32-wide
-// K tile, f32 accumulator, `GemmBatchedIdentityThreadblockSwizzle`, the
-// 8-element LinearCombination epilogue — with the threadblock count taken from
-// `GemmGrouped::sufficient()`, and it fixes the operand roles to this block's
-// layout instead of templating on them:
+// The kernel below keeps that header's Sm80 tag, 32-wide K tile, f32
+// accumulator, `GemmBatchedIdentityThreadblockSwizzle` and 8-element
+// LinearCombination epilogue; only the threadblock shape and stage count differ
+// (the tile is the next paragraph), the threadblock count comes from
+// `GemmGrouped::sufficient()`, and the operand roles are fixed to this block's
+// layout rather than templated:
 //
 //   A [M, K] row-major   the gathered activation rows, one group per expert
 //   B [N, K] column-major the expert's weight slab (the GEMM's logical B is
@@ -164,8 +165,8 @@ cudaError_t run_grouped(GroupArgs const& args, int groups, int threadblocks, cud
 }
 
 /// The CTA count CUTLASS would schedule this kernel with: the device's SM count
-/// times the kernel's own max active blocks per SM. Queried by the wrapper once
-/// per grouped block, not on the host per call.
+/// times the kernel's own max active blocks per SM. Queried once when the
+/// wrapper builds its scratch, not per launch.
 int sufficient_threadblocks() {
   using GemmGrouped = cutlass::gemm::device::GemmGrouped<GroupedKernel>;
   return GemmGrouped::sufficient(/*problem_sizes=*/nullptr, /*problem_count=*/0);

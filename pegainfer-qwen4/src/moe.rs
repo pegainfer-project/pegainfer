@@ -1,5 +1,5 @@
 //! The sparse MoE block in prefill: the router, the routed experts (one grouped
-//! GEMM per leg, or one cuBLAS GEMM per expert for a single token), the shared
+//! GEMM per leg, or one cuBLAS GEMM per expert below four tokens), the shared
 //! expert and the block sum.
 
 use anyhow::Result;
