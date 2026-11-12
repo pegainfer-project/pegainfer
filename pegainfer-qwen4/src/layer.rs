@@ -1,8 +1,9 @@
-//! One decoder layer, stage by stage: the attention hyper-connection mix, the
-//! token mixer (Gated DeltaNet on the qwen35 kernels, or gated full attention
-//! on the qwen35 hd256 prefill), the scatter back into the stream, then the
-//! same around the MoE block. Prefill walks a whole prompt from a fresh state;
-//! decode advances the mixer state by one token.
+//! One decoder layer, stage by stage: the n-gram block on the one layer that
+//! carries it, the attention hyper-connection mix, the token mixer (Gated
+//! DeltaNet on the qwen35 kernels, or gated full attention on the qwen35 hd256
+//! prefill), the scatter back into the stream, then the same around the MoE
+//! block. Prefill walks a whole prompt from a fresh state; decode advances the
+//! state by one token.
 
 use anyhow::Result;
 use anyhow::bail;
@@ -16,14 +17,17 @@ use pegainfer_kernels::ops::GatedNormActivation;
 use pegainfer_kernels::ops::GdrChunkwiseScratch35;
 use pegainfer_kernels::ops::HcMixScratch;
 use pegainfer_kernels::ops::PrefillPagedPlan;
+use pegainfer_kernels::ops::add_batch_into;
 use pegainfer_kernels::ops::attention_prefill_hd256_into;
 use pegainfer_kernels::ops::conv1d_decode_batch_into;
 use pegainfer_kernels::ops::conv1d_prefill_batch_into;
+use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::ops::gated_delta_rule_decode_batch_into;
 use pegainfer_kernels::ops::gated_delta_rule_prefill_chunkwise_into;
 use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::hc_mix_into;
 use pegainfer_kernels::ops::hc_scatter_add_into;
+use pegainfer_kernels::ops::ple_block_into;
 use pegainfer_kernels::ops::rms_norm_gated_batch_into;
 use pegainfer_kernels::paged_kv::PagedKvLayout;
 use pegainfer_kernels::tensor::DeviceContext;
@@ -38,6 +42,7 @@ use crate::weights::GatedDeltaNet;
 use crate::weights::Geometry;
 use crate::weights::HyperConnection;
 use crate::weights::Mixer;
+use crate::weights::PleBlock;
 
 /// Tokens per page of the attention layers' K/V, the size every FlashInfer
 /// caller in the tree uses.
@@ -111,6 +116,57 @@ impl MixerState {
     }
 }
 
+/// What the n-gram block carries from one token to the next: the tokens its
+/// hash still looks back at, and the block inputs of the rows its dilated conv
+/// still reads. The conv kernel takes a whole sequence with a zero state in
+/// front of it, so a decode step recomputes those rows from their inputs and
+/// keeps the last output row; the block is a per row map before the conv, so
+/// the recomputed rows are the rows the conv saw.
+pub struct PleState {
+    /// The last `context` tokens, oldest first.
+    pub history: Vec<i64>,
+    /// The last `conv_state` rows' stream, key and value inputs, oldest first;
+    /// `rows` of them are live.
+    pub stream: HiddenStates,
+    pub key: HiddenStates,
+    pub value: HiddenStates,
+    pub rows: usize,
+}
+
+/// One layer's state for one sequence.
+pub struct LayerState {
+    pub mixer: MixerState,
+    pub ple: Option<PleState>,
+}
+
+impl LayerState {
+    pub fn new(
+        ctx: &DeviceContext,
+        g: &Geometry,
+        layer: &DecoderLayer,
+        capacity: usize,
+    ) -> Result<Self> {
+        let ple = layer
+            .ple
+            .as_ref()
+            .map(|ple| -> Result<PleState> {
+                let rows = ple.geometry.conv_state();
+                Ok(PleState {
+                    history: Vec::new(),
+                    stream: HiddenStates::zeros(ctx, g.stream_width(), rows)?,
+                    key: HiddenStates::zeros(ctx, g.stream_width(), rows)?,
+                    value: HiddenStates::zeros(ctx, g.hidden, rows)?,
+                    rows: 0,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            mixer: MixerState::new(ctx, g, &layer.mixer, capacity)?,
+            ple,
+        })
+    }
+}
+
 pub struct GdnTrace {
     pub qkv: HiddenStates,
     pub z: HiddenStates,
@@ -135,8 +191,20 @@ pub enum MixerTrace {
     Full(AttentionTrace),
 }
 
+pub struct PleTrace {
+    /// The gathered n-gram rows, `[rows, ple_embed]`.
+    pub embeds: HiddenStates,
+    pub key: HiddenStates,
+    pub value: HiddenStates,
+    /// The block's output, added onto the stream.
+    pub out: HiddenStates,
+    /// The stream after the addition, what the attention mix reads.
+    pub stream: HiddenStates,
+}
+
 /// Every stage of one layer forward, kept for the reference gate.
 pub struct LayerTrace {
+    pub ple: Option<PleTrace>,
     pub attn_mixed: HiddenStates,
     pub attn_inject: HiddenStates,
     pub mixer: MixerTrace,
@@ -172,6 +240,142 @@ fn mix(
         Some(&mut inject),
     )?;
     Ok((mixed, inject))
+}
+
+/// The n-gram rows of `ids` gathered on the host and their two projections.
+fn ple_project(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    ple: &PleBlock,
+    row_ids: &[i64],
+    rows: usize,
+) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+    let gathered = ple.rows.gather(row_ids)?;
+    let embeds = HiddenStates::from_host(ctx, &gathered, g.ple_embed, rows)?;
+    let mut key = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
+    gemm_into_checked(ctx, &ple.key_proj, &embeds, &mut key)?;
+    let mut value = HiddenStates::zeros(ctx, g.hidden, rows)?;
+    gemm_into_checked(ctx, &ple.value_proj, &embeds, &mut value)?;
+    Ok((embeds, key, value))
+}
+
+/// The block over `rows` rows whose inputs are given, with the zero conv state
+/// in front; returns the block output.
+fn ple_block(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    ple: &PleBlock,
+    stream: &HiddenStates,
+    key: &HiddenStates,
+    value: &HiddenStates,
+    rows: usize,
+) -> Result<HiddenStates> {
+    let mut out = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
+    let mut workspace: CudaSlice<bf16> =
+        ctx.stream.alloc_zeros(ple.geometry.workspace_len(rows))?;
+    ple_block_into(
+        ctx,
+        &ple.geometry,
+        &stream.data,
+        &key.data,
+        &value.data,
+        &ple.norm_key.data,
+        &ple.norm_query.data,
+        &ple.norm_conv.data,
+        &ple.conv_weight.data,
+        rows,
+        &mut out.data,
+        &mut workspace,
+    )?;
+    Ok(out)
+}
+
+/// Keep the last `conv_state` rows of the block inputs and the last `context`
+/// tokens for the next step.
+fn ple_remember(
+    ctx: &DeviceContext,
+    ple: &PleBlock,
+    state: &mut PleState,
+    ids: &[i64],
+    stream: &HiddenStates,
+    key: &HiddenStates,
+    value: &HiddenStates,
+) -> Result<()> {
+    let rows = stream.seq_len;
+    let keep = rows.min(ple.geometry.conv_state());
+    copy_hidden_token_range_into(ctx, stream, rows - keep, &mut state.stream, 0, keep)?;
+    copy_hidden_token_range_into(ctx, key, rows - keep, &mut state.key, 0, keep)?;
+    copy_hidden_token_range_into(ctx, value, rows - keep, &mut state.value, 0, keep)?;
+    state.rows = keep;
+    let context = ple.hasher.context();
+    state.history = ids[ids.len().saturating_sub(context)..].to_vec();
+    Ok(())
+}
+
+/// The n-gram block over a prompt from a fresh state; returns its stages and
+/// the stream with the block added.
+fn ple_prefill(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    ple: &PleBlock,
+    state: &mut PleState,
+    ids: &[i64],
+    stream_in: &HiddenStates,
+) -> Result<PleTrace> {
+    let rows = stream_in.seq_len;
+    let (embeds, key, value) = ple_project(ctx, g, ple, &ple.hasher.ids(ids), rows)?;
+    let out = ple_block(ctx, g, ple, stream_in, &key, &value, rows)?;
+    let mut stream = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
+    add_batch_into(ctx, stream_in, &out, &mut stream)?;
+    ple_remember(ctx, ple, state, ids, stream_in, &key, &value)?;
+    Ok(PleTrace {
+        embeds,
+        key,
+        value,
+        out,
+        stream,
+    })
+}
+
+/// The n-gram block for one token on the carried state: the hash sees the
+/// remembered tokens, the block runs over the remembered rows plus this one
+/// and keeps the last output row.
+fn ple_decode(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    ple: &PleBlock,
+    state: &mut PleState,
+    id: i64,
+    stream_in: &HiddenStates,
+) -> Result<PleTrace> {
+    let mut ids = state.history.clone();
+    ids.push(id);
+    let heads = ple.hasher.heads();
+    let row_ids = ple.hasher.ids(&ids);
+    let (embeds, key, value) = ple_project(ctx, g, ple, &row_ids[row_ids.len() - heads..], 1)?;
+    let rows = state.rows + 1;
+    let mut all_stream = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
+    let mut all_key = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
+    let mut all_value = HiddenStates::zeros(ctx, g.hidden, rows)?;
+    copy_hidden_token_range_into(ctx, &state.stream, 0, &mut all_stream, 0, state.rows)?;
+    copy_hidden_token_range_into(ctx, &state.key, 0, &mut all_key, 0, state.rows)?;
+    copy_hidden_token_range_into(ctx, &state.value, 0, &mut all_value, 0, state.rows)?;
+    copy_hidden_token_range_into(ctx, stream_in, 0, &mut all_stream, state.rows, 1)?;
+    copy_hidden_token_range_into(ctx, &key, 0, &mut all_key, state.rows, 1)?;
+    copy_hidden_token_range_into(ctx, &value, 0, &mut all_value, state.rows, 1)?;
+    let all_out = ple_block(ctx, g, ple, &all_stream, &all_key, &all_value, rows)?;
+    let mut out = HiddenStates::zeros(ctx, g.stream_width(), 1)?;
+    copy_hidden_token_range_into(ctx, &all_out, rows - 1, &mut out, 0, 1)?;
+    let mut stream = HiddenStates::zeros(ctx, g.stream_width(), 1)?;
+    add_batch_into(ctx, stream_in, &out, &mut stream)?;
+    ple_remember(ctx, ple, state, &ids, &all_stream, &all_key, &all_value)?;
+    Ok(PleTrace {
+        embeds,
+        key,
+        value,
+        out,
+        stream,
+    })
 }
 
 /// The four GDN projections of one block input.
@@ -419,25 +623,24 @@ fn attention_rows(
 }
 
 /// The scatter after the mixer, the second mix, the MoE block and the scatter out.
+#[allow(clippy::too_many_arguments)]
 fn finish_layer(
     ctx: &DeviceContext,
     g: &Geometry,
     w: &DecoderLayer,
     stream_in: &HiddenStates,
+    ple: Option<PleTrace>,
     attn_mixed: HiddenStates,
     attn_inject: HiddenStates,
     mixer: MixerTrace,
     attn_out: HiddenStates,
 ) -> Result<LayerTrace> {
     let rows = stream_in.seq_len;
+    // The scatter adds onto the stream the mix read: with the n-gram block,
+    // the stream with its output added.
+    let base = ple.as_ref().map_or(stream_in, |p| &p.stream);
     let mut stream_after_attn = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
-    hc_scatter_add_into(
-        ctx,
-        &attn_out,
-        &attn_inject,
-        stream_in,
-        &mut stream_after_attn,
-    )?;
+    hc_scatter_add_into(ctx, &attn_out, &attn_inject, base, &mut stream_after_attn)?;
     let (mlp_mixed, mlp_inject) = mix(ctx, g, &w.mlp_hc, &stream_after_attn)?;
     let moe = moe_prefill(ctx, g, &w.moe, &mlp_mixed)?;
     let mut stream_out = HiddenStates::zeros(ctx, g.stream_width(), rows)?;
@@ -449,6 +652,7 @@ fn finish_layer(
         &mut stream_out,
     )?;
     Ok(LayerTrace {
+        ple,
         attn_mixed,
         attn_inject,
         mixer,
@@ -461,7 +665,7 @@ fn finish_layer(
     })
 }
 
-fn check_stream(g: &Geometry, stream_in: &HiddenStates) -> Result<()> {
+fn check_stream(g: &Geometry, ids: &[u32], stream_in: &HiddenStates) -> Result<()> {
     ensure!(stream_in.seq_len > 0, "the prompt is empty");
     ensure!(
         stream_in.hidden_dim == g.stream_width(),
@@ -469,21 +673,42 @@ fn check_stream(g: &Geometry, stream_in: &HiddenStates) -> Result<()> {
         stream_in.hidden_dim,
         g.stream_width()
     );
+    ensure!(
+        ids.len() == stream_in.seq_len,
+        "{} token ids for {} stream rows",
+        ids.len(),
+        stream_in.seq_len
+    );
     Ok(())
 }
 
-/// One whole-sequence pass from the state as given (zeroed for a fresh prompt).
+/// One whole-sequence pass from the state as given (zeroed for a fresh
+/// prompt). `ids` are the prompt's tokens, which only the n-gram block reads.
 pub fn layer_prefill(
     ctx: &DeviceContext,
     g: &Geometry,
     w: &DecoderLayer,
     rope: &Rope,
-    state: &mut MixerState,
+    state: &mut LayerState,
+    ids: &[u32],
     stream_in: &HiddenStates,
 ) -> Result<LayerTrace> {
-    check_stream(g, stream_in)?;
-    let (attn_mixed, attn_inject) = mix(ctx, g, &w.attn_hc, stream_in)?;
-    let (mixer, attn_out) = match (&w.mixer, state) {
+    check_stream(g, ids, stream_in)?;
+    let ple = match (&w.ple, state.ple.as_mut()) {
+        (Some(ple), Some(st)) => {
+            let ids: Vec<i64> = ids.iter().map(|&id| i64::from(id)).collect();
+            Some(ple_prefill(ctx, g, ple, st, &ids, stream_in)?)
+        }
+        (None, None) => None,
+        _ => bail!("the layer state was built for the other PLE shape"),
+    };
+    let (attn_mixed, attn_inject) = mix(
+        ctx,
+        g,
+        &w.attn_hc,
+        ple.as_ref().map_or(stream_in, |p| &p.stream),
+    )?;
+    let (mixer, attn_out) = match (&w.mixer, &mut state.mixer) {
         (Mixer::Linear(gdn), MixerState::Linear(state)) => {
             let (trace, out) = gdn_prefill(ctx, g, gdn, state, &attn_mixed)?;
             (MixerTrace::Linear(trace), out)
@@ -504,6 +729,7 @@ pub fn layer_prefill(
         g,
         w,
         stream_in,
+        ple,
         attn_mixed,
         attn_inject,
         mixer,
@@ -517,17 +743,23 @@ pub fn layer_decode(
     g: &Geometry,
     w: &DecoderLayer,
     rope: &Rope,
-    state: &mut MixerState,
+    state: &mut LayerState,
+    id: u32,
     stream_in: &HiddenStates,
 ) -> Result<LayerTrace> {
-    check_stream(g, stream_in)?;
-    ensure!(
-        stream_in.seq_len == 1,
-        "decode takes one token, got {}",
-        stream_in.seq_len
-    );
-    let (attn_mixed, attn_inject) = mix(ctx, g, &w.attn_hc, stream_in)?;
-    let (mixer, attn_out) = match (&w.mixer, state) {
+    check_stream(g, &[id], stream_in)?;
+    let ple = match (&w.ple, state.ple.as_mut()) {
+        (Some(ple), Some(st)) => Some(ple_decode(ctx, g, ple, st, i64::from(id), stream_in)?),
+        (None, None) => None,
+        _ => bail!("the layer state was built for the other PLE shape"),
+    };
+    let (attn_mixed, attn_inject) = mix(
+        ctx,
+        g,
+        &w.attn_hc,
+        ple.as_ref().map_or(stream_in, |p| &p.stream),
+    )?;
+    let (mixer, attn_out) = match (&w.mixer, &mut state.mixer) {
         (Mixer::Linear(gdn), MixerState::Linear(state)) => {
             let (trace, out) = gdn_decode(ctx, g, gdn, state, &attn_mixed)?;
             (MixerTrace::Linear(trace), out)
@@ -543,6 +775,7 @@ pub fn layer_decode(
         g,
         w,
         stream_in,
+        ple,
         attn_mixed,
         attn_inject,
         mixer,

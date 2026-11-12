@@ -2,8 +2,9 @@
 //! recorded by `tools/accuracy/dump_qwen4_layer_golden.py` on the checkpoint's
 //! own weights: the prompt in prefill and, when the golden carries them, decode
 //! steps on the carried state. Needs `PEGAINFER_QWEN4_MODEL_PATH` (the
-//! checkpoint, or the shards of those layers and the bookends plus the index)
-//! and `PEGAINFER_QWEN4_LAYER_GOLDEN`.
+//! checkpoint, or the shards of those layers and the bookends plus the index;
+//! the n-gram layer also needs the table's shards) and
+//! `PEGAINFER_QWEN4_LAYER_GOLDEN`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use super::Forward;
 use super::Model;
 use super::ModelState;
 use crate::layer::KvScratch;
+use crate::layer::LayerState;
 use crate::layer::LayerTrace;
 use crate::layer::MixerState;
 use crate::layer::MixerTrace;
@@ -193,14 +195,11 @@ fn hold_layer(
     g: &Geometry,
     prefix: &str,
     trace: &LayerTrace,
-    state: &MixerState,
+    state: &LayerState,
 ) -> Result<()> {
     let name = |stage: &str| format!("{prefix}{stage}");
     let rows = trace.attn_mixed.seq_len;
-    let mut stages = vec![
-        stage(ctx, golden, name("attn_mixed"), &trace.attn_mixed)?,
-        stage(ctx, golden, name("attn_inject"), &trace.attn_inject)?,
-    ];
+    let mut stages = Vec::new();
     let mut held = vec![
         "attn_out",
         "stream_after_attn",
@@ -208,7 +207,30 @@ fn hold_layer(
         "moe_out",
         "stream_out",
     ];
-    match (&trace.mixer, state) {
+    if let Some(ple) = &trace.ple {
+        // The rows are gathered from the same table, so any difference is in
+        // the hash.
+        let (embeds, ours, reference) = stage(ctx, golden, name("ple_embeds"), &ple.embeds)?;
+        let d = diff(&ours, &reference);
+        print_diff(&embeds, &d);
+        ensure!(
+            d.max_abs == 0.0,
+            "{embeds}: the gathered n-gram rows differ from the reference's by {:.3e}",
+            d.max_abs
+        );
+        stages.extend([
+            stage(ctx, golden, name("ple_key"), &ple.key)?,
+            stage(ctx, golden, name("ple_value"), &ple.value)?,
+            stage(ctx, golden, name("ple_out"), &ple.out)?,
+            stage(ctx, golden, name("stream_ple"), &ple.stream)?,
+        ]);
+        held.push("ple_out");
+    }
+    stages.extend([
+        stage(ctx, golden, name("attn_mixed"), &trace.attn_mixed)?,
+        stage(ctx, golden, name("attn_inject"), &trace.attn_inject)?,
+    ]);
+    match (&trace.mixer, &state.mixer) {
         (MixerTrace::Linear(t), MixerState::Linear(s)) => {
             stages.extend([
                 stage(ctx, golden, name("gdn_qkv"), &t.qkv)?,
@@ -376,14 +398,14 @@ fn hold_pass(
         "the embedding stream differs from the reference by {:.3e}",
         stream_diff.max_abs
     );
-    for ((layer, trace), mixer) in layers.iter().zip(&forward.layers).zip(&state.layers) {
+    for ((layer, trace), layer_state) in layers.iter().zip(&forward.layers).zip(&state.layers) {
         hold_layer(
             ctx,
             golden,
             g,
             &format!("{prefix}layer{layer}_"),
             trace,
-            mixer,
+            layer_state,
         )?;
     }
     let (_, mixed_ref) = floats(golden, &format!("{prefix}mixed"))?;

@@ -26,8 +26,9 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 # recorded, each layer's under a `layer{N}_` prefix. With `--decode D` the last D
 # prompt tokens are fed one at a time on the layers' caches after a prefill of
 # the rest, so the recorded steps hold the engine's decode path on a carried
-# state. Only the layers' own tensors and the bookends are read, so a single GPU
-# is enough for a few layers without a PLE block.
+# state. Only the layers' own tensors and the bookends are read, and the n-gram
+# layer's table stays in its shards and is read row by row, so a single GPU is
+# enough for a few layers.
 #
 #     python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next \
 #         --layers 0,3 --decode 8 --out golden/qwen4-layers03-decode8.safetensors
@@ -36,7 +37,7 @@ METADATA_KEY = "qwen4_layer_golden"
 FORMAT_VERSION = 4
 # Recorded from the CPU pass as well: the accelerator versus CPU spread of the
 # reference is the floor the engine is held to at these stages.
-CPU_STAGES = ("attn_out", "stream_after_attn", "router_logits", "moe_out", "stream_out", "gdn_state", "logits")
+CPU_STAGES = ("ple_out", "attn_out", "stream_after_attn", "router_logits", "moe_out", "stream_out", "gdn_state", "logits")
 PROMPT = (
     "The hyper-connection stream carries four copies of the residual through every "
     "layer, and the mixer reads them back before the head. Routing picks ten of the "
@@ -47,6 +48,7 @@ LAYER_PREFIX = TEXT_PREFIX + "layers.{layer}."
 MIXER_PREFIX = TEXT_PREFIX + "hyper_connection_mixer."
 EMBED_NAME = TEXT_PREFIX + "embed_tokens.weight"
 HEAD_NAME = "lm_head.weight"
+NGRAM_SHARD = ".ple.ple_embedding.ngram_embedding.shard_"
 
 
 def sha256_of(path: Path) -> str:
@@ -65,27 +67,39 @@ def stage_of(name: str) -> str:
 
 
 def load_state(model_dir: Path, layers: list[int]):
-    """Each layer's tensors keyed as the module names them, and the bookends."""
+    """Each layer's tensors keyed as the module names them, and the bookends.
+
+    The n-gram table is not read: a `layer{N}_ngram` entry lists its pieces in
+    order as (file, tensor name) for `ShardedEmbedding`.
+    """
     weight_map = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
     wanted: dict[str, tuple[str, str]] = {EMBED_NAME: ("embed", "weight"), HEAD_NAME: ("lm_head", "weight")}
+    table: dict[str, dict[int, tuple[Path, str]]] = {}
     for name in weight_map:
         if name.startswith(MIXER_PREFIX):
             wanted[name] = ("mixer", name[len(MIXER_PREFIX) :])
         for layer in layers:
             prefix = LAYER_PREFIX.format(layer=layer)
             if name.startswith(prefix):
-                if ".ple." in name:
-                    raise SystemExit(f"layer {layer} carries the PLE block, whose n-gram table this dump does not load")
-                wanted[name] = (f"layer{layer}", name[len(prefix) :])
+                if NGRAM_SHARD in name:
+                    piece = int(name[name.index(NGRAM_SHARD) + len(NGRAM_SHARD) :].removesuffix(".weight"))
+                    table.setdefault(f"layer{layer}_ngram", {})[piece] = (model_dir / weight_map[name], name)
+                else:
+                    wanted[name] = (f"layer{layer}", name[len(prefix) :])
     by_shard: dict[str, list[str]] = {}
     for name in wanted:
         by_shard.setdefault(weight_map[name], []).append(name)
-    state: dict[str, dict[str, torch.Tensor]] = {}
+    state: dict = {}
     for shard, names in sorted(by_shard.items()):
         with safe_open(model_dir / shard, framework="pt") as f:
             for name in names:
                 group, key = wanted[name]
                 state.setdefault(group, {})[key] = f.get_tensor(name)
+    for group, pieces in table.items():
+        missing = set(range(len(pieces))) - pieces.keys()
+        if missing:
+            raise SystemExit(f"{group}: table pieces {sorted(missing)} are not in the index")
+        state[group] = [pieces[i] for i in range(len(pieces))]
     return state
 
 
@@ -103,12 +117,47 @@ def build(module_factory, state: dict[str, torch.Tensor], device):
     return module.eval()
 
 
+class ShardedEmbedding(torch.nn.Module):
+    """The n-gram table read row by row from its pieces in the checkpoint, in place of the 102 GB `nn.Embedding`.
+
+    `weight` is an empty buffer that only carries the device the rows are returned on, which is all the reference
+    reads from it. Nothing else is held, so the module deep copies with the layer.
+    """
+
+    def __init__(self, pieces: list[tuple[Path, str]]):
+        super().__init__()
+        self.pieces = pieces
+        with safe_open(pieces[0][0], framework="pt") as f:
+            self.rows_per_piece = f.get_slice(pieces[0][1]).get_shape()[0]
+        self.register_buffer("weight", torch.empty(0), persistent=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        flat = ids.reshape(-1).tolist()
+        by_piece: dict[int, list[tuple[int, int]]] = {}
+        for i, row in enumerate(flat):
+            by_piece.setdefault(row // self.rows_per_piece, []).append((i, row % self.rows_per_piece))
+        rows = [None] * len(flat)
+        for piece, wanted in by_piece.items():
+            file, name = self.pieces[piece]
+            with safe_open(file, framework="pt") as f:
+                view = f.get_slice(name)
+                for i, row in wanted:
+                    rows[i] = view[row : row + 1]
+        return torch.cat(rows).reshape(*ids.shape, -1).to(self.weight.device)
+
+
 class Recorder:
     """Forward hooks on the submodules whose boundaries the engine reproduces."""
 
     def __init__(self, layer: Qwen4ExpTextDecoderLayer):
         self.captured: dict[str, torch.Tensor] = {}
         self.handles = []
+        if layer.ple is not None:
+            self.output(layer.ple.ple_embedding, lambda out: {"ple_embeds": out})
+            self.output(layer.ple.key_proj, lambda out: {"ple_key": out})
+            self.output(layer.ple.value_proj, lambda out: {"ple_value": out})
+            self.output(layer.ple, lambda out: {"ple_out": out})
+            self.inputs(layer.attn_hyper_connection, lambda args: {"stream_ple": args[0]})
         self.output(layer.attn_hyper_connection, lambda out: {"attn_mixed": out[0], "attn_inject": out[2]})
         sublayer = layer.linear_attn if layer.layer_type == "linear_attention" else layer.self_attn
         if layer.layer_type == "linear_attention":
@@ -167,10 +216,14 @@ class Chain:
         self.text_config = text_config
         self.device = device
         self.embed = state["embed"]["weight"].to(device)
-        self.layers = [
-            (layer, build(lambda layer=layer: Qwen4ExpTextDecoderLayer(text_config, layer), state[f"layer{layer}"], device))
-            for layer in layers
-        ]
+
+        def decoder_layer(layer: int) -> Qwen4ExpTextDecoderLayer:
+            module = Qwen4ExpTextDecoderLayer(text_config, layer)
+            if module.ple is not None:
+                module.ple.ple_embedding.ngram_embedding = ShardedEmbedding(state[f"layer{layer}_ngram"])
+            return module
+
+        self.layers = [(layer, build(lambda layer=layer: decoder_layer(layer), state[f"layer{layer}"], device)) for layer in layers]
         self.mixer = build(lambda: Qwen4ExpTextGatedResidual(text_config, use_combine=False), state["mixer"], device)
         self.lm_head = build(
             lambda: torch.nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False),

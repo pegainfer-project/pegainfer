@@ -53,6 +53,8 @@ pub(crate) struct TextConfig {
     pub(crate) num_hidden_layers: usize,
     pub(crate) hidden_size: usize,
     pub(crate) vocab_size: usize,
+    /// The n-gram hash pads and resets its context with this token.
+    pub(crate) eos_token_id: i64,
     pub(crate) rms_norm_eps: f32,
     pub(crate) layer_types: Vec<String>,
     pub(crate) full_attention_interval: usize,

@@ -7,6 +7,8 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
+use half::bf16;
+use memmap2::Mmap;
 use pegainfer_core::weight_loader::SlotId;
 use pegainfer_core::weight_loader::StagedWeightLoader;
 use pegainfer_core::weight_loader::VecSlotId;
@@ -16,15 +18,18 @@ use pegainfer_core::weight_loader::load_shard_info;
 use pegainfer_core::weight_loader::load_tensor_1d;
 use pegainfer_core::weight_loader::load_tensor_1d_f32;
 use pegainfer_core::weight_loader::mmap_shards;
+use pegainfer_kernels::ops::PleBlockGeometry;
 use pegainfer_kernels::ops::Qwen4MoeGeometry;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
+use safetensors::Dtype;
 use safetensors::SafeTensors;
 
 use crate::config::Config;
 use crate::config::LayerKind;
 use crate::manifest::schema::Manifest;
+use crate::ngram::NgramHasher;
 
 const TEXT_PREFIX: &str = "model.language_model.";
 
@@ -42,6 +47,7 @@ pub struct Geometry {
     pub rope_theta: f32,
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
+    pub ple_embed: usize,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
@@ -70,6 +76,7 @@ impl Geometry {
             rope_theta: text.rope_parameters.rope_theta as f32,
             indexer_budget: text.indexer_budget,
             indexer_compress_ratio: text.indexer_compress_ratio,
+            ple_embed: text.ple_embed_dim,
             key_heads: text.linear_num_key_heads,
             value_heads: text.linear_num_value_heads,
             key_dim: text.linear_key_head_dim,
@@ -181,6 +188,8 @@ pub struct MoeBlock {
 }
 
 pub struct DecoderLayer {
+    /// The n-gram block, on the one layer `Config::ple_layer` names.
+    pub ple: Option<PleBlock>,
     pub attn_hc: HyperConnection,
     pub mixer: Mixer,
     pub mlp_hc: HyperConnection,
@@ -487,10 +496,6 @@ pub(crate) fn load_layer(
             config.layer_kinds.len()
         )
     })?;
-    ensure!(
-        layer != config.ple_layer,
-        "layer {layer} carries the PLE block, which nothing loads yet"
-    );
     let g = Geometry::from_config(config);
     // The routing kernels are compiled for one expert count and top-k, and the
     // hyper-connection mix folds `1 / hc_count` into a multiply that is exact
@@ -533,6 +538,9 @@ pub(crate) fn load_layer(
         )?),
     };
     let moe = record_moe(&mut loader, &format!("{prefix}mlp"), &g)?;
+    let ple = (layer == config.ple_layer)
+        .then(|| record_ple(&mut loader, &format!("{prefix}ple"), &g))
+        .transpose()?;
     loader.finish()?;
 
     let mixer = match mixer {
@@ -546,7 +554,22 @@ pub(crate) fn load_layer(
         )?),
         MixerSlots::Full(slots) => Mixer::Full(take_attention(&mut loader, &slots)),
     };
+    let ple = ple
+        .map(|slots| {
+            take_ple(
+                ctx,
+                &mut loader,
+                &slots,
+                &shards,
+                &weight_map,
+                model_dir,
+                config,
+                &format!("{prefix}ple"),
+            )
+        })
+        .transpose()?;
     let layer = DecoderLayer {
+        ple,
         attn_hc: take_hc(&mut loader, &attn_hc),
         mixer,
         mlp_hc: take_hc(&mut loader, &mlp_hc),
@@ -598,4 +621,199 @@ pub(crate) fn load_bookends(
     };
     ctx.sync()?;
     Ok(bookends)
+}
+
+/// The n-gram block: the hash that turns tokens into table rows, the table
+/// those rows are read from on the host, and the device half's weights.
+pub struct PleBlock {
+    pub hasher: NgramHasher,
+    pub rows: NgramRows,
+    pub geometry: PleBlockGeometry,
+    /// `[stream, ple_embed]`.
+    pub key_proj: DeviceMatrix,
+    /// `[hidden, ple_embed]`.
+    pub value_proj: DeviceMatrix,
+    pub norm_key: DeviceVec,
+    pub norm_query: DeviceVec,
+    pub norm_conv: DeviceVec,
+    /// `[stream, 1, conv_kernel]` flattened.
+    pub conv_weight: DeviceVec,
+}
+
+/// The n-gram table as the checkpoint ships it: `shards` equal named pieces of
+/// `rows_per_shard` rows, read in place from the mapped files one row at a
+/// time. The table is far too large for a device (95 GiB here), and a prompt
+/// touches `heads` rows per token, so the gather stays on the host.
+pub struct NgramRows {
+    maps: Vec<Mmap>,
+    /// Per shard: the map it lives in and the byte offset of its first row.
+    shards: Vec<(usize, usize)>,
+    rows_per_shard: usize,
+    head_dim: usize,
+}
+
+impl NgramRows {
+    fn open(model_dir: &Path, prefix: &str, config: &Config) -> Result<Self> {
+        let table = &config.ngram;
+        let shard_prefix = format!("{prefix}.ple_embedding.ngram_embedding.shard_");
+        let (paths, weight_map) = shards_for(model_dir, |name| name.starts_with(&shard_prefix))?;
+        let maps = mmap_shards(&paths)?;
+        let views = deserialize_shards(&maps)?;
+        let mut shards = Vec::with_capacity(table.shards);
+        for shard in 0..table.shards {
+            let name = format!("{shard_prefix}{shard}.weight");
+            let view = find_tensor(&views, &weight_map, &name)?;
+            ensure!(
+                view.dtype() == Dtype::BF16
+                    && view.shape() == [table.rows_per_shard, table.head_dim],
+                "{name} is {:?} {:?}, the table needs BF16 [{}, {}]",
+                view.dtype(),
+                view.shape(),
+                table.rows_per_shard,
+                table.head_dim
+            );
+            let start = view.data().as_ptr();
+            let map = maps
+                .iter()
+                .position(|mapped| mapped.as_ptr_range().contains(&start))
+                .expect("a tensor view lies in the file it was read from");
+            shards.push((map, start as usize - maps[map].as_ptr() as usize));
+        }
+        Ok(Self {
+            maps,
+            shards,
+            rows_per_shard: table.rows_per_shard,
+            head_dim: table.head_dim,
+        })
+    }
+
+    /// The rows the ids name, each `head_dim` wide, in order.
+    pub fn gather(&self, ids: &[i64]) -> Result<Vec<bf16>> {
+        let row_bytes = self.head_dim * 2;
+        let mut out = Vec::with_capacity(ids.len() * self.head_dim);
+        for &id in ids {
+            let id = usize::try_from(id).with_context(|| format!("n-gram row {id} is negative"))?;
+            let (map, offset) = *self
+                .shards
+                .get(id / self.rows_per_shard)
+                .with_context(|| format!("n-gram row {id} is past the table"))?;
+            let start = offset + (id % self.rows_per_shard) * row_bytes;
+            out.extend(
+                self.maps[map][start..start + row_bytes]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| bf16::from_bits(u16::from_le_bytes(*pair))),
+            );
+        }
+        Ok(out)
+    }
+}
+
+struct PleSlots {
+    key_proj: SlotId,
+    value_proj: SlotId,
+    norm_key: VecSlotId,
+    norm_query: VecSlotId,
+    norm_conv: VecSlotId,
+}
+
+fn record_ple(loader: &mut StagedWeightLoader, prefix: &str, g: &Geometry) -> Result<PleSlots> {
+    let stream = g.stream_width();
+    Ok(PleSlots {
+        key_proj: loader.matrix(&format!("{prefix}.key_proj.weight"), stream, g.ple_embed)?,
+        value_proj: loader.matrix(
+            &format!("{prefix}.value_proj.weight"),
+            g.hidden,
+            g.ple_embed,
+        )?,
+        norm_key: loader.vector(&format!("{prefix}.norm_key.weight"), stream)?,
+        norm_query: loader.vector(&format!("{prefix}.norm_query.weight"), stream)?,
+        norm_conv: loader.vector(&format!("{prefix}.norm_conv.weight"), stream)?,
+    })
+}
+
+/// A small I64 vector read straight from its shard.
+fn vector_i64(
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Vec<i64>> {
+    let view = find_tensor(shards, weight_map, name)?;
+    ensure!(
+        view.dtype() == Dtype::I64,
+        "{name} is {:?}, expected I64",
+        view.dtype()
+    );
+    Ok(view
+        .data()
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|bytes| i64::from_le_bytes(*bytes))
+        .collect())
+}
+
+/// The staged slots plus what the hash needs: the checkpoint's multipliers
+/// (the seed that made them is not stored), its per head primes and offsets
+/// checked against the ones the config derives, and the mapped table.
+#[allow(clippy::too_many_arguments)]
+fn take_ple(
+    ctx: &DeviceContext,
+    loader: &mut StagedWeightLoader,
+    slots: &PleSlots,
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    model_dir: &Path,
+    config: &Config,
+    prefix: &str,
+) -> Result<PleBlock> {
+    let table = &config.ngram;
+    let embedding = format!("{prefix}.ple_embedding");
+    let multipliers = vector_i64(
+        shards,
+        weight_map,
+        &format!("{embedding}.layer_multipliers"),
+    )?;
+    let sizes = vector_i64(
+        shards,
+        weight_map,
+        &format!("{embedding}.ngram_heads_vocab_sizes"),
+    )?;
+    let offsets = vector_i64(
+        shards,
+        weight_map,
+        &format!("{embedding}.ngram_heads_offsets"),
+    )?;
+    let derived = |values: &[usize]| values.iter().map(|&v| v as i64).collect::<Vec<_>>();
+    ensure!(
+        sizes == derived(&table.head_vocab_sizes) && offsets == derived(&table.head_offsets),
+        "{embedding}: the stored per head primes and offsets differ from the ones the config derives"
+    );
+    let hasher = NgramHasher::new(
+        config.text.eos_token_id,
+        multipliers,
+        sizes,
+        offsets,
+        config.text.heads_per_ngram,
+    )?;
+    let geometry = PleBlockGeometry {
+        hidden: config.text.hidden_size,
+        hc_count: config.text.hc_count,
+        conv_kernel: config.text.ple_conv_kernel_size,
+        dilation: config.text.ngram_size,
+        rms_eps: config.text.rms_norm_eps,
+    };
+    geometry.validate()?;
+    Ok(PleBlock {
+        hasher,
+        rows: NgramRows::open(model_dir, prefix, config)?,
+        geometry,
+        key_proj: loader.take(slots.key_proj),
+        value_proj: loader.take(slots.value_proj),
+        norm_key: loader.take_vec(slots.norm_key),
+        norm_query: loader.take_vec(slots.norm_query),
+        norm_conv: loader.take_vec(slots.norm_conv),
+        conv_weight: load_tensor_1d(ctx, shards, weight_map, &format!("{prefix}.conv1d.weight"))?,
+    })
 }

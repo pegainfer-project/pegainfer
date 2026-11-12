@@ -3906,6 +3906,7 @@ dependencies = [
  "cudarc",
  "half",
  "log",
+ "memmap2",
  "pegainfer-core",
  "pegainfer-frontend",
  "pegainfer-kernels",
