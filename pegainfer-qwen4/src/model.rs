@@ -37,9 +37,17 @@ pub struct Model {
     pub rope: Rope,
 }
 
-/// One sequence's state across the loaded layers.
+/// The state of several sequences, one per slot, across the loaded layers.
 pub struct ModelState {
     pub layers: Vec<LayerState>,
+}
+
+/// Which slots a forward advances: one prompt in a slot, or one token in each
+/// of a batch of slots.
+#[derive(Clone, Copy)]
+enum Pass<'a> {
+    Prefill(usize),
+    Decode(&'a [usize]),
 }
 
 /// Everything one pass produced, kept for the reference gate.
@@ -82,11 +90,17 @@ impl Model {
         })
     }
 
-    pub fn new_state(&self, ctx: &DeviceContext, capacity: usize) -> Result<ModelState> {
+    /// Room for `slots` sequences of `capacity` tokens each.
+    pub fn new_state(
+        &self,
+        ctx: &DeviceContext,
+        slots: usize,
+        capacity: usize,
+    ) -> Result<ModelState> {
         let layers = self
             .layers
             .iter()
-            .map(|(_, layer)| LayerState::new(ctx, &self.g, layer, capacity))
+            .map(|(_, layer)| LayerState::new(ctx, &self.g, layer, slots, capacity))
             .collect::<Result<Vec<_>>>()?;
         Ok(ModelState { layers })
     }
@@ -140,15 +154,15 @@ impl Model {
         Ok((mixed, logits))
     }
 
-    /// `ids` are the tokens `stream_in` embeds: the whole prompt, or the one
-    /// token of a decode step. Only the n-gram block reads them.
+    /// `ids` are the tokens `stream_in` embeds: the whole prompt, or one token
+    /// per slot of a decode step. Only the n-gram block reads them.
     fn forward(
         &self,
         ctx: &DeviceContext,
         ids: &[u32],
         stream_in: HiddenStates,
         state: &mut ModelState,
-        decode: bool,
+        pass: Pass,
     ) -> Result<Forward> {
         ensure!(
             state.layers.len() == self.layers.len(),
@@ -159,10 +173,27 @@ impl Model {
         let mut traces: Vec<LayerTrace> = Vec::with_capacity(self.layers.len());
         for ((_, layer), layer_state) in self.layers.iter().zip(&mut state.layers) {
             let input = traces.last().map_or(&stream_in, |t| &t.stream_out);
-            let trace = if decode {
-                layer_decode(ctx, &self.g, layer, &self.rope, layer_state, ids[0], input)?
-            } else {
-                layer_prefill(ctx, &self.g, layer, &self.rope, layer_state, ids, input)?
+            let trace = match pass {
+                Pass::Prefill(slot) => layer_prefill(
+                    ctx,
+                    &self.g,
+                    layer,
+                    &self.rope,
+                    layer_state,
+                    slot,
+                    ids,
+                    input,
+                )?,
+                Pass::Decode(slots) => layer_decode(
+                    ctx,
+                    &self.g,
+                    layer,
+                    &self.rope,
+                    layer_state,
+                    slots,
+                    ids,
+                    input,
+                )?,
             };
             traces.push(trace);
         }
@@ -176,20 +207,29 @@ impl Model {
         })
     }
 
-    /// A whole prompt from a fresh state.
+    /// A whole prompt in `slot`, from the slot's fresh state.
     pub fn prefill(
         &self,
         ctx: &DeviceContext,
+        slot: usize,
         ids: &[u32],
         state: &mut ModelState,
     ) -> Result<Forward> {
         let stream = self.embed(ctx, ids)?;
-        self.forward(ctx, ids, stream, state, false)
+        self.forward(ctx, ids, stream, state, Pass::Prefill(slot))
     }
 
-    /// One more token on the carried state.
-    pub fn decode(&self, ctx: &DeviceContext, id: u32, state: &mut ModelState) -> Result<Forward> {
-        let stream = self.embed(ctx, &[id])?;
-        self.forward(ctx, &[id], stream, state, true)
+    /// One more token in each of `slots` on its carried state, as one batch:
+    /// `ids[i]` is the token of `slots[i]`, and row `i` of every output belongs
+    /// to it.
+    pub fn decode(
+        &self,
+        ctx: &DeviceContext,
+        slots: &[usize],
+        ids: &[u32],
+        state: &mut ModelState,
+    ) -> Result<Forward> {
+        let stream = self.embed(ctx, ids)?;
+        self.forward(ctx, ids, stream, state, Pass::Decode(slots))
     }
 }

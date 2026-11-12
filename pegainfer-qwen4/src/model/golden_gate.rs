@@ -6,12 +6,17 @@
 //! chain through the loaded layers is printed beside them. Needs
 //! `PEGAINFER_QWEN4_MODEL_PATH` (the checkpoint, or the shards of those layers
 //! and the bookends plus the index; the n-gram layer also needs the table's
-//! shards) and `PEGAINFER_QWEN4_LAYER_GOLDEN`. With
+//! shards) and `PEGAINFER_QWEN4_LAYER_GOLDEN`, one golden or several joined
+//! like `PATH`. Each golden is one sequence in its own slot: the prompts are
+//! prefilled one at a time, and each decode step runs every sequence that still
+//! has one as one batch, each row held against its own golden. With
 //! `PEGAINFER_QWEN4_GATE_STREAMED` set, one layer is resident at a time and
 //! every pass goes through it before the next loads, which is how all 48
 //! layers go through one card.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -20,6 +25,7 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use half::bf16;
+use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 use safetensors::Dtype;
@@ -27,7 +33,7 @@ use safetensors::SafeTensors;
 
 use super::Model;
 use crate::config::Config;
-use crate::layer::KvScratch;
+use crate::layer::KvPool;
 use crate::layer::LayerState;
 use crate::layer::LayerTrace;
 use crate::layer::MixerState;
@@ -36,6 +42,7 @@ use crate::layer::layer_decode;
 use crate::layer::layer_prefill;
 use crate::weights::DecoderLayer;
 use crate::weights::Geometry;
+use crate::weights::Mixer;
 use crate::weights::load_config;
 use crate::weights::load_layer;
 
@@ -142,30 +149,84 @@ fn print_diff(name: &str, d: &Diff) {
     );
 }
 
-/// The stages the reference also recorded on the CPU are held to four times its
-/// own accelerator versus CPU spread, the floor a bf16 port cannot sit below.
-fn hold_floor(golden: &SafeTensors, name: &str, ours: &Diff) -> Result<()> {
+/// One pass's floor for a stage the reference also recorded on the CPU: its
+/// own accelerator versus CPU spread, which a bf16 port cannot sit below. A
+/// bf16 stage is rounded value by value, so two faithful runs can sit one bf16
+/// step apart at its largest value, and a spread under that step is a pair of
+/// runs that happened to round alike: such a stage's floor is at least that
+/// step. Every floor is at least 1e-3.
+fn pass_floor(golden: &SafeTensors, name: &str) -> Result<f32> {
     let (_, accel) = floats(golden, name)?;
     let (_, cpu) = floats(golden, &format!("cpu_{name}"))?;
-    let floor = diff(&accel, &cpu).max_abs;
-    eprintln!("  {name:>30}: reference accelerator vs cpu floor {floor:.3e}");
+    let spread = diff(&cpu, &accel);
+    let step = match golden.tensor(name)?.dtype() {
+        Dtype::BF16 => bf16_step(spread.max_ref),
+        _ => 0.0,
+    };
+    Ok(spread.max_abs.max(step).max(1e-3))
+}
+
+/// A stage is held to four times the largest floor its passes show over the
+/// sequence, which is the same as holding our largest distance over the
+/// sequence to four times the reference's. One pass's spread is a single draw
+/// of how far two faithful runs sit apart, and a draw can come out near
+/// nothing: a one token prompt's layer 3 router logits agreed exactly, and the
+/// recurrent state's spread shrinks with the decay while the distance it is
+/// held against carries every earlier step (a one token prompt's layer 0 state
+/// sat 2.4e-2 apart at decode step 3 and 3.4e-3 apart at step 5).
+fn sequence_floor(seq: &Sequence, stage: &str) -> Result<f32> {
+    seq.passes().iter().try_fold(0f32, |floor, (prefix, _)| {
+        Ok(floor.max(pass_floor(&seq.golden, &format!("{prefix}{stage}"))?))
+    })
+}
+
+fn hold(name: &str, ours: &Diff, floor: f32) -> Result<()> {
+    let line = 4.0 * floor;
+    eprintln!("  {name:>30}: reference floor over the sequence {floor:.3e}, line {line:.3e}");
     ensure!(
-        ours.max_abs <= 4.0 * floor.max(1e-3),
-        "{name}: max |ours - reference| {:.3e} exceeds four times the reference's own floor {floor:.3e}",
+        ours.max_abs <= line,
+        "{name}: max |ours - reference| {:.3e} exceeds {line:.3e}, four times the reference's own floor over the sequence",
         ours.max_abs
     );
     Ok(())
 }
 
-/// One stage as the engine computed it and as the reference recorded it.
+/// The rows `rows` of a batch, on the host.
+fn host_rows(ctx: &DeviceContext, ours: &HiddenStates, rows: &Range<usize>) -> Result<Vec<f32>> {
+    let width = ours.hidden_dim;
+    Ok(ours.to_host(ctx)?[rows.start * width..rows.end * width].to_vec())
+}
+
+/// One stage of one sequence, the rows `rows` of the batch, as the engine
+/// computed it and as the reference recorded it.
 fn stage(
     ctx: &DeviceContext,
     golden: &SafeTensors,
     name: String,
     ours: &HiddenStates,
+    rows: &Range<usize>,
 ) -> Result<(String, Vec<f32>, Vec<f32>)> {
     let reference = floats(golden, &name)?.1;
-    Ok((name, ours.to_host(ctx)?, reference))
+    Ok((name, host_rows(ctx, ours, rows)?, reference))
+}
+
+/// Several passes' rows stacked into one batch, in order.
+fn stack(ctx: &DeviceContext, parts: &[&HiddenStates]) -> Result<HiddenStates> {
+    let width = parts.first().context("nothing to stack")?.hidden_dim;
+    let mut batch = HiddenStates::zeros(ctx, width, parts.iter().map(|p| p.seq_len).sum())?;
+    let mut at = 0;
+    for part in parts {
+        copy_hidden_token_range_into(ctx, part, 0, &mut batch, at, part.seq_len)?;
+        at += part.seq_len;
+    }
+    Ok(batch)
+}
+
+/// Row `row` of a batch on its own.
+fn row_of(ctx: &DeviceContext, batch: &HiddenStates, row: usize) -> Result<HiddenStates> {
+    let mut one = HiddenStates::zeros(ctx, batch.hidden_dim, 1)?;
+    copy_hidden_token_range_into(ctx, batch, row, &mut one, 0, 1)?;
+    Ok(one)
 }
 
 /// The dims the partial RoPE leaves alone, out of `[rows * heads, head_dim]`.
@@ -176,15 +237,22 @@ fn unrotated(values: &[f32], g: &Geometry) -> Vec<f32> {
         .collect()
 }
 
-/// K of the last `rows` positions as the prep kernel wrote it into the scratch
-/// pool, back in `[rows * kv_heads, head_dim]`.
-fn pool_k(ctx: &DeviceContext, kv: &KvScratch, g: &Geometry, rows: usize) -> Result<Vec<f32>> {
+/// K of the last `rows` positions of `slot` as the prep kernel wrote it into
+/// the pool, back in `[rows * kv_heads, head_dim]`.
+fn pool_k(
+    ctx: &DeviceContext,
+    kv: &KvPool,
+    g: &Geometry,
+    slot: usize,
+    rows: usize,
+) -> Result<Vec<f32>> {
     let pool: Vec<bf16> = ctx.stream.clone_dtoh(&kv.pool)?;
     ctx.sync()?;
     let width = g.kv_width();
+    let (first, len) = (kv.first_page(slot), kv.lens[slot]);
     let mut k = Vec::with_capacity(rows * width);
-    for pos in kv.len - rows..kv.len {
-        let row = (pos / kv.layout.page_size) * kv.layout.page_stride
+    for pos in len - rows..len {
+        let row = (first + pos / kv.layout.page_size) * kv.layout.page_stride
             + (pos % kv.layout.page_size) * width;
         k.extend(pool[row..row + width].iter().map(|x| x.to_f32()));
     }
@@ -209,31 +277,29 @@ fn ensure_dense(golden: &SafeTensors, name: &str, rows: usize, kv_len: usize) ->
     Ok(())
 }
 
-/// One layer's forward against the reference's stages under `prefix`: every
-/// stage is printed, the picks must be a top-k of the engine's own logits, and
-/// the floored stages are held.
+/// One sequence's rows `rows` of a layer's forward, in `slot`, against the
+/// reference's stages under `prefix`: every stage is printed, the picks must be
+/// a top-k of the engine's own logits, and the floored stages are held to the
+/// sequence's `floors`.
+#[allow(clippy::too_many_arguments)]
 fn hold_layer(
     ctx: &DeviceContext,
     golden: &SafeTensors,
     g: &Geometry,
     prefix: &str,
     trace: &LayerTrace,
+    rows: Range<usize>,
     state: &LayerState,
+    slot: usize,
+    floors: &BTreeMap<&str, f32>,
 ) -> Result<()> {
     let name = |stage: &str| format!("{prefix}{stage}");
-    let rows = trace.attn_mixed.seq_len;
+    let count = rows.len();
     let mut stages = Vec::new();
-    let mut held = vec![
-        "attn_out",
-        "stream_after_attn",
-        "router_logits",
-        "moe_out",
-        "stream_out",
-    ];
     if let Some(ple) = &trace.ple {
         // The rows are gathered from the same table, so any difference is in
         // the hash.
-        let (embeds, ours, reference) = stage(ctx, golden, name("ple_embeds"), &ple.embeds)?;
+        let (embeds, ours, reference) = stage(ctx, golden, name("ple_embeds"), &ple.embeds, &rows)?;
         let d = diff(&ours, &reference);
         print_diff(&embeds, &d);
         ensure!(
@@ -242,75 +308,93 @@ fn hold_layer(
             d.max_abs
         );
         stages.extend([
-            stage(ctx, golden, name("ple_key"), &ple.key)?,
-            stage(ctx, golden, name("ple_value"), &ple.value)?,
-            stage(ctx, golden, name("ple_out"), &ple.out)?,
-            stage(ctx, golden, name("stream_ple"), &ple.stream)?,
+            stage(ctx, golden, name("ple_key"), &ple.key, &rows)?,
+            stage(ctx, golden, name("ple_value"), &ple.value, &rows)?,
+            stage(ctx, golden, name("ple_out"), &ple.out, &rows)?,
+            stage(ctx, golden, name("stream_ple"), &ple.stream, &rows)?,
         ]);
-        held.push("ple_out");
     }
     stages.extend([
-        stage(ctx, golden, name("attn_mixed"), &trace.attn_mixed)?,
-        stage(ctx, golden, name("attn_inject"), &trace.attn_inject)?,
+        stage(ctx, golden, name("attn_mixed"), &trace.attn_mixed, &rows)?,
+        stage(ctx, golden, name("attn_inject"), &trace.attn_inject, &rows)?,
     ]);
     match (&trace.mixer, &state.mixer) {
-        (MixerTrace::Linear(t), MixerState::Linear(s)) => {
+        (MixerTrace::Linear(t), MixerState::Linear(states)) => {
             stages.extend([
-                stage(ctx, golden, name("gdn_qkv"), &t.qkv)?,
-                stage(ctx, golden, name("gdn_z"), &t.z)?,
-                stage(ctx, golden, name("gdn_b"), &t.b)?,
-                stage(ctx, golden, name("gdn_a"), &t.a)?,
-                stage(ctx, golden, name("gdn_core"), &t.core)?,
-                stage(ctx, golden, name("gdn_normed"), &t.normed)?,
+                stage(ctx, golden, name("gdn_qkv"), &t.qkv, &rows)?,
+                stage(ctx, golden, name("gdn_z"), &t.z, &rows)?,
+                stage(ctx, golden, name("gdn_b"), &t.b, &rows)?,
+                stage(ctx, golden, name("gdn_a"), &t.a, &rows)?,
+                stage(ctx, golden, name("gdn_core"), &t.core, &rows)?,
+                stage(ctx, golden, name("gdn_normed"), &t.normed, &rows)?,
             ]);
-            let recurrent: Vec<f32> = ctx.stream.clone_dtoh(&s.recurrent)?;
+            let recurrent: Vec<f32> = ctx.stream.clone_dtoh(&states[slot].recurrent)?;
             ctx.sync()?;
             let reference = floats(golden, &name("gdn_state"))?.1;
             stages.push((name("gdn_state"), recurrent, reference));
-            held.push("gdn_state");
         }
         (MixerTrace::Full(t), MixerState::Full(kv)) => {
-            ensure_dense(golden, &name("attn_indexer_mask"), rows, kv.len)?;
+            ensure_dense(golden, &name("attn_indexer_mask"), count, kv.lens[slot])?;
             stages.extend([
-                stage(ctx, golden, name("attn_q_proj"), &t.q_proj)?,
-                stage(ctx, golden, name("attn_k_proj"), &t.k_proj)?,
-                stage(ctx, golden, name("attn_v_proj"), &t.v_proj)?,
+                stage(ctx, golden, name("attn_q_proj"), &t.q_proj, &rows)?,
+                stage(ctx, golden, name("attn_k_proj"), &t.k_proj, &rows)?,
+                stage(ctx, golden, name("attn_v_proj"), &t.v_proj, &rows)?,
                 (
                     name("q_norm_unrotated"),
-                    unrotated(&t.q_prepped.to_host(ctx)?, g),
+                    unrotated(&host_rows(ctx, &t.q_prepped, &rows)?, g),
                     unrotated(&floats(golden, &name("attn_q_normed"))?.1, g),
                 ),
                 (
                     name("k_norm_unrotated"),
-                    unrotated(&pool_k(ctx, kv, g, rows)?, g),
+                    unrotated(&pool_k(ctx, kv, g, slot, count)?, g),
                     unrotated(&floats(golden, &name("attn_k_normed"))?.1, g),
                 ),
-                stage(ctx, golden, name("attn_gated"), &t.gated)?,
+                stage(ctx, golden, name("attn_gated"), &t.gated, &rows)?,
             ]);
         }
         _ => bail!("the trace and the state disagree on the layer kind"),
     }
     stages.extend([
-        stage(ctx, golden, name("attn_out"), &trace.attn_out)?,
+        stage(ctx, golden, name("attn_out"), &trace.attn_out, &rows)?,
         stage(
             ctx,
             golden,
             name("stream_after_attn"),
             &trace.stream_after_attn,
+            &rows,
         )?,
-        stage(ctx, golden, name("mlp_mixed"), &trace.mlp_mixed)?,
-        stage(ctx, golden, name("mlp_inject"), &trace.mlp_inject)?,
-        stage(ctx, golden, name("router_logits"), &trace.moe.router_logits)?,
+        stage(ctx, golden, name("mlp_mixed"), &trace.mlp_mixed, &rows)?,
+        stage(ctx, golden, name("mlp_inject"), &trace.mlp_inject, &rows)?,
+        stage(
+            ctx,
+            golden,
+            name("router_logits"),
+            &trace.moe.router_logits,
+            &rows,
+        )?,
         stage(
             ctx,
             golden,
             name("shared_gate_logit"),
             &trace.moe.shared_gate_logit,
+            &rows,
         )?,
-        stage(ctx, golden, name("shared_out"), &trace.moe.shared_out)?,
-        stage(ctx, golden, name("expert_out"), &trace.moe.expert_out)?,
-        stage(ctx, golden, name("moe_out"), &trace.moe.out)?,
-        stage(ctx, golden, name("stream_out"), &trace.stream_out)?,
+        stage(
+            ctx,
+            golden,
+            name("shared_out"),
+            &trace.moe.shared_out,
+            &rows,
+        )?,
+        stage(
+            ctx,
+            golden,
+            name("expert_out"),
+            &trace.moe.expert_out,
+            &rows,
+        )?,
+        stage(ctx, golden, name("moe_out"), &trace.moe.out, &rows)?,
+        stage(ctx, golden, name("stream_out"), &trace.stream_out, &rows)?,
     ]);
     let mut measured = Vec::new();
     for (stage, ours, reference) in &stages {
@@ -325,11 +409,13 @@ fn hold_layer(
     // floor. The gaps are printed for reading.
     let (_, logits_ref) = floats(golden, &name("router_logits"))?;
     let picks_ref = ints(golden, &name("selected_experts"))?;
-    let logits_ours = trace.moe.router_logits.to_host(ctx)?;
+    let logits_ours = host_rows(ctx, &trace.moe.router_logits, &rows)?;
+    let pairs_of = rows.start * g.top_k..rows.end * g.top_k;
     let picks_ours: Vec<i32> = ctx.stream.clone_dtoh(&trace.moe.selected_experts)?;
     ctx.sync()?;
+    let picks_ours = &picks_ours[pairs_of.clone()];
     let mut differing = 0usize;
-    let mut agree = vec![true; rows];
+    let mut agree = vec![true; count];
     for (token, agrees) in agree.iter_mut().enumerate() {
         let pairs = token * g.top_k..(token + 1) * g.top_k;
         let experts = token * g.experts..(token + 1) * g.experts;
@@ -376,16 +462,14 @@ fn hold_layer(
         );
     }
     let (_, weights_ref) = floats(golden, &name("routing_weights"))?;
-    let weights_ours: Vec<f32> = ctx
-        .stream
-        .clone_dtoh(&trace.moe.routing_weights)?
+    let weights_ours: Vec<f32> = ctx.stream.clone_dtoh(&trace.moe.routing_weights)?[pairs_of]
         .iter()
         .map(|w: &bf16| w.to_f32())
         .collect();
     ctx.sync()?;
     let weight_diff = diff(&weights_ours, &weights_ref);
     eprintln!(
-        "  routing: {differing}/{rows} tokens pick a different expert set, weights max {:.3e}",
+        "  routing: {differing}/{count} tokens pick a different expert set, weights max {:.3e}",
         weight_diff.max_abs
     );
     // A token that picks another expert set runs other experts, so its routed
@@ -403,7 +487,7 @@ fn hold_layer(
             eprintln!(
                 "  {full:>30}: max {:.3e} on the {} tokens whose expert sets agree",
                 d.max_abs,
-                rows - differing
+                count - differing
             );
             measured
                 .iter_mut()
@@ -413,14 +497,14 @@ fn hold_layer(
         }
     }
 
-    for stage in held {
+    for (stage, floor) in floors {
         let full = name(stage);
         let ours = &measured
             .iter()
             .find(|(measured, _)| *measured == full)
-            .expect("measured")
+            .with_context(|| format!("{full} is held but was not measured"))?
             .1;
-        hold_floor(golden, &full, ours)?;
+        hold(&full, ours, *floor)?;
     }
     Ok(())
 }
@@ -527,113 +611,250 @@ fn layer_inputs(layers: &[usize]) -> Vec<String> {
         .collect()
 }
 
+/// One golden: a sequence's prompt in prefill, then one decode step per
+/// remaining token.
+struct Sequence<'a> {
+    golden: SafeTensors<'a>,
+    layers: Vec<usize>,
+    ids: Vec<u32>,
+    decode_steps: usize,
+}
+
+impl<'a> Sequence<'a> {
+    fn read(bytes: &'a [u8]) -> Result<Self> {
+        let golden = SafeTensors::deserialize(bytes)?;
+        let (_, metadata) = SafeTensors::read_metadata(bytes)?;
+        let manifest: serde_json::Value = serde_json::from_str(
+            metadata
+                .metadata()
+                .as_ref()
+                .and_then(|m| m.get(METADATA_KEY))
+                .context("golden carries no manifest")?,
+        )?;
+        ensure!(
+            manifest["format_version"].as_u64() == Some(5),
+            "the golden is format {}, and the gate reads format 5, whose floors are each layer's own",
+            manifest["format_version"]
+        );
+        let layers = manifest["layers"]
+            .as_array()
+            .context("manifest has no layers")?
+            .iter()
+            .map(|v| v.as_u64().map(|v| v as usize).context("layer index"))
+            .collect::<Result<_>>()?;
+        let decode_steps = manifest["decode_steps"].as_u64().unwrap_or(0) as usize;
+        let ids = ints(&golden, "input_ids")?
+            .iter()
+            .map(|&id| u32::try_from(id).context("token id"))
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            golden,
+            layers,
+            ids,
+            decode_steps,
+        })
+    }
+
+    fn prompt(&self) -> &[u32] {
+        &self.ids[..self.ids.len() - self.decode_steps]
+    }
+
+    /// The token decode step `step` feeds.
+    fn token(&self, step: usize) -> u32 {
+        self.ids[self.ids.len() - self.decode_steps + step]
+    }
+
+    /// The passes it records, each with the prefix its tensors carry.
+    fn passes(&self) -> Vec<(String, &[u32])> {
+        let prefill = self.prompt().len();
+        std::iter::once((String::new(), self.prompt()))
+            .chain((0..self.decode_steps).map(|step| {
+                let at = prefill + step;
+                (format!("decode{step}_"), &self.ids[at..=at])
+            }))
+            .collect()
+    }
+}
+
+fn decode_steps(sequences: &[Sequence]) -> usize {
+    sequences.iter().map(|s| s.decode_steps).max().unwrap_or(0)
+}
+
+/// Tokens the longest sequence reaches, what each slot has to hold.
+fn capacity(sequences: &[Sequence]) -> usize {
+    sequences.iter().map(|s| s.ids.len()).max().unwrap_or(0)
+}
+
+/// The slots decode step `step` batches, every sequence that has one, and the
+/// token each feeds.
+fn batch_at(sequences: &[Sequence], step: usize) -> (Vec<usize>, Vec<u32>) {
+    sequences
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| step < s.decode_steps)
+        .map(|(slot, s)| (slot, s.token(step)))
+        .unzip()
+}
+
 /// One layer held on the reference's own input: every pass reads the stream
 /// the reference fed this layer, so each held stage measures this layer alone,
 /// against the reference's spread for this layer alone (the CPU pass of the
 /// reference is fed the same way). Down a chain both distances from the
 /// accelerator compound, and one pass of one stage is a single draw of that.
+/// Each prompt runs in its own slot, and each decode step stacks the
+/// reference's rows of every sequence that has one into one batch.
 fn hold_layer_on_reference(
     ctx: &DeviceContext,
-    golden: &SafeTensors,
+    sequences: &[Sequence],
     model: &Model,
     w: &DecoderLayer,
     layer: usize,
     input: &str,
-    passes: &[(String, &[u32])],
 ) -> Result<()> {
     let g = &model.g;
-    let total = passes.iter().map(|(_, ids)| ids.len()).sum();
-    let mut state = LayerState::new(ctx, g, w, total)?;
-    for (pass, (prefix, ids)) in passes.iter().enumerate() {
-        let stream = reference_stream(ctx, golden, g, &format!("{prefix}{input}"), ids.len())?;
-        let trace = if pass == 0 {
-            layer_prefill(ctx, g, w, &model.rope, &mut state, ids, &stream)?
-        } else {
-            layer_decode(ctx, g, w, &model.rope, &mut state, ids[0], &stream)?
-        };
+    let mut held = vec![
+        "attn_out",
+        "stream_after_attn",
+        "router_logits",
+        "moe_out",
+        "stream_out",
+    ];
+    if w.ple.is_some() {
+        held.push("ple_out");
+    }
+    if let Mixer::Linear(_) = w.mixer {
+        held.push("gdn_state");
+    }
+    let floors = sequences
+        .iter()
+        .map(|seq| {
+            held.iter()
+                .map(|&stage| {
+                    Ok((
+                        stage,
+                        sequence_floor(seq, &format!("layer{layer}_{stage}"))?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut state = LayerState::new(ctx, g, w, sequences.len(), capacity(sequences))?;
+    for (slot, seq) in sequences.iter().enumerate() {
+        let prompt = seq.prompt();
+        let stream = reference_stream(ctx, &seq.golden, g, input, prompt.len())?;
+        let trace = layer_prefill(ctx, g, w, &model.rope, &mut state, slot, prompt, &stream)?;
         ctx.sync()?;
+        eprintln!("sequence {slot}:");
+        let prefix = format!("layer{layer}_");
         hold_layer(
             ctx,
-            golden,
+            &seq.golden,
             g,
-            &format!("{prefix}layer{layer}_"),
+            &prefix,
             &trace,
+            0..prompt.len(),
             &state,
+            slot,
+            &floors[slot],
         )?;
+    }
+    for step in 0..decode_steps(sequences) {
+        let (slots, ids) = batch_at(sequences, step);
+        let prefix = format!("decode{step}_");
+        let rows = slots
+            .iter()
+            .map(|&slot| {
+                let name = format!("{prefix}{input}");
+                reference_stream(ctx, &sequences[slot].golden, g, &name, 1)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stream = stack(ctx, &rows.iter().collect::<Vec<_>>())?;
+        let trace = layer_decode(ctx, g, w, &model.rope, &mut state, &slots, &ids, &stream)?;
+        ctx.sync()?;
+        for (row, &slot) in slots.iter().enumerate() {
+            eprintln!("sequence {slot}:");
+            hold_layer(
+                ctx,
+                &sequences[slot].golden,
+                g,
+                &format!("{prefix}layer{layer}_"),
+                &trace,
+                row..row + 1,
+                &state,
+                slot,
+                &floors[slot],
+            )?;
+        }
     }
     Ok(())
 }
 
-/// The readouts of every pass: the head on the reference's last stream, held
-/// to the reference's own floor for the head, then the engine's own chain
-/// through the loaded layers, printed only, since down a chain the distance is
-/// compounded rounding with no floor of its own.
+/// The readouts of every pass of every sequence: the head on the reference's
+/// last stream, held to the reference's own floor for the head, then the
+/// engine's own chain through the loaded layers, printed only, since down a
+/// chain the distance is compounded rounding with no floor of its own.
 fn hold_readouts(
     ctx: &DeviceContext,
-    golden: &SafeTensors,
+    sequences: &[Sequence],
     model: &Model,
     last: usize,
-    passes: &[(String, &[u32])],
-    chained: &[(HiddenStates, HiddenStates)],
+    chained: &[Vec<(HiddenStates, HiddenStates)>],
 ) -> Result<()> {
     let g = &model.g;
-    for ((prefix, ids), (chain_mixed, chain_logits)) in passes.iter().zip(chained) {
-        let stream = reference_stream(
-            ctx,
-            golden,
-            g,
-            &format!("{prefix}layer{last}_stream_out"),
-            ids.len(),
-        )?;
-        let (mixed, logits) = model.readout(ctx, &stream)?;
-        ctx.sync()?;
-        let d = compare_readout(ctx, golden, g, prefix, &mixed, &logits)?;
-        hold_floor(golden, &format!("{prefix}logits"), &d)?;
-        eprintln!("  the engine's own chain:");
-        compare_readout(ctx, golden, g, prefix, chain_mixed, chain_logits)?;
+    for ((slot, seq), chain) in sequences.iter().enumerate().zip(chained) {
+        let logits_floor = sequence_floor(seq, "logits")?;
+        for ((prefix, ids), (chain_mixed, chain_logits)) in seq.passes().iter().zip(chain) {
+            let stream = reference_stream(
+                ctx,
+                &seq.golden,
+                g,
+                &format!("{prefix}layer{last}_stream_out"),
+                ids.len(),
+            )?;
+            let (mixed, logits) = model.readout(ctx, &stream)?;
+            ctx.sync()?;
+            eprintln!("sequence {slot}:");
+            let d = compare_readout(ctx, &seq.golden, g, prefix, &mixed, &logits)?;
+            hold(&format!("{prefix}logits"), &d, logits_floor)?;
+            eprintln!("  the engine's own chain:");
+            compare_readout(ctx, &seq.golden, g, prefix, chain_mixed, chain_logits)?;
+        }
     }
     Ok(())
-}
-
-/// The passes a golden records, each with the prefix its tensors carry: the
-/// prompt's prefill, then one decode step per remaining token.
-fn split_passes(ids: &[u32], decode_steps: usize) -> Vec<(String, &[u32])> {
-    let prefill = ids.len() - decode_steps;
-    std::iter::once((String::new(), &ids[..prefill]))
-        .chain((0..decode_steps).map(|step| {
-            let at = prefill + step;
-            (format!("decode{step}_"), &ids[at..=at])
-        }))
-        .collect()
 }
 
 /// Every layer resident: each is held on the reference's input, and the
-/// engine's own chain is the forward `Model::prefill` and `Model::decode` run.
-fn hold_resident(
-    ctx: &DeviceContext,
-    golden: &SafeTensors,
-    model: &Model,
-    passes: &[(String, &[u32])],
-) -> Result<()> {
-    let total = passes.iter().map(|(_, ids)| ids.len()).sum();
-    let mut state = model.new_state(ctx, total)?;
-    let mut chained = Vec::with_capacity(passes.len());
-    for (pass, (prefix, ids)) in passes.iter().enumerate() {
-        let forward = if pass == 0 {
-            model.prefill(ctx, ids, &mut state)?
-        } else {
-            model.decode(ctx, ids[0], &mut state)?
-        };
+/// engine's own chain is the forward `Model::prefill` and `Model::decode` run,
+/// each prompt in its own slot and each decode step as one batch.
+fn hold_resident(ctx: &DeviceContext, sequences: &[Sequence], model: &Model) -> Result<()> {
+    let mut state = model.new_state(ctx, sequences.len(), capacity(sequences))?;
+    let mut chained = Vec::with_capacity(sequences.len());
+    for (slot, seq) in sequences.iter().enumerate() {
+        let forward = model.prefill(ctx, slot, seq.prompt(), &mut state)?;
         ctx.sync()?;
-        hold_stream_in(ctx, golden, prefix, &forward.stream_in)?;
-        chained.push((forward.mixed, forward.logits));
+        hold_stream_in(ctx, &seq.golden, "", &forward.stream_in)?;
+        chained.push(vec![(forward.mixed, forward.logits)]);
+    }
+    for step in 0..decode_steps(sequences) {
+        let (slots, ids) = batch_at(sequences, step);
+        let forward = model.decode(ctx, &slots, &ids, &mut state)?;
+        ctx.sync()?;
+        let prefix = format!("decode{step}_");
+        for (row, &slot) in slots.iter().enumerate() {
+            let stream_in = row_of(ctx, &forward.stream_in, row)?;
+            hold_stream_in(ctx, &sequences[slot].golden, &prefix, &stream_in)?;
+            chained[slot].push((
+                row_of(ctx, &forward.mixed, row)?,
+                row_of(ctx, &forward.logits, row)?,
+            ));
+        }
     }
     let layers: Vec<usize> = model.layers.iter().map(|(layer, _)| *layer).collect();
     for ((layer, w), input) in model.layers.iter().zip(layer_inputs(&layers)) {
-        hold_layer_on_reference(ctx, golden, model, w, *layer, &input, passes)?;
+        hold_layer_on_reference(ctx, sequences, model, w, *layer, &input)?;
     }
     let last = *layers.last().context("the golden names no layer")?;
-    hold_readouts(ctx, golden, model, last, passes, &chained)
+    hold_readouts(ctx, sequences, model, last, &chained)
 }
 
 /// One layer resident at a time, every pass through it before the next layer
@@ -641,96 +862,116 @@ fn hold_resident(
 /// A layer's pass reads only its own state and the previous layer's output for
 /// that pass, so this order computes the numbers the resident forward computes
 /// with one layer's weights on the card, which is what lets all 48 layers go
-/// through one card against the reference. `model` carries the bookends and the
-/// RoPE tables; the layers come and go.
+/// through one card against the reference. The batches are the resident
+/// forward's too: each prompt alone, each decode step's rows stacked, and the
+/// readouts the same way. `model` carries the bookends and the RoPE tables;
+/// the layers come and go.
 fn hold_streamed(
     ctx: &DeviceContext,
-    golden: &SafeTensors,
+    sequences: &[Sequence],
     model_dir: &Path,
     config: &Config,
     model: &Model,
     layers: &[usize],
-    passes: &[(String, &[u32])],
 ) -> Result<()> {
     let g = &model.g;
-    let total = passes.iter().map(|(_, ids)| ids.len()).sum();
-    let mut streams = Vec::with_capacity(passes.len());
-    for (prefix, ids) in passes {
-        let stream = model.embed(ctx, ids)?;
-        hold_stream_in(ctx, golden, prefix, &stream)?;
-        streams.push(stream);
+    // Every pass of every sequence, `streams[slot][pass]`.
+    let mut streams = Vec::with_capacity(sequences.len());
+    for seq in sequences {
+        let mut passes = Vec::new();
+        for (prefix, ids) in seq.passes() {
+            let stream = model.embed(ctx, ids)?;
+            hold_stream_in(ctx, &seq.golden, &prefix, &stream)?;
+            passes.push(stream);
+        }
+        streams.push(passes);
     }
+    let decode_stack = |streams: &[Vec<HiddenStates>], slots: &[usize], step: usize| {
+        let rows: Vec<&HiddenStates> = slots.iter().map(|&s| &streams[s][step + 1]).collect();
+        stack(ctx, &rows)
+    };
     for (&layer, input) in layers.iter().zip(layer_inputs(layers)) {
         let w = load_layer(ctx, model_dir, config, layer)?;
         eprintln!("qwen4 streamed gate: layer {layer} resident");
-        hold_layer_on_reference(ctx, golden, model, &w, layer, &input, passes)?;
-        let mut state = LayerState::new(ctx, g, &w, total)?;
-        for (pass, ((_, ids), stream)) in passes.iter().zip(&mut streams).enumerate() {
-            let trace = if pass == 0 {
-                layer_prefill(ctx, g, &w, &model.rope, &mut state, ids, stream)?
-            } else {
-                layer_decode(ctx, g, &w, &model.rope, &mut state, ids[0], stream)?
-            };
-            *stream = trace.stream_out;
+        hold_layer_on_reference(ctx, sequences, model, &w, layer, &input)?;
+        let mut state = LayerState::new(ctx, g, &w, sequences.len(), capacity(sequences))?;
+        for (slot, seq) in sequences.iter().enumerate() {
+            let prompt = &streams[slot][0];
+            let trace = layer_prefill(
+                ctx,
+                g,
+                &w,
+                &model.rope,
+                &mut state,
+                slot,
+                seq.prompt(),
+                prompt,
+            )?;
+            streams[slot][0] = trace.stream_out;
+        }
+        for step in 0..decode_steps(sequences) {
+            let (slots, ids) = batch_at(sequences, step);
+            let input = decode_stack(&streams, &slots, step)?;
+            let trace = layer_decode(ctx, g, &w, &model.rope, &mut state, &slots, &ids, &input)?;
+            for (row, &slot) in slots.iter().enumerate() {
+                streams[slot][step + 1] = row_of(ctx, &trace.stream_out, row)?;
+            }
         }
     }
-    let chained = streams
-        .iter()
-        .map(|stream| model.readout(ctx, stream))
-        .collect::<Result<Vec<_>>>()?;
+    let mut chained = Vec::with_capacity(sequences.len());
+    for passes in &streams {
+        chained.push(vec![model.readout(ctx, &passes[0])?]);
+    }
+    for step in 0..decode_steps(sequences) {
+        let (slots, _) = batch_at(sequences, step);
+        let (mixed, logits) = model.readout(ctx, &decode_stack(&streams, &slots, step)?)?;
+        for (row, &slot) in slots.iter().enumerate() {
+            chained[slot].push((row_of(ctx, &mixed, row)?, row_of(ctx, &logits, row)?));
+        }
+    }
     ctx.sync()?;
     let last = *layers.last().context("the golden names no layer")?;
-    hold_readouts(ctx, golden, model, last, passes, &chained)
+    hold_readouts(ctx, sequences, model, last, &chained)
 }
 
 #[test]
 fn model_matches_the_reference() -> Result<()> {
-    let (Some(model_dir), Some(golden_path)) = (
+    let (Some(model_dir), Some(goldens)) = (
         env_path("PEGAINFER_QWEN4_MODEL_PATH"),
-        env_path("PEGAINFER_QWEN4_LAYER_GOLDEN"),
+        std::env::var_os("PEGAINFER_QWEN4_LAYER_GOLDEN"),
     ) else {
         eprintln!("skipped: set PEGAINFER_QWEN4_MODEL_PATH and PEGAINFER_QWEN4_LAYER_GOLDEN");
         return Ok(());
     };
-    let bytes = std::fs::read(&golden_path)?;
-    let golden = SafeTensors::deserialize(&bytes)?;
-    let (_, metadata) = SafeTensors::read_metadata(&bytes)?;
-    let manifest: serde_json::Value = serde_json::from_str(
-        metadata
-            .metadata()
-            .as_ref()
-            .and_then(|m| m.get(METADATA_KEY))
-            .context("golden carries no manifest")?,
-    )?;
-    let layers: Vec<usize> = manifest["layers"]
-        .as_array()
-        .context("manifest has no layers")?
+    let bytes = std::env::split_paths(&goldens)
+        .map(std::fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let sequences = bytes
         .iter()
-        .map(|v| v.as_u64().map(|v| v as usize).context("layer index"))
-        .collect::<Result<_>>()?;
+        .map(|bytes| Sequence::read(bytes))
+        .collect::<Result<Vec<_>>>()?;
+    let layers = sequences.first().context("no golden named")?.layers.clone();
     ensure!(
-        manifest["format_version"].as_u64() == Some(5),
-        "the golden is format {}, and the gate reads format 5, whose floors are each layer's own",
-        manifest["format_version"]
+        sequences.iter().all(|s| s.layers == layers),
+        "the goldens record different layers"
     );
-    let decode_steps = manifest["decode_steps"].as_u64().unwrap_or(0) as usize;
-    let ids: Vec<u32> = ints(&golden, "input_ids")?
-        .iter()
-        .map(|&id| u32::try_from(id).context("token id"))
-        .collect::<Result<_>>()?;
-    let prefill = ids.len() - decode_steps;
 
     let config = load_config(&model_dir)?;
     let ctx = DeviceContext::new()?;
-    let passes = split_passes(&ids, decode_steps);
-    eprintln!(
-        "qwen4 layers {layers:?} gate: {prefill} prompt tokens then {decode_steps} decode steps, max |ours - reference| per stage"
-    );
+    eprintln!("qwen4 layers {layers:?} gate, max |ours - reference| per stage");
+    for (slot, seq) in sequences.iter().enumerate() {
+        eprintln!(
+            "sequence {slot}: {} prompt tokens then {} decode steps",
+            seq.prompt().len(),
+            seq.decode_steps
+        );
+    }
+    let positions = capacity(&sequences);
     if std::env::var_os("PEGAINFER_QWEN4_GATE_STREAMED").is_some() {
-        let model = Model::load(&ctx, &model_dir, &config, &[], ids.len())?;
-        hold_streamed(&ctx, &golden, &model_dir, &config, &model, &layers, &passes)
+        let model = Model::load(&ctx, &model_dir, &config, &[], positions)?;
+        hold_streamed(&ctx, &sequences, &model_dir, &config, &model, &layers)
     } else {
-        let model = Model::load(&ctx, &model_dir, &config, &layers, ids.len())?;
-        hold_resident(&ctx, &golden, &model, &passes)
+        let model = Model::load(&ctx, &model_dir, &config, &layers, positions)?;
+        hold_resident(&ctx, &sequences, &model)
     }
 }

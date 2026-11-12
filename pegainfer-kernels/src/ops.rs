@@ -296,6 +296,8 @@ pub use qwen35::Qwen35GdnGeometry;
 #[cfg(feature = "qwen35")]
 pub use qwen35::Qwen35GdnWorkspace;
 #[cfg(feature = "qwen35")]
+pub use qwen35::attention_decode_via_prefill_hd256_into;
+#[cfg(feature = "qwen35")]
 pub use qwen35::attention_prefill_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::conv1d_decode_batch_into;

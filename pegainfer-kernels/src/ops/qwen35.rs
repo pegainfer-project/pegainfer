@@ -696,6 +696,137 @@ pub fn attention_prefill_hd256_into(
     Ok(())
 }
 
+/// The decode counterpart of [`attention_prefill_hd256_into`]: one new token
+/// for each request of a batch, for a GQA group the batch decode kernels do
+/// not compile. `(1 + w)` q/k norm and partial RoPE at each request's
+/// position, that token's K/V written into the pool at `layer`, FlashInfer's
+/// paged prefill with one query row per request, then the sigmoid of the gate
+/// half on `output`. The plan carries one row and the position of each
+/// request. `k` is normed and rotated in place; `q_prepped` keeps the normed
+/// and rotated Q.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_decode_via_prefill_hd256_into(
+    ctx: &DeviceContext,
+    q_full: &HiddenStates,
+    k: &mut HiddenStates,
+    v: &HiddenStates,
+    q_norm_weight: &DeviceVec,
+    k_norm_weight: &DeviceVec,
+    cos_cache: &DeviceVec,
+    sin_cache: &DeviceVec,
+    kv_buffer: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    layer: usize,
+    plan: &PrefillPagedPlan,
+    rotary_dim: usize,
+    rms_eps: f32,
+    q_prepped: &mut HiddenStates,
+    output: &mut HiddenStates,
+) -> Result<()> {
+    let num_kv_heads = layout.num_kv_heads;
+    let head_dim = layout.head_dim;
+    anyhow::ensure!(
+        head_dim == 256,
+        "hd256 decode: the layout has head_dim {head_dim}"
+    );
+    let num_q_heads = output.hidden_dim / head_dim;
+    anyhow::ensure!(
+        num_q_heads * head_dim == output.hidden_dim
+            && q_prepped.hidden_dim == output.hidden_dim
+            && q_full.hidden_dim == 2 * output.hidden_dim
+            && k.hidden_dim == num_kv_heads * head_dim
+            && v.hidden_dim == num_kv_heads * head_dim,
+        "hd256 decode widths: q_full {} q {} k {} v {} output {} for {num_kv_heads} kv heads",
+        q_full.hidden_dim,
+        q_prepped.hidden_dim,
+        k.hidden_dim,
+        v.hidden_dim,
+        output.hidden_dim
+    );
+    let batch = q_full.seq_len;
+    anyhow::ensure!(
+        [k.seq_len, v.seq_len, q_prepped.seq_len, output.seq_len]
+            .iter()
+            .all(|&rows| rows == batch),
+        "hd256 decode rows: q_full {batch} k {} v {} q {} output {}",
+        k.seq_len,
+        v.seq_len,
+        q_prepped.seq_len,
+        output.seq_len
+    );
+    q_full.checked_extent("hd256 decode q_full")?;
+    k.checked_extent("hd256 decode k")?;
+    v.checked_extent("hd256 decode v")?;
+    q_prepped.checked_extent("hd256 decode q_prepped")?;
+    output.checked_extent("hd256 decode output")?;
+    let PagedGeometry {
+        page_size,
+        num_pages,
+        ..
+    } = checked_paged_geometry(
+        "hd256 decode",
+        layout,
+        kv_buffer.len(),
+        layer,
+        head_dim,
+        num_kv_heads,
+        false,
+    )?;
+    anyhow::ensure!(
+        plan.max_page_index < num_pages,
+        "hd256 decode plan references page {} but the pool holds {num_pages} pages; the kernels \
+         compute addresses from page ids with no device-side bounds check",
+        plan.max_page_index
+    );
+    anyhow::ensure!(
+        plan.max_last_page_len <= page_size,
+        "hd256 decode plan last page length {} exceeds page_size {page_size}",
+        plan.max_last_page_len
+    );
+
+    qk_norm_partial_rope_batched_decode_hd256_into(
+        ctx,
+        q_full,
+        q_prepped,
+        k,
+        q_norm_weight,
+        k_norm_weight,
+        cos_cache,
+        sin_cache,
+        plan.positions_d(),
+        num_q_heads,
+        num_kv_heads,
+        rotary_dim,
+        rms_eps,
+    );
+    paged_attention_batch_decode_via_prefill_hd256_into(
+        ctx,
+        q_prepped,
+        k,
+        v,
+        kv_buffer,
+        layout,
+        layer,
+        plan,
+        plan.positions_d(),
+        output,
+        num_q_heads,
+        batch,
+    )?;
+    let (qf_ptr, _gqf) = q_full.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::attention_gate_batch_hd256_cuda(
+            qf_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            num_q_heads as i32,
+            batch as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+    Ok(())
+}
+
 /// GDN key head dim baked into the kernels: the decode kernel's tiling and shared
 /// memory layout (`GDR_KEY_DIM` in `gated_delta_rule.cu`) and the chunk-wise
 /// prefill's Triton AOT specialization keys both hardcode it.
