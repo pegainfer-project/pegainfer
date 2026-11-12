@@ -12,7 +12,8 @@
 //! has one as one batch, each row held against its own golden. With
 //! `PEGAINFER_QWEN4_GATE_STREAMED` set, one layer is resident at a time and
 //! every pass goes through it before the next loads, which is how all 48
-//! layers go through one card.
+//! layers go through one card. `PEGAINFER_QWEN4_GATE_DEVICES` (comma separated
+//! ordinals) does the same with the engine's own chain run across those cards.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,6 +33,9 @@ use safetensors::Dtype;
 use safetensors::SafeTensors;
 
 use super::Model;
+use super::split::Output;
+use super::split::Readout;
+use super::split::SplitModel;
 use crate::config::Config;
 use crate::layer::KvPool;
 use crate::layer::LayerState;
@@ -865,7 +869,9 @@ fn hold_resident(ctx: &DeviceContext, sequences: &[Sequence], model: &Model) -> 
 /// through one card against the reference. The batches are the resident
 /// forward's too: each prompt alone, each decode step's rows stacked, and the
 /// readouts the same way. `model` carries the bookends and the RoPE tables;
-/// the layers come and go.
+/// the layers come and go. With `split` devices, the engine's own chain runs
+/// through a [`SplitModel`] over them instead, each card holding a run of the
+/// layers, and the readouts read the streams it hands back.
 fn hold_streamed(
     ctx: &DeviceContext,
     sequences: &[Sequence],
@@ -873,6 +879,7 @@ fn hold_streamed(
     config: &Config,
     model: &Model,
     layers: &[usize],
+    split: Option<&[usize]>,
 ) -> Result<()> {
     let g = &model.g;
     // Every pass of every sequence, `streams[slot][pass]`.
@@ -894,6 +901,9 @@ fn hold_streamed(
         let w = load_layer(ctx, model_dir, config, layer)?;
         eprintln!("qwen4 streamed gate: layer {layer} resident");
         hold_layer_on_reference(ctx, sequences, model, &w, layer, &input)?;
+        if split.is_some() {
+            continue;
+        }
         let mut state = LayerState::new(ctx, g, &w, sequences.len(), capacity(sequences))?;
         for (slot, seq) in sequences.iter().enumerate() {
             let prompt = &streams[slot][0];
@@ -915,6 +925,31 @@ fn hold_streamed(
             let trace = layer_decode(ctx, g, &w, &model.rope, &mut state, &slots, &ids, &input)?;
             for (row, &slot) in slots.iter().enumerate() {
                 streams[slot][step + 1] = row_of(ctx, &trace.stream_out, row)?;
+            }
+        }
+    }
+    if let Some(devices) = split {
+        let cards = SplitModel::load(
+            model_dir,
+            devices,
+            layers,
+            sequences.len(),
+            capacity(sequences),
+        )?;
+        let upload = |output: Output, rows: usize| match output {
+            Output::Stream(host) => HiddenStates::from_host(ctx, &host, g.stream_width(), rows),
+            Output::Logits(_) => bail!("asked the cards for the stream"),
+        };
+        for (slot, seq) in sequences.iter().enumerate() {
+            let prompt = seq.prompt();
+            let out = cards.prefill(slot, prompt, Readout::Stream)?;
+            streams[slot][0] = upload(out, prompt.len())?;
+        }
+        for step in 0..decode_steps(sequences) {
+            let (slots, ids) = batch_at(sequences, step);
+            let out = upload(cards.decode(&slots, &ids, Readout::Stream)?, slots.len())?;
+            for (row, &slot) in slots.iter().enumerate() {
+                streams[slot][step + 1] = row_of(ctx, &out, row)?;
             }
         }
     }
@@ -967,11 +1002,27 @@ fn model_matches_the_reference() -> Result<()> {
         );
     }
     let positions = capacity(&sequences);
-    if std::env::var_os("PEGAINFER_QWEN4_GATE_STREAMED").is_some() {
-        let model = Model::load(&ctx, &model_dir, &config, &[], positions)?;
-        hold_streamed(&ctx, &sequences, &model_dir, &config, &model, &layers)
+    let split = std::env::var("PEGAINFER_QWEN4_GATE_DEVICES")
+        .ok()
+        .map(|list| {
+            list.split(',')
+                .map(|device| device.trim().parse::<usize>().context("a device ordinal"))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
+    if split.is_some() || std::env::var_os("PEGAINFER_QWEN4_GATE_STREAMED").is_some() {
+        let model = Model::load(&ctx, &model_dir, &config, &[], positions, true)?;
+        hold_streamed(
+            &ctx,
+            &sequences,
+            &model_dir,
+            &config,
+            &model,
+            &layers,
+            split.as_deref(),
+        )
     } else {
-        let model = Model::load(&ctx, &model_dir, &config, &layers, positions)?;
+        let model = Model::load(&ctx, &model_dir, &config, &layers, positions, true)?;
         hold_resident(&ctx, &sequences, &model)
     }
 }
