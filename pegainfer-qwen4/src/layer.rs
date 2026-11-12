@@ -13,6 +13,7 @@ use anyhow::bail;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtrMut;
+use cudarc::driver::sys::CUdevice_attribute;
 use half::bf16;
 use pegainfer_core::rope::RopeTableSpec;
 use pegainfer_core::rope::precompute_rope;
@@ -32,9 +33,13 @@ use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::hc_mix_into;
 use pegainfer_kernels::ops::hc_scatter_add_into;
 use pegainfer_kernels::ops::ple_block_into;
+use pegainfer_kernels::ops::qsa_indexer_block_scores_into;
+use pegainfer_kernels::ops::qsa_indexer_select_into;
+use pegainfer_kernels::ops::qsa_sparse_attention_into;
 use pegainfer_kernels::ops::rms_norm_gated_batch_into;
 use pegainfer_kernels::paged_kv::PagedKvLayout;
 use pegainfer_kernels::tensor::DeviceContext;
+use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStates;
 
@@ -92,6 +97,12 @@ pub struct KvPool {
     pub capacity: usize,
     /// Tokens written so far per slot; a slot's next token lands at its length.
     pub lens: Vec<usize>,
+    /// Every token's fused indexer projection per slot, `[capacity,
+    /// indexer_width]`: past the dense range the indexer pools and scores the
+    /// keys from token 0 on every pass.
+    pub indexer: Vec<HiddenStates>,
+    /// The card's SM count, which the indexer's score pass splits its grid by.
+    pub sms: usize,
 }
 
 impl KvPool {
@@ -138,11 +149,18 @@ impl MixerState {
             Mixer::Full(_) => {
                 let layout = PagedKvLayout::new(1, g.kv_heads, g.head_dim, KV_PAGE);
                 let pages = slots * capacity.div_ceil(KV_PAGE).max(1);
+                let sms = ctx
+                    .ctx
+                    .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
                 Self::Full(KvPool {
                     pool: ctx.stream.alloc_zeros(pages * layout.page_stride)?,
                     layout,
                     capacity,
                     lens: vec![0; slots],
+                    indexer: (0..slots)
+                        .map(|_| HiddenStates::zeros(ctx, g.indexer_width(), capacity))
+                        .collect::<Result<_>>()?,
+                    sms: usize::try_from(sms)?,
                 })
             }
         })
@@ -267,6 +285,8 @@ pub struct AttentionTrace {
     pub q_prepped: HiddenStates,
     /// The attention output times the sigmoid gate, `o_proj`'s input.
     pub gated: HiddenStates,
+    /// The indexer's fused projection, its query heads and then its key head.
+    pub indexer_qk: HiddenStates,
 }
 
 pub enum MixerTrace {
@@ -636,11 +656,6 @@ fn gdn_decode(
 /// equals it up to that length and no further.
 fn check_reach(g: &Geometry, kv: &KvPool, rope: &Rope, kv_len: usize) -> Result<()> {
     ensure!(
-        kv_len <= g.dense_attention_rows(),
-        "the sequence reaches {kv_len} tokens; past {} the reference's QSA drops keys and dense attention no longer matches it",
-        g.dense_attention_rows()
-    );
-    ensure!(
         kv_len <= kv.capacity,
         "a K/V slot holds {} tokens, the sequence reaches {kv_len}",
         kv.capacity
@@ -653,25 +668,158 @@ fn check_reach(g: &Geometry, kv: &KvPool, rope: &Rope, kv_len: usize) -> Result<
     Ok(())
 }
 
+/// The attention's projections of `mixed`, and the indexer's fused one.
+struct Projections {
+    q: HiddenStates,
+    k: HiddenStates,
+    v: HiddenStates,
+    indexer: HiddenStates,
+}
+
 fn attention_project(
     ctx: &DeviceContext,
     g: &Geometry,
     w: &FullAttention,
     mixed: &HiddenStates,
-) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+) -> Result<Projections> {
     let rows = mixed.seq_len;
-    let mut q_proj = HiddenStates::zeros(ctx, g.q_width(), rows)?;
-    gemm_into_checked(ctx, &w.q_proj, mixed, &mut q_proj)?;
-    let mut k_proj = HiddenStates::zeros(ctx, g.kv_width(), rows)?;
-    gemm_into_checked(ctx, &w.k_proj, mixed, &mut k_proj)?;
-    let mut v_proj = HiddenStates::zeros(ctx, g.kv_width(), rows)?;
-    gemm_into_checked(ctx, &w.v_proj, mixed, &mut v_proj)?;
-    Ok((q_proj, k_proj, v_proj))
+    let project = |weight: &DeviceMatrix, width: usize| -> Result<HiddenStates> {
+        let mut out = HiddenStates::zeros(ctx, width, rows)?;
+        gemm_into_checked(ctx, weight, mixed, &mut out)?;
+        Ok(out)
+    };
+    Ok(Projections {
+        q: project(&w.q_proj, g.q_width())?,
+        k: project(&w.k_proj, g.kv_width())?,
+        v: project(&w.v_proj, g.kv_width())?,
+        indexer: project(&w.indexer.qk_proj, g.indexer_width())?,
+    })
+}
+
+/// Rows past the dense range whose selection runs at once, which bounds the
+/// score and mask buffers of a long prompt.
+const SPARSE_CHUNK: usize = 256;
+
+/// QSA for the rows of `slot` at positions `first..end`: the indexer scores and
+/// selects their tokens, and the attention over those tokens replaces rows
+/// `row..` of `gated`, which the dense entry filled. The slot's indexer rows
+/// and K/V must already hold every token before `end`.
+#[allow(clippy::too_many_arguments)]
+fn attention_sparse(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    w: &FullAttention,
+    rope: &Rope,
+    kv: &KvPool,
+    slot: usize,
+    row: usize,
+    (first, end): (usize, usize),
+    q_proj: &HiddenStates,
+    q_prepped: &HiddenStates,
+    gated: &mut HiddenStates,
+) -> Result<()> {
+    let mut at = first;
+    while at < end {
+        let stop = (at + SPARSE_CHUNK).min(end);
+        let rows = stop - at;
+        let selection = qsa_select(ctx, g, w, rope, &kv.indexer[slot], kv.sms, at, stop)?;
+        qsa_sparse_attention_into(
+            ctx,
+            q_proj,
+            q_prepped,
+            row + (at - first),
+            rows,
+            at,
+            &kv.pool,
+            &kv.layout,
+            kv.first_page(slot),
+            &selection.mask,
+            stop,
+            gated,
+        )?;
+        at = stop;
+    }
+    Ok(())
+}
+
+/// The indexer's choice for the rows at positions `first..end` of one sequence.
+pub struct Selection {
+    /// `[end - first, end]` bytes, 1 where a row keeps a token.
+    pub mask: CudaSlice<u8>,
+    /// `[end - first, blocks]` block scores; a row's entries past its own
+    /// complete blocks are unwritten.
+    pub scores: CudaSlice<f32>,
+    pub blocks: usize,
+}
+
+/// What the indexer selects for the rows at positions `first..end` of the
+/// sequence whose fused indexer projection, from token 0, is `fused`. `sms` is
+/// the card's SM count.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_select(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    w: &FullAttention,
+    rope: &Rope,
+    fused: &HiddenStates,
+    sms: usize,
+    first: usize,
+    end: usize,
+) -> Result<Selection> {
+    ensure!(
+        first < end && end <= fused.seq_len && fused.hidden_dim == g.indexer_width(),
+        "the indexer selects rows {first}..{end} over {} rows of {} wide projections",
+        fused.seq_len,
+        fused.hidden_dim
+    );
+    let rows = end - first;
+    let positions: Vec<i32> = (first..end).map(i32::try_from).collect::<Result<_, _>>()?;
+    let visible: Vec<i32> = (first + 1..=end)
+        .map(i32::try_from)
+        .collect::<Result<_, _>>()?;
+    let positions: CudaSlice<i32> = ctx.stream.clone_htod(&positions)?;
+    let visible: CudaSlice<i32> = ctx.stream.clone_htod(&visible)?;
+    let blocks = end / g.indexer_compress_ratio;
+    let mut scores = ctx.stream.alloc_zeros::<f32>(rows * blocks)?;
+    let mut pooled = ctx
+        .stream
+        .alloc_zeros::<bf16>(blocks * g.indexer_head_dim)?;
+    qsa_indexer_block_scores_into(
+        ctx,
+        &fused.data,
+        &w.indexer.q_norm.data,
+        &w.indexer.k_norm.data,
+        &rope.cos,
+        &rope.sin,
+        &positions,
+        &visible,
+        end,
+        sms,
+        &mut scores,
+        blocks,
+        &mut pooled,
+        g.rms_eps,
+    )?;
+    let mut mask = ctx.stream.alloc_zeros::<u8>(rows * end)?;
+    qsa_indexer_select_into(
+        ctx,
+        &scores,
+        blocks,
+        &positions,
+        g.indexer_budget,
+        end,
+        &mut mask,
+    )?;
+    Ok(Selection {
+        mask,
+        scores,
+        blocks,
+    })
 }
 
 /// Gated full attention over one prompt appended in `slot` at its length,
-/// through the hd256 prefill entry. Returns the stages and the `o_proj`
-/// output.
+/// through the hd256 prefill entry, with the rows past the dense range
+/// replaced by QSA's. Returns the stages and the `o_proj` output.
 fn attention_prefill(
     ctx: &DeviceContext,
     g: &Geometry,
@@ -685,7 +833,15 @@ fn attention_prefill(
     let start = kv.lens[slot];
     let kv_len = start + rows;
     check_reach(g, kv, rope, kv_len)?;
-    let (q_proj, k_proj, v_proj) = attention_project(ctx, g, w, mixed)?;
+    let projections = attention_project(ctx, g, w, mixed)?;
+    copy_hidden_token_range_into(
+        ctx,
+        &projections.indexer,
+        0,
+        &mut kv.indexer[slot],
+        start,
+        rows,
+    )?;
     let pages = kv.pages(slot, kv_len)?;
     let plan = PrefillPagedPlan::new_with_cta_tile_q(
         ctx,
@@ -702,9 +858,9 @@ fn attention_prefill(
     let mut gated = HiddenStates::zeros(ctx, g.attn_width(), rows)?;
     attention_prefill_hd256_into(
         ctx,
-        &q_proj,
-        &k_proj,
-        &v_proj,
+        &projections.q,
+        &projections.k,
+        &projections.v,
         &w.q_norm,
         &w.k_norm,
         &rope.cos,
@@ -720,15 +876,32 @@ fn attention_prefill(
         &mut gated,
     )?;
     kv.lens[slot] = kv_len;
+    let sparse = start.max(g.dense_attention_rows());
+    if sparse < kv_len {
+        attention_sparse(
+            ctx,
+            g,
+            w,
+            rope,
+            kv,
+            slot,
+            sparse - start,
+            (sparse, kv_len),
+            &projections.q,
+            &q_prepped,
+            &mut gated,
+        )?;
+    }
     let mut out = HiddenStates::zeros(ctx, g.hidden, rows)?;
     gemm_into_checked(ctx, &w.o_proj, &gated, &mut out)?;
     Ok((
         AttentionTrace {
-            q_proj,
-            k_proj,
-            v_proj,
+            q_proj: projections.q,
+            k_proj: projections.k,
+            v_proj: projections.v,
             q_prepped,
             gated,
+            indexer_qk: projections.indexer,
         },
         out,
     ))
@@ -761,7 +934,17 @@ fn attention_decode(
         pages.push(slot_pages);
         starts.push(start);
     }
-    let (q_proj, k_proj, v_proj) = attention_project(ctx, g, w, mixed)?;
+    let projections = attention_project(ctx, g, w, mixed)?;
+    for (row, (&slot, &start)) in slots.iter().zip(&starts).enumerate() {
+        copy_hidden_token_range_into(
+            ctx,
+            &projections.indexer,
+            row,
+            &mut kv.indexer[slot],
+            start,
+            1,
+        )?;
+    }
     let plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
         ctx,
         &pages,
@@ -775,14 +958,14 @@ fn attention_decode(
     )?;
     // The entry norms and rotates K in place; the trace keeps the projection.
     let mut k = HiddenStates::zeros(ctx, g.kv_width(), batch)?;
-    copy_hidden_token_range_into(ctx, &k_proj, 0, &mut k, 0, batch)?;
+    copy_hidden_token_range_into(ctx, &projections.k, 0, &mut k, 0, batch)?;
     let mut q_prepped = HiddenStates::zeros(ctx, g.attn_width(), batch)?;
     let mut gated = HiddenStates::zeros(ctx, g.attn_width(), batch)?;
     attention_decode_via_prefill_hd256_into(
         ctx,
-        &q_proj,
+        &projections.q,
         &mut k,
-        &v_proj,
+        &projections.v,
         &w.q_norm,
         &w.k_norm,
         &rope.cos,
@@ -799,15 +982,33 @@ fn attention_decode(
     for &slot in slots {
         kv.lens[slot] += 1;
     }
+    for (row, (&slot, &start)) in slots.iter().zip(&starts).enumerate() {
+        if start >= g.dense_attention_rows() {
+            attention_sparse(
+                ctx,
+                g,
+                w,
+                rope,
+                kv,
+                slot,
+                row,
+                (start, start + 1),
+                &projections.q,
+                &q_prepped,
+                &mut gated,
+            )?;
+        }
+    }
     let mut out = HiddenStates::zeros(ctx, g.hidden, batch)?;
     gemm_into_checked(ctx, &w.o_proj, &gated, &mut out)?;
     Ok((
         AttentionTrace {
-            q_proj,
-            k_proj,
-            v_proj,
+            q_proj: projections.q,
+            k_proj: projections.k,
+            v_proj: projections.v,
             q_prepped,
             gated,
+            indexer_qk: projections.indexer,
         },
         out,
     ))

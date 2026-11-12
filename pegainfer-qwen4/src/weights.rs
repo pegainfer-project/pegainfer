@@ -47,6 +47,8 @@ pub struct Geometry {
     pub rope_theta: f32,
     pub indexer_budget: usize,
     pub indexer_compress_ratio: usize,
+    pub indexer_heads: usize,
+    pub indexer_head_dim: usize,
     pub ple_embed: usize,
     pub key_heads: usize,
     pub value_heads: usize,
@@ -76,6 +78,8 @@ impl Geometry {
             rope_theta: text.rope_parameters.rope_theta as f32,
             indexer_budget: text.indexer_budget,
             indexer_compress_ratio: text.indexer_compress_ratio,
+            indexer_heads: text.indexer_n_heads,
+            indexer_head_dim: text.indexer_head_dim,
             ple_embed: text.ple_embed_dim,
             key_heads: text.linear_num_key_heads,
             value_heads: text.linear_num_value_heads,
@@ -127,6 +131,12 @@ impl Geometry {
         self.indexer_budget + self.indexer_compress_ratio - 1
     }
 
+    /// Width of the indexer's fused `index_qk_proj` output: its query heads,
+    /// then its one key head.
+    pub fn indexer_width(&self) -> usize {
+        (self.indexer_heads + 1) * self.indexer_head_dim
+    }
+
     /// The MoE block as the routing kernels see it.
     pub fn moe(&self) -> Qwen4MoeGeometry {
         Qwen4MoeGeometry {
@@ -166,6 +176,15 @@ pub struct FullAttention {
     pub v_proj: DeviceMatrix,
     pub o_proj: DeviceMatrix,
     /// The checkpoint's `w`; the kernels add the 1.
+    pub q_norm: DeviceVec,
+    pub k_norm: DeviceVec,
+    pub indexer: Indexer,
+}
+
+/// QSA's token indexer: one fused projection to its query heads and its key
+/// head, and their `(1 + w)` norms.
+pub struct Indexer {
+    pub qk_proj: DeviceMatrix,
     pub q_norm: DeviceVec,
     pub k_norm: DeviceVec,
 }
@@ -385,6 +404,9 @@ struct AttentionSlots {
     o_proj: SlotId,
     q_norm: VecSlotId,
     k_norm: VecSlotId,
+    indexer_qk_proj: SlotId,
+    indexer_q_norm: VecSlotId,
+    indexer_k_norm: VecSlotId,
 }
 
 fn record_attention(
@@ -392,7 +414,37 @@ fn record_attention(
     prefix: &str,
     g: &Geometry,
 ) -> Result<AttentionSlots> {
+    // The config pins structure, not widths; the QSA kernels compile these.
+    ensure!(
+        (g.heads, g.kv_heads, g.head_dim) == (24, 2, 256)
+            && (
+                g.indexer_heads,
+                g.indexer_head_dim,
+                g.indexer_compress_ratio
+            ) == (4, 128, 4)
+            && g.indexer_budget <= 2048,
+        "the QSA kernels compile 24 query and 2 K/V heads at 256 and an indexer of 4 heads at \
+         128 over blocks of 4 keeping at most 2048 tokens; this checkpoint has {} and {} heads \
+         at {}, an indexer of {} heads at {} over blocks of {} and a budget of {}",
+        g.heads,
+        g.kv_heads,
+        g.head_dim,
+        g.indexer_heads,
+        g.indexer_head_dim,
+        g.indexer_compress_ratio,
+        g.indexer_budget
+    );
+    let indexer = format!("{prefix}.indexer");
     Ok(AttentionSlots {
+        indexer_qk_proj: loader.matrix(
+            &format!("{indexer}.index_qk_proj.weight"),
+            g.indexer_width(),
+            g.hidden,
+        )?,
+        indexer_q_norm: loader
+            .vector(&format!("{indexer}.q_layernorm.weight"), g.indexer_head_dim)?,
+        indexer_k_norm: loader
+            .vector(&format!("{indexer}.k_layernorm.weight"), g.indexer_head_dim)?,
         q_proj: loader.matrix(&format!("{prefix}.q_proj.weight"), g.q_width(), g.hidden)?,
         k_proj: loader.matrix(&format!("{prefix}.k_proj.weight"), g.kv_width(), g.hidden)?,
         v_proj: loader.matrix(&format!("{prefix}.v_proj.weight"), g.kv_width(), g.hidden)?,
@@ -410,6 +462,11 @@ fn take_attention(loader: &mut StagedWeightLoader, slots: &AttentionSlots) -> Fu
         o_proj: loader.take(slots.o_proj),
         q_norm: loader.take_vec(slots.q_norm),
         k_norm: loader.take_vec(slots.k_norm),
+        indexer: Indexer {
+            qk_proj: loader.take(slots.indexer_qk_proj),
+            q_norm: loader.take_vec(slots.indexer_q_norm),
+            k_norm: loader.take_vec(slots.indexer_k_norm),
+        },
     }
 }
 

@@ -44,7 +44,17 @@ FORMAT_VERSION = 5
 # Recorded from the CPU pass as well: the accelerator versus CPU spread of the
 # reference, each layer on the same input, is the floor the engine is held to at
 # these stages.
-CPU_STAGES = ("ple_out", "attn_out", "stream_after_attn", "router_logits", "moe_out", "stream_out", "gdn_state", "logits")
+CPU_STAGES = (
+    "ple_out",
+    "attn_gated",
+    "attn_out",
+    "stream_after_attn",
+    "router_logits",
+    "moe_out",
+    "stream_out",
+    "gdn_state",
+    "logits",
+)
 PROMPT = (
     "The hyper-connection stream carries four copies of the residual through every "
     "layer, and the mixer reads them back before the head. Routing picks ten of the "
@@ -200,6 +210,7 @@ class Recorder:
             self.output(sublayer.v_proj, lambda out: {"attn_v_proj": out})
             self.output(sublayer.q_norm, lambda out: {"attn_q_normed": out})
             self.output(sublayer.k_norm, lambda out: {"attn_k_normed": out})
+            self.output(sublayer.indexer.index_qk_proj, lambda out: {"attn_indexer_qk": out})
             self.output(sublayer.indexer, lambda out: {"attn_indexer_mask": out})
             self.inputs(sublayer.o_proj, lambda args: {"attn_gated": args[0]})
             self.output(sublayer, lambda out: {"attn_out": out[0]})

@@ -65,6 +65,28 @@ unsafe extern "C" {
         budget: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Gated attention for `rows` consecutive query rows of one sequence over
+    /// the tokens `mask` keeps, reading the sequence's K/V pages from
+    /// `first_page` on. See `ops::qsa_sparse_attention_into` for the contract.
+    ///
+    /// The geometry is compiled in: 24 query and 2 K/V heads at head dim 256,
+    /// pages of 16 tokens, and at most 2051 kept tokens a row (the device traps
+    /// past that).
+    pub fn qwen4_qsa_sparse_attention_cuda(
+        q_full: *const Half,
+        q_prepped: *const Half,
+        pool: *const Half,
+        mask: *const u8,
+        out: *mut Half,
+        rows: i32,
+        first_position: i32,
+        first_page: i32,
+        page_stride: i64,
+        kv_block_len: i64,
+        mask_stride: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 unsafe extern "C" {
