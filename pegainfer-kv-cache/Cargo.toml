@@ -10,7 +10,7 @@ cudarc = { workspace = true }
 dynamo-kv-hashing = { workspace = true }
 half = { workspace = true }
 kvbm-logical = { workspace = true }
-pegainfer-kernels = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"] }
 
 [lints]
 workspace = true

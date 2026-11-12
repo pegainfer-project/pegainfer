@@ -166,7 +166,7 @@ struct RopeParameters {
 }
 
 fn default_selector_top_k() -> usize {
-    pegainfer_kernels::ops::DFLASH2_CANDIDATE_K
+    pegainfer_kernels::DFLASH2_CANDIDATE_K
 }
 
 fn default_markov_head_type() -> String {
@@ -330,8 +330,18 @@ impl Config {
 
     /// GQA ratio is TP-invariant, so the global head counts match the per-rank ones.
     pub(crate) fn decode_group_is_compiled(&self) -> bool {
-        pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
-            .contains(&(self.num_attention_heads / self.num_key_value_heads))
+        #[cfg(feature = "cuda")]
+        {
+            pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+                .contains(&(self.num_attention_heads / self.num_key_value_heads))
+        }
+        #[cfg(feature = "rocm")]
+        {
+            self.num_key_value_heads > 0
+                && self
+                    .num_attention_heads
+                    .is_multiple_of(self.num_key_value_heads)
+        }
     }
 
     pub(crate) fn lm_head_tensor_name(&self) -> &'static str {
@@ -1310,6 +1320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn dspine_checkpoints_are_refused_before_the_target_loads() {
         let directory = tempfile::tempdir().expect("temp dir");
         fs::write(directory.path().join("config.json"), DSPINE_8B_CONFIG).expect("write config");

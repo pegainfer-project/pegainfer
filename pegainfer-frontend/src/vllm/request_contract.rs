@@ -13,6 +13,68 @@ use tower::ServiceExt as _;
 
 const REQUEST_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// HTTP contract for an engine that emits greedy text without score/transfer
+/// support. Reject before the stream opens so clients receive actionable 400s.
+pub fn greedy_text_routes(vllm_router: Router) -> Router {
+    Router::new()
+        .route("/v1/completions", post(validate_greedy_text))
+        .route("/v1/chat/completions", post(validate_greedy_text))
+        .with_state(vllm_router.clone())
+        .fallback_service(vllm_router)
+}
+
+async fn validate_greedy_text(
+    axum::extract::State(router): axum::extract::State<Router>,
+    request: Request,
+) -> Response {
+    let result = async {
+        let (parts, body) = request.into_parts();
+        let body = to_bytes(body, REQUEST_BODY_LIMIT)
+            .await
+            .context("read request body")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).context("parse request JSON")?;
+        let greedy = value
+            .get("temperature")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|t| t.is_finite() && (0.0..1e-5).contains(&t))
+            || value.get("top_k").and_then(serde_json::Value::as_i64) == Some(1);
+        anyhow::ensure!(
+            greedy,
+            "this engine requires greedy sampling: set temperature=0 or top_k=1"
+        );
+        for field in ["logprobs", "prompt_logprobs", "top_logprobs"] {
+            anyhow::ensure!(
+                value
+                    .get(field)
+                    .is_none_or(|v| v.is_null() || v.as_bool() == Some(false)),
+                "this engine does not support {field}"
+            );
+        }
+        anyhow::ensure!(
+            value.get("echo").and_then(serde_json::Value::as_bool) != Some(true),
+            "this engine does not support prompt echo scoring"
+        );
+        anyhow::ensure!(
+            value
+                .pointer("/vllm_xargs/kv_transfer_params")
+                .is_none_or(serde_json::Value::is_null),
+            "this engine does not support KV transfer"
+        );
+        router
+            .oneshot(Request::from_parts(parts, Body::from(body)))
+            .await
+            .context("dispatch request")
+    }
+    .await;
+    match result {
+        Ok(response) => response,
+        Err(error) => (StatusCode::BAD_REQUEST, Json(json!({"error": {
+            "message": format!("{error:#}"), "type": "invalid_request_error", "code": "invalid_request_error"
+        }}))).into_response(),
+    }
+}
+
 pub(crate) fn prefill_only_routes(vllm_router: Router) -> Router {
     Router::new()
         .route("/v1/completions", post(validate_prefill_only))

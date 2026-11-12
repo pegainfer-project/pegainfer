@@ -23,10 +23,10 @@ cudarc = { workspace = true, optional = true }
 half = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
-pegainfer-core = { workspace = true, optional = true }
+pegainfer-core = { workspace = true, features = ["cuda"], optional = true }
 pegainfer-frontend = { workspace = true }
 # `qwen35` for the Gated DeltaNet conv and delta rule wrappers this line shares.
-pegainfer-kernels = { workspace = true, features = ["qwen4", "qwen35"], optional = true }
+pegainfer-kernels = { workspace = true, features = ["cuda", "qwen4", "qwen35"], optional = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

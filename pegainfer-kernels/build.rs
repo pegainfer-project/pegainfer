@@ -2217,6 +2217,19 @@ fn tilelang_nvcc_tasks(
 // ===========================================================================
 
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_ROCM").is_some() {
+        assert!(
+            std::env::var_os("CARGO_FEATURE_CUDA").is_none(),
+            "choose only one GPU backend"
+        );
+        println!("cargo:rerun-if-changed=../pegainfer-device/csrc/runtime.h");
+        pegainfer_build::rocm::compile(
+            "pegainfer_hip_kernels",
+            &["csrc/hip/qwen3.cpp"],
+            &["../pegainfer-device/csrc"],
+        );
+        return;
+    }
     ensure_git_submodules_initialized(&workspace_root());
 
     let toolkit = pegainfer_build::CudaToolkit::discover();

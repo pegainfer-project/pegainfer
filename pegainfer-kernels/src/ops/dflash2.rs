@@ -10,6 +10,7 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
+pub use crate::DFLASH2_CANDIDATE_K;
 use crate::ffi;
 use crate::ops::sampling::flashinfer_top1_row_states_bytes;
 use crate::tensor::DeviceContext;
@@ -17,8 +18,6 @@ use crate::tensor::DeviceMatrix;
 use crate::tensor::HiddenStates;
 use crate::tensor::active_cu_stream;
 use crate::tensor::has_stream_override;
-
-pub const DFLASH2_CANDIDATE_K: usize = 16;
 
 /// Fixed-capacity, stream-local scratch. FlashInfer selects directly from all
 /// input rows; the lattice ignores each anchor row. Tied boundary membership
