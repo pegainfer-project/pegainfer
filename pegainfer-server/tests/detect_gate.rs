@@ -2,13 +2,15 @@
 //!
 //! The line's `probe` and the server's `feature_gate_hint` have unit tests, but
 //! the wiring between them — `main` reading `config.json`, the registry's
-//! `detect`, the hint, and `launch`'s refusal — is only exercised by running the
-//! binary. This drives it against a model directory holding the frozen `qwen4_exp`
-//! config and asserts the two shipped outcomes: a stock build names the feature to
-//! rebuild with, an enabled build detects the line and then refuses to serve it.
+//! `detect`, the hint, and the call into the line's `launch` — is only exercised
+//! by running the binary. This drives it against a model directory holding the
+//! frozen `qwen4_exp` config and no weights, and asserts the two shipped
+//! outcomes: a stock build names the feature to rebuild with, an enabled build
+//! detects the line and its engine then fails to start.
 //!
-//! Neither path reaches CUDA: detection is pure, and `launch` bails before the
-//! engine is built.
+//! The stock path never reaches CUDA. The enabled one does: `launch` counts the
+//! visible cards and each card's worker opens its context before the missing
+//! weights stop it.
 
 use std::fs::File;
 use std::path::Path;
@@ -28,9 +30,9 @@ const FROZEN_CONFIG: &str = include_str!(concat!(
 
 /// The repo's own minimal tokenizer (`pegainfer-frontend/examples/echo-model`,
 /// the fixture `examples/echo-server.rs` serves). An enabled build reaches the
-/// serve path before `launch` bails, and the frontend refuses to start without a
-/// tokenizer — which would surface *that* error instead of the refusal. The
-/// engine failure then cancels the server so the refusal is what reaches stderr.
+/// serve path before `launch` fails, and the frontend refuses to start without a
+/// tokenizer — which would surface *that* error instead of the engine's. The
+/// engine failure then cancels the server so it is what reaches stderr.
 const TOKENIZER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../pegainfer-frontend/examples/echo-model/tokenizer.json"
@@ -100,20 +102,16 @@ fn stock_build_names_the_qwen4_feature() {
 
 #[cfg(feature = "qwen4")]
 #[test]
-fn enabled_build_detects_the_line_and_refuses_to_serve() {
+fn enabled_build_detects_the_line_and_launches_it() {
     let dir = model_dir("enabled");
     let (status, stderr) = run_against(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         !status.success(),
-        "the line must refuse to serve until inference is implemented"
+        "a model directory with no weights must not serve"
     );
     assert!(
-        stderr.contains("Qwen4"),
-        "stderr did not name the detected line:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("not implemented"),
-        "stderr did not carry the refusal reason:\n{stderr}"
+        stderr.contains("failed to start Qwen4 engine"),
+        "stderr did not show the detected line's engine failing to start:\n{stderr}"
     );
 }
