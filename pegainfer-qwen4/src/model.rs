@@ -1,9 +1,9 @@
 //! The model around the layers: the token embedding repeated into the
 //! hyper-connection stream, decoder layers in order, the top-level mixer that
 //! reads the stream out and the untied head. Any subset of the layers can be
-//! loaded, in checkpoint order; that is what one card can hold against the
-//! reference while serving still waits for all 48.
+//! loaded, in checkpoint order, and [`split`] spreads them over several cards.
 
+use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
@@ -28,10 +28,12 @@ use crate::weights::load_layer;
 
 #[cfg(test)]
 mod golden_gate;
+pub mod split;
 
 pub struct Model {
     pub g: Geometry,
-    pub bookends: Bookends,
+    /// The embedding and the readout, on the part of the model that runs either.
+    pub bookends: Option<Bookends>,
     /// Checkpoint index and weights of every loaded layer, in forward order.
     pub layers: Vec<(usize, DecoderLayer)>,
     pub rope: Rope,
@@ -59,24 +61,24 @@ pub struct Forward {
 }
 
 impl Model {
-    /// Load the bookends and the given layers, with RoPE tables for `positions`.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the model line is the next caller")
-    )]
+    /// Load the given layers, the bookends when asked, and RoPE tables for
+    /// `positions`.
     pub(crate) fn load(
         ctx: &DeviceContext,
         model_dir: &std::path::Path,
         config: &Config,
         layers: &[usize],
         positions: usize,
+        bookends: bool,
     ) -> Result<Self> {
         ensure!(
             layers.windows(2).all(|pair| pair[0] < pair[1]),
             "layers must be loaded in increasing order, got {layers:?}"
         );
         let g = Geometry::from_config(config);
-        let bookends = load_bookends(ctx, model_dir, config)?;
+        let bookends = bookends
+            .then(|| load_bookends(ctx, model_dir, config))
+            .transpose()?;
         let layers = layers
             .iter()
             .map(|&index| Ok((index, load_layer(ctx, model_dir, config, index)?)))
@@ -105,6 +107,12 @@ impl Model {
         Ok(ModelState { layers })
     }
 
+    fn bookends(&self) -> Result<&Bookends> {
+        self.bookends
+            .as_ref()
+            .context("this part of the model loads neither the embedding nor the head")
+    }
+
     /// The tokens' embeddings repeated `hc_count` times each: the stream row of
     /// a token is its embedding row written `hc_count` times in a row, so one
     /// gather with every id repeated fills `[rows, hc_count * hidden]` exactly.
@@ -116,7 +124,7 @@ impl Model {
             .collect();
         let ids_d: CudaSlice<u32> = ctx.stream.clone_htod(&repeated)?;
         let mut rows = HiddenStates::zeros(ctx, self.g.hidden, repeated.len())?;
-        embedding_batch(ctx, &self.bookends.embed, &ids_d, &mut rows)?;
+        embedding_batch(ctx, &self.bookends()?.embed, &ids_d, &mut rows)?;
         Ok(HiddenStates {
             data: rows.data,
             hidden_dim: self.g.stream_width(),
@@ -132,10 +140,11 @@ impl Model {
         stream: &HiddenStates,
     ) -> Result<(HiddenStates, HiddenStates)> {
         let g = &self.g;
+        let bookends = self.bookends()?;
         let rows = stream.seq_len;
         let mut scratch = HcMixScratch::new(ctx, rows, g.hidden, g.hc_count, g.hc_lowrank, false)?;
         let mut mixed = HiddenStates::zeros(ctx, g.hidden, rows)?;
-        let m = &self.bookends.mixer;
+        let m = &bookends.mixer;
         hc_mix_into(
             ctx,
             &m.norm,
@@ -150,8 +159,51 @@ impl Model {
             None,
         )?;
         let mut logits = HiddenStates::zeros(ctx, g.vocab, rows)?;
-        gemm_into_checked(ctx, &self.bookends.lm_head, &mixed, &mut logits)?;
+        gemm_into_checked(ctx, &bookends.lm_head, &mixed, &mut logits)?;
         Ok((mixed, logits))
+    }
+
+    fn check_state(&self, state: &ModelState) -> Result<()> {
+        ensure!(
+            state.layers.len() == self.layers.len(),
+            "the state holds {} layers, the model {}",
+            state.layers.len(),
+            self.layers.len()
+        );
+        Ok(())
+    }
+
+    fn layer_pass(
+        &self,
+        ctx: &DeviceContext,
+        layer: &DecoderLayer,
+        layer_state: &mut LayerState,
+        ids: &[u32],
+        input: &HiddenStates,
+        pass: Pass,
+    ) -> Result<LayerTrace> {
+        match pass {
+            Pass::Prefill(slot) => layer_prefill(
+                ctx,
+                &self.g,
+                layer,
+                &self.rope,
+                layer_state,
+                slot,
+                ids,
+                input,
+            ),
+            Pass::Decode(slots) => layer_decode(
+                ctx,
+                &self.g,
+                layer,
+                &self.rope,
+                layer_state,
+                slots,
+                ids,
+                input,
+            ),
+        }
     }
 
     /// `ids` are the tokens `stream_in` embeds: the whole prompt, or one token
@@ -164,38 +216,11 @@ impl Model {
         state: &mut ModelState,
         pass: Pass,
     ) -> Result<Forward> {
-        ensure!(
-            state.layers.len() == self.layers.len(),
-            "the state holds {} layers, the model {}",
-            state.layers.len(),
-            self.layers.len()
-        );
+        self.check_state(state)?;
         let mut traces: Vec<LayerTrace> = Vec::with_capacity(self.layers.len());
         for ((_, layer), layer_state) in self.layers.iter().zip(&mut state.layers) {
             let input = traces.last().map_or(&stream_in, |t| &t.stream_out);
-            let trace = match pass {
-                Pass::Prefill(slot) => layer_prefill(
-                    ctx,
-                    &self.g,
-                    layer,
-                    &self.rope,
-                    layer_state,
-                    slot,
-                    ids,
-                    input,
-                )?,
-                Pass::Decode(slots) => layer_decode(
-                    ctx,
-                    &self.g,
-                    layer,
-                    &self.rope,
-                    layer_state,
-                    slots,
-                    ids,
-                    input,
-                )?,
-            };
-            traces.push(trace);
+            traces.push(self.layer_pass(ctx, layer, layer_state, ids, input, pass)?);
         }
         let last = traces.last().map_or(&stream_in, |t| &t.stream_out);
         let (mixed, logits) = self.readout(ctx, last)?;
@@ -205,6 +230,26 @@ impl Model {
             mixed,
             logits,
         })
+    }
+
+    /// The stream the loaded layers leave after `pass`, each layer's stages
+    /// dropped once the next layer has its input.
+    fn advance(
+        &self,
+        ctx: &DeviceContext,
+        ids: &[u32],
+        stream_in: HiddenStates,
+        state: &mut ModelState,
+        pass: Pass,
+    ) -> Result<HiddenStates> {
+        self.check_state(state)?;
+        let mut stream = stream_in;
+        for ((_, layer), layer_state) in self.layers.iter().zip(&mut state.layers) {
+            stream = self
+                .layer_pass(ctx, layer, layer_state, ids, &stream, pass)?
+                .stream_out;
+        }
+        Ok(stream)
     }
 
     /// A whole prompt in `slot`, from the slot's fresh state.

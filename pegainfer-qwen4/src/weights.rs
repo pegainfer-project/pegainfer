@@ -196,10 +196,6 @@ pub struct DecoderLayer {
     pub moe: MoeBlock,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the model line is the next caller")
-)]
 pub(crate) fn load_config(model_dir: &Path) -> Result<Config> {
     let path = model_dir.join("config.json");
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
@@ -480,10 +476,6 @@ fn take_moe(loader: &mut StagedWeightLoader, slots: &MoeSlots) -> MoeBlock {
 
 /// Load one decoder layer. Only the shards holding that layer are mapped, so a
 /// checkpoint cut down to those shards loads too.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the model line is the next caller")
-)]
 pub(crate) fn load_layer(
     ctx: &DeviceContext,
     model_dir: &Path,
@@ -591,10 +583,6 @@ const MIXER_PREFIX: &str = "model.language_model.hyper_connection_mixer";
 const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
 const HEAD_NAME: &str = "lm_head.weight";
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the model line is the next caller")
-)]
 pub(crate) fn load_bookends(
     ctx: &DeviceContext,
     model_dir: &Path,
