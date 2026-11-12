@@ -1,29 +1,29 @@
-# ROCm 10.1 Qwen3 首版
+# Initial ROCm 10.1 support for Qwen3
 
-**TL;DR：** 原生 Rust + HIP/rocBLAS 路径已在 Radeon AI PRO R9700（gfx1201）运行 Qwen3-0.6B/4B BF16，支持 TP1、greedy、eager、chunked prefill、混合批次及共享 HTTP 前端。两模型均通过 HF golden 和真实 HTTP 生命周期检查。gfx1100 仅完成内核交叉编译，缺少 RDNA 3 实机；这是一版有明确边界的 RDNA 4 预览实现，尚未完成双架构稳定版。
+**TL;DR**: The native Rust + HIP/rocBLAS backend runs Qwen3-0.6B/4B BF16 on Radeon AI PRO R9700 (`gfx1201`), with TP1, greedy decoding, eager execution, chunked prefill, mixed batches, and the shared HTTP frontend. Both models passed HF golden gates and real HTTP lifecycle checks. `gfx1100` has only been cross-compiled; RDNA 3 hardware validation is outstanding. This is an RDNA 4 preview with a limited feature set, not a stable release qualified on both architectures.
 
 Last touched: 2026-11-12
 
-## 支持边界
+## Supported profile
 
-| 项目 | 本版状态 |
+| Area | Current support |
 | --- | --- |
-| 运行平台 | Linux x86_64；锁定的 ROCm 10.1.0 foundation；R9700 / gfx1201 |
-| 模型 | Qwen3-0.6B、Qwen3-4B 原始 BF16 safetensors；其他尺寸尚未取得资格 |
-| 执行 | 单 GPU，rocBLAS BF16 GEMM / FP32 累加，自有 HIP eager 算子 |
-| 调度 | 最多 `--rocm-slots` 个活跃请求，额外请求排队；chunked prefill 与 decode 可同批 |
-| 输出 | greedy；HTTP 显式设置 `temperature=0`，或 `top_k=1` |
-| HTTP | `/v1/completions`、`/v1/chat/completions`、SSE、usage、停止词、EOS、取消、metrics |
-| 上下文 | 默认 4096；配置范围 1–8192，且不能超过 checkpoint 上限；4B HTTP 边界实测 4096；8192 仅有算子资格 |
-| 并发与 chunk | slots 默认 4、范围 1–16；chunk 默认 128、范围 1–512；本次服务资格为 slots=4/chunk=128 |
-| 暂不支持 | HIP Graph、TP/RCCL、随机采样、logprobs/prompt scoring、prefix cache、paged KV、offload/P-D、LoRA、投机解码、量化及其他模型线 |
-| 其他架构 | gfx1100 内核编译通过；gfx1101/1102/1200 是编译器可选 target，均无本项目运行资格 |
+| Platform | Linux x86_64; locked ROCm 10.1.0 foundation image; R9700 / gfx1201 |
+| Models | Qwen3-0.6B and Qwen3-4B with original BF16 safetensors weights; other sizes are not yet qualified |
+| Execution | Single GPU, rocBLAS BF16 GEMM with FP32 accumulation, native HIP eager operators |
+| Scheduling | Up to `--rocm-slots` active requests, with excess requests queued; prefill chunks and decode rows can share a batch |
+| Token selection | Greedy; HTTP clients must explicitly set `temperature=0` or `top_k=1` |
+| HTTP | `/v1/completions`, `/v1/chat/completions`, SSE, usage, stop strings, EOS, cancellation, and metrics |
+| Context | Default 4096; configurable from 1 to 8192, bounded by the checkpoint limit; the 4B HTTP boundary was tested at 4096; 8192 has operator-level qualification only |
+| Slots and chunks | Slots default to 4, range 1–16; chunk size defaults to 128, range 1–512; serving qualification used slots=4/chunk=128 |
+| Unsupported features | HIP Graph, TP/RCCL, random sampling, logprobs/prompt scoring, prefix cache, paged KV, offload/P-D, LoRA, speculative decoding, quantization, and other model families |
+| Other architectures | gfx1100 kernels cross-compile; gfx1101/1102/1200 are accepted compiler targets, but none has runtime qualification in this project |
 
-后端使用固定 KV 槽位，槽位回收后重新从 position 0 写入。它没有 CUDA 后端的共享 prefix/page/offload 状态，不能据此宣称已经迁移这些子系统。启动日志会显示实际 profile；显式要求 `--cuda-graph=true` 或 `--tp-size` 大于 1 时拒绝启动。HTTP 采样、评分、KV transfer 请求在打开 SSE 前返回带原因的 400；scheduler 也保留内部请求校验。
+The backend uses fixed KV slots. Reclaimed slots restart writing at position 0. The CUDA backend's shared prefix, page, and offload state has not been ported. Startup logs identify the execution profile; explicitly requesting `--cuda-graph=true` or a `--tp-size` greater than 1 rejects startup. Unsupported HTTP sampling, scoring, and KV transfer requests receive a 400 response with a reason before an SSE stream opens. The scheduler also validates internal requests.
 
-## 构建与运行
+## Build and run
 
-从本 worktree 根目录运行。工作区已有共享入口 `/home/zihaomu/zihaomu_workspace/rocm10-launch.sh` 和冻结的 foundation 镜像；本项目 launcher 每次先验证 foundation，再校验项目的 HIP/rocBLAS 文件 hash 与 compiler 身份。默认选择 HIP ordinal 2，即物理 GPU0（PCI `0000:03:00.0`）。本机 HIP 顺序与 amd-smi 物理编号不同；HIP ordinal 0 实际是物理 GPU3。项目入口在共享 verifier 执行 GPU 计算之前先做只读 PCI 校验，拒绝错误映射及物理 GPU3。
+Run these commands from the worktree root. The qualification workspace provides `/home/zihaomu/zihaomu_workspace/rocm10-launch.sh` and the locked foundation image. The project launcher validates the foundation, then checks the project HIP/rocBLAS file hashes and compiler identity. It defaults to HIP ordinal 2, which maps to physical GPU0, PCI `0000:03:00.0`. HIP enumeration differs from amd-smi physical numbering on this host: HIP ordinal 0 maps to physical GPU3. Before the shared verifier performs GPU computation, the project launcher checks PCI metadata and rejects an unexpected mapping or the excluded physical GPU3.
 
 ```bash
 HIP_VISIBLE_DEVICES=2 scripts/amd/run_rocm10.sh bash scripts/amd/bootstrap.sh
@@ -31,9 +31,9 @@ HIP_VISIBLE_DEVICES=2 scripts/amd/run_rocm10.sh cargo build --locked --release \
   -p pegainfer-server --no-default-features --features rocm,qwen3
 ```
 
-`bootstrap.sh` 将 Rust toolchain 和 OpenSSL 开发文件放到工作区 `artifacts/amd/toolchain`，不会修改基础镜像。Rust 版本由已有 `rust-toolchain.toml` 固定为 `nightly-2026-07-10`。首次构建需要联网获取 Cargo.lock 指定的依赖；OpenSSL 包、rustup 安装脚本会检查已固定的 SHA256。上游移除这些版本时需要重新取得环境资格，不应静默替换。
+`bootstrap.sh` installs the Rust toolchain and OpenSSL development files under the workspace's `artifacts/amd/toolchain`, without changing the foundation image. The existing `rust-toolchain.toml` pins Rust to `nightly-2026-07-10`. The first build needs network access to fetch dependencies pinned in `Cargo.lock`. The OpenSSL packages and rustup installer are checked against pinned SHA256 hashes. If upstream removes a pinned version, qualify its replacement instead of silently substituting it.
 
-模型下载也固定 revision。下面两条命令已在本工作区执行，当前权重已存在：
+Model downloads also use pinned revisions. Both commands below have been executed in the qualification workspace, where the weights are already present:
 
 ```bash
 HIP_VISIBLE_DEVICES=2 scripts/amd/run_rocm10.sh python scripts/amd/download_models.py \
@@ -42,40 +42,40 @@ HIP_VISIBLE_DEVICES=2 scripts/amd/run_rocm10.sh python scripts/amd/download_mode
   --model Qwen/Qwen3-4B --output ../models/Qwen3-4B
 ```
 
-实际服务参数记录在验收报告的 `http.4B.command` 中；使用项目 launcher 运行其中的二进制，可保证运行时库与编译环境一致。面向宿主机的服务启动命令见本文末尾。每次请求需要显式指定 greedy 参数。
+The exact serving arguments are recorded in `http.4B.command` in the qualification report. Run that binary through the project launcher to use the same runtime libraries as the build. A host-accessible launch example appears at the end of this document. Each request must explicitly select greedy decoding.
 
-## 实现结构与所有权
+## Implementation and ownership
 
-| 入口 | 职责 |
+| Entry point | Responsibility |
 | --- | --- |
-| `pegainfer-build/src/rocm.rs` | 独立 HIP 编译与归档；wheel SDK 的项目内 linker aliases；gfx 列表进入编译产物身份 |
-| `pegainfer-device` | HIP device/stream、rocBLAS handle、typed Buffer、同步拷贝、跨线程重新绑定 |
-| `pegainfer-kernels/csrc/hip/qwen3.cpp` | embedding、RMSNorm、残差、SiLU、RoPE、KV append、causal GQA attention、argmax、rocBLAS GEMM |
-| `pegainfer-kernels/src/rocm.rs` | ABI 封装，校验 shape、容量、buffer 所属 device/stream |
-| `pegainfer-qwen3/src/rocm/model.rs` | 复用 Qwen3 config/EOS/vocabulary；BF16 权重加载、内存预算、连续 KV append、ragged forward |
-| `pegainfer-qwen3/src/rocm/scheduler.rs` | 复用 `RequestLedger` 与 step contract，负责排队、槽位、chunk、停止和取消 |
-| `pegainfer-frontend` / `pegainfer-server` | 复用 vLLM Rust HTTP 前端；ServePlan 可指定请求校验 router，CUDA 默认行为保持原样 |
-| `scripts/amd` | 项目环境锁、下载、构建环境、真实算子/golden/HTTP/CLI 资格检查与证据归档 |
+| `pegainfer-build/src/rocm.rs` | Independent HIP compilation and archiving; project-local linker aliases for the wheel SDK; compiled gfx targets recorded in the artifact |
+| `pegainfer-device` | HIP device/stream, rocBLAS handle, typed buffers, synchronous host copies, and device rebinding across threads |
+| `pegainfer-kernels/csrc/hip/qwen3.cpp` | Embedding, RMSNorm, residual addition, SiLU, RoPE, KV append, causal GQA attention, argmax, and rocBLAS GEMM |
+| `pegainfer-kernels/src/rocm.rs` | ABI wrappers that check shapes, capacity, and buffer ownership by device/stream |
+| `pegainfer-qwen3/src/rocm/model.rs` | Shared Qwen3 config/EOS/vocabulary handling; BF16 weight loading, memory budgeting, contiguous KV appends, and ragged forward execution |
+| `pegainfer-qwen3/src/rocm/scheduler.rs` | Shared `RequestLedger` and step contract; queues, slots, chunks, stopping, and cancellation |
+| `pegainfer-frontend` / `pegainfer-server` | Shared vLLM Rust HTTP frontend; an optional request-validation router in `ServePlan`, with the existing default CUDA routing preserved |
+| `scripts/amd` | Project environment lock, downloads, build environment, real operator/golden/HTTP/CLI qualification, and evidence capture |
 
-CUDA 实现保存在 Qwen3 的 `cuda.rs`，在原 crate root 条件展开；原有符号路径保留。默认 feature 仍选 CUDA。ROCm build 在任何 CUDA toolkit 探测、子模块初始化前分流，且不编译 `cudarc`、CUPTI、CUDA sampling/KV/offload。CUDA 依赖的其他模型显式保留 CUDA feature，避免根 workspace 关闭默认依赖 feature 后改变它们的构建选择。CUDA 与 ROCm feature 互斥，因此不要用 `--all-features` 验收两后端，应建立分别运行的 CI job。
+The Qwen3 CUDA implementation is kept in `cuda.rs`, conditionally included at the original crate root to preserve symbol paths. CUDA remains the default feature. ROCm builds branch before CUDA toolkit discovery or submodule initialization and do not compile `cudarc`, CUPTI, or CUDA sampling/KV/offload dependencies. Other models that depend on CUDA explicitly retain the CUDA feature, preserving their backend selection after workspace dependencies disable default features. CUDA and ROCm features are mutually exclusive; use separate CI jobs for each backend rather than `--all-features`.
 
-设备资源由 `Arc` 保持生命周期，stream 上的提交由 mutex 串行化。跨线程使用前重新绑定 HIP device；H2D/D2H 返回前完成 stream 同步，host 临时数据不会先于拷贝释放。Buffer drop 等待 stream 后释放分配，所有 Buffer 释放后才销毁 runtime。模型在 GPU 步骤开始时置为不可复用状态，仅完整成功后恢复；部分失败不能继续使用已被部分更新的 KV。
+Device resources are kept alive by `Arc`, and a mutex serializes submissions to the stream. Each submission rebinds the HIP device on its calling thread. H2D/D2H copies synchronize the stream before returning, so temporary host memory remains valid until the copy completes. Buffer destruction waits for the stream before freeing memory; the runtime is destroyed after its last buffer owner is released. A model becomes unusable when a GPU step begins and returns to a usable state only after the entire step succeeds. A failed step cannot reuse partially updated KV.
 
-固定槽位的 KV 字节数为 `slots × context × layers × kv_heads × head_dim × 2(K,V) × 2(BF16)`。Qwen3-4B 的 slots=4/context=4096 约占 **2.25 GiB** KV；还需权重、scratch、库 workspace 和预留空间。启动前按实际可用显存检查预算，分配失败会保留错误上下文。metrics 的 KV 使用率表示**活跃槽位所占的预留容量比例**，不是已写 token 的比例；取消后保留底层 pool，复用槽位，不逐请求释放整块显存。
+Fixed-slot KV allocation is `slots × context × layers × kv_heads × head_dim × 2(K,V) × 2(BF16)` bytes. Qwen3-4B with slots=4/context=4096 reserves approximately **2.25 GiB** for KV, in addition to weights, scratch buffers, library workspace, and headroom. Startup checks the budget against available VRAM and retains error context if allocation fails. The KV usage metric reports **the fraction of reserved capacity assigned to active slots**, rather than the fraction containing written tokens. Cancellation reclaims slots while keeping the underlying allocation available for reuse.
 
-attention 是首版正确性基线：每个 query/head 对自己的连续 KV 做 FP32 score/softmax/归约，输出 BF16。没有采用 CUDA 的 warp/PTX 假设；wave 宽度由目标决定。它不是性能优化后的 paged/flash attention，长 prefill 的代价较高。后续优化必须继续通过同一数值和生命周期门限。
+The initial attention kernel establishes a correctness baseline: each query/head computes FP32 scores, softmax, and reductions over its own contiguous KV, then writes BF16 output. Wave width is determined by the target; the implementation does not inherit CUDA warp/PTX assumptions. This is not an optimized paged/flash attention implementation, and long prefills are expensive. Future optimizations must continue to pass the same numerical and lifecycle gates.
 
-## 本次验证结果
+## Validation results
 
-环境身份来自 [environment.lock.json](../../../scripts/amd/environment.lock.json)。运行设备为物理 GPU0，PCI `0000:03:00.0`，UUID `29ff7551-0000-1000-80dc-b03ca15afb63`；容器内 ordinal 0。ROCm release 是 **10.1.0**，HIP component **7.16.26385**，AMD clang revision `d6f6cb691863e9258034ab48c1dfce21689d5606`；HIP 版本没有以 10 开头是该冻结环境的正常身份。
+Environment identities are pinned in [environment.lock.json](../../../scripts/amd/environment.lock.json). The tested device was physical GPU0, PCI `0000:03:00.0`, UUID `29ff7551-0000-1000-80dc-b03ca15afb63`, exposed as logical device 0 inside the container. The stack uses ROCm **10.1.0**, HIP component **7.16.26385**, and AMD clang revision `d6f6cb691863e9258034ab48c1dfce21689d5606`. A HIP version beginning with 7.16 is the expected component identity in this ROCm 10.1.0 image.
 
-运行时不依赖 Python/Torch。CPU Torch 只用于原生算子的独立参考；foundation 的 Torch/Triton 配对保持不变。
+The serving runtime does not depend on Python or Torch. CPU Torch supplies the independent native-operator reference; the foundation's Torch/Triton pairing remains unchanged.
 
-### 数值
+### Numerical gates
 
-复用仓库既有 HF BF16 fixtures，48 条 prompt，长度 8–247，逐条 teacher-force 16 个 decode token。每条执行路径覆盖 **816 个位置 / 6528 个 top-8 logprob 比较**，并检查 GPU argmax 与 CPU tie-break 一致。维持原门限：mean ≤ 0.06、p99 ≤ 0.20、HF argmax regret ≤ 0.20，未放宽门限。
+The tests reuse the repository's HF BF16 fixtures: 48 prompts of length 8–247, each followed by 16 teacher-forced decode tokens. Each execution path covers **816 scored positions / 6528 top-8 logprob comparisons** and checks GPU argmax against the CPU tie-breaking rule. Existing thresholds remain unchanged: mean ≤ 0.06, p99 ≤ 0.20, and HF argmax regret ≤ 0.20.
 
-| 模型 | 路径 | mean | p99 |
+| Model | Path | Mean | p99 |
 | --- | --- | ---: | ---: |
 | Qwen3-0.6B | sequential | 0.040036 | 0.148445 |
 | Qwen3-0.6B | ragged batch4 | 0.039923 | 0.148720 |
@@ -84,54 +84,54 @@ attention 是首版正确性基线：每个 query/head 对自己的连续 KV 做
 | Qwen3-4B | ragged batch4 | 0.031099 | 0.108667 |
 | Qwen3-4B | mixed prefill/decode batch4 | 0.031145 | 0.111609 |
 
-每个模型另外执行固定 shape 的重复 logits 检查；mixed pass 实际执行 52 次 prefill/decode 同批步骤。共计两模型三条路径 **4896 个位置**。
+Each model also passes a repeated-logits check at a fixed shape. The mixed pass executes 52 steps containing both prefill and decode rows. Across both models and all three paths, the gates cover **4896 scored positions**.
 
-独立 HIP 算子检查包含 9 项：RMSNorm、GEMM、残差、SiLU、RoPE、position 8191 内的高位置 RoPE、ragged causal attention、context=8192 attention、argmax ties。高位置 RoPE 最大绝对误差为 0.0078125，其余所测数值项为 0；这是这些固定输入的结果，不是对所有 shape 的精确等价声明。
+The independent HIP operator checks cover nine cases: RMSNorm, GEMM, residual addition, SiLU, RoPE, high-position RoPE through position 8191, ragged causal attention, attention at context=8192, and argmax ties. Maximum absolute error was 0.0078125 for high-position RoPE and zero for the other measured numerical cases. These are results for the tested inputs, not an exact-equivalence claim for every shape.
 
-**参考溯源限制：** 当前权重 revision 已固定，但上游提交的 golden metadata 没有 checkpoint revision/config hash。因此本次是对仓库既有 fixture 的兼容验收，不能宣称已证明 fixture 与当前 snapshot 的字节身份相同。qualification 保存原 fixture metadata/hash 和当前完整模型文件 hash，后续应重建带完整来源的参考，保留原 gate。
+**Reference provenance limitation:** Current weight revisions are pinned, but the committed upstream golden metadata lacks checkpoint revisions and config hashes. These gates establish compatibility with the existing fixtures; they do not prove that the fixture's original checkpoint is byte-identical to the current snapshot. The qualification record preserves the original fixture metadata/hashes and current model file hashes. A follow-up should generate references with complete provenance while retaining the existing gate.
 
-### 服务与资源
+### Serving and resource lifecycle
 
-- 每模型 16 条流式请求，客户端 concurrency=8、服务槽位=4；输入长度不同，跨 chunk 边界，验证 SSE `[DONE]`、finish reason 和 usage。
-- 非流式 completion、chat、stop string；4B 的 4094-token prompt + 2-token output 触达 4096 边界，超限返回 400。
-- 4 个活跃请求 + 1 个等待请求时，分别断开等待连接及活跃连接；确认 running/waiting/KV 使用率全部归零，再成功接入 4 个请求。
-- sampling、logprobs、prompt scoring、echo、KV transfer 均有真实 HTTP 400 检查。TP2、graph、非法容量、量化 checkpoint 有真实 CLI 拒绝检查。
-- SIGINT 正常关闭并等待进程退出。设备层验证 Buffer 在创建者 Device 被 drop 后仍能跨线程读取，以及拷贝边界、零初始化和溢出拒绝。
-- 共享 host 单测：core 9、frontend 97、Qwen3 config 7；server 4；release build、fmt、clippy 通过。clippy 仍有共享 config 在 ROCm 下未使用等 warning；未把 warning-free 当作验收结果。
+- Each model serves 16 streaming requests at client concurrency=8 with 4 engine slots. Inputs vary in length and cross chunk boundaries; checks cover SSE `[DONE]`, finish reasons, and usage.
+- Non-streaming completions, chat, and stop strings are exercised. The 4B boundary case uses a 4094-token prompt and 2 output tokens to reach 4096; over-limit requests return 400.
+- With 4 active requests and 1 queued request, the test disconnects the queued client and then the active clients. Running, waiting, and KV usage metrics must return to zero, after which 4 new requests complete successfully.
+- Real HTTP requests verify 400 responses for sampling, logprobs, prompt scoring, echo, and KV transfer. Production CLI checks reject TP2, graph execution, invalid capacities, and quantized checkpoints.
+- SIGINT shuts down the server cleanly and the harness waits for process exit. Device tests verify buffer reads after the creating `Device` is dropped, including a thread handoff, plus copy bounds, zero initialization, and allocation-size overflow rejection.
+- Shared host unit tests pass: core 9, frontend 97, Qwen3 config 7, and server 4. Release build, formatting, and Clippy checks pass. Clippy still reports warnings, including shared config items unused under ROCm; this is not a warning-free result.
 
-HTTP 报告保留延迟与文本以便排障；没有执行配对性能基准或两小时稳定性实验，不能据此报告相对 CUDA/vLLM 的性能提升。
+HTTP reports retain latency and text for diagnosis. No paired performance benchmark or two-hour stability run was performed, so these results do not establish a performance gain over CUDA or vLLM.
 
-### 复现与证据
+### Reproduction and evidence
 
 ```bash
 HIP_VISIBLE_DEVICES=2 scripts/amd/run_rocm10.sh bash scripts/amd/qualify.sh \
   ../artifacts/amd/qualification/rocm10-v1
 ```
 
-此命令要求一个新的输出目录，防止旧日志混入新资格。重跑时改成新目录。验收脚本执行 release build、设备、原生数值、host/server 单测、CLI、两模型 golden/HTTP、fmt、clippy，全部通过后生成 `qualification.json`。
+This command requires a fresh output directory to prevent old logs from entering a new qualification record. Choose a new directory when rerunning it. The script runs the release build, device tests, native numerical checks, host/server unit tests, CLI checks, golden and HTTP gates for both models, formatting, and Clippy. It writes `qualification.json` only after every stage passes.
 
-当前完整证据位于工作区 `artifacts/amd/qualification/rocm10-v1/`，包括 foundation report、每项日志、HTTP 请求/响应、tracked patch，以及修改源码、二进制、Cargo.lock、模型和 fixture 的 SHA256。验收发生在提交前，报告通过 baseline commit + dirty-source hashes 标识被测候选；提交前再次核对实现文件与这些 hash 一致。原始日志及模型文件保留在工作区，不随 Git 提交发布。
+The accepted evidence is retained in the workspace at `artifacts/amd/qualification/rocm10-v1/`: foundation report, individual logs, HTTP requests/responses, tracked patch, and SHA256 hashes for changed source files, the executable, `Cargo.lock`, model files, and fixtures. Qualification ran before commit, so the report identifies the tested candidate by its baseline commit and dirty-source hashes. Implementation files were checked against those hashes again before commit. Raw logs and model files remain in the workspace and are not published in Git.
 
-RDNA 3 的编译检查使用同一 ROCm 10.1 toolchain 与独立 target directory：
+The RDNA 3 compilation check uses the same ROCm 10.1 toolchain with a separate target directory:
 
 ```bash
 HIP_VISIBLE_DEVICES=2 PEGAINFER_ROCM_ARCH=gfx1100 scripts/amd/run_rocm10.sh \
   cargo build --release -p pegainfer-kernels --no-default-features --features rocm
 ```
 
-对应 `artifacts/amd/qualification/rocm10-v1/cross-gfx1100.log`。该命令运行 foundation 的 gfx1201 环境检查，然后**仅编译** gfx1100 kernel/device 产物，没有执行 gfx1100 code object，也没有验证 RDNA 3 rocBLAS solution。实际设备架构必须在模型加载时与编译 target 列表匹配。
+Its log is `artifacts/amd/qualification/rocm10-v1/cross-gfx1100.log`. The command runs the foundation's gfx1201 environment check, then **only compiles** gfx1100 kernel/device artifacts. It does not execute a gfx1100 code object or validate RDNA 3 rocBLAS solutions. Model loading requires the actual device architecture to match one of the binary's compiled targets.
 
-**设备选择事件：** 初轮测试误将 HIP ordinal 0 当成 amd-smi 物理 GPU0；最终记录实际 PCI 时发现它是被排除的物理 GPU3。初轮 `qualification` 已标为无效并移到 `rocm10-v1-invalid-device-selection`。本文表格对应新增 PCI 守卫后、在物理 GPU0 重新执行的整套验收。`artifacts/amd/INVALID_DEVICE_SELECTION.md` 标明早期 bootstrap/native/http 记录不作为最终资格；错误的 `HIP_VISIBLE_DEVICES=0` 现已验证会在任何 verifier GPU 运算前被拒绝。
+**Device-selection incident:** The initial tests incorrectly treated HIP ordinal 0 as amd-smi physical GPU0. Recording the actual PCI address revealed that it was the excluded physical GPU3. That qualification was invalidated and moved to `rocm10-v1-invalid-device-selection`. The table above reflects the complete suite rerun on physical GPU0 after adding the PCI guard. `artifacts/amd/INVALID_DEVICE_SELECTION.md` marks the earlier bootstrap/native/HTTP records as excluded from final qualification. An incorrect `HIP_VISIBLE_DEVICES=0` selection is now verified to fail before the verifier performs GPU computation.
 
-## 与完整适配计划的关系和下一步
+## Relationship to the full adaptation plan
 
-本版先完成可运行的原生 Qwen3 垂直路径。它复用 config、RequestLedger 和 HTTP contract，但尚未把 CUDA executor、paged KV、sampling 和统一设备 facade 全部迁到共同类型。固定槽位和 rocBLAS 是为尽早验证正确性而作的明确阶段选择；这些限制不等价于完整计划 M1–M3 已完成。
+This release establishes a working native Qwen3 path through model execution and serving. It reuses config, `RequestLedger`, and the HTTP contract, but has not migrated the CUDA executor, paged KV, sampling, or device abstractions to common types. Fixed slots and rocBLAS are deliberate intermediate choices to establish correctness early. They do not complete milestones M1–M3 of the full adaptation plan.
 
-下一步优先在 gfx1100 真机执行相同 gate、补 CUDA GPU 回归与独立后端 CI，再把固定槽位换为可保留生命周期契约的 paged KV，补随机采样/logprobs，随后进入 HIP Graph 和 attention/GEMM 性能优化。long-context HF reference、GPU 失效注入、完整 OOM 恢复和更大并发资格也仍需补齐。
+Next, run the same gates on gfx1100 hardware, add CUDA GPU regression coverage and separate backend CI jobs, then replace fixed slots with paged KV while preserving ownership and lifecycle guarantees. Add random sampling/logprobs before proceeding to HIP Graph and attention/GEMM optimization. Long-context HF references, GPU failure injection, full OOM recovery, and qualification at higher concurrency also remain outstanding.
 
-## 启动检查记录
+## Host-accessible launch check
 
-以下命令在物理 GPU0 上启动了 4B 服务，宿主机访问成功。测试以外层超时发送 SIGINT 收尾，交互使用时直接运行下面命令，Ctrl-C 结束：
+The following command started the 4B server on physical GPU0 and served requests from the host. The recorded check used an outer timeout to send SIGINT afterward. For interactive use, run the command directly and stop it with Ctrl-C:
 
 ```bash
 HIP_VISIBLE_DEVICES=2 ROCM10_NETWORK=host scripts/amd/run_rocm10.sh \
@@ -141,7 +141,7 @@ HIP_VISIBLE_DEVICES=2 ROCM10_NETWORK=host scripts/amd/run_rocm10.sh \
   --rocm-max-context 4096 --rocm-chunk-size 128
 ```
 
-服务使用共享前端的监听配置，host network 模式将端口暴露给宿主机网络。客户端验证：
+The service uses the shared frontend's listener configuration. Host networking exposes the port on the host network. The recorded client request below intentionally tests Chinese input; its payload is preserved verbatim:
 
 ```bash
 curl --fail --silent --show-error http://127.0.0.1:18302/v1/chat/completions \
@@ -149,4 +149,4 @@ curl --fail --silent --show-error http://127.0.0.1:18302/v1/chat/completions \
   -d '{"model":"qwen3-rocm","messages":[{"role":"user","content":"请用中文回答：2 加 2 等于几？"}],"temperature":0,"max_tokens":32,"chat_template_kwargs":{"enable_thinking":false}}'
 ```
 
-实际回答为“2 加 2 等于 4。”。`host-server.log`、`host-response.json` 和 `host-curl-response.json` 保存在最终资格目录。本次交付不留下后台推理服务。
+The recorded response was `2 加 2 等于 4。` ("2 plus 2 equals 4."). `host-server.log`, `host-response.json`, and `host-curl-response.json` are retained in the final qualification directory. The check left no background inference service running.
