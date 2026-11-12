@@ -10,27 +10,17 @@ use crate::sizing;
 /// draft buffers live outside the paged `KvCacheManager`). Split by how it scales:
 ///
 /// - `kv_bytes_per_token` scales with the KV pool (billed by shrinking the target
-///   block count): the draft's own KV cache plus the per-request context-projection
-///   and pending-context buffers, which currently persist at prompt length per
-///   request (see `dflash-speculative-decoding.md` — collapsing that persistence
-///   is a tracked follow-up that would shrink this term to the draft KV alone).
+///   block count): a conservative allowance for the paged draft pool and dense
+///   request mirrors, retaining the former context/tail/capture budget.
 /// - `fixed_bytes` does not scale with the pool (billed via the memory margin):
-///   the draft weights plus the lane-level batched scratch sized for the whole
-///   decode batch.
-// TODO: the draft scratch is now a single lane-level `DFlashBatchScratch`
-// allocated once (dense buffers sized `max_batch * block_size`, plus one shared
-// varlen tail), not a per-request buffer. The per-token `tail_scratch` term and
-// the per-request `block_headroom` tail term are therefore over-estimates — kept
-// as a conservative upper bound until the accounting is retuned against the
-// batched allocation.
+///   the draft weights, lane-level draft/materialize scratch, and the in-fill
+///   block beyond each request's committed K/V.
 pub(crate) struct DFlashMemoryReservation {
     pub(crate) kv_bytes_per_token: usize,
-    /// The subset of [`Self::kv_bytes_per_token`] each *request* owns: the draft
-    /// KV, the projected-context scratch, and the pending capture buffer. The
-    /// tail scratch is lane-level and shared, so it is excluded here. The lane
+    /// The subset of [`Self::kv_bytes_per_token`] each *request* owns: its dense
+    /// draft K/V mirror. The paged pool is shared across requests. The lane
     /// charges this per token of a request's `max_cache_len` against the draft
-    /// budget, which is what keeps shared prefixes from overcommitting state
-    /// the pool reservation only billed once.
+    /// state budget to limit the extra mirrors allocated for shared prefixes.
     pub(crate) request_state_bytes_per_token: usize,
     pub(crate) fixed_bytes: usize,
     /// Drafter block size, surfaced so startup budgets (hedge scratch pages,
@@ -69,18 +59,21 @@ impl DFlashMemoryReservation {
         // Per-sequence-token, pool-scaling buffers.
         // DFlashLayerCache k+v
         let draft_kv = sizing::product(&[config.num_hidden_layers, 2, kv_dim, BF16])?;
-        // Scratch split by what it tracks: `context_*` grows with the committed
-        // prefix; `tail_input` grows with the in-fill tail, one block past it.
-        let context_scratch = sizing::product(&[2, hidden, BF16])?; // context_projected + context_hidden
-        let tail_scratch = sizing::product(&[hidden, BF16])?;
-        let pending = sizing::product(&[hidden, capture_layers, BF16])?; // context_feature_dim
-        // Conservative per-token term: it covers the paged draft KV pool
-        // (draft_kv), the per-request mirror (draft_kv), the shared tail scratch,
-        // and the (now unused) capture/context buffers. The stage-2 pool is
-        // addressed by target block IDs and shares the target radix cache's
-        // lifetime; a later pass can tighten this term once the lane-level
-        // materialize scratch is billed explicitly.
-        let kv_bytes_per_token = sizing::sum(&[draft_kv, context_scratch, tail_scratch, pending])?;
+        // Preserve the upstream pool allowance. These retired buffer terms are
+        // retained budget, not live allocations; retuning it requires revisiting
+        // both the shared pool and the lane's request-mirror admission budget.
+        let context_allowance = sizing::product(&[2, hidden, BF16])?;
+        let tail_allowance = sizing::product(&[
+            sizing::sum(&[hidden, sizing::product(&[2, kv_dim])?])?,
+            BF16,
+        ])?;
+        let capture_allowance = sizing::product(&[hidden, capture_layers, BF16])?;
+        let kv_bytes_per_token = sizing::sum(&[
+            draft_kv,
+            context_allowance,
+            tail_allowance,
+            capture_allowance,
+        ])?;
         // Per-request state is just the dense draft K/V mirror; the paged pool
         // is shared by every request.
         let request_state_bytes_per_token = draft_kv;
@@ -123,16 +116,10 @@ impl DFlashMemoryReservation {
         let weights = sizing::sum(&[sizing::product(&[per_layer, config.num_hidden_layers])?, fc])?;
         let weights = sizing::sum(&[weights, weights / 10])?;
 
-        // The durable draft KV and the tail scratch are sized to `context +
-        // block_size` — one in-fill block past the lifetime the KV pool reserves
-        // for the request. The per-token term bills only the pool's tokens, so
-        // reserve that one-block headroom per concurrently decoding request to
-        // keep the reservation an upper bound.
-        let block_headroom = sizing::product(&[
-            max_decode_batch_size,
-            config.block_size,
-            sizing::sum(&[draft_kv, tail_scratch])?,
-        ])?;
+        // Each dense request mirror has one in-fill block beyond the committed
+        // context; the per-token term bills only the pool's tokens.
+        let block_headroom =
+            sizing::product(&[max_decode_batch_size, config.block_size, draft_kv])?;
 
         let native = if let Some(conv) = &config.conv {
             let dynamic_width = sizing::product(&[2, conv.taps, hidden / conv.group_size])?;
@@ -155,7 +142,7 @@ impl DFlashMemoryReservation {
         };
 
         // Lane-level materialize scratch: captured rows, the fused context, a
-        // dummy query window, one layer's K/V, and the slot index list. Sized
+        // dummy query window, and the slot index list. Sized
         // for the largest prefill chunk (or one draft block), allocated once.
         let materialize_rows = max_prefill_tokens.max(config.block_size.saturating_add(1));
         let capture_dim = sizing::product(&[hidden, capture_layers])?;
@@ -163,7 +150,6 @@ impl DFlashMemoryReservation {
             sizing::product(&[capture_dim, materialize_rows, BF16])?,
             sizing::product(&[2 * hidden, materialize_rows, BF16])?,
             sizing::product(&[q_dim, materialize_rows, BF16])?,
-            sizing::product(&[2 * kv_dim, materialize_rows, BF16])?,
             sizing::product(&[materialize_rows, 4])?,
         ])?;
 

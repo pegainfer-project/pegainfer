@@ -7,6 +7,7 @@ use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
+use super::attention::checked_row_offset;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 use crate::tensor::HiddenStates;
@@ -39,11 +40,13 @@ fn validate(
             hidden, src.hidden_dim,
             "{op} buffer pairs disagree on hidden_dim"
         );
-        let rows_bound = if gather { dst.seq_len } else { src.seq_len };
-        assert!(
-            rows <= rows_bound,
-            "{op} source rows {rows} exceed seq_len {rows_bound}"
-        );
+        if gather {
+            assert!(
+                rows <= dst.seq_len,
+                "{op} destination rows {rows} exceed seq_len {}",
+                dst.seq_len
+            );
+        }
     }
     assert!(
         locs.len() >= rows,
@@ -56,6 +59,7 @@ fn validate(
 fn launch(
     ctx: &DeviceContext,
     pairs: &mut [(&HiddenStates, &mut HiddenStates)],
+    source_row_offset: usize,
     locs: &CudaSlice<i32>,
     rows: usize,
     gather: bool,
@@ -75,9 +79,14 @@ fn launch(
     let mut dsts = [std::ptr::null_mut::<ffi::Half>(); MAX_PAIRS];
     let mut guards = Vec::with_capacity(2 * pair_count);
     for (i, (src, dst)) in pairs.iter_mut().enumerate() {
+        let source_byte_offset = if gather {
+            0
+        } else {
+            checked_row_offset(src, source_row_offset, rows, op)?
+        };
         let (src_ptr, src_guard) = src.data.device_ptr(&ctx.stream);
         let (dst_ptr, dst_guard) = dst.data.device_ptr_mut(&ctx.stream);
-        srcs[i] = src_ptr as *const ffi::Half;
+        srcs[i] = (src_ptr + source_byte_offset) as *const ffi::Half;
         dsts[i] = dst_ptr as *mut ffi::Half;
         guards.push(src_guard);
         guards.push(dst_guard);
@@ -113,16 +122,17 @@ fn launch(
     Ok(())
 }
 
-/// Write `rows` rows of each source into the slots `locs[0..rows]` names in
-/// the matching destination. Every location must index a row of every
-/// destination; the page table that produces them is validated by the caller.
+/// Write `rows` rows starting at `source_row_offset` in each source into the
+/// slots `locs[0..rows]` names in the matching destination. Every location must
+/// index a destination row; the caller validates the page table.
 pub fn draft_kv_scatter_into(
     ctx: &DeviceContext,
     pairs: &mut [(&HiddenStates, &mut HiddenStates)],
+    source_row_offset: usize,
     locs: &CudaSlice<i32>,
     rows: usize,
 ) -> Result<()> {
-    launch(ctx, pairs, locs, rows, false)
+    launch(ctx, pairs, source_row_offset, locs, rows, false)
 }
 
 /// Read the slots `locs[0..rows]` of each source into the first `rows` rows of
@@ -133,5 +143,5 @@ pub fn draft_kv_gather_into(
     locs: &CudaSlice<i32>,
     rows: usize,
 ) -> Result<()> {
-    launch(ctx, pairs, locs, rows, true)
+    launch(ctx, pairs, 0, locs, rows, true)
 }
