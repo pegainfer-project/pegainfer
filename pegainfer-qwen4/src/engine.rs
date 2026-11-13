@@ -83,6 +83,11 @@ impl Qwen4Scheduler {
         if request.lora_adapter.is_some() {
             return unsupported("LoRA adapters");
         }
+        // Nothing here hands the K/V over; served as a plain generation, a
+        // request that asks for a transfer would lose it without a word.
+        if request.kv_transfer_params.is_some() {
+            return unsupported("kv_transfer");
+        }
         if request.prompt_tokens.len() + request.max_tokens > self.limit {
             return Some(RejectReason::ContextLength {
                 prompt_tokens: request.prompt_tokens.len(),

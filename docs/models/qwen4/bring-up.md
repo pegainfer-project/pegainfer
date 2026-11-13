@@ -266,7 +266,7 @@ target/release/pegainfer --model-path /data/models/Qwen3.8-Flash-Next --port 180
 
 - A running request holds one of 8 slots, which is its K/V pages, GDN state and n-gram rows on every card. A step admits at most one waiting prompt, returns its slot to a fresh state, prefills it alone and picks its first token from the last row; then every running slot decodes as one batch. The last card picks the tokens with `pegainfer_sample::select_batch`, which takes each request's own params and step, so a seeded request gives the same text whatever shares its batch.
 - The servable length is the dense range, 2051 tokens on this checkpoint: attention runs dense, which is the reference's QSA only while a sequence fits the indexer budget. The engine reports it to the frontend, which refuses a longer prompt and caps `max_tokens` to what is left, as vLLM does; the scheduler refuses a request past it as well.
-- Logprobs, prompt logprobs, LoRA adapters and an empty prompt are refused. The shared frontend renders any engine refusal as a 500 and leaves the reason in the server log.
+- Logprobs, prompt logprobs, LoRA adapters, KV transfers and an empty prompt are refused. The shared frontend renders any engine refusal as a 500 and leaves the reason in the server log.
 
 On the four GH200s of one node:
 
