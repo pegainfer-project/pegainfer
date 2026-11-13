@@ -342,6 +342,7 @@ def main() -> None:
     parser.add_argument("--model", required=True, type=Path, help="checkpoint directory (sharded safetensors)")
     parser.add_argument("--layers", default="0", help="comma separated layer indices or a-b ranges, increasing, or all")
     parser.add_argument("--tokens", type=int, default=32, help="prompt tokens kept")
+    parser.add_argument("--ids", help="comma separated token ids to record in place of the fixed prompt, all of them kept")
     parser.add_argument("--decode", type=int, default=0, help="prompt tokens fed one at a time after the prefill")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", required=True, type=Path)
@@ -352,12 +353,16 @@ def main() -> None:
     # The arithmetic reference for attention, with the additive mask built above.
     text_config._attn_implementation = "eager"
     layers = parse_layers(args.layers, text_config.num_hidden_layers)
-    if not 0 <= args.decode < args.tokens:
-        raise SystemExit(f"--decode {args.decode} must leave at least one prompt token of the {args.tokens}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    ids = tokenizer(PROMPT, return_tensors="pt").input_ids[:, : args.tokens]
-    if ids.shape[1] != args.tokens:
-        raise SystemExit(f"the prompt tokenizes to {ids.shape[1]} tokens, fewer than the {args.tokens} asked for")
+    if args.ids:
+        ids = torch.tensor([[int(token) for token in args.ids.split(",")]], dtype=torch.int64)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        ids = tokenizer(PROMPT, return_tensors="pt").input_ids[:, : args.tokens]
+        if ids.shape[1] != args.tokens:
+            raise SystemExit(f"the prompt tokenizes to {ids.shape[1]} tokens, fewer than the {args.tokens} asked for")
+    tokens = ids.shape[1]
+    if not 0 <= args.decode < tokens:
+        raise SystemExit(f"--decode {args.decode} must leave at least one prompt token of the {tokens}")
 
     checkpoint = Checkpoint(args.model)
     kinds = Counter(text_config.layer_types[layer] for layer in layers)
@@ -385,10 +390,10 @@ def main() -> None:
         "format_version": FORMAT_VERSION,
         "layers": layers,
         "layer_types": [text_config.layer_types[layer] for layer in layers],
-        "tokens": args.tokens,
-        "prefill_tokens": args.tokens - args.decode,
+        "tokens": tokens,
+        "prefill_tokens": tokens - args.decode,
         "decode_steps": args.decode,
-        "prompt": PROMPT,
+        "prompt": None if args.ids else PROMPT,
         "config_sha256": sha256_of(args.model / "config.json"),
         "index_sha256": sha256_of(args.model / "model.safetensors.index.json"),
         "transformers_version": transformers.__version__,

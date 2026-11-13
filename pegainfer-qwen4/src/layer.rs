@@ -216,6 +216,25 @@ impl LayerState {
         })
     }
 
+    /// Return `slot` to the fresh state a prompt starts from, for the next
+    /// sequence that takes it.
+    pub fn reset(&mut self, ctx: &DeviceContext, slot: usize) -> Result<()> {
+        self.check_slots(&[slot])?;
+        match &mut self.mixer {
+            MixerState::Linear(states) => {
+                let state = &mut states[slot];
+                ctx.stream.memset_zeros(&mut state.conv.data)?;
+                ctx.stream.memset_zeros(&mut state.recurrent)?;
+            }
+            MixerState::Full(kv) => kv.lens[slot] = 0,
+        }
+        if let Some(states) = &mut self.ple {
+            states[slot].history.clear();
+            states[slot].rows = 0;
+        }
+        Ok(())
+    }
+
     /// `slots` must be distinct slots of this state.
     fn check_slots(&self, slots: &[usize]) -> Result<()> {
         let held = self.mixer.slots();

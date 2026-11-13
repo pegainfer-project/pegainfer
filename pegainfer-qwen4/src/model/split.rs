@@ -1,8 +1,8 @@
 //! The model spread over several cards by layer. Each card runs a contiguous
 //! run of the layers in a worker thread of its own, which owns the card's
 //! context, its layers and their state for every slot; the first card also
-//! embeds and the last reads out. A pass hands the stream from card to card
-//! through host memory.
+//! embeds and the last reads out and picks the tokens. A pass hands the
+//! stream from card to card through host memory.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,9 +14,12 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use half::bf16;
+use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::copy_hidden_token_range_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
+use pegainfer_sample::SampleScratch;
+use pegainfer_sample::select_batch;
 
 use super::Model;
 use super::ModelState;
@@ -25,19 +28,27 @@ use crate::weights::Geometry;
 use crate::weights::load_config;
 
 /// What a pass hands back from the last card.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Readout {
     /// The stream the last layer leaves, `[rows, stream_width]`.
     Stream,
-    /// The logits of the last row, `[vocab]`.
-    LastRow,
-    /// The logits of every row, `[rows, vocab]`.
-    EveryRow,
+    /// The next token of each sequence: from the last row of a prompt, or
+    /// from every row of a decode step.
+    Sample(Sampling),
+}
+
+/// One row's params and request local step per sequence, and a fresh seed
+/// for the call, as `pegainfer_sample::select_batch` takes them.
+#[derive(Clone, Debug)]
+pub struct Sampling {
+    pub params: Vec<SamplingParams>,
+    pub steps: Vec<u64>,
+    pub seed: u64,
 }
 
 pub enum Output {
     Stream(Vec<bf16>),
-    Logits(Vec<f32>),
+    Tokens(Vec<u32>),
 }
 
 #[derive(Clone)]
@@ -46,68 +57,126 @@ enum Slots {
     Decode(Vec<usize>),
 }
 
-struct Job {
-    slots: Slots,
-    ids: Vec<u32>,
-    /// The stream the previous card left; the first card embeds instead.
-    stream: Option<Vec<bf16>>,
-    /// What to hand back, on the last card only.
-    readout: Option<Readout>,
+enum Work {
+    Pass {
+        slots: Slots,
+        ids: Vec<u32>,
+        /// The stream the previous card left; the first card embeds instead.
+        stream: Option<Vec<bf16>>,
+        /// What to hand back, on the last card only.
+        readout: Option<Readout>,
+    },
+    Reset(usize),
 }
 
 /// One card's part: its layers, the bookends when it is the first or the
-/// last, and the state of its layers for every slot.
+/// last, the state of its layers for every slot, and on the last card the
+/// sampler's scratch.
 struct Stage {
     ctx: DeviceContext,
     model: Model,
     state: ModelState,
+    sampler: Option<SampleScratch>,
 }
 
 impl Stage {
-    fn run(&mut self, job: Job) -> Result<Output> {
-        let rows = job.ids.len();
+    fn run(
+        &mut self,
+        slots: &Slots,
+        ids: &[u32],
+        stream: Option<Vec<bf16>>,
+        readout: Option<Readout>,
+    ) -> Result<Output> {
+        let rows = ids.len();
         let ctx = &self.ctx;
-        let stream = match job.stream {
-            None => self.model.embed(ctx, &job.ids)?,
+        let stream = match stream {
+            None => self.model.embed(ctx, ids)?,
             Some(host) => HiddenStates::from_host(ctx, &host, self.model.g.stream_width(), rows)?,
         };
-        let pass = match &job.slots {
+        let pass = match slots {
             Slots::Prefill(slot) => Pass::Prefill(*slot),
             Slots::Decode(slots) => Pass::Decode(slots),
         };
         let out = self
             .model
-            .advance(ctx, &job.ids, stream, &mut self.state, pass)?;
-        let output = match job.readout {
+            .advance(ctx, ids, stream, &mut self.state, pass)?;
+        match readout {
             None | Some(Readout::Stream) => {
                 let host = ctx.stream.clone_dtoh(&out.data)?;
                 ctx.sync()?;
-                Output::Stream(host)
+                Ok(Output::Stream(host))
             }
-            Some(Readout::LastRow) => {
-                let mut last = HiddenStates::zeros(ctx, out.hidden_dim, 1)?;
-                copy_hidden_token_range_into(ctx, &out, rows - 1, &mut last, 0, 1)?;
-                Output::Logits(self.model.readout(ctx, &last)?.1.to_host(ctx)?)
+            Some(Readout::Sample(sampling)) => {
+                let read = match slots {
+                    Slots::Prefill(_) => {
+                        let mut last = HiddenStates::zeros(ctx, out.hidden_dim, 1)?;
+                        copy_hidden_token_range_into(ctx, &out, rows - 1, &mut last, 0, 1)?;
+                        last
+                    }
+                    Slots::Decode(_) => out,
+                };
+                let (_, logits) = self.model.readout(ctx, &read)?;
+                let scratch = self
+                    .sampler
+                    .as_mut()
+                    .context("only the last card picks tokens")?;
+                let params: Vec<&SamplingParams> = sampling.params.iter().collect();
+                let tokens = select_batch(
+                    ctx,
+                    &logits,
+                    &params,
+                    &sampling.steps,
+                    sampling.seed,
+                    scratch,
+                )?;
+                Ok(Output::Tokens(tokens))
             }
-            Some(Readout::EveryRow) => {
-                Output::Logits(self.model.readout(ctx, &out)?.1.to_host(ctx)?)
+        }
+    }
+
+    fn work(&mut self, work: Work) -> Result<Option<Output>> {
+        match work {
+            Work::Pass {
+                slots,
+                ids,
+                stream,
+                readout,
+            } => self.run(&slots, &ids, stream, readout).map(Some),
+            Work::Reset(slot) => {
+                self.state.reset(&self.ctx, slot)?;
+                self.ctx.sync()?;
+                Ok(None)
             }
-        };
-        Ok(output)
+        }
     }
 }
 
 struct StageHandle {
-    jobs: Option<mpsc::Sender<Job>>,
-    outputs: mpsc::Receiver<Result<Output>>,
+    work: Option<mpsc::Sender<Work>>,
+    replies: mpsc::Receiver<Result<Option<Output>>>,
     join: Option<JoinHandle<()>>,
     device: usize,
 }
 
+impl StageHandle {
+    fn ask(&self, work: Work) -> Result<Option<Output>> {
+        self.work
+            .as_ref()
+            .expect("the work channel lives as long as the handle")
+            .send(work)
+            .ok()
+            .with_context(|| format!("card {}'s worker stopped", self.device))?;
+        self.replies
+            .recv()
+            .with_context(|| format!("card {}'s worker stopped", self.device))?
+            .with_context(|| format!("on card {}", self.device))
+    }
+}
+
 impl Drop for StageHandle {
     fn drop(&mut self) {
-        // Closing the job channel ends the worker's loop.
-        self.jobs.take();
+        // Closing the work channel ends the worker's loop.
+        self.work.take();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -116,7 +185,6 @@ impl Drop for StageHandle {
 
 pub struct SplitModel {
     stages: Vec<StageHandle>,
-    pub vocab: usize,
 }
 
 impl SplitModel {
@@ -140,7 +208,6 @@ impl SplitModel {
             layers.windows(2).all(|pair| pair[0] < pair[1]),
             "layers must be loaded in increasing order, got {layers:?}"
         );
-        let vocab = Geometry::from_config(&load_config(model_dir)?).vocab;
         let (base, extra) = (layers.len() / devices.len(), layers.len() % devices.len());
         let mut start = 0;
         let mut pending = Vec::with_capacity(devices.len());
@@ -148,12 +215,15 @@ impl SplitModel {
             let end = start + base + usize::from(index < extra);
             let run = layers[start..end].to_vec();
             start = end;
-            let bookends = index == 0 || index + 1 == devices.len();
+            let part = Part {
+                first: index == 0,
+                last: index + 1 == devices.len(),
+            };
             pending.push(spawn_stage(
                 model_dir.to_path_buf(),
                 device,
                 run,
-                bookends,
+                part,
                 slots,
                 capacity,
             )?);
@@ -166,37 +236,30 @@ impl SplitModel {
                 .with_context(|| format!("loading card {}'s layers", stage.device))?;
             stages.push(stage);
         }
-        Ok(Self { stages, vocab })
+        Ok(Self { stages })
     }
 
     fn pass(&self, slots: &Slots, ids: &[u32], readout: Readout) -> Result<Output> {
         let mut stream = None;
+        let mut readout = Some(readout);
         let last = self.stages.len() - 1;
         for (index, stage) in self.stages.iter().enumerate() {
-            let job = Job {
-                slots: slots.clone(),
-                ids: ids.to_vec(),
-                stream: stream.take(),
-                readout: (index == last).then_some(readout),
-            };
-            stage
-                .jobs
-                .as_ref()
-                .expect("the job channel lives as long as the handle")
-                .send(job)
-                .ok()
-                .with_context(|| format!("card {}'s worker stopped", stage.device))?;
             let output = stage
-                .outputs
-                .recv()
-                .with_context(|| format!("card {}'s worker stopped", stage.device))?
-                .with_context(|| format!("on card {}", stage.device))?;
+                .ask(Work::Pass {
+                    slots: slots.clone(),
+                    ids: ids.to_vec(),
+                    stream: stream.take(),
+                    readout: if index == last { readout.take() } else { None },
+                })?
+                .context("a pass hands back an output")?;
             if index == last {
                 return Ok(output);
             }
             match output {
                 Output::Stream(host) => stream = Some(host),
-                Output::Logits(_) => bail!("card {} read out before the last card", stage.device),
+                Output::Tokens(_) => {
+                    bail!("card {} picked tokens before the last card", stage.device)
+                }
             }
         }
         unreachable!("the last card returns")
@@ -212,6 +275,22 @@ impl SplitModel {
     pub fn decode(&self, slots: &[usize], ids: &[u32], readout: Readout) -> Result<Output> {
         self.pass(&Slots::Decode(slots.to_vec()), ids, readout)
     }
+
+    /// Return `slot` to a fresh state on every card.
+    pub fn reset(&self, slot: usize) -> Result<()> {
+        for stage in &self.stages {
+            stage.ask(Work::Reset(slot))?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a card's run sits: the first card embeds, the last reads out and
+/// picks the tokens.
+#[derive(Clone, Copy)]
+struct Part {
+    first: bool,
+    last: bool,
 }
 
 /// Destroys the cuBLAS handles a card's worker thread created.
@@ -228,12 +307,12 @@ fn spawn_stage(
     model_dir: PathBuf,
     device: usize,
     layers: Vec<usize>,
-    bookends: bool,
+    part: Part,
     slots: usize,
     capacity: usize,
 ) -> Result<(StageHandle, mpsc::Receiver<Result<()>>)> {
-    let (jobs, job_rx) = mpsc::channel::<Job>();
-    let (output_tx, outputs) = mpsc::channel();
+    let (work, work_rx) = mpsc::channel::<Work>();
+    let (reply_tx, replies) = mpsc::channel();
     let (ready_tx, ready) = mpsc::channel();
     let join = std::thread::Builder::new()
         .name(format!("qwen4-card{device}"))
@@ -245,9 +324,20 @@ fn spawn_stage(
             let load = || -> Result<Stage> {
                 let ctx = DeviceContext::new_with_device(device)?;
                 let config = load_config(&model_dir)?;
+                let bookends = part.first || part.last;
                 let model = Model::load(&ctx, &model_dir, &config, &layers, capacity, bookends)?;
                 let state = model.new_state(&ctx, slots, capacity)?;
-                Ok(Stage { ctx, model, state })
+                let vocab = Geometry::from_config(&config).vocab;
+                let sampler = part
+                    .last
+                    .then(|| SampleScratch::new(&ctx, vocab, slots))
+                    .transpose()?;
+                Ok(Stage {
+                    ctx,
+                    model,
+                    state,
+                    sampler,
+                })
             };
             let mut stage = match load() {
                 Ok(stage) => {
@@ -259,8 +349,8 @@ fn spawn_stage(
                     return;
                 }
             };
-            while let Ok(job) = job_rx.recv() {
-                if output_tx.send(stage.run(job)).is_err() {
+            while let Ok(work) = work_rx.recv() {
+                if reply_tx.send(stage.work(work)).is_err() {
                     return;
                 }
             }
@@ -268,8 +358,8 @@ fn spawn_stage(
         .context("spawning a card's worker")?;
     Ok((
         StageHandle {
-            jobs: Some(jobs),
-            outputs,
+            work: Some(work),
+            replies,
             join: Some(join),
             device,
         },
