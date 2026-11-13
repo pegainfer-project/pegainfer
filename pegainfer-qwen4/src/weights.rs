@@ -414,21 +414,24 @@ fn record_attention(
     prefix: &str,
     g: &Geometry,
 ) -> Result<AttentionSlots> {
-    // The config pins structure, not widths; the QSA kernels compile these.
+    // The config pins structure and leaves the widths free. The QSA kernels
+    // compile these, the indexer's rotation and the cos/sin row it reads included.
     ensure!(
-        (g.heads, g.kv_heads, g.head_dim) == (24, 2, 256)
+        (g.heads, g.kv_heads, g.head_dim, g.rotary_dim) == (24, 2, 256, 64)
             && (
                 g.indexer_heads,
                 g.indexer_head_dim,
                 g.indexer_compress_ratio
             ) == (4, 128, 4)
             && g.indexer_budget <= 2048,
-        "the QSA kernels compile 24 query and 2 K/V heads at 256 and an indexer of 4 heads at \
-         128 over blocks of 4 keeping at most 2048 tokens; this checkpoint has {} and {} heads \
-         at {}, an indexer of {} heads at {} over blocks of {} and a budget of {}",
+        "the QSA kernels compile 24 query and 2 K/V heads at 256 rotating 64 dims and an \
+         indexer of 4 heads at 128 over blocks of 4 keeping at most 2048 tokens; this \
+         checkpoint has {} and {} heads at {} rotating {}, an indexer of {} heads at {} over \
+         blocks of {} and a budget of {}",
         g.heads,
         g.kv_heads,
         g.head_dim,
+        g.rotary_dim,
         g.indexer_heads,
         g.indexer_head_dim,
         g.indexer_compress_ratio,
