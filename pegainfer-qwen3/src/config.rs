@@ -316,6 +316,7 @@ impl Config {
             config.num_attention_heads,
             config.num_key_value_heads,
         );
+        #[cfg(feature = "cuda")]
         if !config.decode_group_is_compiled() {
             log::warn!(
                 "Qwen3 GQA group {}/{} has no compiled decode kernel; decode runs eager \
@@ -329,19 +330,10 @@ impl Config {
     }
 
     /// GQA ratio is TP-invariant, so the global head counts match the per-rank ones.
+    #[cfg(feature = "cuda")]
     pub(crate) fn decode_group_is_compiled(&self) -> bool {
-        #[cfg(feature = "cuda")]
-        {
-            pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
-                .contains(&(self.num_attention_heads / self.num_key_value_heads))
-        }
-        #[cfg(feature = "rocm")]
-        {
-            self.num_key_value_heads > 0
-                && self
-                    .num_attention_heads
-                    .is_multiple_of(self.num_key_value_heads)
-        }
+        pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
+            .contains(&(self.num_attention_heads / self.num_key_value_heads))
     }
 
     pub(crate) fn lm_head_tensor_name(&self) -> &'static str {

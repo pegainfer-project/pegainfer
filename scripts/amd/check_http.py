@@ -157,8 +157,17 @@ def main():
                                    ("kv_transfer", {"vllm_xargs": {"kv_transfer_params": {"do_remote_prefill": True}}}),
                                    ("context_overflow", {"prompt": [100] * args.context, "max_tokens": 1})]:
                 status, body = request("/v1/completions", payload(**changes))
-                assert 400 <= status < 500, (label, status, body)
+                assert status == 400, (label, status, body)
+                assert json.loads(body)["error"]["message"], body
                 record("reject_" + label, status=status, response=json.loads(body))
+            for label, changes in [("top_k_one", {"temperature": 1, "top_k": 1}),
+                                   ("temperature_below_epsilon", {"temperature": 0.000009}),]:
+                response, _ = complete(**changes)
+                assert response["usage"]["completion_tokens"] == 24
+                record("accept_" + label, response=response)
+            status, body = request("/v1/completions", payload(temperature=0.00001))
+            assert status == 400, (status, body)
+            record("reject_temperature_at_epsilon", status=status, response=json.loads(body))
             edge, _ = complete(prompt=[100] * (args.context - 2), max_tokens=2)
             assert edge["usage"]["completion_tokens"] == 2
             record("context_boundary", usage=edge["usage"])

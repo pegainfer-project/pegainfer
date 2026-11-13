@@ -160,7 +160,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `subsystems/runtime/rocm10-qwen3.md` | Initial ROCm 10.1 support: Qwen3-0.6B/4B BF16 TP1 eager/greedy golden, mixed-batch, and HTTP qualification on R9700/gfx1201; environment locks, reproduction steps, and fixed KV slot limits. gfx1100 is cross-compiled only; RDNA 3 hardware validation and CUDA regression remain outstanding. |
+| `subsystems/runtime/rocm10-qwen3.md` | Initial ROCm 10.1 Qwen3 BF16 eager support: public SDK setup, gfx1100/gfx1201 CPU CI and contract tests, manual GPU golden/HTTP/trap gates, fixed-slot limits, and remaining RDNA 3 qualification. |
 | `subsystems/router/kv-aware-routing.md` | Dynamo KV-aware routing on 8×Qwen3-4B (RTX 5090): cache-affinity routing keeps a multi-turn conversation on its home worker, so follow-up-turn TTFT stays flat ~45ms vs round-robin 160–170ms / random 165–180ms (all-turns p50 3.3–3.8× lower). Router prefix overlap 0.72 under KV, 0 under stateless policies; `kv_hit_rate>0` is the gate that the worker↔router block-hash bridge is actually matching. Includes the per-response `prompt_tokens_details.cached_tokens` signal. |
 | `subsystems/runtime/kv-cache-design.md` | Dynamo 式 logical/physical 分层 KV cache：BlockManager 管 block 生命周期和 admission，PhysicalBackend trait 管 GPU 内存和布局（FullAttention / MLA）。支持 TP / DP。基于 vLLM/Dynamo/pegaflow 调研。 |
 | `subsystems/runtime/qwen3-kvbm-integration-spec.md` | Qwen3-4B spec (2026-05) for replacing the hand-written `PagePool` with kvbm-logical's `BlockManager`. It landed: `pegainfer-kv-cache` wraps the block manager today. |

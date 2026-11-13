@@ -20,8 +20,9 @@ __global__ void embedding(const B *weights, const uint32_t *ids, B *output,
   size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i < size_t(rows) * hidden) {
     auto id = ids[i / hidden];
-    output[i] = id < uint32_t(vocab) ? weights[size_t(id) * hidden + i % hidden]
-                                     : B(0.f);
+    if (id >= uint32_t(vocab))
+      __builtin_trap();
+    output[i] = weights[size_t(id) * hidden + i % hidden];
   }
 }
 __global__ void norm(const B *x, const B *weight, B *out, int width,
@@ -75,7 +76,7 @@ __global__ void cache(const B *k, const B *v, B *keys, B *values,
     return;
   int row = i / width, slot = slots[row], pos = positions[row];
   if (slot < 0 || slot >= capacity || pos < 0 || pos >= context)
-    return;
+    __builtin_trap();
   size_t dst = (size_t(slot) * context + pos) * width + i % width;
   keys[dst] = k[i];
   values[dst] = v[i];
@@ -87,7 +88,7 @@ __global__ void attention(const B *q, const B *keys, const B *values, B *out,
   int row = blockIdx.x, head = blockIdx.y, t = threadIdx.x;
   int slot = slots[row], pos = positions[row];
   if (slot < 0 || slot >= capacity || pos < 0 || pos >= context)
-    return;
+    __builtin_trap();
   int kv = head / (heads / kv_heads), lane = t % warpSize, wave = t / warpSize;
   extern __shared__ float scores[];
   __shared__ float tmp[256];

@@ -1,35 +1,13 @@
 {
   "schema_version": 1,
-  "profile": "pegainfer-rocm10.1-qwen3-bf16-eager-v1",
-  "baseline_commit": "68eafde7caef06d70ef4aa29878a2cf79121d6ec",
   "rocm_release": "10.1.0",
-  "image_id": "sha256:a79c374ab2bc93c0e4358da6c7bda5cb84cf1308e8aff74fc99fc95c511cbd03",
-  "hip_build": "7.16.26385",
-  "clang_revision": "d6f6cb691863e9258034ab48c1dfce21689d5606",
+  "sdk_package": "rocm[libraries,devel]==10.1.0",
+  "sdk_index": "https://stable.repo.amd.com/rocm/whl-next/",
   "rust_toolchain": "nightly-2026-07-10",
-  "qualified_architecture": "gfx1201",
-  "device_selection": {
-    "default_hip_visible_devices": "2",
-    "pci_bus_id": "0000:03:00.0",
-    "excluded_pci_bus_ids": ["0000:63:00.0"]
-  },
-  "cross_compile_only": ["gfx1100"],
-  "runtime_files": {
-    "/opt/venv/lib/python3.13/site-packages/_rocm_sdk_core/lib/libamdhip64.so.7": "6d1dbee8cb3ad924e4c1bca7734e22f2c93026eb3bc871a7f64a916778d55e36",
-    "/opt/venv/lib/python3.13/site-packages/_rocm_sdk_libraries/lib/librocblas.so.5": "52fa89ce901efb729d63cd675bf591ae0605710f15ddd6e89dea4e80cf760237",
-    "/opt/rocm/core-10.1/include/rocblas/rocblas.h": "312b39e9a670a780abe9a87414624b60d54cc52c019b34567e8a063348cca577"
-  },
-  "reference_tools": {
-    "python": "3.13.13",
-    "torch": "2.14.0+rocm10.1.0",
-    "triton": "3.8.0+git669b31ac.rocm10.1.0"
-  },
+  "qualified_architectures": ["gfx1201"],
+  "compile_only_architectures": ["gfx1100"],
   "models": {
     "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
     "Qwen/Qwen3-4B": "1cfa9a7208912126459214e8b04321603b3df60c"
-  },
-  "openssl_packages": {
-    "libssl-dev_3.0.13-0ubuntu3.16_amd64.deb": "2b4734df0475e305ac03abb0a2cc5659651ed37ef02d967a1c4033a154cf714b",
-    "libssl3t64_3.0.13-0ubuntu3.16_amd64.deb": "219f43b1cd836a4da550938db5fda93160d269d39a4edcf1f1ce698a470db797"
   }
 }

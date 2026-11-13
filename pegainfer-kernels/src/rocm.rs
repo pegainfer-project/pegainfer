@@ -99,6 +99,8 @@ fn check<T: DeviceRepr>(device: &Device, buffer: &Buffer<T>, len: usize) -> Resu
     );
     Ok(())
 }
+/// Gather rows. Every device-side ID must be below `vocab`; violations trap
+/// and surface at submission or stream synchronization. No zero-row fallback.
 pub fn embedding(
     d: &Device,
     w: &Buffer<bf16>,
@@ -243,6 +245,8 @@ pub struct AttentionShape {
     pub context: usize,
     pub capacity: usize,
 }
+/// Append KV rows. Device slots/positions must be in `[0, capacity)` and
+/// `[0, context)` and writes must be unique. Bounds violations trap.
 pub fn cache(
     d: &Device,
     k: &Buffer<bf16>,
@@ -281,6 +285,8 @@ pub fn cache(
         })
     }
 }
+/// Attend to each row's causal prefix. Slot/position bounds are checked on
+/// device and trap on violation, rather than returning stale output.
 pub fn attention(
     d: &Device,
     q: &Buffer<bf16>,
@@ -338,4 +344,16 @@ pub fn top1(
 /// Exact targets compiled into this artifact.
 pub fn built_arches() -> &'static str {
     env!("PEGAINFER_BUILT_ROCM_ARCH")
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn dimensions_reject_zero_abi_overflow_and_product_overflow() {
+        assert!(dims(&[1, 128]).is_ok());
+        assert!(dims(&[0, 128]).is_err());
+        assert!(dims(&[i32::MAX as usize + 1]).is_err());
+        assert!(dims(&[i32::MAX as usize; 3]).is_err());
+    }
 }

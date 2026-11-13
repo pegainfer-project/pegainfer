@@ -8,7 +8,7 @@ import shutil
 import tempfile
 
 binary = str(Path(os.environ["CARGO_TARGET_DIR"]) / "release/pegainfer")
-model = Path("../models/Qwen3-0.6B")
+model = Path(os.environ.get("PEGAINFER_MODEL_ROOT", "models")) / "Qwen3-0.6B"
 checks = []
 for flags, expected in [
     (["--tp-size", "2"], "requires --tp-size=1"),

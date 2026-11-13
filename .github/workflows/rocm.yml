@@ -1,0 +1,51 @@
+name: ROCm
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-build-and-contracts:
+    name: ROCm 10.1 build and CPU contracts (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [gfx1100, gfx1201]
+    env:
+      PEGAINFER_ROCM_ARCH: ${{ matrix.arch }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-10
+          components: rustfmt, clippy
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+      - name: Install public ROCm 10.1 SDK (no GPU required)
+        run: |
+          bash scripts/amd/install_sdk.sh "$RUNNER_TEMP/rocm-sdk"
+          sdk_root=$("$RUNNER_TEMP/rocm-sdk/bin/rocm-sdk" path --root)
+          echo "ROCM_PATH=$sdk_root" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$sdk_root/lib:$sdk_root/lib64" >> "$GITHUB_ENV"
+          "$sdk_root/bin/hipcc" --version
+      - name: Build all ROCm targets and run CPU contracts
+        run: scripts/amd/run_rocm10.sh bash scripts/amd/check_ci.sh
+      # GPU golden, ownership, wrapper, trap, and HTTP tests are explicit manual
+      # gates in qualify.sh. Ignored tests are compiled above, never simulated.

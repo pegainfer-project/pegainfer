@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
-# Run inside run_rocm10.sh. This links the exact production native sources.
+# Optional independent CPU Torch oracle for the production native sources.
 set -euo pipefail
-artifact_root="$PWD/../artifacts/amd/native-probe/${PEGAINFER_ROCM_ARCH}"
+sdk_root=${ROCM_PATH:-/opt/rocm}
+core=${PEGAINFER_ROCM_CORE:-$sdk_root}
+libraries=${PEGAINFER_ROCM_LIBRARIES:-$sdk_root}
+artifact_root="${CARGO_TARGET_DIR:-$PWD/target}/native-probe/${PEGAINFER_ROCM_ARCH}"
 mkdir -p "$artifact_root"
-hip_flags=(-x hip -std=c++17 -O3 -fPIC -c
-  "--hip-path=$PEGAINFER_ROCM_CORE"
-  "--rocm-device-lib-path=$PEGAINFER_ROCM_CORE/lib/llvm/amdgcn/bitcode"
-  "-I$PEGAINFER_ROCM_CORE/include" "-I$PEGAINFER_ROCM_LIBRARIES/include"
-  "-I${PEGAINFER_ROCM_DEV_INCLUDE:-/opt/rocm/core-10.1/include}"
+hip_flags=(-x hip -std=c++17 -O3 -fPIC -c "--hip-path=$core"
+  "-I$core/include" "-I$libraries/include" "-I${PEGAINFER_ROCM_DEV_INCLUDE:-$sdk_root/include}"
   -Ipegainfer-device/csrc)
+if [[ -d "$core/lib/llvm/amdgcn/bitcode" ]]; then
+  hip_flags+=("--rocm-device-lib-path=$core/lib/llvm/amdgcn/bitcode")
+fi
 IFS=',' read -r -a targets <<< "$PEGAINFER_ROCM_ARCH"
 for target in "${targets[@]}"; do hip_flags+=("--offload-arch=$target"); done
-"${PEGAINFER_HIPCC:-hipcc}" "${hip_flags[@]}" pegainfer-device/csrc/runtime.cpp -o "$artifact_root/runtime.o"
-"${PEGAINFER_HIPCC:-hipcc}" "${hip_flags[@]}" pegainfer-kernels/csrc/hip/qwen3.cpp -o "$artifact_root/kernels.o"
+hipcc=${PEGAINFER_HIPCC:-$core/bin/hipcc}
+[[ -x "$hipcc" ]] || hipcc=hipcc
+"$hipcc" "${hip_flags[@]}" pegainfer-device/csrc/runtime.cpp -o "$artifact_root/runtime.o"
+"$hipcc" "${hip_flags[@]}" pegainfer-kernels/csrc/hip/qwen3.cpp -o "$artifact_root/kernels.o"
+resolve_library() {
+  local candidate
+  for candidate in "$1"/lib/lib"$2".so* "$1"/lib64/lib"$2".so*; do
+    if [[ -f "$candidate" ]]; then readlink -f "$candidate"; return; fi
+  done
+  echo "Missing $2 runtime library under $1" >&2
+  return 1
+}
 g++ -shared "$artifact_root/runtime.o" "$artifact_root/kernels.o" \
-  "$PEGAINFER_ROCM_CORE/lib/libamdhip64.so.7" \
-  "$PEGAINFER_ROCM_LIBRARIES/lib/librocblas.so.5" -o "$artifact_root/libpegainfer_hip.so"
-python scripts/amd/check_native.py "$artifact_root/libpegainfer_hip.so"
+  "$(resolve_library "$core" amdhip64)" "$(resolve_library "$libraries" rocblas)" \
+  -o "$artifact_root/libpegainfer_hip.so"
+python3 scripts/amd/check_native.py "$artifact_root/libpegainfer_hip.so"

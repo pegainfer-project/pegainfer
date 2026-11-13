@@ -74,7 +74,17 @@ impl ModelLine for RocmQwen3Line {
             chunk_size: args.rocm_chunk_size,
         };
         let model = Model::load(&ctx.shared.model_path, o)?;
+        if ctx.shared.cuda_graph {
+            log::info!(
+                "Using eager execution: the shared cuda_graph default is ignored by the ROCm backend"
+            );
+        }
         log::info!("ROCm profile: BF16, TP1, eager, greedy, fixed KV slots; prefix reuse disabled");
+        if ctx.shared.no_prefix_cache {
+            log::info!(
+                "--no-prefix-cache is redundant for this backend: prefix caching is always disabled"
+            );
+        }
         let scheduler = spawn_scheduler("qwen3-rocm", RocmScheduler::new(model));
         Ok(Engine {
             schedulers: vec![scheduler],
