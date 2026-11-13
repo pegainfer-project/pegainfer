@@ -17,9 +17,9 @@ half = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
 pegainfer-bench = { workspace = true }
-pegainfer-core = { workspace = true }
+pegainfer-core = { workspace = true, features = ["cuda"] }
 pegainfer-frontend = { workspace = true }
-pegainfer-kernels = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"] }
 pegainfer-kv-cache = { workspace = true }
 pegainfer-sample = { workspace = true }
 rand = { workspace = true }

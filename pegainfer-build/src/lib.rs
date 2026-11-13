@@ -222,3 +222,5 @@ mod tests {
         assert_eq!(tk.header_dir("cuda.h"), None);
     }
 }
+
+pub mod rocm;

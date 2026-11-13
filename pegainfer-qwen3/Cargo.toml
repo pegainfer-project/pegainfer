@@ -1,5 +1,6 @@
 [package]
 autobenches = false
+autotests = false
 edition = "2024"
 license = "Apache-2.0"
 name = "pegainfer-qwen3"
@@ -10,9 +11,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true }
-cudarc = { workspace = true }
+cudarc = { workspace = true, optional = true }
 fastrace = { workspace = true }
 half = { workspace = true }
+memmap2 = { workspace = true }
+pegainfer-device = { workspace = true, optional = true, features = ["rocm"] }
 hex = { workspace = true, optional = true }
 log = { workspace = true }
 pegainfer-bench = { workspace = true, optional = true }
@@ -20,9 +23,9 @@ pegainfer-core = { workspace = true }
 pegainfer-cupti = { workspace = true, optional = true }
 pegainfer-frontend = { workspace = true }
 pegainfer-kernels = { workspace = true }
-pegainfer-kv-cache = { workspace = true }
-pegainfer-kv-offload = { workspace = true }
-pegainfer-sample = { workspace = true }
+pegainfer-kv-cache = { workspace = true, optional = true }
+pegainfer-kv-offload = { workspace = true, optional = true }
+pegainfer-sample = { workspace = true, optional = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -32,6 +35,9 @@ tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true, optional = true }
 
 [features]
+default = ["cuda"]
+cuda = ["dep:cudarc", "dep:pegainfer-kv-cache", "dep:pegainfer-kv-offload", "dep:pegainfer-sample", "pegainfer-core/cuda", "pegainfer-kernels/cuda"]
+rocm = ["dep:pegainfer-device", "pegainfer-core/rocm", "pegainfer-kernels/rocm"]
 kernel-call-trace = ["pegainfer-core/kernel-call-trace"]
 kernel-report = [
   "dep:comfy-table",
@@ -51,14 +57,149 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 vllm-text = { workspace = true }
 
 [[bin]]
+name = "qwen3_decode_context"
+path = "src/bin/qwen3_decode_context.rs"
+required-features = ["cuda"]
+
+[[bin]]
 name = "qwen3_kernel_report"
 path = "src/bin/qwen3_kernel_report.rs"
-required-features = ["kernel-report"]
+required-features = ["cuda", "kernel-report"]
 
 [[bin]]
 name = "qwen3_model_report"
 path = "src/bin/qwen3_model_report.rs"
-required-features = ["kernel-report"]
+required-features = ["cuda", "kernel-report"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "batch_invariance_attention_path"
+path = "tests/batch_invariance_attention_path.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_decode_gemm_graph"
+path = "tests/batch_invariance_decode_gemm_graph.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_decode_splitkv_graph"
+path = "tests/batch_invariance_decode_splitkv_graph.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_endtoend"
+path = "tests/batch_invariance_endtoend.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_envelope"
+path = "tests/batch_invariance_envelope.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_output"
+path = "tests/batch_invariance_output.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_reject"
+path = "tests/batch_invariance_reject.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "batch_invariance_unified"
+path = "tests/batch_invariance_unified.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "cached_tokens_usage"
+path = "tests/cached_tokens_usage.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "context_window"
+path = "tests/context_window.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "context_window_in_window"
+path = "tests/context_window_in_window.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "dflash_sampled_equivalence"
+path = "tests/dflash_sampled_equivalence.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "dflash_speculative_gate"
+path = "tests/dflash_speculative_gate.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "dflash_speculative_perf"
+path = "tests/dflash_speculative_perf.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "eagle3_speculative_gate"
+path = "tests/eagle3_speculative_gate.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "hf_golden_gate"
+path = "tests/hf_golden_gate.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "kv_offload_cpu_hit"
+path = "tests/kv_offload_cpu_hit.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "logprobs_contract"
+path = "tests/logprobs_contract.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "lora_golden_gate"
+path = "tests/lora_golden_gate.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "lora_smoke"
+path = "tests/lora_smoke.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "prefix_cache"
+path = "tests/prefix_cache.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "report_gemm_faithful"
+path = "tests/report_gemm_faithful.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "rocm_golden"
+path = "tests/rocm_golden.rs"
+required-features = ["rocm"]
+
+[[test]]
+name = "sampling_behavior"
+path = "tests/sampling_behavior.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "scheduler_robustness"
+path = "tests/scheduler_robustness.rs"
+required-features = ["cuda"]
+
+[[test]]
+name = "tp_concurrent_decode"
+path = "tests/tp_concurrent_decode.rs"
+required-features = ["cuda"]

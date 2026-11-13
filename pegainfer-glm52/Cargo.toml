@@ -16,9 +16,9 @@ half = { workspace = true }
 hex = { workspace = true }
 log = { workspace = true }
 memmap2 = { workspace = true }
-pegainfer-core = { workspace = true }
+pegainfer-core = { workspace = true, features = ["cuda"] }
 pegainfer-frontend = { workspace = true }
-pegainfer-kernels = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"] }
 pegainfer-kv-store = { workspace = true }
 pegainfer-sample = { workspace = true }
 rayon = { workspace = true }

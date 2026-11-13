@@ -292,6 +292,9 @@ pub struct LaunchContext<'a> {
 /// any other crate breaks on the next field added here and nothing catches it
 /// until that crate is checked by hand.
 pub struct ServePlan {
+    /// Optional model-specific HTTP contract; runs before the upstream router.
+    /// Scheduler validation remains necessary for non-HTTP engine clients.
+    pub extend_router: Option<fn(axum::Router) -> axum::Router>,
     /// Scheduler partitions (logical DP ranks) the launched engine will
     /// expose. The HTTP frontend registers one engine identity per partition
     /// *while the engine is still loading*, so this must be derivable from
@@ -326,6 +329,7 @@ impl ServePlan {
 impl Default for ServePlan {
     fn default() -> Self {
         Self {
+            extend_router: None,
             scheduler_partition_count: 1,
             prefill_only: false,
             lora_modules: None,
