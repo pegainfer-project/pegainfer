@@ -44,7 +44,9 @@ use crate::layer::MixerState;
 use crate::layer::MixerTrace;
 use crate::layer::layer_decode;
 use crate::layer::layer_prefill;
+use crate::layer::qsa_select;
 use crate::weights::DecoderLayer;
+use crate::weights::FullAttention;
 use crate::weights::Geometry;
 use crate::weights::Mixer;
 use crate::weights::load_config;
@@ -263,22 +265,223 @@ fn pool_k(
     Ok(k)
 }
 
-/// The reference's indexer mask is additive, zero where a key is kept, one row
-/// per query over every key so far. Dense attention stands in for it only while
-/// every causal key is kept.
-fn ensure_dense(golden: &SafeTensors, name: &str, rows: usize, kv_len: usize) -> Result<()> {
-    let (shape, mask) = floats(golden, name)?;
+/// The indexer's choice for this pass's rows of `slot` against the reference's
+/// mask, which is additive, zero where a key is kept, one row per query over
+/// every key so far. Inside the dense range a row keeps every causal key. Past
+/// it the same kernels run on the reference's own indexer projection of every
+/// token so far, read from the passes in `passes`, and must make the
+/// reference's choice up to blocks tied at a row's cut; on the engine's
+/// projection, whose bf16 rounding moves scores further, the rows that differ
+/// are printed. Returns the positions past the dense range where the engine's
+/// own choice is the reference's.
+#[allow(clippy::too_many_arguments)]
+fn hold_selection(
+    ctx: &DeviceContext,
+    golden: &SafeTensors,
+    model: &Model,
+    attn: &FullAttention,
+    passes: &[String],
+    kv: &KvPool,
+    slot: usize,
+    rows: usize,
+) -> Result<Vec<usize>> {
+    let g = &model.g;
+    let prefix = passes.last().context("no pass to hold")?;
+    let name = format!("{prefix}attn_indexer_mask");
+    let kv_len = kv.lens[slot];
+    let (shape, reference) = floats(golden, &name)?;
     ensure!(shape == [rows, kv_len], "{name} is {shape:?}");
     let first = kv_len - rows;
+    let dense = g.dense_attention_rows();
     let dropped = (0..rows)
-        .flat_map(|i| (0..=first + i).map(move |j| i * kv_len + j))
-        .filter(|&at| mask[at] != 0.0)
+        .filter(|&i| first + i < dense)
+        .flat_map(|i| (0..=first + i).map(move |t| i * kv_len + t))
+        .filter(|&at| reference[at] != 0.0)
         .count();
     ensure!(
         dropped == 0,
-        "the reference's indexer dropped {dropped} causal keys, so dense attention is not the reference for this prompt"
+        "the reference's indexer dropped {dropped} causal keys inside the dense range"
+    );
+    let sparse = first.max(dense);
+    if sparse >= kv_len {
+        return Ok(Vec::new());
+    }
+    let mut history = Vec::with_capacity(kv_len * g.indexer_width());
+    for pass in passes {
+        history.extend(floats(golden, &format!("{pass}attn_indexer_qk"))?.1);
+    }
+    ensure!(
+        history.len() == kv_len * g.indexer_width(),
+        "the reference's indexer projections hold {} values, {kv_len} tokens need {}",
+        history.len(),
+        kv_len * g.indexer_width()
+    );
+    let history: Vec<bf16> = history.into_iter().map(bf16::from_f32).collect();
+    let on_reference = HiddenStates {
+        data: ctx.stream.clone_htod(&history)?,
+        hidden_dim: g.indexer_width(),
+        seq_len: kv_len,
+    };
+    let on_reference = disagreement(
+        ctx,
+        model,
+        attn,
+        &on_reference,
+        kv.sms,
+        first,
+        kv_len,
+        &reference,
+    )?;
+    let engine = disagreement(
+        ctx,
+        model,
+        attn,
+        &kv.indexer[slot],
+        kv.sms,
+        first,
+        kv_len,
+        &reference,
+    )?;
+    eprintln!(
+        "  selection: {} rows past the dense range; on the reference's projection {on_reference}, on the engine's {engine}",
+        kv_len - sparse
+    );
+    ensure!(
+        on_reference.gap <= SELECTION_TIE,
+        "on the reference's own projection the indexer swaps blocks {:.3e} from the row's cut, past the {SELECTION_TIE:.0e} a tie allows",
+        on_reference.gap
+    );
+    Ok((sparse..kv_len)
+        .filter(|pos| !engine.rows.contains(pos))
+        .collect())
+}
+
+/// The attention of the rows past the dense range at `positions`, where the
+/// engine keeps the reference's tokens, so both sides compute the same sum and
+/// the distance is rounding alone: held to the reference's own floor for the
+/// attention, with none of the margin the other stages get. Keeping the dense
+/// result for these rows lands within that margin, so the plain hold of the
+/// stage would not see it.
+#[allow(clippy::too_many_arguments)]
+fn hold_sparse_attention(
+    ctx: &DeviceContext,
+    golden: &SafeTensors,
+    g: &Geometry,
+    name: &str,
+    gated: &HiddenStates,
+    rows: &Range<usize>,
+    first: usize,
+    positions: &[usize],
+    floors: &BTreeMap<&str, f32>,
+) -> Result<()> {
+    let floor = *floors
+        .get("attn_gated")
+        .context("rows past the dense range are held on the attention, which has no floor here")?;
+    let width = g.attn_width();
+    let ours = host_rows(ctx, gated, rows)?;
+    let (_, reference) = floats(golden, name)?;
+    let worst = positions
+        .iter()
+        .flat_map(|&pos| {
+            let row = (pos - first) * width..(pos - first + 1) * width;
+            ours[row.clone()]
+                .iter()
+                .zip(&reference[row])
+                .map(|(a, b)| (a - b).abs())
+        })
+        .fold(0f32, f32::max);
+    eprintln!(
+        "  {name} past the dense range: max {worst:.3e} over the {} rows that keep the reference's tokens, floor {floor:.3e}",
+        positions.len()
+    );
+    ensure!(
+        worst <= floor,
+        "{name}: the rows past the dense range that keep the reference's tokens differ by {worst:.3e}, past the reference's own floor {floor:.3e}"
     );
     Ok(())
+}
+
+/// Within this distance of a row's cut, a block is as valid a pick as the one
+/// it displaces: the score pass's bound against the reference on its long case
+/// (`qwen4_qsa_indexer_score_parity`), and `torch.topk` leaves a tied cut open.
+const SELECTION_TIE: f32 = 5e-3;
+
+/// Where an indexer choice and the reference's part: the positions whose rows
+/// differ, the most tokens one row differs on, and how far from its row's cut,
+/// in score, the farthest block that changed sides lies.
+struct Disagreement {
+    rows: BTreeSet<usize>,
+    tokens: usize,
+    gap: f32,
+}
+
+impl std::fmt::Display for Disagreement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} differ (at most {} tokens, {:.3e} from the cut)",
+            self.rows.len(),
+            self.tokens,
+            self.gap
+        )
+    }
+}
+
+/// The indexer's choice on `fused` for the rows past the dense range among
+/// positions `first..kv_len`, against `reference`, the reference's additive
+/// mask of those rows over `kv_len` keys.
+#[allow(clippy::too_many_arguments)]
+fn disagreement(
+    ctx: &DeviceContext,
+    model: &Model,
+    attn: &FullAttention,
+    fused: &HiddenStates,
+    sms: usize,
+    first: usize,
+    kv_len: usize,
+    reference: &[f32],
+) -> Result<Disagreement> {
+    let g = &model.g;
+    let sparse = first.max(g.dense_attention_rows());
+    let selection = qsa_select(ctx, g, attn, &model.rope, fused, sms, sparse, kv_len)?;
+    let mask: Vec<u8> = ctx.stream.clone_dtoh(&selection.mask)?;
+    let scores: Vec<f32> = ctx.stream.clone_dtoh(&selection.scores)?;
+    ctx.sync()?;
+    let ratio = g.indexer_compress_ratio;
+    let mut out = Disagreement {
+        rows: BTreeSet::new(),
+        tokens: 0,
+        gap: 0.0,
+    };
+    for pos in sparse..kv_len {
+        let row = pos - sparse;
+        let ours = &mask[row * kv_len..][..=pos];
+        let theirs = &reference[(pos - first) * kv_len..][..=pos];
+        let changed: Vec<usize> = (0..=pos)
+            .filter(|&t| (ours[t] != 0) != (theirs[t] == 0.0))
+            .collect();
+        if changed.is_empty() {
+            continue;
+        }
+        out.rows.insert(pos);
+        out.tokens = out.tokens.max(changed.len());
+        let complete = (pos + 1) / ratio;
+        let row_scores = &scores[row * selection.blocks..][..complete];
+        // The weakest block the row keeps is where it cuts.
+        let cut = (0..complete)
+            .filter(|&block| ours[block * ratio] != 0)
+            .map(|block| row_scores[block])
+            .fold(f32::INFINITY, f32::min);
+        for t in changed {
+            let block = t / ratio;
+            ensure!(
+                block < complete,
+                "row {pos} disagrees on token {t} of its incomplete tail, which every row keeps"
+            );
+            out.gap = out.gap.max((row_scores[block] - cut).abs());
+        }
+    }
+    Ok(out)
 }
 
 /// One sequence's rows `rows` of a layer's forward, in `slot`, against the
@@ -289,14 +492,17 @@ fn ensure_dense(golden: &SafeTensors, name: &str, rows: usize, kv_len: usize) ->
 fn hold_layer(
     ctx: &DeviceContext,
     golden: &SafeTensors,
-    g: &Geometry,
-    prefix: &str,
+    model: &Model,
+    w: &DecoderLayer,
+    passes: &[String],
     trace: &LayerTrace,
     rows: Range<usize>,
     state: &LayerState,
     slot: usize,
     floors: &BTreeMap<&str, f32>,
 ) -> Result<()> {
+    let g = &model.g;
+    let prefix = passes.last().context("no pass to hold")?;
     let name = |stage: &str| format!("{prefix}{stage}");
     let count = rows.len();
     let mut stages = Vec::new();
@@ -338,7 +544,34 @@ fn hold_layer(
             stages.push((name("gdn_state"), recurrent, reference));
         }
         (MixerTrace::Full(t), MixerState::Full(kv)) => {
-            ensure_dense(golden, &name("attn_indexer_mask"), count, kv.lens[slot])?;
+            let Mixer::Full(attn) = &w.mixer else {
+                bail!("the trace and the weights disagree on the layer kind");
+            };
+            let agreeing = hold_selection(ctx, golden, model, attn, passes, kv, slot, count)?;
+            if !agreeing.is_empty() {
+                hold_sparse_attention(
+                    ctx,
+                    golden,
+                    g,
+                    &name("attn_gated"),
+                    &t.gated,
+                    &rows,
+                    kv.lens[slot] - count,
+                    &agreeing,
+                    floors,
+                )?;
+            }
+            // A golden dumped before the dump took the indexer's projection has
+            // none; the selection above needs it only past the dense range.
+            if golden.tensor(&name("attn_indexer_qk")).is_ok() {
+                stages.push(stage(
+                    ctx,
+                    golden,
+                    name("attn_indexer_qk"),
+                    &t.indexer_qk,
+                    &rows,
+                )?);
+            }
             stages.extend([
                 stage(ctx, golden, name("attn_q_proj"), &t.q_proj, &rows)?,
                 stage(ctx, golden, name("attn_k_proj"), &t.k_proj, &rows)?,
@@ -700,6 +933,17 @@ fn batch_at(sequences: &[Sequence], step: usize) -> (Vec<usize>, Vec<u32>) {
         .unzip()
 }
 
+/// The stage prefixes of `layer` in every pass up to decode step `step`, or
+/// in the prompt alone, oldest first.
+fn passes(layer: usize, step: Option<usize>) -> Vec<String> {
+    std::iter::once(format!("layer{layer}_"))
+        .chain(
+            step.into_iter()
+                .flat_map(|step| (0..=step).map(move |s| format!("decode{s}_layer{layer}_"))),
+        )
+        .collect()
+}
+
 /// One layer held on the reference's own input: every pass reads the stream
 /// the reference fed this layer, so each held stage measures this layer alone,
 /// against the reference's spread for this layer alone (the CPU pass of the
@@ -731,8 +975,27 @@ fn hold_layer_on_reference(
     }
     let floors = sequences
         .iter()
-        .map(|seq| {
-            held.iter()
+        .enumerate()
+        .map(|(slot, seq)| {
+            let mut stages = held.clone();
+            if let Mixer::Full(_) = w.mixer {
+                // Past the dense range QSA changes the attention itself, which
+                // `o_proj` then dilutes into the residual, so it is held before.
+                if seq
+                    .golden
+                    .tensor(&format!("cpu_layer{layer}_attn_gated"))
+                    .is_ok()
+                {
+                    stages.push("attn_gated");
+                } else {
+                    ensure!(
+                        seq.ids.len() <= g.dense_attention_rows(),
+                        "sequence {slot} runs past the dense range, but its golden has no CPU attention to hold it on"
+                    );
+                }
+            }
+            stages
+                .iter()
                 .map(|&stage| {
                     Ok((
                         stage,
@@ -749,12 +1012,12 @@ fn hold_layer_on_reference(
         let trace = layer_prefill(ctx, g, w, &model.rope, &mut state, slot, prompt, &stream)?;
         ctx.sync()?;
         eprintln!("sequence {slot}:");
-        let prefix = format!("layer{layer}_");
         hold_layer(
             ctx,
             &seq.golden,
-            g,
-            &prefix,
+            model,
+            w,
+            &passes(layer, None),
             &trace,
             0..prompt.len(),
             &state,
@@ -780,8 +1043,9 @@ fn hold_layer_on_reference(
             hold_layer(
                 ctx,
                 &sequences[slot].golden,
-                g,
-                &format!("{prefix}layer{layer}_"),
+                model,
+                w,
+                &passes(layer, Some(step)),
                 &trace,
                 row..row + 1,
                 &state,

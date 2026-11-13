@@ -2,9 +2,8 @@
 //! running sequence holds one slot (its K/V, GDN state and n-gram rows on
 //! every card). Each step admits at most one prompt, prefilled alone with its
 //! first token picked from the last row, then decodes every running slot as
-//! one batch. Attention runs dense, which is the reference's QSA only while a
-//! sequence fits the selection budget, so a request whose prompt and
-//! completion could pass that length is refused.
+//! one batch. A request whose prompt and completion could pass [`MAX_TOKENS`]
+//! is refused.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -36,6 +35,11 @@ use crate::weights::load_config;
 
 /// Sequences decoded together.
 const SLOTS: usize = 8;
+
+/// Prompt and completion tokens one sequence may reach, well under the
+/// checkpoint's 262144 positions: a prompt is prefilled whole, so the longest
+/// one sets the activation memory on every card.
+const MAX_TOKENS: usize = 32768;
 
 struct Running {
     id: RequestId,
@@ -226,18 +230,17 @@ pub fn launch(model_path: &Path) -> Result<Engine> {
     let cards = CudaContext::device_count().context("counting the visible cards")?;
     let devices: Vec<usize> = (0..usize::try_from(cards)?).collect();
     let layers: Vec<usize> = (0..config.layer_kinds.len()).collect();
-    let limit = g.dense_attention_rows();
     log::info!(
-        "qwen4: {} layers over {} cards, {SLOTS} slots of {limit} tokens",
+        "qwen4: {} layers over {} cards, {SLOTS} slots of {MAX_TOKENS} tokens",
         layers.len(),
         devices.len()
     );
-    let model = SplitModel::load(model_path, &devices, &layers, SLOTS, limit)?;
+    let model = SplitModel::load(model_path, &devices, &layers, SLOTS, MAX_TOKENS)?;
     let eos = pegainfer_core::eos::eos_token_ids(model_path, g.vocab)?;
     let scheduler = Qwen4Scheduler {
         model,
         eos,
-        limit,
+        limit: MAX_TOKENS,
         slots: (0..SLOTS).map(|_| None).collect(),
         waiting: VecDeque::new(),
         calls: 0,
@@ -246,7 +249,7 @@ pub fn launch(model_path: &Path) -> Result<Engine> {
         schedulers: vec![spawn_scheduler("qwen4-scheduler", scheduler)],
         info: EngineInfo {
             kv_capacity: None,
-            servable_len: Some(u32::try_from(limit)?),
+            servable_len: Some(u32::try_from(MAX_TOKENS)?),
         },
         lora: None,
     })

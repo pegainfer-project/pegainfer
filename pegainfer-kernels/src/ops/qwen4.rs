@@ -45,6 +45,9 @@ use crate::ffi;
 use crate::ops::checked_i32;
 use crate::ops::gemm_into_checked;
 use crate::ops::silu_mul_batch_into;
+use crate::paged_kv::KvFormat;
+use crate::paged_kv::KvStorage;
+use crate::paged_kv::PagedKvLayout;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -359,6 +362,117 @@ pub fn qsa_indexer_select_into(
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
+}
+
+/// The attention heads the sparse attention kernel compiles: 24 query heads in
+/// two K/V groups at head dim 256, over pages of 16 tokens.
+const QSA_HEADS: usize = 24;
+const QSA_KV_HEADS: usize = 2;
+const QSA_HEAD_DIM: usize = 256;
+const QSA_PAGE: usize = 16;
+
+/// Gated QSA attention for `rows` consecutive query rows of one sequence, the
+/// first at `first_position`, over the tokens `mask` keeps: one byte per (row,
+/// token) with row stride `mask_stride`, as [`qsa_indexer_select_into`] writes
+/// it. Semantics: `csrc/qwen4/qwen4_qsa_sparse_attention.cu`.
+///
+/// `q_full` and `q_prepped` are the dense attention entry's `q_proj` output
+/// and prepped query, and `out` its gated output; rows `row..row + rows` of all
+/// three are this call's, so a call can replace the dense result of the rows
+/// past the indexer budget in place. The entry must already have written these
+/// rows' K/V: the kernel reads the sequence's keys and values from `pool`, one
+/// layer in `layout`, in pages contiguous from `first_page`.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_sparse_attention_into(
+    ctx: &DeviceContext,
+    q_full: &HiddenStates,
+    q_prepped: &HiddenStates,
+    row: usize,
+    rows: usize,
+    first_position: usize,
+    pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    first_page: usize,
+    mask: &CudaSlice<u8>,
+    mask_stride: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let width = QSA_HEADS * QSA_HEAD_DIM;
+    ensure!(
+        q_full.hidden_dim == 2 * width && q_prepped.hidden_dim == width && out.hidden_dim == width,
+        "QSA attention wants q_proj {} wide and q/out {width} wide, got {}, {} and {}",
+        2 * width,
+        q_full.hidden_dim,
+        q_prepped.hidden_dim,
+        out.hidden_dim
+    );
+    let end = row + rows;
+    ensure!(
+        end <= q_full.seq_len && end <= q_prepped.seq_len && end <= out.seq_len,
+        "QSA attention rows {row}..{end} run past q_proj ({}), q ({}) or out ({})",
+        q_full.seq_len,
+        q_prepped.seq_len,
+        out.seq_len
+    );
+    ensure!(
+        layout.num_layers == 1
+            && layout.num_kv_heads == QSA_KV_HEADS
+            && layout.head_dim == QSA_HEAD_DIM
+            && layout.page_size == QSA_PAGE
+            && matches!(layout.storage, KvStorage::Bf16)
+            && matches!(layout.format, KvFormat::Split),
+        "QSA attention reads one bf16 split layer of {QSA_KV_HEADS} heads at {QSA_HEAD_DIM} \
+         in pages of {QSA_PAGE}, got {layout:?}"
+    );
+    let kv_len = first_position + rows;
+    let pages = first_page + kv_len.div_ceil(QSA_PAGE);
+    ensure!(
+        pool.len() >= pages.saturating_mul(layout.page_stride),
+        "QSA attention reads {pages} pages of {} elements from a pool of {}",
+        layout.page_stride,
+        pool.len()
+    );
+    ensure!(
+        kv_len <= mask_stride && mask.len() >= rows.saturating_mul(mask_stride),
+        "QSA attention over {kv_len} tokens needs a mask of {rows} rows of at least that \
+         many bytes, got stride {mask_stride} and {} bytes",
+        mask.len()
+    );
+    let rows_i32 = checked_i32(rows, "QSA attention rows")?;
+    let first_position = checked_i32(first_position, "QSA attention first position")?;
+    let first_page = checked_i32(first_page, "QSA attention first page")?;
+    let mask_stride = checked_i32(mask_stride, "QSA attention mask stride")?;
+    let page_stride = i64::try_from(layout.page_stride)?;
+    let kv_block_len = i64::try_from(layout.kv_block_len)?;
+    let q_full = q_full.data.slice(row * 2 * width..end * 2 * width);
+    let q_prepped = q_prepped.data.slice(row * width..end * width);
+    let mut out = out.data.slice_mut(row * width..end * width);
+    let (q_full_ptr, _q_full_guard) = q_full.device_ptr(&ctx.stream);
+    let (q_ptr, _q_guard) = q_prepped.device_ptr(&ctx.stream);
+    let (pool_ptr, _pool_guard) = pool.device_ptr(&ctx.stream);
+    let (mask_ptr, _mask_guard) = mask.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_qsa_sparse_attention_cuda(
+            q_full_ptr as *const ffi::Half,
+            q_ptr as *const ffi::Half,
+            pool_ptr as *const ffi::Half,
+            mask_ptr as *const u8,
+            out_ptr as *mut ffi::Half,
+            rows_i32,
+            first_position,
+            first_page,
+            page_stride,
+            kv_block_len,
+            mask_stride,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("QSA attention launch failed: {err}"))
 }
 
 fn ensure_finite(value: f32, what: &str) -> Result<()> {

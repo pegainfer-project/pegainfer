@@ -268,6 +268,8 @@ pub use qwen4::qsa_indexer_block_scores_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qsa_indexer_select_into;
 #[cfg(feature = "qwen4")]
+pub use qwen4::qsa_sparse_attention_into;
+#[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_combine_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_route_into;
