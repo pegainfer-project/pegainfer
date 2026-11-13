@@ -879,17 +879,19 @@ pub fn hc_mix_into(
 const ROUTE_CHUNK_PAIRS: usize = 256;
 /// Pair count where the tiled route metadata overtakes the sequential kernel.
 /// The sequential kernel's cost is `2 * experts * pairs` comparisons on one SM;
-/// the tiled path's is a function of `pairs` plus three launches. Measured on
-/// this box: the tiled path is 1.4x ahead at the 320 pairs of a 32-token prompt
-/// and 52x at the 20480 pairs of a 2048-token one, while 100 pairs is inside the
-/// noise of the two launches either side, so 256 pairs (26 tokens) keeps the
-/// decode and short-prompt path sequential.
+/// the tiled path's is a function of `pairs` plus three launches. Measured on a
+/// throttled sm_120 card: the tiled path is 1.4x ahead at the 320 pairs of a
+/// 32-token prompt and 52x at the 20480 pairs of a 2048-token one (sm_89: 1.4x
+/// and 48x), while 100 pairs is inside the noise of the two launches either
+/// side, so 256 pairs (26 tokens) keeps the decode and short-prompt path
+/// sequential.
 const ROUTE_TILED_MIN_PAIRS: usize = 256;
 /// Token count where the bf16x8 combine overtakes the scalar one. The
 /// vectorized grid is per token, so below it the extra blocks cost more than
-/// the 16 B accesses save: measured on this box the two cross near 16 tokens,
-/// 1.5x at 32 and 2.1x at 64, so 64 keeps the decode-sized batches on the
-/// scalar kernel with margin.
+/// the 16 B accesses save: measured on a throttled sm_120 card the two cross
+/// near 16 tokens, 1.5x at 32 and 2.1x at 64, so 64 keeps the decode-sized
+/// batches on the scalar kernel with margin. On sm_89 the vector kernel is
+/// level to 1.3x over the same range — never slower, but much less ahead.
 const COMBINE_VEC_MIN_TOKENS: usize = 64;
 /// Above this the vectorized combine's `grid.y` (the token axis) would pass the
 /// runtime's 65535-block cap; the scalar kernel has no such bound, so longer
@@ -1883,7 +1885,9 @@ impl Qwen4GroupedGemmScratch {
 ///
 /// `x` is the gathered `[pairs, k]` activation, `weight` the `[experts * n, k]`
 /// expert bank, `out` the `[pairs, n]` slot output and `indptr` the routing
-/// offsets; `n` is the per-expert output width. The grouping is read on the
+/// offsets — ascending, `indptr[experts] <= x.seq_len`, which the caller owns:
+/// the kernel turns them into pointers on the device and never checks them.
+/// `n` is the per-expert output width. The grouping is read on the
 /// device, so this replaces `experts` cuBLAS launches and the `indptr` copy to
 /// the host; `scratch` carries the CUTLASS grid size the device reported.
 ///

@@ -25,10 +25,12 @@ use crate::weights::Geometry;
 use crate::weights::MoeBlock;
 
 /// Token count from which the expert GEMMs run as one grouped launch per leg.
-/// Measured at the real 1280x2560 and 2560x640 legs on this box: at one token
-/// the grouped launch is level on gate_up (0.96x) and 1.7x on down, 1.2x at
-/// four, and 2.5x / 2.0x at 2048, so the per-expert loop keeps the single-token
-/// slot and its role as the gate's reference.
+/// Measured at the real 1280x2560 and 2560x640 legs on a throttled sm_120 card:
+/// at one token the grouped launch is level on gate_up (0.96x) and 1.7x on down,
+/// 1.2x at four, and 2.5x / 2.0x at 2048, so the per-expert loop keeps the
+/// single-token slot and its role as the gate's reference. An unthrottled L20
+/// (sm_89) agrees on the boundary: one token 0.97x on the whole block, four
+/// 1.08x, 2048 1.52x.
 const GROUPED_MIN_TOKENS: usize = 4;
 
 /// Every stage of one block forward, kept for the reference gate.

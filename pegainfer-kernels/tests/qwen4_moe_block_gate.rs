@@ -14,14 +14,12 @@
 //!   CUTLASS's 32-wide K tiles and per-tile epilogue order the roundings
 //!   differently, so the two sums land on opposite sides of a bf16 rounding
 //!   boundary often enough that single elements differ by one bf16 quantum.
-//!   The bound is the quantum plus the accumulated f32 noise:
+//!   The bound is the quantum plus the reference's own rounding:
 //!   `max|diff| <= 2^-6 * max|want|` — two bf16 quanta at the largest magnitude
 //!   present, since one quantum is at most `2^-7` of it (one for the rounding
-//!   flip, one of margin) — and `||diff||_2 <= 1e-3 * ||want||_2` (the f32
-//!   summation noise of a different `K` split, `~K * eps_f32`). The measured
-//!   worst at the real geometry is 5.6e-3 of the largest magnitude (0.36 of the
-//!   first bound) and 1.6e-4 rms relative (0.16 of the second), and the control
-//!   below shows a wrong grouping is two orders past both.
+//!   flip, one of margin) — and `||diff||_2 <= 5e-3 * ||want||_2`, whose
+//!   measurement `RMS_REL` carries. The control below shows a wrong weight bank
+//!   is two orders past both.
 //!
 //! The default cases run at the frozen expert count and top-k (they are
 //! compiled into the routing kernels) with a narrowed hidden/intermediate, so
@@ -285,6 +283,65 @@ fn weighted_combine_is_bit_identical_to_the_scalar_kernel() {
     }
 }
 
+/// The vectorized combine puts the token on `grid.y`, which the runtime caps at
+/// 65535 blocks: the dispatcher must hand longer prompts to the scalar kernel,
+/// and the vector entry must refuse them at the launch.
+#[test]
+fn combine_dispatch_holds_the_grid_y_cap() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    // hidden 8 keeps the 65536-token slot buffers a few MB.
+    let g = geometry(8);
+    for tokens in [65535usize, 65536] {
+        let pairs = tokens * TOP_K;
+        let down =
+            HiddenStates::from_host(&ctx, &common::fill(3, pairs * g.hidden), g.hidden, pairs)
+                .unwrap();
+        let weights = ctx.stream.clone_htod(&common::fill(5, pairs)).unwrap();
+        let routing = route(&ctx, &g, tokens);
+        let mut scalar = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
+        let mut got = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
+        qwen4_moe_weighted_combine_scalar_into(
+            &ctx,
+            &g,
+            &down,
+            &weights,
+            &routing.slot,
+            &mut scalar,
+        )
+        .unwrap();
+        qwen4_moe_weighted_combine_into(&ctx, &g, &down, &weights, &routing.slot, &mut got)
+            .unwrap();
+        let want = bits(&scalar.to_host(&ctx).unwrap());
+        assert_eq!(
+            want,
+            bits(&got.to_host(&ctx).unwrap()),
+            "dispatched, {tokens} tokens"
+        );
+        let vector = qwen4_moe_weighted_combine_vector_into(
+            &ctx,
+            &g,
+            &down,
+            &weights,
+            &routing.slot,
+            &mut got,
+        );
+        if tokens == 65535 {
+            vector.unwrap();
+            assert_eq!(
+                want,
+                bits(&got.to_host(&ctx).unwrap()),
+                "vectorized, {tokens} tokens"
+            );
+        } else {
+            // The refusal must come from the launch, not an earlier shape check.
+            let err = vector.unwrap_err().to_string();
+            assert!(err.contains("launch failed"), "{tokens} tokens: {err}");
+        }
+    }
+}
+
 /// The per-expert reference: one `gemm_rows_span` per expert over its slot
 /// range, exactly the loop the production prefill path ran before the grouped
 /// launch.
@@ -319,10 +376,12 @@ fn per_expert(
 /// it rounds, so the bound is two quanta — one for a rounding flip, one of
 /// margin.
 const MAX_ABS_REL: f32 = 1.0 / 64.0;
-/// `||diff||_2 / ||want||_2`: the accumulated f32 noise of two different
-/// summation orders over `K` terms, `~K * eps_f32 ~ 1.5e-4` in the worst case;
-/// measured 1.6e-4 on the real 2048-token leg. Six-fold margin.
-const RMS_REL: f64 = 1e-3;
+/// `||diff||_2 / ||want||_2`: dominated by the reference's own rounding, not the
+/// grouped kernel's. Against an f64 oracle the grouped output stays at the bf16
+/// store floor at every span, while cuBLAS at 32..128 rows per expert — where a
+/// 2048-token prefill lands — stores 40% of elements one quantum off: rms 2.7e-3
+/// on sm_89, 1.6e-4 on sm_120. Twice the worst measured.
+const RMS_REL: f64 = 5e-3;
 
 /// A control must be two orders past the bound, or the bound cannot tell a
 /// right grouping from a wrong one.
