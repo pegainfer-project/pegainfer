@@ -338,7 +338,8 @@ jobs:
       (github.event_name == 'push' || github.event.pull_request.draft == false)
       && needs.cuda-clippy-rows.outputs.rows != '[]'
     name: ${{ matrix.model_name }} CUDA Clippy (sm_${{ matrix.cuda_sm }})
-    runs-on: ubuntu-latest
+    # CUDA 13.0 packages are unavailable in the Ubuntu 26.04 repository.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       CUDA_PATH: /usr/local/cuda
