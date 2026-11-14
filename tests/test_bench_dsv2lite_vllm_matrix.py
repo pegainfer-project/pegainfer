@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -722,6 +724,9 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                     "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
                     "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
                     "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "device",
+                    "PEGAINFER_DSV2_LITE_DECODE_ATTENTION": "host",
+                    "PEGAINFER_DSV2_LITE_NVTX": "1",
+                    "PEGAINFER_DSV2_LITE_GRAPH_PROBE_TRACE": "1",
                     "CUDA_VISIBLE_DEVICES": "0,1",
                     "UNRELATED": "ignored",
                 }
@@ -731,6 +736,9 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                 "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH": "serial",
                 "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "grouped",
                 "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "device",
+                "PEGAINFER_DSV2_LITE_DECODE_ATTENTION": "host",
+                "PEGAINFER_DSV2_LITE_NVTX": "1",
+                "PEGAINFER_DSV2_LITE_GRAPH_PROBE_TRACE": "1",
                 "CUDA_VISIBLE_DEVICES": "0,1",
             },
         )
@@ -1192,6 +1200,141 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
         )
         self.assertIn("baseline_missing", regression["comparability"]["reasons"])
         self.assertIn("no directional claim", regression["docs_summary"])
+
+    def rebuild_retained_cli(self, root: Path, *, baseline: Path | None = None):
+        command = [
+            sys.executable, str(SCRIPT_PATH), "--summarize-only", str(root),
+            "--concurrency", "1", "--repeats", "1",
+        ]
+        if baseline is not None:
+            command.extend(["--baseline-summary", str(baseline / "summary.json")])
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": os.defpath, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads((root / "regression_summary.json").read_text(encoding="utf-8"))
+
+    def retained_cli_bundle(self, root: Path, *, engine="pegainfer-nccl", **row_context):
+        artifact = root / "http_raw" / engine / "c1" / "r0" / "result.json"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(json.dumps(self.valid_http_payload()), encoding="utf-8")
+        summary = {
+            "metadata": self.minimal_summary()["metadata"],
+            "http_concurrency_pressure": [{"engine": engine, **row_context}],
+        }
+        (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+    def test_cli_comparison_refuses_changed_serving_configuration(self) -> None:
+        args = self.base_args(Path("."), vllm_serve_extra_args=["--enforce-eager"])
+        vllm_command = bench_matrix.server_command(args, bench_matrix.ENGINES[2], 8000)
+        nccl_command = bench_matrix.server_command(args, bench_matrix.ENGINES[1], 8001)
+        runtime = {"available": True, "exit_code": 0, "version_code": 23004, "version": "2.30.4"}
+        vllm_context = {"server_command": vllm_command, "server_env": {}}
+        nccl_context = {
+            "server_command": nccl_command, "nccl_runtime": runtime,
+            "server_env": {"PEGAINFER_DSV2_LITE_EP_BACKEND": "nccl"},
+        }
+        cases = {
+            "eager": ("vllm-tp2", vllm_context, {"server_command": vllm_command[:-1]}),
+            "unknown_flag": ("vllm-tp2", vllm_context, {"server_command": [*vllm_command, "--new-scheduler-option"]}),
+            "backend_env": ("pegainfer-nccl", nccl_context, {
+                "server_env": {**nccl_context["server_env"], "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "host"},
+            }),
+            "decode_attention": ("pegainfer-nccl", nccl_context, {
+                "server_env": {**nccl_context["server_env"], "PEGAINFER_DSV2_LITE_DECODE_ATTENTION": "host"},
+            }),
+            "linked_nccl": ("pegainfer-nccl", nccl_context, {
+                "nccl_runtime": {**runtime, "version_code": 23100, "version": "2.31.0"},
+            }),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, (engine, context, changed) in cases.items():
+                with self.subTest(change=name):
+                    baseline = root / f"{name}-baseline"
+                    self.retained_cli_bundle(baseline, engine=engine, **context)
+                    self.rebuild_retained_cli(baseline)
+                    current = root / name
+                    self.retained_cli_bundle(current, engine=engine, **{**context, **changed})
+                    regression = self.rebuild_retained_cli(current, baseline=baseline)
+                    self.assertFalse(regression["comparability"]["comparable"])
+                    self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_cli_comparison_ignores_ports_artifact_paths_and_runtime_process_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline"
+            current = root / "current"
+            for bundle, port, pid in ((baseline, "8000", 123), (current, "9000", 456)):
+                self.retained_cli_bundle(
+                    bundle,
+                    server_command=[str(bundle / "bin" / "vllm"), "serve", "model", f"--port={port}", "--enforce-eager"],
+                    server_log=str(bundle / "server.log"),
+                    nccl_runtime={
+                        "available": True, "exit_code": 0, "version_code": 23004,
+                        "version": "2.30.4", "process_group_id": pid, "mapped_pids": [pid],
+                    },
+                )
+            self.rebuild_retained_cli(baseline)
+            regression = self.rebuild_retained_cli(current, baseline=baseline)
+            self.assertTrue(regression["comparability"]["comparable"])
+
+    def test_cli_direct_comparison_retains_backend_setting_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline"
+            current = root / "current"
+            for bundle, attention in ((baseline, "device"), (current, "host")):
+                self.retained_cli_bundle(bundle)
+                artifact = bundle / "direct_diagnostic_batch" / "nccl" / "batch1.json"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text(json.dumps({
+                    "backend": "nccl", "config": {"batch_size": 1},
+                    "timing": {"per_token_decode_stats": {"mean_us": 5000}},
+                    "accuracy": {"token_sha256": "tokens", "text_sha256": "text"},
+                }), encoding="utf-8")
+                summary_path = bundle / "summary.json"
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                summary["direct_diagnostic_batch"] = [{
+                    "backend": "nccl", "batch_size": 1,
+                    "env": {"PEGAINFER_DSV2_LITE_DECODE_ATTENTION": attention},
+                }]
+                summary_path.write_text(json.dumps(summary), encoding="utf-8")
+            self.rebuild_retained_cli(baseline)
+            regression = self.rebuild_retained_cli(current, baseline=baseline)
+            self.assertIn(
+                "execution_configuration_changed:direct_diagnostic_batch:nccl/1",
+                regression["comparability"]["reasons"],
+            )
+
+    def test_direct_diagnostic_captures_backend_setting_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = self.base_args(Path(tmp), direct_batches=[1], keep_going=True, command_timeout_s=1)
+            settings = {
+                "PEGAINFER_DSV2_LITE_DECODE_ATTENTION": "host",
+                "PEGAINFER_DSV2_LITE_NCCL_ROUTER": "host",
+                "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH": "serial",
+            }
+            # No GPU command runs: this check covers the production capture boundary.
+            with mock.patch.dict(bench_matrix.os.environ, settings), mock.patch.object(
+                bench_matrix, "run_capture", side_effect=RuntimeError("GPU execution intentionally not run")
+            ):
+                rows = bench_matrix.run_direct_diagnostic(args, Path(tmp))
+            for row in rows:
+                self.assertEqual(row["env"], {
+                    **bench_matrix.benchmark_server_env(bench_matrix.os.environ),
+                    **settings, "PEGAINFER_DSV2_LITE_EP_BACKEND": row["backend"],
+                })
+
+    def test_direct_comparison_ignores_output_paths_but_keeps_execution_flags(self) -> None:
+        baseline = self.minimal_summary()
+        current = self.minimal_summary()
+        baseline["direct_diagnostic_batch"][0]["command"] = ["cargo", "run", "--", "--out", "old/result.json"]
+        current["direct_diagnostic_batch"][0]["command"] = ["cargo", "run", "--", "--out=new/result.json"]
+        self.assertEqual(bench_matrix.comparability_reasons(current, baseline), [])
+        current["direct_diagnostic_batch"][0]["command"].append("--cuda-graph=false")
+        self.assertTrue(bench_matrix.comparability_reasons(current, baseline))
 
     def test_regression_summary_reports_resolved_failed_setup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
