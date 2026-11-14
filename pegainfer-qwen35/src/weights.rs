@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
 use cudarc::nccl::safe::Comm;
 use cudarc::nccl::safe::ReduceOp;
 use log::debug;
@@ -87,6 +89,10 @@ pub struct Qwen35Model {
     /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
     pub(super) decode_admission_batch: usize,
     tp_comm: Option<Comm>,
+    /// Alternate streams that let independent requests in one prefill chunk
+    /// overlap; created on first use by [`Qwen35Model::batch_prefill_logits`].
+    /// Empty (the TP path and single-request steps) means the serial pass.
+    pub(super) prefill_streams: Vec<Arc<CudaStream>>,
     /// -inf suppression for the tile-alignment pad rows, applied by
     /// [`Qwen35Model::output_logits_into`] (absent when the selection width
     /// needs no padding).
@@ -195,6 +201,25 @@ fn candidate_decode_targets(
             .collect()
     } else {
         Vec::new()
+    }
+}
+
+/// Bytes one prefill pass needs at `tokens`, measured by the active GDN backend.
+///
+/// Startup reserves this same estimator at `SCRATCH_ESTIMATE_SEQ`, so a pool of
+/// overlapped passes sized from these numbers stays inside that reservation.
+pub(super) fn gdn_prefill_scratch_bytes(
+    config: &Config35,
+    geometry: LocalGeometry,
+    flashinfer_gdn: Option<&pegainfer_kernels::ops::Qwen35GdnAot>,
+    tokens: usize,
+    page_size: usize,
+) -> usize {
+    match flashinfer_gdn {
+        Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
+            config, geometry, backend, tokens, page_size,
+        ),
+        None => super::prefill_buffers::prefill_scratch_bytes(config, geometry, tokens),
     }
 }
 
@@ -392,21 +417,17 @@ impl Qwen35Model {
         let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
-        // Reserve space for prefill scratch (GDR chunkwise + pass-wide buffers)
-        // before allocating KV pool, so prefill doesn't OOM.
+        // Reserve space for prefill scratch (the active GDN backend's chunk
+        // resources plus pass-wide buffers) before allocating KV pool, so
+        // prefill doesn't OOM.
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
-        let scratch_reserve = match &flashinfer_gdn {
-            Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
-                &config,
-                geometry,
-                backend,
-                max_prefill_len,
-                page_size,
-            ),
-            None => {
-                super::prefill_buffers::prefill_scratch_bytes(&config, geometry, max_prefill_len)
-            }
-        };
+        let scratch_reserve = gdn_prefill_scratch_bytes(
+            &config,
+            geometry,
+            flashinfer_gdn.as_ref(),
+            max_prefill_len,
+            page_size,
+        );
         let recurrent_reserve = STATES_PER_DECODE_SLOT
             * max_batch
             * super::recurrent_state::bytes_per_request(&config, geometry);
@@ -491,6 +512,7 @@ impl Qwen35Model {
             reserved_decode_slots: max_batch,
             decode_admission_batch,
             tp_comm: None,
+            prefill_streams: Vec::new(),
             pad_logit_suppress,
         })
     }
@@ -556,6 +578,12 @@ impl Qwen35Model {
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
         self.tp_comm = Some(comm);
+    }
+
+    /// Whether tensor-parallel collectives are installed. TP prefills stay on
+    /// one stream: NCCL calls assume a single stream.
+    pub(crate) fn is_tp(&self) -> bool {
+        self.tp_comm.is_some()
     }
 
     /// Force NCCL connect before any CUDA Graph capture records a collective

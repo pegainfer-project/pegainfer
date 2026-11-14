@@ -72,7 +72,7 @@ impl Drop for AsyncPrefillOutput {
     }
 }
 
-pub(super) fn fatal_cuda_lifecycle(message: &str) -> ! {
+pub(crate) fn fatal_cuda_lifecycle(message: &str) -> ! {
     log::error!("FATAL: {message}; aborting before CUDA-referenced state is released");
     std::process::abort();
 }
@@ -356,7 +356,10 @@ impl SingleGpuBackend {
         )
     }
 
-    pub(super) fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
+    pub(super) fn batch_prefill_logits(
+        &mut self,
+        chunk: &mut ScheduledChunk,
+    ) -> Result<HiddenStates> {
         let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
         let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU prefill received TP chunk state");
