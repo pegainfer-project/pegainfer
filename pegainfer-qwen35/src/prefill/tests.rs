@@ -187,7 +187,6 @@ fn flashinfer_gdn_chunk_continuation_and_model_outputs_match() -> Result<()> {
         &model_path,
         1,
         crate::DEFAULT_MAX_PREFILL_TOKENS,
-        crate::Qwen35SchedulerPolicy::Off,
         crate::Qwen35DecodeOverlap::Off,
     )?;
 

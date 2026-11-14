@@ -604,13 +604,7 @@ fn run_scheduler_e2e(acceptance: &GdnAcceptance) {
         crate::Qwen35DecodeOverlap::Off
     };
     let handle = acceptance
-        .launch_engine(
-            &model_path,
-            8,
-            crate::DEFAULT_MAX_PREFILL_TOKENS,
-            crate::Qwen35SchedulerPolicy::Off,
-            overlap,
-        )
+        .launch_engine(&model_path, 8, crate::DEFAULT_MAX_PREFILL_TOKENS, overlap)
         .expect("Failed to start Qwen3.5 scheduler");
     let mut handle = EngineHarness::new(handle);
     info!("scheduler loaded in {:.2?}", start.elapsed());
@@ -648,14 +642,8 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
 
     let (off_reference_tokens, off_decoder_tokens) = {
         let off_handle = acceptance
-            .launch_engine(
-                &model_path,
-                4,
-                8192,
-                crate::Qwen35SchedulerPolicy::Off,
-                crate::Qwen35DecodeOverlap::Off,
-            )
-            .expect("Failed to start Qwen3.5 default-Off scheduler");
+            .launch_engine(&model_path, 4, 8192, crate::Qwen35DecodeOverlap::Off)
+            .expect("Failed to start Qwen3.5 reference scheduler");
         let mut off_handle = EngineHarness::new(off_handle);
         let off_request = submit_repeated_token_request(
             &off_handle,
@@ -674,7 +662,7 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
         assert_eq!(
             off.tokens.len(),
             2,
-            "default-Off reference request must finish before Shared-SM parity"
+            "reference request must finish before Shared-SM parity"
         );
         let decoder_request = submit_repeated_token_request(
             &off_handle,
@@ -694,78 +682,8 @@ fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
         (off.tokens, decoder.tokens)
     };
 
-    // The auto policy may now combine with Shared-SM overlap: it only reshapes
-    // per-step prefill chunk budgets, so chunk boundaries change while greedy
-    // tokens must not.
-    {
-        let auto_handle = acceptance
-            .launch_engine(
-                &model_path,
-                4,
-                8192,
-                crate::Qwen35SchedulerPolicy::Auto,
-                crate::Qwen35DecodeOverlap::SharedSm,
-            )
-            .expect("Failed to start Qwen3.5 auto + shared-SM scheduler");
-        let mut auto_handle = EngineHarness::new(auto_handle);
-
-        let auto_active_request = submit_repeated_token_request(
-            &auto_handle,
-            "overlap-auto-last-decoder",
-            seed_token,
-            512,
-            128,
-        );
-        wait_for_first_token(
-            &mut auto_handle,
-            &auto_active_request,
-            "overlap-auto-last-decoder",
-        );
-        let _ = drain_tokens(
-            &mut auto_handle,
-            &auto_active_request,
-            "overlap-auto-last-decoder",
-        );
-        let auto_prefill_request = submit_repeated_token_request(
-            &auto_handle,
-            "overlap-auto-inflight-prefill",
-            seed_token,
-            8192,
-            2,
-        );
-        wait_for_running_requests(&auto_handle, 2, std::time::Duration::from_secs(10));
-        assert_no_generated_event(
-            &mut auto_handle,
-            &auto_prefill_request,
-            "overlap-auto-inflight-prefill",
-        );
-        auto_active_request.abort();
-        let auto_prefill = collect_generation_with_timeout(
-            &mut auto_handle,
-            &auto_prefill_request,
-            "overlap-auto-inflight-prefill",
-            None,
-            std::time::Duration::from_secs(30),
-        );
-        assert_eq!(
-            auto_prefill.tokens.len(),
-            2,
-            "auto + shared-SM in-flight prefill must finish after the last decoder is cancelled"
-        );
-        assert_eq!(
-            auto_prefill.tokens, off_reference_tokens,
-            "auto + shared-SM overlapped prefill must match the greedy default-Off reference"
-        );
-    }
-
     let handle = acceptance
-        .launch_engine(
-            &model_path,
-            4,
-            8192,
-            crate::Qwen35SchedulerPolicy::Off,
-            crate::Qwen35DecodeOverlap::SharedSm,
-        )
+        .launch_engine(&model_path, 4, 8192, crate::Qwen35DecodeOverlap::SharedSm)
         .expect("Failed to start Qwen3.5 shared-SM scheduler");
     let mut handle = EngineHarness::new(handle);
 

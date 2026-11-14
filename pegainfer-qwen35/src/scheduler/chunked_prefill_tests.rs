@@ -29,7 +29,6 @@ fn start_engine(
             model_path,
             MAX_BATCH,
             max_prefill_tokens,
-            crate::Qwen35SchedulerPolicy::Off,
             crate::Qwen35DecodeOverlap::Off,
         )
         .map(EngineHarness::new)

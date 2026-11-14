@@ -206,7 +206,7 @@ pub struct SharedArgs {
 
     /// Cap on total prompt tokens forwarded in one scheduler step. Qwen3 and
     /// Qwen3.5 only (rejected for other model lines); when omitted, they use
-    /// their own crate defaults.
+    /// their own crate defaults. Must be at least 1.
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
@@ -233,9 +233,14 @@ const SHARED_ARG_REQUIREMENTS: &[ArgRequirement] = &[
 ];
 
 impl SharedArgs {
-    /// Interactions between shared flags that hold for every consumer.
+    /// Rules on shared flags that hold for every consumer.
     /// Line-specific rules live in each line's [`ModelLine::validate`].
     pub fn validate(&self, provided: &BTreeSet<String>) -> Result<(), CliError> {
+        // A zero cap would leave every prompt waiting for a step that never
+        // forwards a row; reject it at the flag boundary.
+        if self.max_prefill_tokens == Some(0) {
+            return Err(CliError::rule("--max-prefill-tokens must be at least 1"));
+        }
         if self.dump_graph_png.is_some() && !self.cuda_graph {
             return Err(CliError::rule(
                 "--dump-graph-png requires --cuda-graph=true",
@@ -888,6 +893,21 @@ mod tests {
             .map(ModelLine::name)
             .expect_err("empty config");
         assert!(error.to_string().contains("model_type=missing"));
+    }
+
+    #[test]
+    fn rejects_zero_prefill_budget() {
+        use clap::Args as _;
+        use clap::FromArgMatches as _;
+        let matches = SharedArgs::augment_args(clap::Command::new("test"))
+            .try_get_matches_from(["test", "--max-prefill-tokens", "0"])
+            .expect("zero parses as a usize");
+        let shared = SharedArgs::from_arg_matches(&matches).expect("shared args");
+        let error = shared
+            .validate(&BTreeSet::new())
+            .expect_err("a zero cap can never forward a prompt row")
+            .to_string();
+        assert!(error.contains("at least 1"), "{error}");
     }
 
     #[test]

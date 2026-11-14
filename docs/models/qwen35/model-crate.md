@@ -7,12 +7,12 @@
 ## Ownership and entry points
 
 The crate owns config and weight loading, recurrent/conv state, paged KV,
-prefill/decode/unified execution, scheduler policy, TP workers and model-local
+prefill/decode/unified execution, step planning, TP workers and model-local
 tests. Shared CUDA wrappers and kernel builds remain in `pegainfer-core` and
 `pegainfer-kernels`; HTTP and the engine contract belong to
 `pegainfer-frontend`.
 
-`start_engine*` and `launch_with_options_policy_and_overlap` return
+`start_engine*` and `launch_with_options` return
 `Result<Engine>`. `Qwen35Line::launch` returns `LaunchedEngine::Stepped`,
 exposing one logical scheduler for either a single GPU or a TP replica.
 `EngineInfo` carries the servable context limit and logical KV capacity.

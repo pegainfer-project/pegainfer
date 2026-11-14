@@ -995,7 +995,6 @@ fn run_short_golden(acceptance: &common::GdnAcceptance) {
                 &model_path,
                 MAX_EXECUTOR_BATCH,
                 crate::DEFAULT_MAX_PREFILL_TOKENS,
-                crate::Qwen35SchedulerPolicy::Off,
                 crate::Qwen35DecodeOverlap::Off,
             )
             .expect("load Qwen3.5 logits executor model")
@@ -1151,7 +1150,6 @@ fn run_long_golden(acceptance: &common::GdnAcceptance) {
             &model_path,
             MAX_EXECUTOR_BATCH,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
-            crate::Qwen35SchedulerPolicy::Off,
             crate::Qwen35DecodeOverlap::Off,
         )
         .expect("load Qwen3.5 logits executor model");

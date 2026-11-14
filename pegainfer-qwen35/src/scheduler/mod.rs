@@ -59,23 +59,20 @@ use rand::rngs::StdRng;
 
 use self::backend::*;
 use self::emit::*;
-use self::plan::ActiveDecodeState;
 use self::plan::ActiveKvBudget;
-use self::plan::ExecutionPlan;
 use self::plan::PrefillKvBudget;
 use self::plan::PrefillQueueState;
 use self::plan::RejectReason;
+use self::plan::StepPlan;
 use self::plan::admit_pending_requests;
-use self::plan::choose_prefill_budget;
 use self::plan::compaction_after_retire;
-use self::plan::plan_prefill_chunks;
+use self::plan::plan_step;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
 use self::steps::*;
 use self::telemetry::*;
 use self::tp::*;
 use crate::Qwen35DecodeOverlap;
-use crate::Qwen35SchedulerPolicy;
 use crate::batch_decode_graph::BatchDecodeGraphState;
 use crate::executor::DecodeRequestResult;
 use crate::executor::DecodeResult;
@@ -186,7 +183,11 @@ impl PrefillStepArtifacts {
     }
 }
 
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+/// Default per-step prefill budget: one standard prompt chunk
+/// (`plan::STANDARD_PROMPT_CHUNK` rows). The serving cells that set Qwen3.5's
+/// tail target were tuned against this step size; `--max-prefill-tokens`
+/// overrides it.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = plan::STANDARD_PROMPT_CHUNK;
 
 // ── Entry point ─────────────────────────────────────────────────────────
 
@@ -196,22 +197,20 @@ pub fn start_with_capacity(
     max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<Engine> {
-    start_with_capacity_and_policy(
+    start_with_capacity_and_overlap(
         model,
         seed,
         max_batch,
         max_prefill_tokens,
-        Qwen35SchedulerPolicy::Off,
         Qwen35DecodeOverlap::Off,
     )
 }
 
-pub(crate) fn start_with_capacity_and_policy(
+pub(crate) fn start_with_capacity_and_overlap(
     model: Qwen35Model,
     seed: u64,
     max_batch: usize,
     max_prefill_tokens: usize,
-    scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<Engine> {
     assert!(
@@ -242,7 +241,6 @@ pub(crate) fn start_with_capacity_and_policy(
                         SchedulerBackend::Single(backend),
                         seed,
                         max_prefill_tokens,
-                        scheduler_policy,
                     ),
                     wiring,
                 );
@@ -314,12 +312,7 @@ pub(crate) fn start_tp_with_capacity(
     Ok(Engine {
         schedulers: vec![spawn_scheduler(
             "scheduler-qwen35-tp",
-            Qwen35Scheduler::new(
-                SchedulerBackend::Tp(backend),
-                seed,
-                max_prefill_tokens,
-                Qwen35SchedulerPolicy::Off,
-            ),
+            Qwen35Scheduler::new(SchedulerBackend::Tp(backend), seed, max_prefill_tokens),
         )],
         info: EngineInfo {
             servable_len: Some(servable),
@@ -395,18 +388,12 @@ struct Qwen35Scheduler {
     pending: Vec<QueuedRequest>,
     rng: StdRng,
     prefill_budget: usize,
-    scheduler_policy: Qwen35SchedulerPolicy,
     failed: bool,
     backend: SchedulerBackend,
 }
 
 impl Qwen35Scheduler {
-    fn new(
-        backend: SchedulerBackend,
-        seed: u64,
-        prefill_budget: usize,
-        scheduler_policy: Qwen35SchedulerPolicy,
-    ) -> Self {
+    fn new(backend: SchedulerBackend, seed: u64, prefill_budget: usize) -> Self {
         info!("scheduler ready (max_batch={})", backend.max_batch());
         Self {
             inflight_prefill: None,
@@ -415,7 +402,6 @@ impl Qwen35Scheduler {
             pending: Vec::new(),
             rng: StdRng::seed_from_u64(seed),
             prefill_budget,
-            scheduler_policy,
             failed: false,
             backend,
         }
@@ -429,14 +415,9 @@ impl Qwen35Scheduler {
             pending,
             rng,
             prefill_budget,
-            scheduler_policy,
             backend,
             ..
         } = self;
-        let decode_overlap = matches!(
-            backend,
-            SchedulerBackend::Single(single) if single.overlap_enabled()
-        );
         let max_batch = backend.max_batch();
 
         let prefill_ready = inflight_prefill
@@ -504,7 +485,24 @@ impl Qwen35Scheduler {
                 );
                 ("overlap_wait", result)
             } else {
-                let result = decode_step(backend, active, rng, ledger);
+                // The async prefill owns the stream; only decode rows move this
+                // step. It is still a planned step with an empty prompt side.
+                let plan = StepPlan {
+                    decode: true,
+                    prefill: Vec::new(),
+                };
+                let snapshot_stride = backend.snapshot_stride();
+                let result = run_step(
+                    backend,
+                    active,
+                    prefilling,
+                    &plan,
+                    inflight_prefill,
+                    rng,
+                    ledger,
+                    snapshot_stride,
+                )
+                .map(|_| ());
                 ("overlap_decode", result)
             };
             log_itl_step(
@@ -600,17 +598,9 @@ impl Qwen35Scheduler {
             admission_pending = admission.deferred;
         }
 
-        // Choose this tick's prefill budget, take that chunk off the front of
-        // the queue, then dispatch by plan. Auto can return 0 for a short
-        // decode-priority tick; the next iteration reconsiders the same FIFO
-        // prefill without reordering it.
-        let active_decode: Vec<ActiveDecodeState> = active
-            .iter()
-            .map(|req| ActiveDecodeState {
-                generated_count: ledger.completion_tokens(req.id),
-                max_tokens: req.max_tokens,
-            })
-            .collect();
+        // One budget decides the step: the active batch moves if anything is
+        // live, and the remaining rows go to the FIFO front of the prefill
+        // queue. A prompt that crosses the budget resumes next step.
         let prefill_queue: Vec<PrefillQueueState> = prefilling
             .iter()
             .map(|req| PrefillQueueState {
@@ -622,51 +612,44 @@ impl Qwen35Scheduler {
                     .saturating_sub(req.cursor),
             })
             .collect();
-        let step_prefill_budget = choose_prefill_budget(
-            *scheduler_policy,
-            *prefill_budget,
-            &active_decode,
-            &prefill_queue,
-            decode_overlap,
-        );
-        let scheduled =
-            take_prefill_chunks(prefilling, step_prefill_budget, backend.snapshot_stride());
-        // ITL diagnostics (#470): capture the *actual* prefill-chunk token count
-        // and the frozen decode width for this step before the plan consumes the
-        // scheduled set. Off unless PEGAINFER_ITL_DEBUG is set.
-        let itl_debug = itl_debug_enabled();
-        let itl_prefill_tokens: usize = scheduled.iter().map(|p| p.step_chunk).sum();
-        let itl_prefill_reqs = scheduled.len();
-        let itl_decode_n = active.len();
-        let plan = plan::build_next_plan(!active.is_empty(), scheduled);
-        if let Some(plan) = plan {
-            let itl_plan_kind = match &plan {
-                ExecutionPlan::Unified { .. } if decode_overlap => "overlap_launch",
-                ExecutionPlan::Unified { .. } => "unified",
-                ExecutionPlan::Prefill { .. } => "prefill",
-                ExecutionPlan::Decode => "decode",
+        let plan = plan_step(active.len(), *prefill_budget, &prefill_queue);
+        if !plan.is_empty() {
+            let overlap = backend.overlap_enabled();
+            let itl_plan_kind = match (plan.decode, plan.prefill.is_empty()) {
+                (true, true) => "decode",
+                (true, false) if overlap => "overlap_launch",
+                (true, false) => "unified",
+                (false, _) => "prefill",
             };
+            // ITL diagnostics (#470): forwarded prompt rows, scheduled prompt
+            // count, and the frozen decode width for this step. The stride
+            // alignment in `take_prefill_chunks` can shorten the tail chunk, so
+            // report the rows the executor actually forwards. Off unless
+            // PEGAINFER_ITL_DEBUG is set.
+            let itl_debug = itl_debug_enabled();
+            let itl_prefill_reqs = plan.prefill.len();
+            let itl_decode_n = active.len();
             let itl_step_start = itl_debug.then(Instant::now);
-            let step_result = match plan {
-                ExecutionPlan::Unified { pending } => {
-                    if decode_overlap {
-                        launch_overlap_step(backend, active, pending, inflight_prefill, rng, ledger)
-                    } else {
-                        unified_step_sched(backend, active, pending, prefilling, rng, ledger)
-                    }
-                }
-                ExecutionPlan::Prefill { pending } => {
-                    prefill_batch(backend, active, pending, prefilling, rng, ledger)
-                }
-                ExecutionPlan::Decode => decode_step(backend, active, rng, ledger),
-            };
-            log_itl_step(
-                itl_step_start,
-                itl_plan_kind,
-                itl_prefill_tokens,
-                itl_prefill_reqs,
-                itl_decode_n,
+            let snapshot_stride = backend.snapshot_stride();
+            let step_result = run_step(
+                backend,
+                active,
+                prefilling,
+                &plan,
+                inflight_prefill,
+                rng,
+                ledger,
+                snapshot_stride,
             );
+            if let Ok(forwarded) = &step_result {
+                log_itl_step(
+                    itl_step_start,
+                    itl_plan_kind,
+                    *forwarded,
+                    itl_prefill_reqs,
+                    itl_decode_n,
+                );
+            }
             step_result?;
         }
         Ok(())

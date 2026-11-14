@@ -12,7 +12,6 @@ use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen35::Qwen35LaunchOptions;
-use pegainfer_qwen35::Qwen35SchedulerPolicy;
 
 mod common;
 
@@ -41,10 +40,9 @@ fn start_engine_with_graph(
     prefix_cache_mib: usize,
     cuda_graph: bool,
 ) -> EngineHarness {
-    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
+    let handle = pegainfer_qwen35::launch_with_options(
         Path::new(model_path),
         Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, prefix_cache_mib),
-        Qwen35SchedulerPolicy::Off,
         pegainfer_qwen35::Qwen35DecodeOverlap::Off,
     )
     .unwrap_or_else(|err| panic!("failed to start Qwen3.5 TP{tp_size} prefix-cache engine: {err}"));
@@ -405,10 +403,9 @@ fn restore_during_live_decode(
         576,
     );
     let start_engine = || {
-        pegainfer_qwen35::launch_with_options_policy_and_overlap(
+        pegainfer_qwen35::launch_with_options(
             Path::new(&model_path),
             Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, 128),
-            Qwen35SchedulerPolicy::Off,
             overlap,
         )
         .map(EngineHarness::new)
