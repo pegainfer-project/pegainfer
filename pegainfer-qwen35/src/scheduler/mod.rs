@@ -186,7 +186,11 @@ impl PrefillStepArtifacts {
     }
 }
 
-pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 1024;
+/// Default per-step prefill budget. Four standard prompts per step keeps the
+/// prefill step count low; `choose_prefill_budget` tightens it once the decode
+/// batch is wide enough that a long step would land on every stream's
+/// inter-token latency.
+pub const DEFAULT_MAX_PREFILL_TOKENS: usize = 4096;
 
 // ── Entry point ─────────────────────────────────────────────────────────
 

@@ -38,6 +38,16 @@ pub(super) struct PrefillQueueState {
 
 const DECODE_FINISH_WINDOW_TOKENS: usize = 4;
 
+/// Decode batch width at which the scheduler stops packing several prompts
+/// into one prefill step. At this width a packed 4096-row step already spans
+/// every live stream's inter-token gap; below it the A100 c8/c16 cells keep
+/// the four-prompt step.
+const BUSY_DECODE_BATCH: usize = 16;
+
+/// Prefill rows allowed per step while the decode batch is busy: one standard
+/// prompt chunk, the size the fixed-budget serving cells were tuned against.
+const BUSY_PREFILL_BUDGET: usize = 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SlotCompaction {
     pub(super) moved_from: usize,
@@ -74,8 +84,12 @@ pub(super) fn choose_prefill_budget(
         base_budget > 0,
         "Qwen3.5 adaptive scheduler requires a positive base prefill budget"
     );
+    // The ceiling applies to every policy: the busy-decode cells were tuned
+    // against a fixed 1024-token step, and the wider default budget only serves
+    // the small-batch cells where fewer streams wait on the step.
+    let ceiling = prefill_budget_ceiling(base_budget, active.len());
     if policy == Qwen35SchedulerPolicy::Off || active.is_empty() || prefilling.is_empty() {
-        return base_budget;
+        return ceiling;
     }
 
     // With stream overlap the finishing request's last tokens keep ticking on
@@ -89,7 +103,22 @@ pub(super) fn choose_prefill_budget(
         return 0;
     }
 
-    prefilling[0].remaining_tokens.min(base_budget)
+    prefilling[0].remaining_tokens.min(ceiling)
+}
+
+/// Prefill rows a step may forward while `active_decodes` streams are live.
+///
+/// The default budget carries four standard prompts in one step. That cuts the
+/// number of prefill steps interrupting decode, which is a win while only a few
+/// streams wait, and a tail-latency loss once the batch is wide: every live
+/// stream's next inter-token gap spans the whole step. Cap the step back to one
+/// standard prompt chunk at that point.
+fn prefill_budget_ceiling(base_budget: usize, active_decodes: usize) -> usize {
+    if active_decodes >= BUSY_DECODE_BATCH {
+        base_budget.min(BUSY_PREFILL_BUDGET)
+    } else {
+        base_budget
+    }
 }
 
 pub(super) fn admit_pending_requests<T>(
@@ -348,6 +377,89 @@ mod tests {
             ),
             1024,
             "off keeps the fixed chunk budget"
+        );
+    }
+
+    fn wide_decode_batch(width: usize, max_tokens: usize) -> Vec<ActiveDecodeState> {
+        (0..width)
+            .map(|_| ActiveDecodeState {
+                generated_count: 16,
+                max_tokens,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn busy_decode_batch_caps_the_prefill_budget() {
+        let active = wide_decode_batch(16, 256);
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Off,
+                crate::DEFAULT_MAX_PREFILL_TOKENS,
+                &active,
+                &prefilling,
+                false
+            ),
+            1024,
+            "a wide decode batch caps the step to one standard prompt chunk"
+        );
+    }
+
+    #[test]
+    fn moderate_decode_batch_keeps_the_full_prefill_budget() {
+        let active = wide_decode_batch(15, 256);
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Off,
+                crate::DEFAULT_MAX_PREFILL_TOKENS,
+                &active,
+                &prefilling,
+                false
+            ),
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            "below the busy threshold the step keeps the full budget"
+        );
+    }
+
+    #[test]
+    fn busy_decode_cap_never_raises_a_smaller_budget() {
+        let active = wide_decode_batch(48, 256);
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 512,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(Qwen35SchedulerPolicy::Off, 512, &active, &prefilling, false),
+            512,
+            "the busy-decode cap is a ceiling over --max-prefill-tokens, not a floor"
+        );
+    }
+
+    #[test]
+    fn busy_decode_batch_caps_under_auto_policy_too() {
+        let active = wide_decode_batch(40, 256);
+        let prefilling = [PrefillQueueState {
+            remaining_tokens: 4096,
+        }];
+
+        assert_eq!(
+            choose_prefill_budget(
+                Qwen35SchedulerPolicy::Auto,
+                crate::DEFAULT_MAX_PREFILL_TOKENS,
+                &active,
+                &prefilling,
+                false
+            ),
+            1024,
+            "auto inherits the same busy-decode ceiling"
         );
     }
 

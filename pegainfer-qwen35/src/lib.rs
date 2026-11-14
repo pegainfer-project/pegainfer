@@ -85,10 +85,12 @@ pub mod runtime_ops {
 /// Scheduler policy for balancing Qwen3.5 prefill work against active decode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Qwen35SchedulerPolicy {
-    /// Preserve the fixed chunked-prefill behavior.
+    /// No decode-priority finishing tick. The busy-decode prefill cap still
+    /// applies.
     #[default]
     Off,
-    /// Adapt per scheduler tick based on active decode and prefill pressure.
+    /// Add a decode-priority finishing tick. The busy-decode prefill cap still
+    /// applies.
     Auto,
 }
 
