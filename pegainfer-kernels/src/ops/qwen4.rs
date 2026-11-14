@@ -879,26 +879,10 @@ pub fn hc_mix_into(
 const ROUTE_CHUNK_PAIRS: usize = 256;
 /// Pair count where the tiled route metadata overtakes the sequential kernel.
 /// The sequential kernel's cost is `2 * experts * pairs` comparisons on one SM;
-/// the tiled path's is a function of `pairs` plus three launches. Measured on a
-/// throttled sm_120 card: the tiled path is 1.4x ahead at the 320 pairs of a
-/// 32-token prompt and 52x at the 20480 pairs of a 2048-token one (sm_89: 1.4x
-/// and 48x), while 100 pairs is inside the noise of the two launches either
-/// side, so 256 pairs (26 tokens) keeps the decode and short-prompt path
-/// sequential.
+/// the tiled path's is a function of `pairs` plus three launches, so it wins
+/// once there are enough pairs and loses on the decode-sized batches. The
+/// measured crossover is recorded in `docs/models/qwen4/bring-up.md`.
 const ROUTE_TILED_MIN_PAIRS: usize = 256;
-/// Token count where the bf16x8 combine overtakes the scalar one. The
-/// vectorized grid is per token, so below it the extra blocks cost more than
-/// the 16 B accesses save: measured on a throttled sm_120 card the two cross
-/// near 16 tokens, 1.5x at 32 and 2.1x at 64, so 64 keeps the decode-sized
-/// batches on the scalar kernel with margin. On sm_89 the vector kernel is
-/// level to 1.3x over the same range — never slower, but much less ahead.
-const COMBINE_VEC_MIN_TOKENS: usize = 64;
-/// Above this the vectorized combine's `grid.y` (the token axis) would pass the
-/// runtime's 65535-block cap; the scalar kernel has no such bound, so longer
-/// prompts stay on it.
-const COMBINE_VEC_MAX_TOKENS: usize = 65535;
-/// bf16 elements per thread in the vectorized combine.
-const COMBINE_VEC: usize = 8;
 
 /// The MoE block geometry: `hidden`, `moe_intermediate` and
 /// `shared_intermediate` are data-driven; `experts` and `top_k` are frozen
@@ -1283,21 +1267,6 @@ pub fn qwen4_moe_route_meta_into(
     .map_err(|err| anyhow!("Qwen3.8-FN MoE route meta (tiled) launch failed: {err}"))
 }
 
-/// [`qwen4_moe_route_meta_into`]'s small-token kernel, kept as the decode path
-/// and as the tiled path's reference.
-pub fn qwen4_moe_route_meta_sequential_into(
-    ctx: &DeviceContext,
-    geometry: &Qwen4MoeGeometry,
-    ids: &CudaSlice<i32>,
-    tokens: usize,
-    indptr: &mut CudaSlice<i32>,
-    gather_rows: &mut CudaSlice<i32>,
-    route_slot: &mut CudaSlice<i32>,
-) -> Result<()> {
-    let shape = check_route_meta(geometry, ids, tokens, indptr, gather_rows, route_slot)?;
-    launch_route_meta_sequential(ctx, &shape, ids, indptr, gather_rows, route_slot)
-}
-
 struct RouteMetaShape {
     rows: i32,
     top_k: i32,
@@ -1369,11 +1338,11 @@ fn launch_route_meta_sequential(
     .map_err(|err| anyhow!("Qwen3.8-FN MoE route meta launch failed: {err}"))
 }
 
-/// The routed-expert combine, dispatched on token count: the bf16x8 2D-grid
-/// kernel from [`COMBINE_VEC_MIN_TOKENS`] to [`COMBINE_VEC_MAX_TOKENS`] tokens
-/// (and when `hidden` is a multiple of 8), the scalar grid-stride kernel outside
-/// that range. Both accumulate in f32 over the same `j` order and round each
-/// element once, so the choice changes throughput, not output.
+/// The routed-expert combine: `out[t] = sum_j w[t, j] * down_out[route_slot[t, j]]`,
+/// accumulated in f32 in ascending `j` and rounded once. A grid-stride kernel
+/// over `tokens * hidden` elements; its access pattern already runs near the
+/// card's bandwidth, so a vectorized variant buys little (see
+/// `docs/models/qwen4/bring-up.md`).
 pub fn qwen4_moe_weighted_combine_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
@@ -1384,61 +1353,30 @@ pub fn qwen4_moe_weighted_combine_into(
 ) -> Result<()> {
     let tokens = expert_out.seq_len;
     check_weighted_combine(geometry, tokens, down_out, weights, route_slot, expert_out)?;
-    if (COMBINE_VEC_MIN_TOKENS..=COMBINE_VEC_MAX_TOKENS).contains(&tokens)
-        && geometry.hidden.is_multiple_of(COMBINE_VEC)
-    {
-        launch_weighted_combine_vector(ctx, geometry, down_out, weights, route_slot, expert_out)
-    } else {
-        launch_weighted_combine_scalar(ctx, geometry, down_out, weights, route_slot, expert_out)
+    if tokens == 0 {
+        return Ok(());
     }
-}
-
-/// [`qwen4_moe_weighted_combine_into`]'s scalar kernel, kept as the decode path
-/// and as the vectorized path's reference.
-pub fn qwen4_moe_weighted_combine_scalar_into(
-    ctx: &DeviceContext,
-    geometry: &Qwen4MoeGeometry,
-    down_out: &HiddenStates,
-    weights: &CudaSlice<bf16>,
-    route_slot: &CudaSlice<i32>,
-    expert_out: &mut HiddenStates,
-) -> Result<()> {
-    check_weighted_combine(
-        geometry,
-        expert_out.seq_len,
-        down_out,
-        weights,
-        route_slot,
-        expert_out,
-    )?;
-    launch_weighted_combine_scalar(ctx, geometry, down_out, weights, route_slot, expert_out)
-}
-
-/// [`qwen4_moe_weighted_combine_into`]'s vectorized kernel, exposed so the gate
-/// can hold it against the scalar one at every token count, including the ones
-/// the dispatcher keeps on the scalar path.
-pub fn qwen4_moe_weighted_combine_vector_into(
-    ctx: &DeviceContext,
-    geometry: &Qwen4MoeGeometry,
-    down_out: &HiddenStates,
-    weights: &CudaSlice<bf16>,
-    route_slot: &CudaSlice<i32>,
-    expert_out: &mut HiddenStates,
-) -> Result<()> {
-    check_weighted_combine(
-        geometry,
-        expert_out.seq_len,
-        down_out,
-        weights,
-        route_slot,
-        expert_out,
-    )?;
-    ensure!(
-        geometry.hidden.is_multiple_of(COMBINE_VEC),
-        "MoE weighted combine (vector): hidden {} is not a multiple of {COMBINE_VEC}",
-        geometry.hidden
-    );
-    launch_weighted_combine_vector(ctx, geometry, down_out, weights, route_slot, expert_out)
+    let tokens_i = checked_i32(tokens, "MoE weighted combine tokens")?;
+    let top_k = checked_i32(geometry.top_k, "MoE weighted combine top_k")?;
+    let hidden = checked_i32(geometry.hidden, "MoE weighted combine hidden")?;
+    let (down_ptr, _down_guard) = down_out.data.device_ptr(&ctx.stream);
+    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
+    let (slot_ptr, _slot_guard) = route_slot.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = expert_out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_weighted_combine_cuda(
+            down_ptr as *const ffi::Half,
+            weights_ptr as *const ffi::Half,
+            slot_ptr as *const i32,
+            out_ptr as *mut ffi::Half,
+            tokens_i,
+            top_k,
+            hidden,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN MoE weighted combine launch failed: {err}"))
 }
 
 fn check_weighted_combine(
@@ -1473,76 +1411,6 @@ fn check_weighted_combine(
     down_out.checked_extent("MoE weighted combine down_out")?;
     expert_out.checked_extent("MoE weighted combine expert_out")?;
     Ok(())
-}
-
-fn launch_weighted_combine_scalar(
-    ctx: &DeviceContext,
-    geometry: &Qwen4MoeGeometry,
-    down_out: &HiddenStates,
-    weights: &CudaSlice<bf16>,
-    route_slot: &CudaSlice<i32>,
-    expert_out: &mut HiddenStates,
-) -> Result<()> {
-    let tokens = expert_out.seq_len;
-    if tokens == 0 {
-        return Ok(());
-    }
-    let tokens_i = checked_i32(tokens, "MoE weighted combine tokens")?;
-    let top_k = checked_i32(geometry.top_k, "MoE weighted combine top_k")?;
-    let hidden = checked_i32(geometry.hidden, "MoE weighted combine hidden")?;
-    let (down_ptr, _down_guard) = down_out.data.device_ptr(&ctx.stream);
-    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
-    let (slot_ptr, _slot_guard) = route_slot.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = expert_out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::qwen4_moe_weighted_combine_cuda(
-            down_ptr as *const ffi::Half,
-            weights_ptr as *const ffi::Half,
-            slot_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            tokens_i,
-            top_k,
-            hidden,
-            active_cu_stream(ctx),
-        )
-    }
-    .result()
-    .map_err(|err| anyhow!("Qwen3.8-FN MoE weighted combine launch failed: {err}"))
-}
-
-fn launch_weighted_combine_vector(
-    ctx: &DeviceContext,
-    geometry: &Qwen4MoeGeometry,
-    down_out: &HiddenStates,
-    weights: &CudaSlice<bf16>,
-    route_slot: &CudaSlice<i32>,
-    expert_out: &mut HiddenStates,
-) -> Result<()> {
-    let tokens = expert_out.seq_len;
-    if tokens == 0 {
-        return Ok(());
-    }
-    let tokens_i = checked_i32(tokens, "MoE weighted combine tokens")?;
-    let top_k = checked_i32(geometry.top_k, "MoE weighted combine top_k")?;
-    let hidden = checked_i32(geometry.hidden, "MoE weighted combine hidden")?;
-    let (down_ptr, _down_guard) = down_out.data.device_ptr(&ctx.stream);
-    let (weights_ptr, _weights_guard) = weights.device_ptr(&ctx.stream);
-    let (slot_ptr, _slot_guard) = route_slot.device_ptr(&ctx.stream);
-    let (out_ptr, _out_guard) = expert_out.data.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::qwen4_moe_weighted_combine_vec_cuda(
-            down_ptr as *const ffi::Half,
-            weights_ptr as *const ffi::Half,
-            slot_ptr as *const i32,
-            out_ptr as *mut ffi::Half,
-            tokens_i,
-            top_k,
-            hidden,
-            active_cu_stream(ctx),
-        )
-    }
-    .result()
-    .map_err(|err| anyhow!("Qwen3.8-FN MoE weighted combine (vector) launch failed: {err}"))
 }
 
 /// The checkpoint's PLE block geometry. Frozen with the line: `pegainfer-qwen4`

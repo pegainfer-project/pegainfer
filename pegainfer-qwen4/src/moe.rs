@@ -25,12 +25,10 @@ use crate::weights::Geometry;
 use crate::weights::MoeBlock;
 
 /// Token count from which the expert GEMMs run as one grouped launch per leg.
-/// Measured at the real 1280x2560 and 2560x640 legs on a throttled sm_120 card:
-/// at one token the grouped launch is level on gate_up (0.96x) and 1.7x on down,
-/// 1.2x at four, and 2.5x / 2.0x at 2048, so the per-expert loop keeps the
-/// single-token slot and its role as the gate's reference. An unthrottled L20
-/// (sm_89) agrees on the boundary: one token 0.97x on the whole block, four
-/// 1.08x, 2048 1.52x.
+/// Below it the per-expert cuBLAS loop is level or ahead and keeps the
+/// single-token slot's role as the gate's reference; the grouped launch wins
+/// once a batch has enough rows. The measured crossover is recorded in
+/// `docs/models/qwen4/bring-up.md`.
 const GROUPED_MIN_TOKENS: usize = 4;
 
 /// Every stage of one block forward, kept for the reference gate.
@@ -88,7 +86,7 @@ pub fn moe_prefill(
     let mut down_out = HiddenStates::zeros(ctx, g.hidden, pairs)?;
     // The expert GEMMs: one grouped launch per leg above `GROUPED_MIN_TOKENS`,
     // where it beats the per-expert cuBLAS loop and lets `indptr` stay on the
-    // device; below it the loop is level or ahead (see the constant's numbers).
+    // device; below it the loop is level or ahead.
     if tokens >= GROUPED_MIN_TOKENS {
         let mut grouped = Qwen4GroupedGemmScratch::new(ctx, &geometry)?;
         qwen4_moe_grouped_gemm_into(

@@ -17,11 +17,8 @@
 // dominate the layer.
 //
 // Weighted combine. `out[t] = sum_j f32(w[t, j]) * f32(down_out[route_slot[t, j]])`,
-// accumulated in f32 and rounded once. The reference adds expert by expert in
-// bf16; the difference sits below the gate's floor. Both kernels — scalar and
-// bf16x8 — accumulate in ascending `j` and round each element once, so they
-// are bit-identical; the vectorized one is the prefill path, the scalar one the
-// decode path and the vectorized one's reference.
+// accumulated in f32 in ascending `j` and rounded once. The reference adds
+// expert by expert in bf16; the difference sits below the gate's floor.
 
 #include "../common.cuh"
 #include "../shared/ffi_guard.cuh"
@@ -40,10 +37,6 @@ constexpr int kCombineThreads = 256;
 constexpr int kRouteChunkPairs = 256;
 /// Warps (chunks) per CTA in the tiled route-metadata kernels.
 constexpr int kRouteWarps = 4;
-/// bf16 elements one vectorized combine thread handles: 16 B loads and stores.
-/// The token-count dispatch lives in the wrapper (`ops/qwen4.rs`).
-constexpr int kCombineVec = 8;
-constexpr int kCombineVecThreads = 128;
 
 // One block. Thread e owns expert e: a count pass, a serial exclusive scan over
 // the counts in shared memory, then a placement pass in pair order.
@@ -217,43 +210,6 @@ __global__ void qwen4_moe_weighted_combine_kernel(
   }
 }
 
-// The same arithmetic over 8 bf16 elements per thread: grid.y is the token (so
-// the 64-bit `at / hidden` and the per-element slot/weight reads disappear),
-// grid.x covers the hidden axis in 16 B chunks. The accumulation loop is
-// element-wise and in ascending `j`, exactly the scalar kernel's.
-__global__ void qwen4_moe_weighted_combine_vec_kernel(
-    const __nv_bfloat16* __restrict__ down_out, const __nv_bfloat16* __restrict__ weights,
-    const int* __restrict__ route_slot, __nv_bfloat16* __restrict__ out, int hidden,
-    int top_k) {
-  const long long token = blockIdx.y;
-  const int h = (blockIdx.x * blockDim.x + threadIdx.x) * kCombineVec;
-  if (h >= hidden) return;
-  float acc[kCombineVec];
-#pragma unroll
-  for (int i = 0; i < kCombineVec; ++i) acc[i] = 0.0f;
-  for (int j = 0; j < top_k; ++j) {
-    const int pair = static_cast<int>(token) * top_k + j;
-    const int slot = __ldg(route_slot + pair);
-    if (slot < 0) continue;
-    const float w = __bfloat162float(__ldg(weights + pair));
-    const uint4 packed =
-        *reinterpret_cast<const uint4*>(down_out + static_cast<long long>(slot) * hidden + h);
-    const __nv_bfloat162* halves = reinterpret_cast<const __nv_bfloat162*>(&packed);
-#pragma unroll
-    for (int i = 0; i < kCombineVec / 2; ++i) {
-      acc[2 * i] += w * __bfloat162float(__low2bfloat16(halves[i]));
-      acc[2 * i + 1] += w * __bfloat162float(__high2bfloat16(halves[i]));
-    }
-  }
-  uint4 packed;
-  __nv_bfloat162* halves = reinterpret_cast<__nv_bfloat162*>(&packed);
-#pragma unroll
-  for (int i = 0; i < kCombineVec / 2; ++i) {
-    halves[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
-  }
-  *reinterpret_cast<uint4*>(out + token * hidden + h) = packed;
-}
-
 }  // namespace
 
 extern "C" {
@@ -345,26 +301,6 @@ CUresult qwen4_moe_route_meta_tiled_cuda(const int* ids, int* indptr, int* gathe
   qwen4_moe_route_meta_place_kernel<<<blocks, kRouteWarps * WARP_SIZE, 2 * row_smem, stream>>>(
       ids, chunk_hist, indptr, gather_rows, route_slot, static_cast<int>(pairs), top_k, experts,
       chunk_count);
-  return consume_last_cuda_error();
-}
-
-CUresult qwen4_moe_weighted_combine_vec_cuda(const __nv_bfloat16* down_out,
-                                             const __nv_bfloat16* weights,
-                                             const int* route_slot, __nv_bfloat16* out,
-                                             int tokens, int top_k, int hidden,
-                                             cudaStream_t stream) {
-  if (down_out == nullptr || weights == nullptr || route_slot == nullptr || out == nullptr) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  // The 16 B load/store needs `hidden` to be a whole number of vectors.
-  if (tokens < 0 || top_k <= 0 || hidden <= 0 || hidden % kCombineVec != 0) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (tokens == 0) return CUDA_SUCCESS;
-  const int columns = hidden / kCombineVec;
-  const dim3 grid((columns + kCombineVecThreads - 1) / kCombineVecThreads, tokens, 1);
-  qwen4_moe_weighted_combine_vec_kernel<<<grid, kCombineVecThreads, 0, stream>>>(
-      down_out, weights, route_slot, out, hidden, top_k);
   return consume_last_cuda_error();
 }
 

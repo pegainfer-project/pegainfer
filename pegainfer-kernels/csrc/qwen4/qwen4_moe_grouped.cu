@@ -25,14 +25,12 @@
 //
 // so `D` is exactly the `[pairs, N]` buffer the per-expert loop wrote.
 //
-// The tile is 64 rows by 128 columns. At 2048 tokens a prefill group averages
-// 40 rows (20480 pairs over 512 experts), so one 64-row tile spans M and the
-// expert's weight slab is read once across its N tiles, while a 128-row tile
-// would leave 88 of its 128 rows padding. A sweep over tile/stage configs at
-// 200 tokens (narrow geometry, both legs) put 64x128x4 at
-// 197/156 us, 64x128x3 at 194/158 (level), 64x128x2 at 230/138 (mixed) and
-// 128x128x4 at 388/310 (2x worse), so only 64x128x4 ships; the CTA count sweep
-// (13/26/52/104/208/416) showed the occupancy-based count (52 on 26 SMs) best.
+// The tile is 64 rows by 128 columns with 4 stages: a prefill group averages
+// ~40 rows (20480 pairs over 512 experts at 2048 tokens), so one 64-row tile
+// spans M and the expert's weight slab is read once across its N tiles, while
+// a 128-row tile would spend most of its rows on padding. This was the best of
+// the tile/stage configs swept; the CTA count comes from occupancy. The
+// measured sweeps are recorded in `docs/models/qwen4/bring-up.md`.
 //
 // Numerics: CUTLASS accumulates each output element over K in f32 like cuBLAS,
 // but the split/order of the accumulation and the tile's epilogue order differ,

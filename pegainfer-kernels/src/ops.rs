@@ -281,15 +281,9 @@ pub use qwen4::qwen4_moe_route_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_route_meta_into;
 #[cfg(feature = "qwen4")]
-pub use qwen4::qwen4_moe_route_meta_sequential_into;
-#[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_shared_branch_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_weighted_combine_into;
-#[cfg(feature = "qwen4")]
-pub use qwen4::qwen4_moe_weighted_combine_scalar_into;
-#[cfg(feature = "qwen4")]
-pub use qwen4::qwen4_moe_weighted_combine_vector_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::rms_norm_grouped_offset_batch_into;
 #[cfg(feature = "qwen35")]

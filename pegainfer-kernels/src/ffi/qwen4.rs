@@ -259,19 +259,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// [`qwen4_moe_weighted_combine_cuda`] at 8 bf16 per thread on a 2D grid;
-    /// `hidden` must be a multiple of 8. Bit-identical output.
-    pub fn qwen4_moe_weighted_combine_vec_cuda(
-        down_out: *const Half,
-        weights: *const Half,
-        route_slot: *const i32,
-        out: *mut Half,
-        tokens: i32,
-        top_k: i32,
-        hidden: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     /// Bytes the grouped GEMM's per-group argument scratch needs for `experts`
     /// groups.
     pub fn qwen4_moe_grouped_args_bytes(experts: i32) -> usize;

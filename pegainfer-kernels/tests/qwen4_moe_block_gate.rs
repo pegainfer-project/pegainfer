@@ -1,14 +1,13 @@
 //! Qwen3.8-Flash-Next MoE block: the prefill paths against the ones they
 //! replaced.
 //!
-//! Three seams, each new path against the implementation it is meant to
-//! replace, on deterministic synthetic inputs:
+//! Two seams on deterministic synthetic inputs:
 //!
-//! * route metadata — the tiled histogram/scan/placement against the single-CTA
-//!   sequential kernel. **Bit-identical**, including `indptr[experts]` and the
-//!   `-1` of an out-of-range id.
-//! * weighted combine — the bf16x8 2D-grid kernel against the scalar
-//!   grid-stride kernel. **Bit-identical**.
+//! * route metadata — the tiled histogram/scan/placement's layout is pinned
+//!   directly: offsets ascend to the valid pair count, one slot per valid pair,
+//!   `gather` matching each pair's token, and each expert's range holding only
+//!   its own pairs in ascending order. That admits exactly one layout, on both
+//!   sides of the dispatch threshold.
 //! * expert GEMM — one grouped CUTLASS launch per leg against the per-expert
 //!   cuBLAS loop. A **bound**, not bitwise: both accumulate over K in f32, but
 //!   CUTLASS's 32-wide K tiles and per-tile epilogue order the roundings
@@ -47,10 +46,6 @@ use pegainfer_kernels::ops::gather_hidden_tokens_into;
 use pegainfer_kernels::ops::gemm_rows_span_into_checked;
 use pegainfer_kernels::ops::qwen4_moe_grouped_gemm_into;
 use pegainfer_kernels::ops::qwen4_moe_route_meta_into;
-use pegainfer_kernels::ops::qwen4_moe_route_meta_sequential_into;
-use pegainfer_kernels::ops::qwen4_moe_weighted_combine_into;
-use pegainfer_kernels::ops::qwen4_moe_weighted_combine_scalar_into;
-use pegainfer_kernels::ops::qwen4_moe_weighted_combine_vector_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::DeviceMatrix;
 use pegainfer_kernels::tensor::HiddenStates;
@@ -96,7 +91,6 @@ fn ids_data(tokens: usize, seed: u64) -> Vec<i32> {
 struct Routing {
     indptr: CudaSlice<i32>,
     gather: CudaSlice<i32>,
-    slot: CudaSlice<i32>,
     indptr_host: Vec<i32>,
 }
 
@@ -122,47 +116,27 @@ fn route(ctx: &DeviceContext, g: &Qwen4MoeGeometry, tokens: usize) -> Routing {
     Routing {
         indptr,
         gather,
-        slot,
         indptr_host,
     }
 }
 
-fn bits(values: &[f32]) -> Vec<u32> {
-    values.iter().map(|v| v.to_bits()).collect()
-}
-
 #[test]
-fn route_meta_is_bit_identical_to_the_sequential_kernel() {
+fn route_meta_layout_is_pinned() {
     let Some(ctx) = common::device_or_skip() else {
         return;
     };
     let g = geometry(256);
-    // Below the tiled threshold both sides run the sequential kernel; 25 and 26
-    // tokens straddle it (250/260 pairs), and 32/64/200/2048 tokens are
-    // 320/640/2000/20480 pairs, i.e. 2, 3, 8 and 80 chunks of the tiled path.
+    // 25 and 26 tokens straddle the tiled threshold (250/260 pairs); below it
+    // the dispatched entry runs the sequential kernel, above it the tiled path
+    // (32/64/200/2048 tokens are 2, 3, 8 and 80 chunks).
     for tokens in [1usize, 3, 10, 25, 26, 32, 64, 200, 2048] {
         let pairs = tokens * TOP_K;
         let ids = ctx.stream.clone_htod(&ids_data(tokens, 11)).unwrap();
-        let mut want = (
-            ctx.stream.alloc_zeros(EXPERTS + 1).unwrap(),
-            ctx.stream.alloc_zeros(pairs).unwrap(),
-            ctx.stream.alloc_zeros(pairs).unwrap(),
-        );
         let mut got = (
             ctx.stream.alloc_zeros(EXPERTS + 1).unwrap(),
             ctx.stream.alloc_zeros(pairs).unwrap(),
             ctx.stream.alloc_zeros(pairs).unwrap(),
         );
-        qwen4_moe_route_meta_sequential_into(
-            &ctx,
-            &g,
-            &ids,
-            tokens,
-            &mut want.0,
-            &mut want.1,
-            &mut want.2,
-        )
-        .unwrap();
         let mut scratch = Qwen4RouteMetaScratch::new(&ctx, &g, tokens).unwrap();
         qwen4_moe_route_meta_into(
             &ctx,
@@ -178,24 +152,9 @@ fn route_meta_is_bit_identical_to_the_sequential_kernel() {
         let indptr: Vec<i32> = ctx.stream.clone_dtoh(&got.0).unwrap();
         let gather: Vec<i32> = ctx.stream.clone_dtoh(&got.1).unwrap();
         let slot: Vec<i32> = ctx.stream.clone_dtoh(&got.2).unwrap();
-        assert_eq!(
-            ctx.stream.clone_dtoh(&want.0).unwrap(),
-            indptr,
-            "indptr, {tokens} tokens"
-        );
-        assert_eq!(
-            ctx.stream.clone_dtoh(&want.1).unwrap(),
-            gather,
-            "gather_rows, {tokens} tokens"
-        );
-        assert_eq!(
-            ctx.stream.clone_dtoh(&want.2).unwrap(),
-            slot,
-            "route_slot, {tokens} tokens"
-        );
-        // Shape of the layout itself, independent of the reference: offsets
-        // ascend, the last is the valid pair count, every valid pair has its
-        // own slot, and each expert's slots keep ascending pair order.
+        // The layout itself: offsets ascend, the last is the valid pair count,
+        // every valid pair has its own slot, and each expert's slots keep
+        // ascending pair order. Together these admit exactly one answer.
         let ids = ids_data(tokens, 11);
         assert_eq!(indptr[0], 0);
         assert!(indptr.windows(2).all(|w| w[0] <= w[1]));
@@ -232,112 +191,6 @@ fn route_meta_is_bit_identical_to_the_sequential_kernel() {
                     .all(|p| *p != usize::MAX && ids[*p] == e as i32),
                 "{tokens} tokens: expert {e}'s slot range holds another expert's pair"
             );
-        }
-    }
-}
-
-#[test]
-fn weighted_combine_is_bit_identical_to_the_scalar_kernel() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
-    let g = geometry(2560);
-    // 63 and 64 straddle the vectorized kernel's dispatch, 2048 is the prefill
-    // size and 1 the decode one. The vectorized kernel is run directly, not
-    // through the dispatcher, so the counts the dispatcher keeps on the scalar
-    // path still compare two different kernels.
-    for tokens in [1usize, 63, 64, 200, 2048] {
-        let pairs = tokens * TOP_K;
-        let down =
-            HiddenStates::from_host(&ctx, &common::fill(3, pairs * g.hidden), g.hidden, pairs)
-                .unwrap();
-        let weights = ctx.stream.clone_htod(&common::fill(5, pairs)).unwrap();
-        let routing = route(&ctx, &g, tokens);
-        let mut want = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
-        let mut vector = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
-        let mut dispatched = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
-        qwen4_moe_weighted_combine_scalar_into(&ctx, &g, &down, &weights, &routing.slot, &mut want)
-            .unwrap();
-        qwen4_moe_weighted_combine_vector_into(
-            &ctx,
-            &g,
-            &down,
-            &weights,
-            &routing.slot,
-            &mut vector,
-        )
-        .unwrap();
-        qwen4_moe_weighted_combine_into(&ctx, &g, &down, &weights, &routing.slot, &mut dispatched)
-            .unwrap();
-        let want = bits(&want.to_host(&ctx).unwrap());
-        assert_eq!(
-            want,
-            bits(&vector.to_host(&ctx).unwrap()),
-            "vectorized combine, {tokens} tokens"
-        );
-        assert_eq!(
-            want,
-            bits(&dispatched.to_host(&ctx).unwrap()),
-            "dispatched combine, {tokens} tokens"
-        );
-    }
-}
-
-/// The vectorized combine puts the token on `grid.y`, which the runtime caps at
-/// 65535 blocks: the dispatcher must hand longer prompts to the scalar kernel,
-/// and the vector entry must refuse them at the launch.
-#[test]
-fn combine_dispatch_holds_the_grid_y_cap() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
-    // hidden 8 keeps the 65536-token slot buffers a few MB.
-    let g = geometry(8);
-    for tokens in [65535usize, 65536] {
-        let pairs = tokens * TOP_K;
-        let down =
-            HiddenStates::from_host(&ctx, &common::fill(3, pairs * g.hidden), g.hidden, pairs)
-                .unwrap();
-        let weights = ctx.stream.clone_htod(&common::fill(5, pairs)).unwrap();
-        let routing = route(&ctx, &g, tokens);
-        let mut scalar = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
-        let mut got = HiddenStates::zeros(&ctx, g.hidden, tokens).unwrap();
-        qwen4_moe_weighted_combine_scalar_into(
-            &ctx,
-            &g,
-            &down,
-            &weights,
-            &routing.slot,
-            &mut scalar,
-        )
-        .unwrap();
-        qwen4_moe_weighted_combine_into(&ctx, &g, &down, &weights, &routing.slot, &mut got)
-            .unwrap();
-        let want = bits(&scalar.to_host(&ctx).unwrap());
-        assert_eq!(
-            want,
-            bits(&got.to_host(&ctx).unwrap()),
-            "dispatched, {tokens} tokens"
-        );
-        let vector = qwen4_moe_weighted_combine_vector_into(
-            &ctx,
-            &g,
-            &down,
-            &weights,
-            &routing.slot,
-            &mut got,
-        );
-        if tokens == 65535 {
-            vector.unwrap();
-            assert_eq!(
-                want,
-                bits(&got.to_host(&ctx).unwrap()),
-                "vectorized, {tokens} tokens"
-            );
-        } else {
-            // The refusal must come from the launch, not an earlier shape check.
-            let err = vector.unwrap_err().to_string();
-            assert!(err.contains("launch failed"), "{tokens} tokens: {err}");
         }
     }
 }
