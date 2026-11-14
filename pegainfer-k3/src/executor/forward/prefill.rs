@@ -1017,6 +1017,8 @@ fn mla_expand_window(
         &s.mla_ctx_latent,
         row,
         &mut s.mla_ctx_nope_v,
+        0,
+        len,
     )?;
     k3_mla_prefill_expand_k_launch(
         ctx,

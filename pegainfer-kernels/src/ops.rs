@@ -208,7 +208,6 @@ pub use linear::gemm_lt_tune;
 pub use linear::gemm_per_token;
 pub use linear::gemm_rows_into;
 pub use linear::gemm_rows_into_checked;
-pub use linear::gemm_rows_span_at_into_checked;
 pub use linear::gemm_rows_span_into_checked;
 pub use linear::gemm_strided_batched_bf16;
 pub use linear::gemm_strided_batched_f32;
@@ -248,7 +247,11 @@ pub use qwen4::HcMixScratch;
 #[cfg(feature = "qwen4")]
 pub use qwen4::PleBlockGeometry;
 #[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4GroupedGemmScratch;
+#[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4MoeGeometry;
+#[cfg(feature = "qwen4")]
+pub use qwen4::Qwen4RouteMetaScratch;
 #[cfg(feature = "qwen4")]
 pub use qwen4::Qwen4SharedBranchScratch;
 #[cfg(feature = "qwen4")]
@@ -271,6 +274,8 @@ pub use qwen4::qsa_indexer_select_into;
 pub use qwen4::qsa_sparse_attention_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_combine_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_grouped_gemm_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_route_into;
 #[cfg(feature = "qwen4")]
