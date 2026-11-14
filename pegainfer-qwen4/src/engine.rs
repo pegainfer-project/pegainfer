@@ -15,6 +15,7 @@ use cudarc::driver::CudaContext;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
@@ -80,9 +81,6 @@ impl Qwen4Scheduler {
         };
         if request.prompt_tokens.is_empty() {
             return unsupported("an empty prompt");
-        }
-        if request.prompt_logprobs.is_some() {
-            return unsupported("prompt logprobs");
         }
         if request.lora_adapter.is_some() {
             return unsupported("LoRA adapters");
@@ -156,13 +154,27 @@ impl Qwen4Scheduler {
                 steps: vec![0],
                 seed: self.next_seed(),
                 logprobs: vec![request.logprobs],
+                prompt_logprobs: request.prompt_logprobs,
             };
-            let Output::Tokens { ids, logprobs } =
-                self.model
-                    .prefill(slot, &request.prompt_tokens, Readout::Sample(sampling))?
+            let Output::Tokens {
+                ids,
+                logprobs,
+                prompt,
+            } = self
+                .model
+                .prefill(slot, &request.prompt_tokens, Readout::Sample(sampling))?
             else {
                 bail!("the cards handed back a stream for a prompt");
             };
+            if let Some(prompt) = prompt {
+                ledger.echo_prompt(
+                    id,
+                    PromptEcho {
+                        ids: request.prompt_tokens.clone(),
+                        logprobs: prompt,
+                    },
+                );
+            }
             self.slots[slot] = Some(Running {
                 id,
                 params: request.params,
@@ -202,8 +214,9 @@ impl Qwen4Scheduler {
             steps,
             seed: self.next_seed(),
             logprobs,
+            prompt_logprobs: None,
         };
-        let Output::Tokens { ids, logprobs } =
+        let Output::Tokens { ids, logprobs, .. } =
             self.model.decode(&slots, &ids, Readout::Sample(sampling))?
         else {
             bail!("the cards handed back a stream for a decode step");

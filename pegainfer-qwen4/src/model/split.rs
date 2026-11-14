@@ -41,24 +41,33 @@ pub enum Readout {
 }
 
 /// One row's params and request local step per sequence, and a fresh seed
-/// for the call, as `pegainfer_sample::select_batch` takes them, and per
-/// sequence how many top logprobs to report with its token, if any.
+/// for the call, as `pegainfer_sample::select_batch` takes them, per sequence
+/// how many top logprobs to report with its token, if any, and for a prompt
+/// how many with each of its tokens.
 #[derive(Clone, Debug)]
 pub struct Sampling {
     pub params: Vec<SamplingParams>,
     pub steps: Vec<u64>,
     pub seed: u64,
     pub logprobs: Vec<Option<usize>>,
+    pub prompt_logprobs: Option<usize>,
 }
 
 pub enum Output {
     Stream(Vec<bf16>),
-    /// One token per sequence, and its logprob where the sequence asked.
+    /// One token per sequence and its logprob where the sequence asked, and
+    /// for a prompt that asked, every prompt token's logprob (none for the
+    /// first).
     Tokens {
         ids: Vec<u32>,
         logprobs: Vec<Option<TokenLogprob>>,
+        prompt: Option<Vec<Option<TokenLogprob>>>,
     },
 }
+
+/// Prompt rows read out at once for their logprobs, which bounds the logits a
+/// long prompt holds: each row is the whole vocabulary wide.
+const PROMPT_SCORE_ROWS: usize = 512;
 
 #[derive(Clone)]
 enum Slots {
@@ -116,6 +125,10 @@ impl Stage {
                 Ok(Output::Stream(host))
             }
             Some(Readout::Sample(sampling)) => {
+                let prompt = match (slots, sampling.prompt_logprobs) {
+                    (Slots::Prefill(_), Some(top_k)) => Some(self.score_prompt(&out, ids, top_k)?),
+                    _ => None,
+                };
                 let read = match slots {
                     Slots::Prefill(_) => {
                         let mut last = HiddenStates::zeros(ctx, out.hidden_dim, 1)?;
@@ -154,9 +167,49 @@ impl Stage {
                     .iter()
                     .map(|top_k| top_k.and_then(|_| scored.next()))
                     .collect();
-                Ok(Output::Tokens { ids, logprobs })
+                Ok(Output::Tokens {
+                    ids,
+                    logprobs,
+                    prompt,
+                })
             }
         }
+    }
+
+    /// The logprob of every prompt token after the first, each read out from
+    /// the last layer's stream of the row before it, [`PROMPT_SCORE_ROWS`]
+    /// rows at a time; the first token has none.
+    fn score_prompt(
+        &self,
+        out: &HiddenStates,
+        ids: &[u32],
+        top_k: usize,
+    ) -> Result<Vec<Option<TokenLogprob>>> {
+        let ctx = &self.ctx;
+        let scored = ids.len() - 1;
+        let mut scores = Vec::with_capacity(ids.len());
+        scores.push(None);
+        let mut start = 0;
+        while start < scored {
+            let rows = PROMPT_SCORE_ROWS.min(scored - start);
+            let mut chunk = HiddenStates::zeros(ctx, out.hidden_dim, rows)?;
+            copy_hidden_token_range_into(ctx, out, start, &mut chunk, 0, rows)?;
+            let (_, logits) = self.model.readout(ctx, &chunk)?;
+            let wanted: Vec<LogprobRequest> = (0..rows)
+                .map(|row| LogprobRequest {
+                    row,
+                    picked: ids[start + row + 1],
+                    top_k,
+                })
+                .collect();
+            scores.extend(
+                token_logprobs_batch(ctx, &logits, &wanted)?
+                    .into_iter()
+                    .map(Some),
+            );
+            start += rows;
+        }
+        Ok(scores)
     }
 
     fn work(&mut self, work: Work) -> Result<Option<Output>> {
