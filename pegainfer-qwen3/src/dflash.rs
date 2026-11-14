@@ -6,7 +6,7 @@ use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceMatrix;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
-use pegainfer_kernels::ops::gemm_rows_span_at_into_checked;
+use pegainfer_kernels::ops::gemm_rows_span_into_checked;
 
 use crate::config::DFlashConfig;
 use crate::dspark::MarkovHead;
@@ -489,7 +489,7 @@ impl DFlashDraftModel {
         let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let cache = &mut state.layers[layer_idx];
-            gemm_rows_span_at_into_checked(
+            gemm_rows_span_into_checked(
                 ctx,
                 &layer.attention.qkv_proj,
                 q_dim,
@@ -500,7 +500,7 @@ impl DFlashDraftModel {
                 start_pos,
                 token_count,
             )?;
-            gemm_rows_span_at_into_checked(
+            gemm_rows_span_into_checked(
                 ctx,
                 &layer.attention.qkv_proj,
                 q_dim + kv_dim,
@@ -686,7 +686,7 @@ impl DFlashDraftModel {
             for (i, state) in states.iter_mut().enumerate() {
                 let row_offset = i * block_size;
                 let cache = &mut state.layers[layer_idx];
-                gemm_rows_span_at_into_checked(
+                gemm_rows_span_into_checked(
                     ctx,
                     &layer.attention.qkv_proj,
                     q_dim,
@@ -697,7 +697,7 @@ impl DFlashDraftModel {
                     state.committed_len,
                     block_size,
                 )?;
-                gemm_rows_span_at_into_checked(
+                gemm_rows_span_into_checked(
                     ctx,
                     &layer.attention.qkv_proj,
                     q_dim + kv_dim,
