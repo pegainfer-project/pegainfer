@@ -23,6 +23,7 @@ use pegainfer_frontend::engine::RequestLedger;
 use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::StopPolicy;
+use pegainfer_frontend::engine::TokenLogprob;
 use pegainfer_frontend::engine::spawn_scheduler;
 use pegainfer_frontend::sampler::SamplingParams;
 
@@ -46,6 +47,8 @@ struct Running {
     params: SamplingParams,
     stop: StopPolicy,
     max_tokens: usize,
+    /// Top logprobs to report with each token, when the request asked.
+    logprobs: Option<usize>,
     /// Tokens picked so far; the last one is the next step's input.
     produced: usize,
     last: u32,
@@ -78,9 +81,6 @@ impl Qwen4Scheduler {
         if request.prompt_tokens.is_empty() {
             return unsupported("an empty prompt");
         }
-        if request.logprobs.is_some() {
-            return unsupported("logprobs");
-        }
         if request.prompt_logprobs.is_some() {
             return unsupported("prompt logprobs");
         }
@@ -102,11 +102,20 @@ impl Qwen4Scheduler {
         None
     }
 
-    /// Record the token picked for `slot`'s sequence and free the slot when
-    /// the sequence stops.
-    fn emit(&mut self, ledger: &mut RequestLedger, slot: usize, token: u32) {
+    /// Record the token picked for `slot`'s sequence, with its logprob when the
+    /// request asked, and free the slot when the sequence stops.
+    fn emit(
+        &mut self,
+        ledger: &mut RequestLedger,
+        slot: usize,
+        token: u32,
+        logprob: Option<TokenLogprob>,
+    ) {
         let running = self.slots[slot].as_mut().expect("a running slot");
-        ledger.push_tokens(running.id, &[token], &[]);
+        match logprob {
+            Some(logprob) => ledger.push_tokens(running.id, &[token], &[Some(logprob)]),
+            None => ledger.push_tokens(running.id, &[token], &[]),
+        }
         running.produced += 1;
         running.last = token;
         let eos = &self.eos;
@@ -146,8 +155,9 @@ impl Qwen4Scheduler {
                 params: vec![request.params],
                 steps: vec![0],
                 seed: self.next_seed(),
+                logprobs: vec![request.logprobs],
             };
-            let Output::Tokens(tokens) =
+            let Output::Tokens { ids, logprobs } =
                 self.model
                     .prefill(slot, &request.prompt_tokens, Readout::Sample(sampling))?
             else {
@@ -158,10 +168,13 @@ impl Qwen4Scheduler {
                 params: request.params,
                 stop: request.stop_policy,
                 max_tokens: request.max_tokens,
+                logprobs: request.logprobs,
                 produced: 0,
                 last: 0,
             });
-            self.emit(ledger, slot, *tokens.first().context("a token per prompt")?);
+            let token = *ids.first().context("a token per prompt")?;
+            let logprob = logprobs.into_iter().next().flatten();
+            self.emit(ledger, slot, token, logprob);
             return Ok(());
         }
         Ok(())
@@ -183,17 +196,20 @@ impl Qwen4Scheduler {
         let ids: Vec<u32> = running().map(|r| r.last).collect();
         let params: Vec<SamplingParams> = running().map(|r| r.params).collect();
         let steps: Vec<u64> = running().map(|r| r.produced as u64).collect();
+        let logprobs: Vec<Option<usize>> = running().map(|r| r.logprobs).collect();
         let sampling = Sampling {
             params,
             steps,
             seed: self.next_seed(),
+            logprobs,
         };
-        let Output::Tokens(tokens) = self.model.decode(&slots, &ids, Readout::Sample(sampling))?
+        let Output::Tokens { ids, logprobs } =
+            self.model.decode(&slots, &ids, Readout::Sample(sampling))?
         else {
             bail!("the cards handed back a stream for a decode step");
         };
-        for (&slot, token) in slots.iter().zip(tokens) {
-            self.emit(ledger, slot, token);
+        for ((&slot, token), logprob) in slots.iter().zip(ids).zip(logprobs) {
+            self.emit(ledger, slot, token, logprob);
         }
         Ok(())
     }

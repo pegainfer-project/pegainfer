@@ -1202,7 +1202,7 @@ fn hold_streamed(
         )?;
         let upload = |output: Output, rows: usize| match output {
             Output::Stream(host) => HiddenStates::from_host(ctx, &host, g.stream_width(), rows),
-            Output::Tokens(_) => bail!("asked the cards for the stream"),
+            Output::Tokens { .. } => bail!("asked the cards for the stream"),
         };
         for (slot, seq) in sequences.iter().enumerate() {
             let prompt = seq.prompt();
