@@ -7,7 +7,7 @@
 //! route decompresses to bf16 (a different numerical regime) behind a fragile
 //! trust_remote_code load. The fixture
 //! (`test_data/kimi-k2.6-vllm-golden.safetensors`, produced once on the
-//! serving hardware by `tools/accuracy/dump_kimi_k2_vllm_golden.py`) pins the
+//! serving hardware by `scripts/accuracy/kimi_k2_vllm_golden.py`) pins the
 //! prompt token ids, vLLM's greedy tail, and vLLM's top-K logprobs per
 //! position.
 //!
@@ -217,7 +217,7 @@ fn load_fixture() -> Fixture {
     let bytes = std::fs::read(FIXTURE).unwrap_or_else(|e| {
         panic!(
             "kimi vllm_golden_gate: fixture {FIXTURE} is missing ({e}); \
-             generate it with tools/accuracy/dump_kimi_k2_vllm_golden.py"
+             generate it with scripts/accuracy/kimi_k2_vllm_golden.py"
         )
     });
     let (_, header) = SafeTensors::read_metadata(&bytes).expect("parse fixture header");

@@ -19,7 +19,7 @@ and the attention/MLP sublayers are stubs that return fixed bf16 tensors — so 
 values are the reference's own two scatter lines given those inputs, not a re-derivation.
 The manifest is one JSON metadata key (`qwen4_hc_golden`).
 
-    python tools/accuracy/dump_qwen38fn_hc_golden.py --out test_data/qwen38fn-hc-golden.safetensors
+    python scripts/accuracy/qwen4_hc_golden.py --out test_data/qwen38fn-hc-golden.safetensors
 """
 
 from __future__ import annotations

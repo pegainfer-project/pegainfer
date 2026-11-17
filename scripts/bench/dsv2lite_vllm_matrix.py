@@ -546,7 +546,7 @@ def run_correctness_gate(args: argparse.Namespace, out_dir: Path) -> dict[str, A
 
     steps = [
         (
-            [resolved_hf_python(args), "tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py",
+            [resolved_hf_python(args), "scripts/accuracy/dsv2lite_ep2_greedy.py",
              "--model-path", model, "--case-set-json", case_set, "--out", hf_json_arg],
             {},
             "hf",
@@ -573,7 +573,7 @@ def run_correctness_gate(args: argparse.Namespace, out_dir: Path) -> dict[str, A
             "nccl",
         ),
         (
-            [sys.executable, "tools/accuracy/compare_dsv2_lite_ep2_outputs.py",
+            [sys.executable, "scripts/accuracy/dsv2lite_ep2_compare.py",
              "--hf", hf_json_arg, "--host-staged", host_json_arg, "--nccl", nccl_json_arg,
              "--out", comparison_json_arg, "--require-all-exact"],
             {},
@@ -2776,7 +2776,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
                 "label": "hf",
                 "command": redact_command([
                     resolved_hf_python(args),
-                    "tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py",
+                    "scripts/accuracy/dsv2lite_ep2_greedy.py",
                     "--model-path",
                     str(args.model_path),
                     "--case-set-json",
@@ -2789,7 +2789,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
                 "label": "compare",
                 "command": redact_command([
                     sys.executable,
-                    "tools/accuracy/compare_dsv2_lite_ep2_outputs.py",
+                    "scripts/accuracy/dsv2lite_ep2_compare.py",
                     "--hf",
                     "<artifact-dir>/correctness/hf.json",
                     "--host-staged",

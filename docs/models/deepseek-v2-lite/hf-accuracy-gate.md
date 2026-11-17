@@ -51,7 +51,7 @@ Run all three outputs from the same model snapshot:
 ```bash
 mkdir -p target/accuracy/dsv2-lite-ep2
 
-python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
+python scripts/accuracy/dsv2lite_ep2_greedy.py \
   --model-path models/DeepSeek-V2-Lite \
   --case-set-json test_data/deepseek-v2-lite-ep2-cases.json \
   --out target/accuracy/dsv2-lite-ep2/hf.json
@@ -67,7 +67,7 @@ PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
 PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl.json \
   cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
+python scripts/accuracy/dsv2lite_ep2_compare.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \
   --host-staged target/accuracy/dsv2-lite-ep2/host-staged.json \
   --nccl target/accuracy/dsv2-lite-ep2/nccl.json \

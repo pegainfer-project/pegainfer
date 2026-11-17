@@ -1,6 +1,6 @@
 //! HF-oracle gate for the decode bookends (embed / final RMSNorm / lm_head).
 //!
-//! The oracle side is `tools/accuracy/glm52_oracle.py --stage bookend`. Three
+//! The oracle side is `scripts/accuracy/glm52_oracle.py --stage bookend`. Three
 //! assertions, typed by what each op can promise:
 //! - embed: a bf16 gather is EXACT — assert the embed-rows digest bit-for-bit.
 //! - logits: RMS-scaled probe tolerance (bf16 GEMV vs f32 reference matmul).
@@ -66,7 +66,7 @@ fn glm52_lm_head(
 }
 
 // ---- BEGIN GENERATED: glm52_oracle bookend probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
+// uv run scripts/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
 //     --ctx 8 --seed 0x5eed604d --precision fp8sim --stage bookend
 // transformers=5.13.0.dev0 torch=2.12.1+cu130
 const ORACLE_SEED: u64 = 0x5eed604d;

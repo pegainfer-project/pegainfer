@@ -9,7 +9,7 @@
 //! satisfies; only a real regression escapes the tolerance.
 //!
 //! The reference (`test_data/qwen3-{size}-hf-golden.safetensors`, produced once
-//! by `tools/accuracy/dump_qwen3_hf_golden.py`) pins a set of fixed token
+//! by `scripts/accuracy/qwen3_golden.py`) pins a set of fixed token
 //! sequences and HF's top-K next-token logprobs at each position. We replay the
 //! *same fixed sequences* through pegainfer by teacher-forcing — prefill the
 //! prompt, then decode feeding the reference's own tail tokens — so every
@@ -233,7 +233,7 @@ impl Golden {
                 );
                 eprintln!(
                     "skipping qwen3 hf_golden_gate: no golden fixture for size {size} at {path}; \
-                     generate one with tools/accuracy/dump_qwen3_hf_golden.py"
+                     generate one with scripts/accuracy/qwen3_golden.py"
                 );
                 return None;
             }

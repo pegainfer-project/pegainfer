@@ -10,7 +10,7 @@ versions at test time. The B matrices are calibrated into [MIN_EFFECT, MAX_EFFEC
 outside that band the script refuses to write (a null fixture would let a silently
 dropped adapter pass).
 
-    uv run --no-project python tools/accuracy/dump_qwen3_4b_lora_golden.py \
+    uv run --no-project python scripts/accuracy/qwen3_lora_golden.py \
         --model-path /data/models/Qwen3-4B \
         --out test_data/qwen3-4b-lora-golden.safetensors
 """

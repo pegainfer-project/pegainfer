@@ -23,7 +23,7 @@ margin threshold makes it unnecessary here.
 
 Output is safetensors, not JSON: it is machine-only numeric data, nobody reads it.
 
-    uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
+    uv run --no-project python scripts/accuracy/qwen3_golden.py \
         --model-path /data/models/Qwen3-14B \
         --out test_data/qwen3-14b-hf-golden.safetensors
 """

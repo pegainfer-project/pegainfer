@@ -31,7 +31,7 @@ inputs, `rows` slice, hashed ids, recorded projections and expected block output
 Scope: full-sequence (cache=None) only; the decode states (2-token id window and
 dilated conv state) need their own dump.
 
-    python tools/accuracy/dump_qwen38fn_ple_golden.py --out <fixture>
+    python scripts/accuracy/qwen4_ple_golden.py --out <fixture>
 """
 
 from __future__ import annotations

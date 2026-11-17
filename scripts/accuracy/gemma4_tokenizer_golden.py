@@ -1,6 +1,6 @@
 """Dump a Gemma 4 tokenizer/chat-template golden from a local checkpoint.
 
-    python tools/accuracy/dump_gemma4_tokenizer_golden.py <model-dir> <out.json> \
+    python scripts/accuracy/gemma4_tokenizer_golden.py <model-dir> <out.json> \
         --source-repo google/gemma-4-12B-it --revision <sha>
 
 Provenance is required rather than inferred: a checkpoint directory carries no

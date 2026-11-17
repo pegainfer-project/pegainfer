@@ -54,7 +54,7 @@ Local transformers at `/data/code/workspace-rustllm/transformers` (5.13.0.dev0, 
 - topk = `torch.topk`.
 - Hadamard skipped.
 
-The oracle harness (`tools/accuracy/glm52_oracle.py`) runs transformers 5.12.1 (pinned). **Must bump to 5.13.0.dev0** (or wait for 5.13.0 release) so the indexer RoPE matches vllm. See "Oracle gate" below.
+The oracle harness (`scripts/accuracy/glm52_oracle.py`) runs transformers 5.12.1 (pinned). **Must bump to 5.13.0.dev0** (or wait for 5.13.0 release) so the indexer RoPE matches vllm. See "Oracle gate" below.
 
 ## Scope
 
@@ -117,7 +117,7 @@ After checking vendored FlashInfer / existing repo code, only **one** new CUDA k
 
 ## Oracle gate
 
-Extends the existing harness (#499, `tools/accuracy/glm52_oracle.py` + `oracle/mla.rs`):
+Extends the existing harness (#499, `scripts/accuracy/glm52_oracle.py` + `oracle/mla.rs`):
 
 1. **Bump transformers pin** to 5.13.0.dev0 (or 5.13.0 release if available). The indexer RoPE fix (PR #46842) is required for oracle correctness. `glm52_oracle.py` line 6 already has the pin comment.
 2. **Add `--stage indexer` tap set** to the harness: `index_q`, `index_k`, `index_weights`, `mqa_logits`, `topk_indices`. The harness already captures `topk_indices` (line 301) but does not assert it.

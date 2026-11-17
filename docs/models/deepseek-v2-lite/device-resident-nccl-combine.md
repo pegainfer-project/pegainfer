@@ -46,7 +46,7 @@ cargo clippy --offline --release -p pegainfer-deepseek-v2-lite \
   -A clippy::manual_midpoint \
   -A clippy::needless_range_loop
 
-python tools/accuracy/hf_dump_dsv2_lite_ep2_greedy.py \
+python scripts/accuracy/dsv2lite_ep2_greedy.py \
   --model-path models/DeepSeek-V2-Lite \
   --prompt Hello \
   --output-len 16 \
@@ -61,7 +61,7 @@ PEGAINFER_DSV2_LITE_EP_BACKEND=nccl \
 PEGAINFER_DSV2_LITE_E2E_JSON_OUT=target/accuracy/dsv2-lite-ep2/nccl-after-decouple-cleanup.json \
   cargo test --offline --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 
-python tools/accuracy/compare_dsv2_lite_ep2_outputs.py \
+python scripts/accuracy/dsv2lite_ep2_compare.py \
   --hf target/accuracy/dsv2-lite-ep2/hf.json \
   --host-staged target/accuracy/dsv2-lite-ep2/host-staged.json \
   --nccl target/accuracy/dsv2-lite-ep2/nccl-after-decouple-cleanup.json \

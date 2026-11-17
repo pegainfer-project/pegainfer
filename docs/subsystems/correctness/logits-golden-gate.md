@@ -62,7 +62,7 @@ The single worst token is the **same** one across bs=1 / eager-9 / graph-9 — a
 
 ## Applying it to a new model line
 
-1. **Dumper** (`tools/accuracy/dump_<model>_hf_golden.py`) — seed-pinned fixed sequences spanning short→long prompts (cover multi-block KV / high RoPE positions) plus a teacher-forced decode tail; HF bf16; top-K logprobs at positions `P-1 .. P+D-1`; safetensors out.
+1. **Dumper** (`scripts/accuracy/<model>_golden.py`) — seed-pinned fixed sequences spanning short→long prompts (cover multi-block KV / high RoPE positions) plus a teacher-forced decode tail; HF bf16; top-K logprobs at positions `P-1 .. P+D-1`; safetensors out.
 2. **Gate** (`tests/hf_golden_gate.rs`) — load the golden, teacher-force the same sequences, apply the regret + mean + p99 guards, replay the paths that model line actually owns: bs=1, batched eager when it exists, graph-padded bucket straddles, and any model-local state handoff surface such as Qwen3.5 slot compaction.
 3. **Calibrate** — measure the floor, set tolerances as a small recorded multiple, write them down.
 

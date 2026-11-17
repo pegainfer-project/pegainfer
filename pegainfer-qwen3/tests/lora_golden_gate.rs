@@ -1,7 +1,7 @@
 //! PEFT-LoRA logits gate for Qwen3-4B. The zero-adapter `lora_smoke` test only
 //! proves the route runs; this gate replays teacher-forced sequences with a non-zero
 //! rank-1 q/v adapter against a PEFT reference, so a transposed, missing, or mis-scaled
-//! delta fails. The fixture (from `tools/accuracy/dump_qwen3_4b_lora_golden.py`) embeds
+//! delta fails. The fixture (from `scripts/accuracy/qwen3_lora_golden.py`) embeds
 //! the adapter tensors themselves — nothing reproduces PEFT or RNG at test time.
 //!
 //! Replay framework and tolerances are copied from `hf_golden_gate.rs` (tests cannot

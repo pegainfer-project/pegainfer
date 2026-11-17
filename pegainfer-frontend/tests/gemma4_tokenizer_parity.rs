@@ -1,5 +1,5 @@
 //! Chat-render parity against a Hugging Face reference dumped by
-//! `tools/accuracy/dump_gemma4_tokenizer_golden.py`. Owned by the frontend
+//! `scripts/accuracy/gemma4_tokenizer_golden.py`. Owned by the frontend
 //! crate because the contract under test is the chat-render path (the
 //! vendored vllm renderer against the reference's Jinja2); the fixture is
 //! shared test data and the checkpoint comes from the environment. The

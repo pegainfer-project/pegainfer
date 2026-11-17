@@ -1,14 +1,15 @@
-"""Dump the Gemma 4 window-crossing logprob reference.
+"""Dump the Gemma 4 long-context logprob reference.
 
-    python tools/accuracy/dump_gemma4_window_golden.py <model-dir> <out.safetensors> \
+    python scripts/accuracy/gemma4_longctx_golden.py <model-dir> <out.safetensors> \
         --source-repo google/gemma-4-12B-it \
-        --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
+        --revision <same revision as the window fixture>
 
-Four prompt lengths around and beyond the sliding window (1023, 1024, 1025,
-4096), each followed by 8 teacher-forced continuation tokens from the corpus.
-Every position records the top-64 ids and logprobs under both sdpa and eager;
-docs/models/gemma4/hf-golden.md says why a distribution under two backends is
-the only reachable reference at this depth.
+Two waypoints far past the sliding window (16384, 32768), each followed by 8
+teacher-forced continuation tokens from the corpus. Every position records
+the top-64 ids and logprobs under both sdpa and eager; eager materialises the
+full attention matrix per layer, so a waypoint where it cannot fit is
+recorded sdpa-only and named in the manifest — the consumer borrows the
+widest dual-backend floor instead.
 
 Refuses to write rather than record something unusable: non-finite scores at
 any position abort the dump.
@@ -17,9 +18,7 @@ any position abort the dump.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -28,8 +27,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 TOP_K = 64
 TEACHER_STEPS = 8
-METADATA_KEY = "gemma4_window_golden"
-CASES = {"w1023": 1023, "w1024": 1024, "w1025": 1025, "w4096": 4096}
+METADATA_KEY = "gemma4_longctx_golden"
+CASES = {"w16384": 16384, "w32768": 32768}
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,7 +42,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def corpus_ids(tokenizer, min_len: int) -> list[int]:
-    rows = "  <tr>\n    <td>item</td>\n  </tr>\n" * 800
+    rows = "  <tr>\n    <td>item</td>\n  </tr>\n" * 7000
     ids = tokenizer(f"<table>\n{rows}", return_tensors="pt").input_ids[0].tolist()
     if len(ids) < min_len:
         raise SystemExit(f"corpus tokenizes to {len(ids)} < {min_len} tokens")
@@ -56,24 +55,35 @@ def main() -> None:
     ids = corpus_ids(tokenizer, max(CASES.values()) + TEACHER_STEPS)
 
     tensors: dict[str, torch.Tensor] = {}
+    eager_skipped: list[str] = []
     for impl in ("sdpa", "eager"):
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir, dtype=torch.bfloat16, device_map=args.device, attn_implementation=impl
+            args.model_dir, dtype=torch.bfloat16, attn_implementation=impl, device_map=args.device
         )
         model.eval()
         for case, length in CASES.items():
             seq = torch.tensor([ids[: length + TEACHER_STEPS]], device=model.device if args.device == "auto" else args.device)
 
             def rows_of() -> torch.Tensor:
-                # Slice to the recorded positions before the fp32 upcast:
-                # the full 262k-vocab logits over 4k positions in fp32 is
-                # ~4.3 GiB and OOMs next to the 22 GiB tower.
+                # Keep only the recorded positions' logits: the full
+                # 262k-vocab head over 32k positions is ~17 GiB in bf16 and
+                # does not fit next to the 22 GiB tower.
                 with torch.no_grad():
-                    return model(seq).logits[0, length - 1 : length + TEACHER_STEPS].float()
+                    return model(seq, logits_to_keep=TEACHER_STEPS + 1).logits[0].float()
 
-            rows = rows_of()
+            try:
+                rows = rows_of()
+            except torch.cuda.OutOfMemoryError:
+                if impl == "sdpa":
+                    raise SystemExit(f"case {case}: sdpa itself cannot fit — no reference")
+                eager_skipped.append(case)
+                torch.cuda.empty_cache()
+                print(f"eager {case}: does not fit, recorded sdpa-only")
+                continue
             if not torch.equal(rows, rows_of()):
                 raise SystemExit(f"case {case} ({impl}): forward is not reproducible")
+            if not torch.isfinite(rows).all():
+                raise SystemExit(f"case {case} ({impl}): non-finite logits")
             logprobs = F.log_softmax(rows, dim=-1)
             top = logprobs.topk(TOP_K, dim=-1)
             tensors[f"{case}_{impl}_ids"] = top.indices.to(torch.int32).cpu()
@@ -87,6 +97,8 @@ def main() -> None:
         tensors[f"{case}_teacher"] = torch.tensor(
             ids[length : length + TEACHER_STEPS], dtype=torch.int32
         )
+        if case in eager_skipped:
+            continue
         # The consumer's floor: how far the two backends sit apart on the
         # recorded positions, evaluated at the sdpa top-64 ids.
         sdpa_ids = tensors[f"{case}_sdpa_ids"]
@@ -115,12 +127,11 @@ def main() -> None:
         "cases": CASES,
         "teacher_steps": TEACHER_STEPS,
         "top_k": TOP_K,
+        "eager_skipped": sorted(eager_skipped),
         "corpus": "an unnumbered <table> row repeated, trimmed per case",
-        "reference": "teacher-forced top-64 logprobs under both sdpa and eager",
+        "reference": "teacher-forced top-64 logprobs under sdpa and, where it fits, eager",
     }
     save_file(tensors, args.out, metadata={METADATA_KEY: json.dumps(manifest, sort_keys=True)})
-    digest = hashlib.sha256(Path(args.out).read_bytes()).hexdigest()
-    print(f"wrote {args.out} sha256 {digest}")
 
 
 if __name__ == "__main__":

@@ -95,7 +95,7 @@ Adaptation, not rewrite: the picks must land on main's refactored op surfaces (`
 
 ## Oracle gates
 
-Extends `tools/accuracy/glm52_oracle.py` + the `oracle/mla.rs` pattern (probe consts, input-digest-first, fp8sim precision, `--emit rust`). Note: layer 3 (the first MoE layer) is a **shared-indexer** layer, so the MoE gate uses **layer 6** — the first layer that is both MoE and `full`-indexer, making the decoder-layer oracle self-contained.
+Extends `scripts/accuracy/glm52_oracle.py` + the `oracle/mla.rs` pattern (probe consts, input-digest-first, fp8sim precision, `--emit rust`). Note: layer 3 (the first MoE layer) is a **shared-indexer** layer, so the MoE gate uses **layer 6** — the first layer that is both MoE and `full`-indexer, making the decoder-layer oracle self-contained.
 
 1. **`oracle/layer.rs::layer_moe_oracle_gate`** — layer 6, full decoder layer via `--stage layer` (official `GlmMoeDsaDecoderLayer`, fp8sim linears incl. a lazy-dequant `Fp8SimExperts`): probes on `layer_out`, run for BOTH expert paths (Grouped and Gemv) against the same constants; router last-position selection emitted as a debugging reference.
 2. **`oracle/layer.rs::layer_dense_oracle_gate`** — layer 0 full-layer probes (residual/norm wiring around the already-gated MLA brick + `fp8_mlp` at 12288).
@@ -135,7 +135,7 @@ Gate env: jz38 H200 + `/data/models/GLM-5.2-FP8`, same build env as `oracle-harn
 - **Environment pitfalls (jz-38)**:
   - `PEGAINFER_DEEPGEMM_ROOT` must point at **`.../DeepGEMM/deep_gemm`** (the python-package dir that contains `include/`), not the submodule root — the JIT `IncludeParser` resolves `$ROOT/include/deep_gemm/...`; the wrong root fails as an opaque `CUDA_ERROR_LAUNCH_FAILED` at the MQA metadata launch. Docs and gate comments corrected.
   - The repo venv's `nvidia/nccl` is back to 2.29.7 (a torch reinstall downgraded it); the `moe`-feature DeepEP shim needs ≥ 2.30.4 → `PEGAINFER_NCCL_ROOT=/root/develop/xingming/nccl-latest/nvidia/nccl` (nvidia-nccl-cu12 2.30.7 wheel).
-  - transformers 5.13.0.dev0 is not on PyPI; run the harness with the repo venv python (`.venv/bin/python tools/accuracy/glm52_oracle.py ...`), not `uv run`.
+  - transformers 5.13.0.dev0 is not on PyPI; run the harness with the repo venv python (`.venv/bin/python scripts/accuracy/glm52_oracle.py ...`), not `uv run`.
 - **Pre-existing breakage fixed en passant**: `tests/checkpoint.rs` used `{event:?}` but `TokenEvent` had no `Debug` (fixed by deriving it); `pegainfer-kernels/tests/glm52_indexer_smoke.rs` had a type error — `--tests` compile of both crates was red on main.
 - **Toxic-review round (Request Changes → fixed, all gates re-run green)**: cherry-pick had smuggled `CUBLAS_COMPUTE_32F_PEDANTIC` back into the router (the exact kimi lesson this doc forbids — fixed to `CUBLAS_COMPUTE_32F`; at bs=1 the tie-flip outlier set did not move); scatter/combine validated `expert_offsets.len() > topk` while the kernels index by expert id (fixed to `> n_experts`, a silent-OOB trap); the caller-less plain weight-only GEMV path was deleted (~150 lines, re-cherry-pick from the PP8 branch if PR5 wants it); the post-attention boundary now uses `fused_add_rms_norm_round_batch_into` (bit-identical); contradictory pad-row invariant docs unified on the row-isolation argument (zeroing not required for correctness).
 

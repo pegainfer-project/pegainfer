@@ -130,7 +130,7 @@ Qwen3.5-4B follows the same HF-golden rule with one model-specific caveat: its f
 After a change that alters numerical output, regenerate the reference. The Qwen3-4B golden is recomputed on GPU through HuggingFace:
 
 ```bash
-uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
+uv run --no-project python scripts/accuracy/qwen3_golden.py \
     --model-path models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 ```
 
@@ -138,10 +138,10 @@ Qwen3.5 uses size-keyed HF logits goldens (4B and 9B committed, short + long eac
 
 ```bash
 # 4B short + long
-python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-4B
-python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-4B --prompt-lens 4097,8192 --decode-tokens 8
+python3 scripts/accuracy/qwen35_golden.py --model-path models/Qwen3.5-4B
+python3 scripts/accuracy/qwen35_golden.py --model-path models/Qwen3.5-4B --prompt-lens 4097,8192 --decode-tokens 8
 # 9B (add --prompt-lens 4097,8192 --decode-tokens 8 for the long variant)
-python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path models/Qwen3.5-9B \
+python3 scripts/accuracy/qwen35_golden.py --model-path models/Qwen3.5-9B \
     --model-revision c202236235762e1c871ad0ccb60c8ee5ba337b9a
 ```
 

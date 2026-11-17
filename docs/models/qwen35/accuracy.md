@@ -49,7 +49,7 @@
 ### HF logits golden
 
 - Fixture: `test_data/qwen35-4b-hf-golden.safetensors` (~59 KiB).
-- Dumper: `tools/accuracy/dump_qwen35_hf_golden.py`.
+- Dumper: `scripts/accuracy/qwen35_golden.py`.
 - Oracle path: HF `AutoModelForCausalLM.eval()` in bf16, prompt prefill with `use_cache=True`, then one-token teacher-forced decode through `past_key_values`.
 - Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 - Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.
@@ -87,7 +87,7 @@ themselves.
 ### Long-prompt HF logits golden
 
 - Fixture: `test_data/qwen35-4b-hf-long-golden.safetensors` (~58 KiB).
-- Dumper: `tools/accuracy/dump_qwen35_hf_golden.py` with `--prompt-lens 4097,8192 --decode-tokens 8`.
+- Dumper: `scripts/accuracy/qwen35_golden.py` with `--prompt-lens 4097,8192 --decode-tokens 8`.
 - Oracle path: same HF `AutoModelForCausalLM.eval()` bf16 `past_key_values` path as the short golden.
 - Model snapshot: `Qwen/Qwen3.5-4B` revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`.
 - Config hash: `ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670`.

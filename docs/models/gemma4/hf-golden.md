@@ -117,15 +117,15 @@ Per case: `{case}_prompt` and `{case}_teacher` (int32), plus `{case}_sdpa_ids` /
 ## Regenerating
 
 ```bash
-python tools/accuracy/dump_gemma4_hf_golden.py <checkpoint-dir> \
+python scripts/accuracy/gemma4_golden.py <checkpoint-dir> \
     test_data/gemma4-12b-hf-golden.safetensors \
     --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 
-python tools/accuracy/dump_gemma4_window_golden.py <checkpoint-dir> \
+python scripts/accuracy/gemma4_window_golden.py <checkpoint-dir> \
     test_data/gemma4-12b-hf-window-golden.safetensors \
     --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 
-python tools/accuracy/dump_gemma4_longctx_golden.py <checkpoint-dir> \
+python scripts/accuracy/gemma4_longctx_golden.py <checkpoint-dir> \
     test_data/gemma4-12b-hf-longctx-golden.safetensors \
     --source-repo google/gemma-4-12B-it --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 ```
@@ -145,22 +145,22 @@ device. `--device` defaults to `cuda:0`.
 
 ```bash
 # the base fixture, one card
-python tools/accuracy/dump_gemma4_hf_golden.py <31b-checkpoint-dir> \
+python scripts/accuracy/gemma4_golden.py <31b-checkpoint-dir> \
     test_data/gemma4-31b-hf-golden.safetensors \
     --source-repo google/gemma-4-31B-it --revision <sha> --device cuda:0
 
 # the two deep ones, tower sharded over the visible GPUs
-python tools/accuracy/dump_gemma4_window_golden.py <31b-checkpoint-dir> \
+python scripts/accuracy/gemma4_window_golden.py <31b-checkpoint-dir> \
     test_data/gemma4-31b-hf-window-golden.safetensors \
     --source-repo google/gemma-4-31B-it --revision <sha> --device auto
 
-python tools/accuracy/dump_gemma4_longctx_golden.py <31b-checkpoint-dir> \
+python scripts/accuracy/gemma4_longctx_golden.py <31b-checkpoint-dir> \
     test_data/gemma4-31b-hf-longctx-golden.safetensors \
     --source-repo google/gemma-4-31B-it --revision <sha> --device auto
 ```
 
 The generate fixture the prompt-backed gates read follows the same naming
-(`test_data/gemma4-<tag>-generate.safetensors`, `dump_gemma4_generate.py`), and so does the chat
+(`test_data/gemma4-<tag>-generate.safetensors`, `gemma4_generate.py`), and so does the chat
 reference `docs/models/gemma4/tokenizer.md` describes. A sharded checkpoint is fingerprinted by its
 index plus each shard's header rather than by a single `model.safetensors`, so the provenance check
 holds for both layouts. Only the 12B set is committed; another tag's files are local to the box that
@@ -170,7 +170,7 @@ The generate fixture's three prompts do not carry over between sizes, because wh
 checkpoint is sure of depends on the checkpoint: the committed set holds for 12B and 31B and gives
 1, 0 and 1 decisive tokens on the 26B routed one where the dumper needs twenty, while a counting
 prompt holds the 26B tower for all fifty tokens and stops after two on 31B. The 26B set is
-`tools/accuracy/gemma4-26b-prompts.json`, passed with `--prompts`; the fixture records the set it
+`scripts/accuracy/gemma4_26b_prompts.json`, passed with `--prompts`; the fixture records the set it
 was dumped with. The margins it was chosen on:
 
 | case | prompt | decisive tokens | min margin |
@@ -180,7 +180,7 @@ was dumped with. The margins it was chosen on:
 | `c` | `2024-01-01` onwards, one per line | 50 | 3.50 |
 
 A checkpoint HF cannot load needs a second directory. The 26B routed one is NVFP4, so the reference
-tower is a bf16 copy of its weights, written by `tools/accuracy/dequantize_gemma4_nvfp4.py`
+tower is a bf16 copy of its weights, written by `scripts/accuracy/gemma4_nvfp4_dequant.py`
 (ModelOpt unpacks the experts, the only quantized tensors in this checkpoint). The base fixture is
 dumped from that copy with `--fingerprint-dir` pointing at the checkpoint the gates serve:
 `file_sha256` pins the served checkpoint, and a `reference_tower` block records `--tower` (how the
@@ -190,19 +190,19 @@ from the same copy under the same `--source-repo` and `--revision`.
 
 ```bash
 # transformers 5.16.1, torch 2.13.0, nvidia-modelopt 0.46.1
-python tools/accuracy/dequantize_gemma4_nvfp4.py <26b-nvfp4-checkpoint> <26b-bf16-copy> \
+python scripts/accuracy/gemma4_nvfp4_dequant.py <26b-nvfp4-checkpoint> <26b-bf16-copy> \
     --device cuda:0
 
 REV=a19cfe00be84568a6867111c9a68c9c44fdcffe6   # nvidia/Gemma-4-26B-A4B-NVFP4
-python tools/accuracy/dump_gemma4_hf_golden.py <26b-bf16-copy> \
+python scripts/accuracy/gemma4_golden.py <26b-bf16-copy> \
     test_data/gemma4-26b-hf-golden.safetensors \
     --source-repo nvidia/Gemma-4-26B-A4B-NVFP4 --revision $REV --device auto \
     --fingerprint-dir <26b-nvfp4-checkpoint> \
-    --tower "dequantize_gemma4_nvfp4.py, nvidia-modelopt 0.46.1"
-python tools/accuracy/dump_gemma4_generate.py <26b-bf16-copy> \
+    --tower "gemma4_nvfp4_dequant.py, nvidia-modelopt 0.46.1"
+python scripts/accuracy/gemma4_generate.py <26b-bf16-copy> \
     test_data/gemma4-26b-generate.safetensors \
     --source-repo nvidia/Gemma-4-26B-A4B-NVFP4 --revision $REV --device auto \
-    --prompts tools/accuracy/gemma4-26b-prompts.json
+    --prompts scripts/accuracy/gemma4_26b_prompts.json
 # the window and long-context dumpers take the same arguments as the 31B ones above,
 # with the bf16 copy, this repo and this revision
 ```

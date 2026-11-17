@@ -1,6 +1,6 @@
 //! HF-oracle gate for the single-layer MLA decode brick.
 //!
-//! The oracle side is `tools/accuracy/glm52_oracle.py` (pinned transformers
+//! The oracle side is `scripts/accuracy/glm52_oracle.py` (pinned transformers
 //! `glm_moe_dsa` — the official modeling code): it runs layer-0 attention on a
 //! seeded input and emits the probe constants pasted below. This test replays
 //! the *same* input through `glm52_mla_decode_forward` position by position
@@ -46,7 +46,7 @@ use crate::mla_front::Glm52MlaLayerWeights;
 use crate::model::rope_tables;
 
 // ---- BEGIN GENERATED: glm52_oracle probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path /work/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
+// uv run scripts/accuracy/glm52_oracle.py --model-path /work/hf_cache/hub/models--zai-org--GLM-5.2-FP8/snapshots/ba978f7d347eaf65d22f1a86833408afdb953541 \
 //     --ctx 200 --seed 0x5eed604d --layer 0 --precision gemv
 // transformers=5.14.0.dev0 torch=2.11.0+cu130
 const ORACLE_SEED: u64 = 0x5eed604d;
@@ -232,7 +232,7 @@ fn run_mla_oracle_gate(topk: usize, sm_parts_cap: Option<usize>) -> Result<()> {
     let digest = bf16_digest(&hidden_host);
     ensure!(
         digest == ORACLE_HIDDEN_DIGEST,
-        "input digest {digest} != oracle {ORACLE_HIDDEN_DIGEST}: PRNG drift or stale probes — regenerate with tools/accuracy/glm52_oracle.py"
+        "input digest {digest} != oracle {ORACLE_HIDDEN_DIGEST}: PRNG drift or stale probes — regenerate with scripts/accuracy/glm52_oracle.py"
     );
 
     let ctx = DeviceContext::new()?;

@@ -42,15 +42,15 @@ never assert a float digest across implementations.
 
 Usage (paste the emitted block into pegainfer-glm52/tests/mla_decode_oracle.rs):
 
-    uv run tools/accuracy/glm52_oracle.py \
+    uv run scripts/accuracy/glm52_oracle.py \
         --model-path /data/models/GLM-5.2-FP8 --emit rust
 
     # full tensor dump for debugging a divergence
-    uv run tools/accuracy/glm52_oracle.py \
+    uv run scripts/accuracy/glm52_oracle.py \
         --model-path /data/models/GLM-5.2-FP8 --emit safetensors --out /tmp/taps.safetensors
 
     # negative control: the gate MUST go red against fault-injected probes
-    uv run tools/accuracy/glm52_oracle.py \
+    uv run scripts/accuracy/glm52_oracle.py \
         --model-path /data/models/GLM-5.2-FP8 --emit rust --inject-fault rope-swap
 """
 
@@ -268,7 +268,7 @@ def assert_indexer_rope_interleave():
     (`apply_rotary_pos_emb`), which shifts ~450/2048 top-k slots at ctx 4096 —
     probes generated with it would gate the engine against the wrong
     convention. Use a build with the fix (e.g. the repo `.venv`'s
-    5.13.0.dev0: `.venv/bin/python tools/accuracy/glm52_oracle.py ...`)."""
+    5.13.0.dev0: `.venv/bin/python scripts/accuracy/glm52_oracle.py ...`)."""
     import inspect
 
     from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as m
@@ -627,7 +627,7 @@ def emit_rust(taps, args, versions: str) -> str:
     )
     return f"""\
 {fault_banner}// ---- BEGIN GENERATED: glm52_oracle probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+// uv run scripts/accuracy/glm52_oracle.py --model-path {args.model_path} \\
 //     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision}
 // {versions}
 const ORACLE_SEED: u64 = {args.seed:#x};
@@ -673,7 +673,7 @@ def emit_rust_indexer(taps, args, versions: str) -> str:
 
     return f"""\
 {fault_banner}// ---- BEGIN GENERATED: glm52_oracle indexer probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+// uv run scripts/accuracy/glm52_oracle.py --model-path {args.model_path} \\
 //     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} --stage indexer
 // {versions}
 const ORACLE_SEED: u64 = {args.seed:#x};
@@ -742,7 +742,7 @@ const ORACLE_ROUTER_LAST: &[(i32, f32)] = &[
 ];"""
     return f"""\
 {fault_banner}// ---- BEGIN GENERATED: glm52_oracle layer probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+// uv run scripts/accuracy/glm52_oracle.py --model-path {args.model_path} \\
 //     --ctx {args.ctx} --seed {args.seed:#x} --layer {args.layer} --precision {args.precision} \\
 //     --stage layer --input-scale {args.input_scale}
 // {versions}
@@ -768,7 +768,7 @@ def emit_rust_bookend(taps, args, versions: str) -> str:
     argmax = ", ".join(str(int(v)) for v in taps["argmax"].tolist())
     return f"""\
 // ---- BEGIN GENERATED: glm52_oracle bookend probes ----
-// uv run tools/accuracy/glm52_oracle.py --model-path {args.model_path} \\
+// uv run scripts/accuracy/glm52_oracle.py --model-path {args.model_path} \\
 //     --ctx {args.ctx} --seed {args.seed:#x} --precision {args.precision} --stage bookend
 // {versions}
 const ORACLE_SEED: u64 = {args.seed:#x};

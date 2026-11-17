@@ -34,9 +34,9 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
 # before the next layer is read, so all 48 layers fit one card and one host.
 # The n-gram layer's table stays in its shards and is read row by row.
 #
-#     python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next \
+#     python scripts/accuracy/qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next \
 #         --layers 0,3 --decode 8 --out golden/qwen4-layers03-decode8.safetensors
-#     python tools/accuracy/dump_qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next \
+#     python scripts/accuracy/qwen4_layer_golden.py --model /data/models/Qwen3.8-Flash-Next \
 #         --layers all --decode 8 --out golden/qwen4-all-decode8.safetensors
 
 METADATA_KEY = "qwen4_layer_golden"

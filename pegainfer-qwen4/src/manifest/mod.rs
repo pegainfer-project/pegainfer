@@ -9,7 +9,7 @@ pub(crate) mod schema;
 pub(crate) mod validate;
 
 /// Every shard header of the frozen revision, as
-/// `tools/accuracy/dump_qwen4_frozen_tensors.py` writes them, plus the two n-gram
+/// `scripts/accuracy/qwen4_frozen_tensors.py` writes them, plus the two n-gram
 /// partition vectors the checkpoint stores.
 #[cfg(test)]
 #[derive(serde::Deserialize)]
