@@ -1,4 +1,1 @@
-interface:
-  display_name: "vLLM Bench"
-  short_description: "Run multi-turn LLM serving benchmarks"
-  default_prompt: "Use $vllm-bench to run a multi-turn benchmark against my OpenAI-compatible server."
+../../../../.agents/skills/vllm-bench/agents/openai.yaml
