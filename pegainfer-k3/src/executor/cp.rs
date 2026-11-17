@@ -188,7 +188,7 @@ pub(crate) fn k3_cp_stripe_kept(cp_size: usize, owner: usize) -> Vec<usize> {
 pub(crate) fn k3_cp_stripe_helped(cp_size: usize, helper: usize) -> Vec<usize> {
     debug_assert!(helper < cp_size);
     (helper + 1..cp_size)
-        .filter(|q| (q - helper) % 2 == 0)
+        .filter(|q| (q - helper).is_multiple_of(2))
         .collect()
 }
 
@@ -1012,7 +1012,7 @@ impl K3CpScratch {
     /// The query window: my queries fan out to my helpers, and I read the
     /// queries of every owner I help.
     pub(crate) fn stripe_query_kind(&self) -> K3CpWindowKind {
-        let helpers = (0..self.cp_rank).filter(|h| (self.cp_rank - h) % 2 == 0);
+        let helpers = (0..self.cp_rank).filter(|h| (self.cp_rank - h).is_multiple_of(2));
         K3CpWindowKind::Stripe {
             from: rank_mask(self.stripe_helped()),
             by: rank_mask(helpers),
@@ -1276,7 +1276,7 @@ mod tests {
             // The deepest rank: r + 1/2 unstriped, at most (r + 3) / 2 striped.
             let deep = load(cp_size - 1);
             assert!(
-                deep <= (cp_size as f64 + 2.0) / 2.0,
+                deep <= (cp_size as f64).midpoint(2.0),
                 "{cp_size}: deep {deep}"
             );
             assert!(
