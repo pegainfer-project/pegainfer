@@ -209,7 +209,7 @@ nsys profile --force-overwrite=true --trace=cuda,nvtx \
     --out "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.json" \
     request --prompt-len 1 --output-len 128 --concurrency 64 --warmup 1 --iters 1
 
-uv run --no-project python tools/nsys_tail_stats.py \
+uv run --no-project python scripts/profiling/nsys_tail_stats.py \
   "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}.sqlite" \
   --out "$RESULT_ROOT/kimi-profile/tp1dp8_bs64_o128_${COMMIT}_tail.md"
 ```

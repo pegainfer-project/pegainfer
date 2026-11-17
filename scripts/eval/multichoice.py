@@ -17,7 +17,7 @@ thinking model so reasoning lands in `reasoning`, the final answer text in
 `content` — extraction runs on `content` only.
 
 Usage:
-  python eval_mc.py ceval|supergpqa|mmlu_pro|mmlu_redux \
+  python scripts/eval/multichoice.py ceval|supergpqa|mmlu_pro|mmlu_redux \
       --base-url http://127.0.0.1:18082/v1 --model qwen35-27b-tp2
 """
 import argparse
@@ -181,7 +181,7 @@ def sg_extract_content(text, options_content):
 # No generation-time stop strings: this stack matches stop text against the
 # raw decoded stream before reasoning/final separation, so a marker like
 # "Question:" that reappears inside a thinking block ends the generation
-# before the final answer exists (see eval_gsm8k_thinking.py). If a stop is
+# before the final answer exists (see gsm8k.py). If a stop is
 # ever needed, use "<|im_end|>" only.
 STOP_MAP: dict[str, list[str]] = {}
 
@@ -215,7 +215,7 @@ def make_record(name, idx, item, prompt, gold, out):
     failed = out['reasoning'].startswith('__ERROR__')
     extra = {'subject': item.get('subject')}
     if name == 'supergpqa':
-        # Keep the option texts: eval_rerun_truncated.py falls back to
+        # Keep the option texts: rerun_truncated.py falls back to
         # content matching when a rerun answer names an option, not a letter.
         extra.update({'discipline': item.get('discipline'),
                       'field': item.get('field'),

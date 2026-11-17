@@ -7,7 +7,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release.yml"
-      - "scripts/package_qwen3_release.sh"
+      - ".github/scripts/package-qwen3-release.sh"
   workflow_dispatch:
 
 permissions:
@@ -128,7 +128,7 @@ jobs:
       - name: Package release candidate
         run: |
           chmod +x target/release/pegainfer
-          scripts/package_qwen3_release.sh \
+          .github/scripts/package-qwen3-release.sh \
             "v${{ needs.build.outputs.version }}" dist
 
       - name: Upload release candidate

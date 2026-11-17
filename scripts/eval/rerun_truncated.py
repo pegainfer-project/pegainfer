@@ -15,8 +15,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from eval_mc import (first_capital, mmlupro_extract, repair_jsonl_tail,
-                     sg_extract_labels, sg_extract_content, STOP_MAP)
+from multichoice import (first_capital, mmlupro_extract, repair_jsonl_tail,
+                         sg_extract_labels, sg_extract_content, STOP_MAP)
 import httpx
 
 
@@ -26,7 +26,7 @@ def extract(bench, item, text):
     if bench == 'mmlu_pro':
         return mmlupro_extract(text).lower()
     if bench == 'mmlu_redux':
-        # Same marker-aware extractor as eval_mc.py: a first-anywhere [ABCD]
+        # Same marker-aware extractor as multichoice.py: a first-anywhere [ABCD]
         # search scores the "A" of "Answer".
         return sg_extract_labels(text, 'ABCD') or ''
     pred = sg_extract_labels(text)
@@ -135,7 +135,7 @@ def main():
     # rows: regenerating them would burn the large-budget completions again
     # and could turn a previously successful row into a failure. The merged
     # file must provably belong to the current base samples (a fresh
-    # evaluation in this directory would have been overwritten by eval_mc
+    # evaluation in this directory would have been overwritten by multichoice
     # but the stale merged file could linger otherwise) — validate the
     # length and per-row prompt linkage before trusting it.
     base_samples = json.loads((out / f'{args.benchmark}_samples.json').read_text())
@@ -148,7 +148,7 @@ def main():
         if not linked:
             sys.exit(f'refusing to resume from {merged_path}: it does not match the '
                      'current base samples (stale rerun data from an older run). '
-                     'Re-run eval_mc.py (it now clears stale rerun artifacts) or remove the file.')
+                     'Re-run multichoice.py (it now clears stale rerun artifacts) or remove the file.')
         samples = candidate
         print(f'{args.benchmark}: resuming from {merged_path.name}', flush=True)
     else:

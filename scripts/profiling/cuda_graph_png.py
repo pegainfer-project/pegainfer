@@ -14,7 +14,7 @@ unfolded 36-layer chain exceeds Graphviz's ~32767px raster ceiling
 backend, with DPI auto-scaled down for graphs that stay tall after folding;
 a missing renderer is a hard error, not a degraded image.
 
-Usage: uv run python tools/cuda_graph_png.py INPUT.dot [-o OUT.png] [--title TITLE] [--no-fold]
+Usage: uv run python scripts/profiling/cuda_graph_png.py INPUT.dot [-o OUT.png] [--title TITLE] [--no-fold]
 
 Needs `dot` (graphviz with cairo) and `c++filt` on PATH.
 """

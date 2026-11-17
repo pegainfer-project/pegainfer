@@ -10,7 +10,7 @@ usage() {
 
 version=${1#v}
 output_dir=$2
-repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 binary="$repo_root/target/release/pegainfer"
 cuda_root=${CUDA_PATH:-${CUDA_HOME:-/usr/local/cuda}}
 asset_name=pegainfer-qwen3-linux-x86_64-cu130

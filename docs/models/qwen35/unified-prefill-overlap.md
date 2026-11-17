@@ -289,7 +289,7 @@ examples include prefill GEMMs overlapping `conv1d_decode_batch_kernel` and
 execution, beyond host launch interleave. Profiler timings are not used in the
 HTTP tables because CUDA Graph node tracing inflates absolute time.
 
-`cuda_gpu_kern_sum`, `cuda_api_sum`, and `tools/nsys_tail_stats.py` were all run
+`cuda_gpu_kern_sum`, `cuda_api_sum`, and `scripts/profiling/nsys_tail_stats.py` were all run
 on the Stream SQLite. The top GPU totals remained projection GEMMs; the host
 table was dominated by expected event synchronization and whole-process model
 load traffic. No new kernel-first optimization is justified by this trace.

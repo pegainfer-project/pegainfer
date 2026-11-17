@@ -50,7 +50,7 @@ knee, harmful below it, and useless once `qps·prefill_s ≳ 1`.
 | chunk ON | default `--max-prefill-tokens` → budget 1024 |
 | chunk OFF | `--max-prefill-tokens 99999999` (whole prompt in one step) |
 | Sweep | `qps ∈ {0.25, 0.5, 1.0}` × `prompt ∈ {4k, 8k, 12k, 16k}` × `{ON, OFF}` = 24 cells |
-| Diagnostics | `PEGAINFER_ITL_DEBUG=1` + `scripts/itl_step_agg.py` |
+| Diagnostics | `PEGAINFER_ITL_DEBUG=1` + `scripts/profiling/itl_step_agg.py` |
 | Hygiene | `sleep 25` between cells; `nvidia-smi` GPU-idle (~3 MiB) check before each |
 | Raw data | `datasets/mixed-load-itl-470-data-mb8/` (untracked — repo-root `datasets/` is gitignored; per-cell `.json` + `.log`) |
 
@@ -264,7 +264,7 @@ PEGAINFER_ITL_DEBUG=1 RUST_LOG=info "$BIN" \
   --bg-concurrency 4 --bg-prompt-len 512 --bg-output-len 4096 \
   --inj-prompt-len 4096 --inj-output-len 1 --qps 0.5 --num-injections 10 \
   --inj-warm-frac 0.0 --warmup 5 > /tmp/cell.log 2>&1
-python3 scripts/itl_step_agg.py /tmp/cell.log   # valid gate: decode_n reaches bg_concurrency
+python3 scripts/profiling/itl_step_agg.py /tmp/cell.log   # valid gate: decode_n reaches bg_concurrency
 ```
 
 The full matrix wraps the command above in

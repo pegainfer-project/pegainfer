@@ -20,8 +20,8 @@ and is apples-to-oranges across chunk on/off). Compare the `unified` rows across
 a chunk-ON vs chunk-OFF log to see chunking bound the per-step freeze.
 
 Usage:
-    python3 scripts/itl_step_agg.py LOG [LOG ...]
-    python3 scripts/itl_step_agg.py --label on canonical_on.log --label off canonical_off.log
+    python3 scripts/profiling/itl_step_agg.py LOG [LOG ...]
+    python3 scripts/profiling/itl_step_agg.py --label on canonical_on.log --label off canonical_off.log
 """
 
 import argparse
