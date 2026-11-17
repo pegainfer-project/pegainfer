@@ -1,10 +1,9 @@
 name: ROCm
 
+# Run by hand (Actions tab, or `gh workflow run rocm.yml --ref <branch>`) when a change
+# touches the ROCm backend or before a ROCm release; it does not gate every PR.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

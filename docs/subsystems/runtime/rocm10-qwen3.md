@@ -1,6 +1,6 @@
 # Initial ROCm 10.1 support for Qwen3
 
-**TL;DR**: Qwen3-0.6B/4B BF16 runs on R9700 (`gfx1201`) through native Rust + HIP/rocBLAS, using single-GPU eager execution, greedy decoding, chunked prefill, and mixed batches. Both models pass independent HF golden and HTTP lifecycle gates. CI cross-compiles gfx1100/gfx1201 and runs CPU contract tests using the public ROCm 10.1 SDK; real GPU gates remain manual. RDNA 3 execution and a stable release with the CUDA backend's full feature set remain outstanding.
+**TL;DR**: Qwen3-0.6B/4B BF16 runs on R9700 (`gfx1201`) through native Rust + HIP/rocBLAS, using single-GPU eager execution, greedy decoding, chunked prefill, and mixed batches. Both models pass independent HF golden and HTTP lifecycle gates. An on-demand workflow (`rocm.yml`, run by hand; it does not gate PRs) cross-compiles gfx1100/gfx1201 and runs CPU contract tests using the public ROCm 10.1 SDK; real GPU gates remain manual. RDNA 3 execution and a stable release with the CUDA backend's full feature set remain outstanding.
 
 Last touched: 2026-11-13
 
@@ -74,7 +74,7 @@ CUDA remains the default backend. Its implementation is included at the original
 
 ## Automated and manual verification
 
-[The ROCm workflow](../../../.github/workflows/rocm.yml) installs the public SDK on CPU runners and checks gfx1100/gfx1201. It runs the same script available locally:
+[The ROCm workflow](../../../.github/workflows/rocm.yml) installs the public SDK on CPU runners and checks gfx1100/gfx1201. It runs only when started by hand (for a change to the ROCm backend, or before a ROCm release), so ordinary PRs do not pay for it. It runs the same script available locally:
 
 ```bash
 scripts/amd/run_rocm10.sh bash scripts/amd/check_ci.sh
