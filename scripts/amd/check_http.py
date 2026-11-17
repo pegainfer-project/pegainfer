@@ -24,7 +24,7 @@ def main():
     args = parser.parse_args()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    binary = Path(os.environ["CARGO_TARGET_DIR"]) / "release/pegainfer"
+    binary = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/pegainfer"
     command = [str(binary), "--model-path", args.model_path,
                "--served-model-name", "rocm-qwen3", "--port", str(args.port),
                "--cuda-graph=false", "--no-prefix-cache", "--rocm-slots", "4",

@@ -7,7 +7,7 @@ import subprocess
 import shutil
 import tempfile
 
-binary = str(Path(os.environ["CARGO_TARGET_DIR"]) / "release/pegainfer")
+binary = str(Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release/pegainfer")
 model = Path(os.environ.get("PEGAINFER_MODEL_ROOT", "models")) / "Qwen3-0.6B"
 checks = []
 for flags, expected in [
