@@ -11,7 +11,7 @@ use safetensors::SafeTensors;
 /// genuine ties fall well under it; where HF has a clear winner the only token
 /// within this regret is HF's argmax itself, so this still enforces exact
 /// agreement there.
-pub const MARGIN_TOL: f32 = 0.20;
+pub(crate) const MARGIN_TOL: f32 = 0.20;
 /// Two coverage-stable, strict bounds on the head-delta distribution. They are
 /// the right guards precisely because — unlike the single worst delta — they
 /// barely move as coverage grows: widening the golden from 108 to 816 positions
@@ -24,20 +24,20 @@ pub const MARGIN_TOL: f32 = 0.20;
 /// `MEAN_TOL` 0.06 ≈ 2× the floor: a uniform logit drift of `d` nat shifts every
 /// delta by ~`d`, so this trips on any systematic drift past ~0.03 nat (one bf16
 /// ULP at logit magnitude ~8). That is the sensitivity the gate exists for.
-pub const MEAN_TOL: f32 = 0.06;
+pub(crate) const MEAN_TOL: f32 = 0.06;
 /// `P99_TOL` 0.20 ≈ 1.6× the floor (0.12): catches *spread* inflation — a subset
 /// of positions getting noisier — that the mean would average away. The single
 /// worst token can't move it (it is one delta in thousands), so it stays put as
 /// coverage grows, unlike the absolute max.
-pub const P99_TOL: f32 = 0.20;
+pub(crate) const P99_TOL: f32 = 0.20;
 /// Head depth for the logprob tolerance check (tail tokens are inherently noisy).
-pub const HEAD_K: usize = 8;
+pub(crate) const HEAD_K: usize = 8;
 
-pub const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.6b", "1.7b", "4b", "8b", "14b", "32b"];
+pub(crate) const COMMITTED_FIXTURE_SIZES: &[&str] = &["0.6b", "1.7b", "4b", "8b", "14b", "32b"];
 
 /// The fixture size a checkpoint geometry maps to, by `hidden_size` and
 /// `num_hidden_layers`.
-pub fn size_name(hidden: u64, layers: u64) -> Option<&'static str> {
+pub(crate) fn size_name(hidden: u64, layers: u64) -> Option<&'static str> {
     match (hidden, layers) {
         (1024, 28) => Some("0.6b"),
         (2048, 28) => Some("1.7b"),
@@ -49,7 +49,7 @@ pub fn size_name(hidden: u64, layers: u64) -> Option<&'static str> {
     }
 }
 
-pub fn default_fixture_path(size: &str) -> String {
+pub(crate) fn default_fixture_path(size: &str) -> String {
     format!(
         "{}/../test_data/qwen3-{size}-hf-golden.safetensors",
         env!("CARGO_MANIFEST_DIR")
@@ -86,20 +86,20 @@ fn as_f32(st: &SafeTensors, name: &str) -> Vec<f32> {
 
 /// The stored HF reference, parsed into owned vectors (the safetensors view
 /// borrows the file bytes, so we copy out and let both drop).
-pub struct Golden {
-    pub prompt_tokens: Vec<i32>, // ragged, sliced by `prompt_lens`
-    pub prompt_lens: Vec<i32>,   // [S]
-    pub decode_tokens: Vec<i32>, // [S, D] flattened
-    pub topk_ids: Vec<i32>,      // [S, D+1, K] flattened
-    pub topk_lp: Vec<f32>,       // [S, D+1, K] flattened
-    pub num_seqs: usize,
-    pub decode_len: usize, // D
-    pub positions: usize,  // D + 1
-    pub k: usize,
+pub(crate) struct Golden {
+    pub(crate) prompt_tokens: Vec<i32>, // ragged, sliced by `prompt_lens`
+    pub(crate) prompt_lens: Vec<i32>,   // [S]
+    pub(crate) decode_tokens: Vec<i32>, // [S, D] flattened
+    pub(crate) topk_ids: Vec<i32>,      // [S, D+1, K] flattened
+    pub(crate) topk_lp: Vec<f32>,       // [S, D+1, K] flattened
+    pub(crate) num_seqs: usize,
+    pub(crate) decode_len: usize, // D
+    pub(crate) positions: usize,  // D + 1
+    pub(crate) k: usize,
 }
 
 impl Golden {
-    pub fn load_path(path: &str) -> Golden {
+    pub(crate) fn load_path(path: &str) -> Golden {
         let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
@@ -129,7 +129,7 @@ impl Golden {
         }
     }
 
-    pub fn prompt(&self, seq: usize) -> Vec<u32> {
+    pub(crate) fn prompt(&self, seq: usize) -> Vec<u32> {
         let off: usize = self.prompt_lens[..seq].iter().map(|&l| l as usize).sum();
         let len = self.prompt_lens[seq] as usize;
         self.prompt_tokens[off..off + len]
@@ -138,13 +138,13 @@ impl Golden {
             .collect()
     }
 
-    pub fn decode(&self, seq: usize, step: usize) -> u32 {
+    pub(crate) fn decode(&self, seq: usize, step: usize) -> u32 {
         self.decode_tokens[seq * self.decode_len + step] as u32
     }
 
     /// HF's top-K `(token, logprob)` at `pos` (0 is the prompt's last row, then
     /// one per decode step), in HF's descending order.
-    pub fn topk(&self, seq: usize, pos: usize) -> Vec<(u32, f32)> {
+    pub(crate) fn topk(&self, seq: usize, pos: usize) -> Vec<(u32, f32)> {
         let base = (seq * self.positions + pos) * self.k;
         (0..self.k)
             .map(|j| (self.topk_ids[base + j] as u32, self.topk_lp[base + j]))
