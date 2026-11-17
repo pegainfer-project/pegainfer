@@ -1,21 +1,10 @@
 #include "runtime.h"
-#include <cstdlib>
-#include <cstring>
 #include <new>
 
 thread_local char pgi_error[1024];
 extern "C" const char *pgi_last_error() { return pgi_error; }
 extern "C" int pgi_create(int ordinal, void **result) {
   *result = nullptr;
-  if (const char *expected = std::getenv("PEGAINFER_EXPECTED_PCI_BUS_ID")) {
-    char bus[64]{};
-    PGI_HIP(hipDeviceGetPCIBusId(bus, sizeof(bus), ordinal));
-    if (std::strcmp(bus, expected) != 0) {
-      std::snprintf(pgi_error, sizeof(pgi_error),
-                    "device PCI mismatch: got %s, expected %s", bus, expected);
-      return -1;
-    }
-  }
   PGI_HIP(hipSetDevice(ordinal));
   auto *d = new (std::nothrow) PgiDevice{ordinal};
   if (!d)
