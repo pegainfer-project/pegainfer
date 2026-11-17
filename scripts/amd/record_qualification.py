@@ -24,6 +24,15 @@ def command(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
+def hipcc():
+    # Resolve the compiler the way pegainfer-build does, so the record names the one that built.
+    if explicit := os.environ.get("PEGAINFER_HIPCC"):
+        return explicit
+    core = Path(os.environ.get("PEGAINFER_ROCM_CORE") or os.environ.get("ROCM_PATH") or "/opt/rocm")
+    bundled = core / "bin" / "hipcc"
+    return str(bundled) if bundled.is_file() else "hipcc"
+
+
 names = set(command("git", "diff", "HEAD", "--name-only").splitlines())
 names.update(command("git", "ls-files", "--others", "--exclude-standard").splitlines())
 source_hashes = {name: digest(root / name) for name in sorted(names) if (root / name).is_file()}
@@ -53,7 +62,7 @@ report = {
     "binary_sha256": digest(Path(os.environ["CARGO_TARGET_DIR"]) / "release/pegainfer"),
     "cargo_lock_sha256": digest("Cargo.lock"),
     "rustc": command("rustc", "--version"), "cargo": command("cargo", "--version"),
-    "hipcc": command(os.environ.get("PEGAINFER_HIPCC", "hipcc"), "--version"),
+    "hipcc": command(hipcc(), "--version"),
     "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"),
     "logical_device": 0, "kernel": command("uname", "-r"),
     "models": models, "fixtures": fixtures,
