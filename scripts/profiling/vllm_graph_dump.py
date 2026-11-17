@@ -27,11 +27,11 @@ By default vLLM captures FULL_AND_PIECEWISE: one big graph per decode batch
 size plus one small graph per compiled fragment. The CLI pins cudagraph_mode
 to FULL_DECODE_ONLY so only the whole-step decode graphs are captured; pass
 --cudagraph-mode FULL_AND_PIECEWISE to also dump the per-fragment graphs.
-Render the output with tools/cuda_graph_png.py.
+Render the output with scripts/profiling/cuda_graph_png.py.
 
 Run inside a Python environment that has vLLM:
 
-    uv run python tools/vllm_graph_dump.py MODEL_PATH -o dots/
+    uv run python scripts/profiling/vllm_graph_dump.py MODEL_PATH -o dots/
 
 or import `install_graph_dump_hooks()` before any vLLM import in your own
 script to attach the dumper to an arbitrary vLLM workload.
@@ -162,7 +162,7 @@ def main():
     )
     out = llm.generate([args.prompt], SamplingParams(max_tokens=args.max_tokens))
     print("generated:", out[0].outputs[0].text)
-    print(f"done; render with: uv run python tools/cuda_graph_png.py {args.out_dir}/<file>.dot")
+    print(f"done; render with: uv run python scripts/profiling/cuda_graph_png.py {args.out_dir}/<file>.dot")
 
 
 if __name__ == "__main__":

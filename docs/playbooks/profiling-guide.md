@@ -87,7 +87,7 @@ Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). Du
 
 The common failure mode is a kernel with a healthy p50 but a large p99/max. That usually points to route imbalance, rank arrival skew, allocator churn, stream drains, or rare launch/runtime stalls. In MoE decode, NCCL all-reduce and routed expert kernels are especially likely to look cheap at p50 while dominating p99.
 
-Use the checked-in helper `tools/nsys_tail_stats.py` on exported sqlite traces when tail behavior matters. It emits separate kernel and CUDA API tables sorted by total time and by tail score, so a trace review can call out both steady-state cost and rare stalls.
+Use the checked-in helper `scripts/profiling/nsys_tail_stats.py` on exported sqlite traces when tail behavior matters. It emits separate kernel and CUDA API tables sorted by total time and by tail score, so a trace review can call out both steady-state cost and rare stalls.
 
 For keep/revert decisions, a profile that only reports p50 or avg is incomplete. The minimum acceptable evidence is the tail table plus a clear statement of whether the profile includes prompt, steady decode, HTTP/frontend, or profiler overhead.
 

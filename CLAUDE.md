@@ -116,6 +116,8 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 1. Compiles `pegainfer-kernels/csrc/*.cu` with nvcc (auto-detects GPU SM targets)
 2. Feature-gated codegen: `qwen35` runs Triton AOT via `pegainfer-kernels/tools/triton/gen_triton_aot.py`; `kimi-k2` adds MLA/MoE/Marlin CUDA; `glm52` adds MLA/MoE/FP8 CUDA plus TileLang sparse-MLA codegen on sm_90a
 
+**Scripts**: `scripts/` holds what a person runs by hand, with one directory per kind once there are several (`bench/`, `accuracy/`, `profiling/`, `eval/`). Code that only a build or CI job runs lives next to its caller: build-time generators under `pegainfer-kernels/tools/` and `pegainfer-{gemma4,k3}/kernels/`, workflow steps under `.github/scripts/`.
+
 ## EP Free-Running Discipline
 
 Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it). Invariants — violating any of these is a deadlock design:

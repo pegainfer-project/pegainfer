@@ -178,7 +178,7 @@ This tells you **where the CPU/host is spending time**. Watch for:
 ### Step 3: Tail-aware stats
 
 ```bash
-python3 tools/nsys_tail_stats.py target/profiling/<trace>.sqlite --limit 15
+python3 scripts/profiling/nsys_tail_stats.py target/profiling/<trace>.sqlite --limit 15
 ```
 
 This is the team's custom tool that goes beyond nsys's built-in p50/avg reporting. It shows `p50, p95, p99, max` and a tail score for each kernel. The p50 can hide serious problems:

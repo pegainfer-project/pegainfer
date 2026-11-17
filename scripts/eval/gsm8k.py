@@ -10,7 +10,7 @@ This script works around that by:
   4. Applying gsm8k's standard extraction regexes
 
 Usage:
-  python scripts/eval_gsm8k_thinking.py \
+  python scripts/eval/gsm8k.py \
     --base-url http://localhost:8000/v1/completions \
     --model Qwen3.5-4B \
     --tokenizer models/Qwen3.5-4B \
