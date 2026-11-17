@@ -1,1 +1,1 @@
-../../../.claude/skills/nsys-profiling/SKILL.md
+../../../.agents/skills/nsys-profiling/SKILL.md
