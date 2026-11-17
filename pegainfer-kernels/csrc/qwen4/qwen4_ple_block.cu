@@ -50,6 +50,7 @@
 #include "../shared/ffi_guard.cuh"
 
 #include <climits>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -150,6 +151,66 @@ __global__ void qwen4_ple_gate_kernel(
   }
 }
 
+// Vector twin of the gate kernel. The dot keeps the scalar body's exact
+// reduction order (same per-thread partials, same warp tree, same cross-warp
+// sum), so its bf16 roundings land on the same bits; the k/q rows are staged
+// through shared memory so the global reads are 16-byte vectors instead of
+// 2-byte scalars, and the value broadcast writes 16-byte vectors too.
+__global__ void qwen4_ple_gate_vec_kernel(
+    const __nv_bfloat16* __restrict__ key_normed,
+    const __nv_bfloat16* __restrict__ query_normed,
+    const __nv_bfloat16* __restrict__ value,
+    __nv_bfloat16* __restrict__ gated, int seq_len, float sqrt_hidden) {
+  __shared__ float shared[kGateWarps];
+  __shared__ __align__(16) __nv_bfloat16 s_k[kHidden];
+  __shared__ __align__(16) __nv_bfloat16 s_q[kHidden];
+
+  const int block = blockIdx.x;
+  const int branch = block % kHc;
+  const int row = block / kHc;
+  const int64_t row_base = static_cast<int64_t>(row) * kWidth;
+  const int64_t first = static_cast<int64_t>(branch) * kHidden;
+
+  const __nv_bfloat16* k_row = key_normed + row_base + first;
+  const __nv_bfloat16* q_row = query_normed + row_base + first;
+  constexpr int kVecs = kHidden / 8;
+#pragma unroll
+  for (int v = threadIdx.x; v < kVecs; v += kGateThreads) {
+    *reinterpret_cast<uint4*>(s_k + v * 8) = *reinterpret_cast<const uint4*>(k_row + v * 8);
+    *reinterpret_cast<uint4*>(s_q + v * 8) = *reinterpret_cast<const uint4*>(q_row + v * 8);
+  }
+  __syncthreads();
+
+  float partial = 0.0f;
+  for (int j = threadIdx.x; j < kHidden; j += kGateThreads) {
+    const float k = __bfloat162float(s_k[j]);
+    const float q = __bfloat162float(s_q[j]);
+    partial += bf16_round(k * q);
+  }
+  const float dot = block_all_sum(partial, shared);
+
+  const float pre_gate = bf16_round(bf16_round(dot) / sqrt_hidden);
+  const float magnitude = bf16_round(fmaxf(fabsf(pre_gate), kGateClampMin));
+  const float root = bf16_round(sqrtf(magnitude));
+  const float restore = torch_sign(pre_gate);
+  const float gate = bf16_round(root * restore);
+  const float weight = bf16_round(1.0f / (1.0f + expf(-gate)));
+
+  const __nv_bfloat16* value_row = value + static_cast<int64_t>(row) * kHidden;
+  __nv_bfloat16* gated_row = gated + row_base + static_cast<int64_t>(branch) * kHidden;
+#pragma unroll
+  for (int v = threadIdx.x; v < kVecs; v += kGateThreads) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(value_row + v * 8);
+    const __nv_bfloat16* x = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    uint4 packed;
+    __nv_bfloat16* d = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      d[k] = __float2bfloat16(weight * __bfloat162float(x[k]));
+    *reinterpret_cast<uint4*>(gated_row + v * 8) = packed;
+  }
+}
+
 // `out = gated + silu(bf16(dilated causal depthwise conv(conv_in)))`.
 //
 // `conv_in`, `gated` and `out` are row-major `[seq_len, kWidth]`;
@@ -205,6 +266,61 @@ int map_grid(int seq_len) {
   return grid > static_cast<int64_t>(INT_MAX) ? -1 : static_cast<int>(grid);
 }
 
+// Eight channels per thread, one block per (row, chunk). The four taps of the
+// eight channels' weights are 32 contiguous channel-major bf16, loaded as
+// four 16-byte vectors once; the tap accumulation keeps the scalar body's
+// order, so the bf16 roundings land on the same bits.
+constexpr int kConvVecThreads = 256;
+
+__global__ void qwen4_ple_conv_residual_vec_kernel(
+    const __nv_bfloat16* __restrict__ conv_in,
+    const __nv_bfloat16* __restrict__ gated,
+    const __nv_bfloat16* __restrict__ conv_weight,
+    __nv_bfloat16* __restrict__ out, int dilation, int per_row_blocks) {
+  const int row = blockIdx.x / per_row_blocks;
+  const int chunk = blockIdx.x - row * per_row_blocks;
+  const int ch0 = chunk * kConvVecThreads * 8 + threadIdx.x * 8;
+  if (ch0 >= kWidth) return;
+
+  // [ch0..ch0+8) x [0..4) is 32 contiguous channel-major bf16.
+  __nv_bfloat16 raw[32];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    *reinterpret_cast<uint4*>(raw + i * 8) =
+        *reinterpret_cast<const uint4*>(conv_weight + ch0 * kConvKernel + i * 8);
+  float w[kConvKernel][8];
+#pragma unroll
+  for (int t = 0; t < kConvKernel; ++t)
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[t][k] = __bfloat162float(raw[k * kConvKernel + t]);
+
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int t = 0; t < kConvKernel; ++t) {
+    const int source = row - (kConvKernel - 1 - t) * dilation;
+    if (source >= 0) {
+      const uint4 raw_in = *reinterpret_cast<const uint4*>(
+          conv_in + static_cast<int64_t>(source) * kWidth + ch0);
+      const __nv_bfloat16* x = reinterpret_cast<const __nv_bfloat16*>(&raw_in);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) acc[k] += __bfloat162float(x[k]) * w[t][k];
+    }
+  }
+
+  const int64_t at = static_cast<int64_t>(row) * kWidth + ch0;
+  const uint4 gv = *reinterpret_cast<const uint4*>(gated + at);
+  const __nv_bfloat16* g = reinterpret_cast<const __nv_bfloat16*>(&gv);
+  uint4 packed;
+  __nv_bfloat16* d = reinterpret_cast<__nv_bfloat16*>(&packed);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const float convolved = bf16_round(acc[k]);
+    const float activated = bf16_round(convolved / (1.0f + expf(-convolved)));
+    d[k] = __float2bfloat16(__bfloat162float(g[k]) + activated);
+  }
+  *reinterpret_cast<uint4*>(out + at) = packed;
+}
+
 }  // namespace
 
 extern "C" {
@@ -247,8 +363,17 @@ CUresult qwen4_ple_gate_cuda(const __nv_bfloat16* key_normed,
     return CUDA_ERROR_INVALID_VALUE;
   }
   const int grid = static_cast<int>(gate_grid);
-  qwen4_ple_gate_kernel<<<grid, kGateThreads, 0, stream>>>(
-      key_normed, query_normed, value, gated, seq_len, sqrt_hidden);
+  const uintptr_t gate_align = reinterpret_cast<uintptr_t>(key_normed) |
+                               reinterpret_cast<uintptr_t>(query_normed) |
+                               reinterpret_cast<uintptr_t>(value) |
+                               reinterpret_cast<uintptr_t>(gated);
+  if ((gate_align & 15) == 0) {
+    qwen4_ple_gate_vec_kernel<<<grid, kGateThreads, 0, stream>>>(
+        key_normed, query_normed, value, gated, seq_len, sqrt_hidden);
+  } else {
+    qwen4_ple_gate_kernel<<<grid, kGateThreads, 0, stream>>>(
+        key_normed, query_normed, value, gated, seq_len, sqrt_hidden);
+  }
   return consume_last_cuda_error();
 }
 
@@ -281,6 +406,26 @@ CUresult qwen4_ple_conv_residual_cuda(const __nv_bfloat16* conv_in,
   }
   if (seq_len == 0) {
     return CUDA_SUCCESS;
+  }
+  const uintptr_t conv_align = reinterpret_cast<uintptr_t>(conv_in) |
+                               reinterpret_cast<uintptr_t>(gated) |
+                               reinterpret_cast<uintptr_t>(conv_weight) |
+                               reinterpret_cast<uintptr_t>(out);
+  // Steady decode runs this block per slot over the conv state plus the new
+  // row (`conv_state() + 1` = 10 rows), where the flat scalar grid's wider
+  // launch wins. The floor sits above that window: the vector body is level
+  // at 64 rows and ahead from 128 on the reference sm_89 card.
+  constexpr int kConvVecMinRows = 64;
+  if ((conv_align & 15) == 0 && seq_len >= kConvVecMinRows) {
+    constexpr int per_row_blocks =
+        (kWidth + kConvVecThreads * 8 - 1) / (kConvVecThreads * 8);
+    const int64_t vec_grid = static_cast<int64_t>(seq_len) * per_row_blocks;
+    if (vec_grid <= INT_MAX) {
+      qwen4_ple_conv_residual_vec_kernel<<<static_cast<int>(vec_grid), kConvVecThreads, 0,
+                                           stream>>>(conv_in, gated, conv_weight, out,
+                                                     dilation, per_row_blocks);
+      return consume_last_cuda_error();
+    }
   }
   const int grid = map_grid(seq_len);
   if (grid < 0) {

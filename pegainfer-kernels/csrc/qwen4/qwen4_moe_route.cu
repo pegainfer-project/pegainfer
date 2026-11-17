@@ -50,6 +50,7 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <cstdint>
 
 namespace {
 
@@ -333,6 +334,41 @@ __global__ void qwen4_moe_shared_combine_kernel(
   }
 }
 
+// Eight bf16 per thread, one block per (token, row chunk): the gate sigmoid is
+// computed once per thread instead of once per element, and the row
+// decomposition is a division on blockIdx.x instead of a 64-bit divide per
+// element. Same per-element arithmetic and rounding order as the scalar body,
+// so identical bits; the launcher keeps the scalar body for shapes the vector
+// one cannot serve.
+constexpr int kCombThreads = 256;
+
+__global__ void qwen4_moe_shared_combine_vec_kernel(
+    const __nv_bfloat16* __restrict__ gate_logit,
+    const __nv_bfloat16* __restrict__ expert_out,
+    const __nv_bfloat16* __restrict__ shared_out, __nv_bfloat16* __restrict__ out,
+    int hidden, int per_row_blocks) {
+  const int token = blockIdx.x / per_row_blocks;
+  const int chunk = blockIdx.x - token * per_row_blocks;
+  const int h0 = chunk * kCombThreads * 8 + threadIdx.x * 8;
+  if (h0 >= hidden) return;
+  const float logit = __bfloat162float(gate_logit[token]);
+  const float gate =
+      __bfloat162float(__float2bfloat16(1.0f / (1.0f + expf(-logit))));
+  const long long at = static_cast<long long>(token) * hidden + h0;
+  const uint4 ev = *reinterpret_cast<const uint4*>(expert_out + at);
+  const uint4 sv = *reinterpret_cast<const uint4*>(shared_out + at);
+  const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&ev);
+  const __nv_bfloat16* s = reinterpret_cast<const __nv_bfloat16*>(&sv);
+  uint4 w;
+  __nv_bfloat16* d = reinterpret_cast<__nv_bfloat16*>(&w);
+#pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const float gated = __bfloat162float(__float2bfloat16(gate * __bfloat162float(s[k])));
+    d[k] = __float2bfloat16(__bfloat162float(e[k]) + gated);
+  }
+  *reinterpret_cast<uint4*>(out + at) = w;
+}
+
 }  // namespace
 
 extern "C" {
@@ -376,6 +412,19 @@ CUresult qwen4_moe_shared_combine_cuda(const __nv_bfloat16* gate_logit,
   if (tokens == 0) return CUDA_SUCCESS;
   const long long total = static_cast<long long>(tokens) * hidden;
   const int block = 256;
+  const uintptr_t align = reinterpret_cast<uintptr_t>(expert_out) |
+                          reinterpret_cast<uintptr_t>(shared_out) |
+                          reinterpret_cast<uintptr_t>(out);
+  if (hidden % 8 == 0 && (align & 15) == 0) {
+    const int per_row_blocks = (hidden + kCombThreads * 8 - 1) / (kCombThreads * 8);
+    const long long vec_grid = static_cast<long long>(tokens) * per_row_blocks;
+    if (vec_grid <= 2147483647LL) {
+      qwen4_moe_shared_combine_vec_kernel<<<static_cast<int>(vec_grid), kCombThreads, 0,
+                                            stream>>>(gate_logit, expert_out, shared_out,
+                                                      out, hidden, per_row_blocks);
+      return map_cuda_error(cudaGetLastError());
+    }
+  }
   const long long grid = (total + block - 1) / block;
   if (grid > 2147483647LL) {
     return CUDA_ERROR_INVALID_VALUE;

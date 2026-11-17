@@ -60,7 +60,9 @@ constexpr int kRadixBins = 256;
 constexpr int kStaticSharedBytes =
     kWarps * kRadixBins * static_cast<int>(sizeof(unsigned int)) +
     2 * static_cast<int>(sizeof(unsigned int)) +
-    (kThreads + 1) * static_cast<int>(sizeof(int));
+    (kThreads + 1) * static_cast<int>(sizeof(int)) +
+    kRadixBins * static_cast<int>(sizeof(int)) +
+    2 * static_cast<int>(sizeof(int));
 // The default per-block shared-memory ceiling on every supported arch; the
 // bitmap plus the block's static state must fit under it without an opt-in.
 constexpr int kMaxSharedBytes = 48 * 1024;
@@ -129,6 +131,10 @@ __global__ void qwen4_qsa_select_kernel(
   __shared__ unsigned int hist[kWarps * kRadixBins];
   __shared__ unsigned int radix_prefix;
   __shared__ int radix_remaining;
+  // Descending inclusive prefix of the bin counts, and the pass's boundary bin.
+  __shared__ int bin_scan[kRadixBins];
+  __shared__ int pass_chosen;
+  __shared__ int pass_remaining;
   const int warp = tid / WARP_SIZE;
   if (tid == 0) {
     radix_prefix = 0u;
@@ -151,25 +157,44 @@ __global__ void qwen4_qsa_select_kernel(
       atomicAdd(&hist[warp * kRadixBins + ((key >> shift) & 0xFFu)], 1u);
     }
     __syncthreads();
-    if (tid == 0) {
-      int remaining = radix_remaining;
-      int chosen = -1;
-      for (int bin = kRadixBins - 1; bin >= 0; --bin) {
-        int count = 0;
-        for (int w = 0; w < kWarps; ++w) {
-          count += static_cast<int>(hist[w * kRadixBins + bin]);
-        }
-        if (count >= remaining) {
-          chosen = bin;
-          break;
-        }
-        remaining -= count;
+    // Sum the per-warp histograms into per-bin counts, then a descending
+    // inclusive prefix: bin_scan[b] = sum_{b' >= b} count[b']. The chosen bin
+    // is the unique boundary where the prefix crosses `remaining` — the same
+    // bin a serial top-down scan picks, with the same leftover count — found
+    // in parallel instead of one thread walking all bins × warps.
+    if (tid < kRadixBins) {
+      int count = 0;
+      for (int w = 0; w < kWarps; ++w) {
+        count += static_cast<int>(hist[w * kRadixBins + tid]);
       }
-      if (chosen < 0) {
+      bin_scan[tid] = count;
+    }
+    __syncthreads();
+    for (int off = 1; off < kRadixBins; off <<= 1) {
+      int v = 0;
+      if (tid < kRadixBins && tid + off < kRadixBins) v = bin_scan[tid + off];
+      __syncthreads();
+      if (tid < kRadixBins) bin_scan[tid] += v;
+      __syncthreads();
+    }
+    if (tid == 0) pass_chosen = -1;
+    __syncthreads();
+    if (tid < kRadixBins) {
+      const int remaining = radix_remaining;
+      const int here = bin_scan[tid];
+      const int above = tid + 1 < kRadixBins ? bin_scan[tid + 1] : 0;
+      if (here >= remaining && above < remaining) {
+        pass_chosen = tid;
+        pass_remaining = remaining - above;
+      }
+    }
+    __syncthreads();
+    if (tid == 0) {
+      if (pass_chosen < 0) {
         __trap();  // `keep` exceeds the row's block count
       }
-      radix_prefix = prefix | (static_cast<unsigned int>(chosen) << shift);
-      radix_remaining = remaining;
+      radix_prefix = prefix | (static_cast<unsigned int>(pass_chosen) << shift);
+      radix_remaining = pass_remaining;
     }
     __syncthreads();
   }
