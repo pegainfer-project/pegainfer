@@ -31,7 +31,7 @@ and the binary layout is ~3.5x smaller (same convention as the Qwen goldens).
 Run on a host with 8 GPUs and the vLLM venv (the gate's pegainfer run needs
 the same GPUs, so generation and gating are sequential on one box):
 
-    .venv/bin/python tools/accuracy/dump_kimi_k2_vllm_golden.py \
+    .venv/bin/python scripts/accuracy/kimi_k2_vllm_golden.py \
         --model-path /data/models/Kimi-K2.6 \
         --out test_data/kimi-k2.6-vllm-golden.safetensors
 """
@@ -196,7 +196,7 @@ def main() -> None:
         "top_k": str(TOP_K),
         "seq_names": ",".join(name for name, _ in PROMPTS),
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "generator": "tools/accuracy/dump_kimi_k2_vllm_golden.py",
+        "generator": "scripts/accuracy/kimi_k2_vllm_golden.py",
     }
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)

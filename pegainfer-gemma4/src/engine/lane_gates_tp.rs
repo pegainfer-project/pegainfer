@@ -1378,7 +1378,7 @@ fn hf_distance(
 /// cannot afford a single-rank control on: a 31B's whole tower is 57 GiB, so its
 /// baseline is impossible on one card and the *reference* is the baseline here.
 /// The fixture is that checkpoint's own HF dump
-/// (`tools/accuracy/dump_gemma4_hf_golden.py`, selected with
+/// (`scripts/accuracy/gemma4_golden.py`, selected with
 /// `PEGAINFER_GEMMA4_GOLDEN`), compared over the teacher-forced prompt rows'
 /// top-64 logprobs.
 ///

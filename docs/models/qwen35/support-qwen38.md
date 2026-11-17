@@ -104,7 +104,7 @@ comparing against the wrong oracle. The revision is the only field that pins the
 an unresolvable local revision is now a **panic naming
 `PEGAINFER_TEST_MODEL_REVISION`**, not a skip: a skip reported `ok` without
 comparing anything. The `SIZE_NAMES` table in
-`tools/accuracy/dump_qwen35_hf_golden.py` only names the dumper's default
+`scripts/accuracy/qwen35_golden.py` only names the dumper's default
 output; the gate never reads it.
 
 ## Chat template parity
@@ -253,10 +253,10 @@ text tower.
 python3 -m pip install flash-linear-attention einops
 
 # 1. reference fixtures (short and long), pinned to the revision the gate asserts
-python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
+python3 scripts/accuracy/qwen35_golden.py --model-path $D \
   --model-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
   --tokenizer-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
-python3 tools/accuracy/dump_qwen35_hf_golden.py --model-path $D \
+python3 scripts/accuracy/qwen35_golden.py --model-path $D \
   --model-revision … --tokenizer-revision … \
   --prompt-lens 4097,8192 --decode-tokens 8
 

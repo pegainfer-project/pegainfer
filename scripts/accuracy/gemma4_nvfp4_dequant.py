@@ -1,6 +1,6 @@
 """Write a bf16 copy of a Gemma 4 NVFP4 checkpoint, for HF to load as a reference tower.
 
-    python tools/accuracy/dequantize_gemma4_nvfp4.py <nvfp4-dir> <out-dir> --device cuda:0
+    python scripts/accuracy/gemma4_nvfp4_dequant.py <nvfp4-dir> <out-dir> --device cuda:0
 
 ModelOpt's `NVFP4QTensor` unpacks the quantized weights; the per-expert weights
 are then restacked into the fused `gate_up_proj` and `down_proj` parameters

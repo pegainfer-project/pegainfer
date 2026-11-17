@@ -28,7 +28,7 @@ reference's mask builder passes an int32 index to `Tensor.scatter` (torch wants
 int64 on some versions), so `_scatter_int64` casts it for that call only, scoped
 -- the dump runs on torch 2.14.1 and older.
 
-    python tools/accuracy/dump_qwen38fn_qsa_attn_golden.py --out test_data/qwen38fn-qsa-attn-golden.safetensors
+    python scripts/accuracy/qwen4_qsa_attn_golden.py --out test_data/qwen38fn-qsa-attn-golden.safetensors
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import (
     Qwen4ExpTextRotaryEmbedding,
 )
 
-# Repo root (tools/accuracy/<this file> -> repo root).
+# Repo root (scripts/accuracy/<this file> -> repo root).
 ROOT = Path(__file__).resolve().parents[2]
 # Frozen checkpoint config: the single source of geometry (no hand-written dims).
 CONFIG = "pegainfer-qwen4/tests/frozen_config.json"

@@ -10,7 +10,7 @@ The methodology (why HF, why a tolerance not a hash, why teacher-forcing, why re
 
 | Knob | Value | Where |
 |------|-------|-------|
-| Goldens (committed) | `qwen3-{0.6b,1.7b,4b,8b,14b,32b}-hf-golden.safetensors`; size-keyed from config `(hidden_size, num_hidden_layers)` via `COMMITTED_FIXTURE_SIZES` | dumped by `tools/accuracy/dump_qwen3_hf_golden.py` |
+| Goldens (committed) | `qwen3-{0.6b,1.7b,4b,8b,14b,32b}-hf-golden.safetensors`; size-keyed from config `(hidden_size, num_hidden_layers)` via `COMMITTED_FIXTURE_SIZES` | dumped by `scripts/accuracy/qwen3_golden.py` |
 | Sequences | 48 seed-fixed (`SEED=0x5EED604D`), prompt 1–256 tokens, 16 decode tokens | dumper constants |
 | Positions scored | 48 × (16+1) = **816** | `P-1 .. P+D-1` per sequence |
 | Reference top-K | HF bf16 top-64 logprobs per position | dumper |
@@ -55,7 +55,7 @@ Tolerances were calibrated from this floor, strictly: `MEAN_TOL` 0.06 ≈ 2× th
 After a change that legitimately alters numerical output, recompute the golden on GPU through HuggingFace (bf16, `device_map=auto` so it scales to larger models), then re-run the gate:
 
 ```bash
-uv run --no-project python tools/accuracy/dump_qwen3_hf_golden.py \
+uv run --no-project python scripts/accuracy/qwen3_golden.py \
     --model-path /data/models/Qwen3-4B --out test_data/qwen3-4b-hf-golden.safetensors
 
 PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \

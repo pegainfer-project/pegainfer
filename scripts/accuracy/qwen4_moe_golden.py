@@ -30,7 +30,7 @@ shared_out`.
 
 Metadata is a single JSON key (`qwen4_moe_golden`, format_version 2).
 
-    python tools/accuracy/dump_qwen38fn_moe_golden.py --out test_data/qwen38fn-moe-golden.safetensors
+    python scripts/accuracy/qwen4_moe_golden.py --out test_data/qwen38fn-moe-golden.safetensors
 """
 
 from __future__ import annotations

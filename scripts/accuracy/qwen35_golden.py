@@ -7,7 +7,7 @@ For Qwen3.5 the HF oracle follows the same incremental shape: prefill the prompt
 with `use_cache=True`, then feed one fixed decode token at a time through
 `past_key_values`.
 
-    uv run --no-project python tools/accuracy/dump_qwen35_hf_golden.py \
+    uv run --no-project python scripts/accuracy/qwen35_golden.py \
         --model-path /data/models/Qwen3.5-4B \
         --out test_data/qwen35-4b-hf-golden.safetensors
 """

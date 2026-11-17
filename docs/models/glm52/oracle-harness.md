@@ -1,6 +1,6 @@
 # GLM5.2 Oracle Harness
 
-> **TL;DR:** Self-contained accuracy oracle for the GLM5.2 bricks: `tools/accuracy/glm52_oracle.py` (uv script, pinned `transformers==5.12.1` official `glm_moe_dsa` modeling code) emits paste-ready Rust probe constants; `pegainfer-glm52/src/oracle/mla.rs` replays the identical seeded input through the engine and asserts them. First gate (MLA decode brick) is green on jz38 H200 — 64/64 probes, full-tensor diff RMS 1.8e-5 vs tol 6.9e-5 — and both negative controls (rope-swap, q_b head negate) go red. No MB-scale fixtures in git: probes are hardcoded constants, the full tap dump is an optional local safetensors.
+> **TL;DR:** Self-contained accuracy oracle for the GLM5.2 bricks: `scripts/accuracy/glm52_oracle.py` (uv script, pinned `transformers==5.12.1` official `glm_moe_dsa` modeling code) emits paste-ready Rust probe constants; `pegainfer-glm52/src/oracle/mla.rs` replays the identical seeded input through the engine and asserts them. First gate (MLA decode brick) is green on jz38 H200 — 64/64 probes, full-tensor diff RMS 1.8e-5 vs tol 6.9e-5 — and both negative controls (rope-swap, q_b head negate) go red. No MB-scale fixtures in git: probes are hardcoded constants, the full tap dump is an optional local safetensors.
 >
 > **Last touched:** 2026-07
 
@@ -27,7 +27,7 @@
 
 ```bash
 # 1) generate probes (jz38 or any box with the checkpoint; CPU-only, ~4 min)
-uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 --emit rust
+uv run scripts/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 --emit rust
 
 # 2) paste the emitted block over the GENERATED section in oracle/mlla.rs
 
@@ -36,7 +36,7 @@ PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
   cargo test --release -p pegainfer-glm52 --features glm52 --lib mla_oracle -- --ignored --nocapture
 
 # debugging a divergence: dump all taps, gate then also whole-tensor-diffs `o`
-uv run tools/accuracy/glm52_oracle.py --model-path ... --emit safetensors --out /tmp/taps.safetensors
+uv run scripts/accuracy/glm52_oracle.py --model-path ... --emit safetensors --out /tmp/taps.safetensors
 PEGAINFER_GLM52_ORACLE_DUMP=/tmp/taps.safetensors cargo test ... mla_oracle -- --ignored --nocapture
 ```
 

@@ -12,6 +12,6 @@
 
 1. **Every writer of the 656-byte fp8_ds_mla cache must produce power-of-two group scales**, rounded UP (`2^ceil(log2(amax/448))`). In GLM5.2 that is the UE8M0 per-token-group quant (`glm52_fp8_per_token_group_quant_bf16_ue8m0_*`) feeding `glm52_mla_cache_pack`. Exact bit trick, no `log2f` rounding hazard: `(bits + 0x007FFFFF) & 0x7F800000`.
 2. GEMM **activation** quant (MoE/dense DeepGEMM paths) keeps amax/448 scales — the contract is only about the FlashMLA KV cache.
-3. Accuracy harnesses must model the cache with the same pow2 quant (`quant_dequant_groups_ue8m0` in `tools/accuracy/glm52_oracle.py`, exact via `torch.frexp`).
+3. Accuracy harnesses must model the cache with the same pow2 quant (`quant_dequant_groups_ue8m0` in `scripts/accuracy/glm52_oracle.py`, exact via `torch.frexp`).
 4. **Kimi-K2 uses the same FlashMLA sparse kernels.** It currently runs 8×H200 only; if it ever moves to Blackwell, its cache writer needs the same audit *first*.
 5. When bringing up a new arch, run the weights-free kernel gate before any model-level gate — it separates "kernel/glue broken on this arch" from modeling questions in minutes.

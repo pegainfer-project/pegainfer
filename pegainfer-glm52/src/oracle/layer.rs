@@ -1,6 +1,6 @@
 //! HF-oracle gates for the full decoder-layer composition.
 //!
-//! The oracle side is `tools/accuracy/glm52_oracle.py --stage layer` (official
+//! The oracle side is `scripts/accuracy/glm52_oracle.py --stage layer` (official
 //! `GlmMoeDsaDecoderLayer`, fp8sim precision): it runs one whole decoder layer
 //! (norms + MLA/DSA attention + residuals + dense-or-MoE MLP) on a seeded input
 //! and emits `layer_out` probe constants. These tests replay the same input
@@ -55,7 +55,7 @@ use crate::moe_decode::Glm52MoeRoutedExpertBytes;
 use crate::scratch::Glm52DecodeScratch;
 
 // ---- BEGIN GENERATED: glm52_oracle layer probes (dense, layer 0) ----
-// uv run tools/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
+// uv run scripts/accuracy/glm52_oracle.py --model-path /data/models/GLM-5.2-FP8 \
 //     --ctx 200 --seed 0x5eed604d --layer 0 --precision fp8sim \
 //     --stage layer --input-scale 0.02
 // transformers=5.13.0.dev0 torch=2.12.1+cu130
@@ -148,7 +148,7 @@ pub(crate) const MOE_ORACLE_HIDDEN_DIGEST: &str = "d39daa8ba2c7f939";
 // Non-expert projections use the engine's bf16-activation GEMV precision.
 // Routed experts use loader-time UE8M0 weight requantization and UE8M0
 // activation quantization before W13 and W2, matching the SM100 DeepGEMM path.
-// uv run tools/accuracy/glm52_oracle.py --model-path <GLM-5.2-FP8> \
+// uv run scripts/accuracy/glm52_oracle.py --model-path <GLM-5.2-FP8> \
 //     --ctx 200 --seed 0x5eed604d --layer 6 --precision deepgemm \
 //     --stage layer --input-scale 0.02
 // transformers=5.13.1 torch=2.11.0+cu130

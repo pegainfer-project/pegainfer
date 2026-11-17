@@ -3,7 +3,7 @@
 //!
 //! `test_data/qwen38fn-qsa-indexer-golden.safetensors` was dumped from
 //! transformers 5.16.1 `qwen4_exp` by
-//! `tools/accuracy/dump_qwen38fn_qsa_indexer_golden.py`. Each case carries the
+//! `scripts/accuracy/qwen4_qsa_indexer_golden.py`. Each case carries the
 //! indexer's inputs *after* `index_qk_proj` plus the reference's per-row block
 //! scores, so this gate replays those inputs through the kernel and compares.
 //! Cases cover the tail (5), a block-aligned short input (8), a medium one

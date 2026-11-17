@@ -1248,7 +1248,7 @@ fn incremental_serving_matches_recompute() {
 }
 
 /// Greedy continuation matches HF `generate()` token for token on three
-/// prompts. The fixture is dumped by tools/accuracy/dump_gemma4_generate.py
+/// prompts. The fixture is dumped by scripts/accuracy/gemma4_generate.py
 /// (prompt + up to 50 greedy tokens per case).
 #[test]
 #[ignore = "requires the pinned 12B checkpoint, fixtures, and a GPU"]

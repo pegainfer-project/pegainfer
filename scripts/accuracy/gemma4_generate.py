@@ -1,6 +1,6 @@
 """Dump the Gemma 4 HF greedy-generation reference.
 
-    python tools/accuracy/dump_gemma4_generate.py <model-dir> <out.safetensors> \
+    python scripts/accuracy/gemma4_generate.py <model-dir> <out.safetensors> \
         --source-repo google/gemma-4-12B-it \
         --revision 707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7
 

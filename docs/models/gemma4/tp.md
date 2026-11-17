@@ -132,7 +132,7 @@ The **real 31B checkpoint**, which no single card holds, is served end to end on
 
 ### The real 31B against its own Hugging Face dump
 
-`engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference` compares the two-rank engine directly against a Hugging Face reference for the **60-layer 31B** — the checkpoint whose single-rank baseline one card cannot hold. The fixture is that checkpoint's own dump (`tools/accuracy/dump_gemma4_hf_golden.py`, pinned by file digests), compared over the teacher-forced prompt rows' top-64 logprobs. Measured on two L20s, nine-token prompt:
+`engine::lane_gates_tp::the_two_rank_engine_matches_the_hf_reference` compares the two-rank engine directly against a Hugging Face reference for the **60-layer 31B** — the checkpoint whose single-rank baseline one card cannot hold. The fixture is that checkpoint's own dump (`scripts/accuracy/gemma4_golden.py`, pinned by file digests), compared over the teacher-forced prompt rows' top-64 logprobs. Measured on two L20s, nine-token prompt:
 
 | claim | result |
 | --- | --- |

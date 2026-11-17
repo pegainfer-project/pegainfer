@@ -40,7 +40,7 @@ The last two are the ones that exercise the carried state. No row selection is
 needed (widest stored tensor: S=128 `mixed_qkv` [1,128,10240], 2.5 MiB). Metadata
 is a single JSON key (`qwen4_gdn_golden`, format_version 2).
 
-    python tools/accuracy/dump_qwen38fn_gdn_golden.py --out <fixture>
+    python scripts/accuracy/qwen4_gdn_golden.py --out <fixture>
 """
 
 from __future__ import annotations

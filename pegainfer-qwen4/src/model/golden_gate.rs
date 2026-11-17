@@ -1,5 +1,5 @@
 //! Holds a chain of layers with the bookends around them against the reference
-//! recorded by `tools/accuracy/dump_qwen4_layer_golden.py` on the checkpoint's
+//! recorded by `scripts/accuracy/qwen4_layer_golden.py` on the checkpoint's
 //! own weights: the prompt in prefill and, when the golden carries them, decode
 //! steps on the carried state. Every layer is held on the reference's own
 //! input for it and the head on the reference's last stream; the engine's own

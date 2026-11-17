@@ -57,7 +57,7 @@ GPU-argmax-vs-host-log-softmax disagreement on the same logits.
 
 ```bash
 # Generate the fixture (once per vLLM/weights revision; ~20 min, 8 GPUs):
-.venv/bin/python tools/accuracy/dump_kimi_k2_vllm_golden.py \
+.venv/bin/python scripts/accuracy/kimi_k2_vllm_golden.py \
   --model-path /data/models/Kimi-K2.6 \
   --out test_data/kimi-k2.6-vllm-golden.safetensors
 
