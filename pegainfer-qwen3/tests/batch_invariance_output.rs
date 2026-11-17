@@ -113,7 +113,7 @@ impl Harness {
             },
             output.0,
         );
-        req.logprobs = output.1;
+        req.logprobs = (output.1 > 0).then_some(output.1);
         req.client_label = Some(Arc::from(label.as_str()));
         let control = self
             .handle

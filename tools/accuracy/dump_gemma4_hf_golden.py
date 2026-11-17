@@ -36,6 +36,14 @@ SEED = 0x_4E11_A404
 TOP_K = 64
 SHORT_LEN = 9
 HASHED_FILES = ("config.json", "generation_config.json")
+
+
+def input_device(model, device: str):
+    """Where the prompt ids go: the requested device, or the sharded model's first
+    device when `--device auto` spread the weights over several GPUs."""
+    return model.device if device == "auto" else device
+
+
 # Where the final RMSNorm sits, as a cut target alongside integer layer indices.
 FINAL_NORM = "final_norm"
 METADATA_KEY = "gemma4_golden"
@@ -48,26 +56,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-repo", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--fingerprint-dir",
+        type=Path,
+        help="the checkpoint the gates serve, when the tower here is a copy derived from it",
+    )
+    parser.add_argument(
+        "--tower",
+        help="how the tower was derived; given together with --fingerprint-dir",
+    )
     return parser.parse_args()
 
 
-def safetensors_header_sha256(model_dir: Path) -> tuple[str, str]:
-    """Fingerprint the tensor layout without reading 22 GiB of payload.
-
-    The header carries every tensor name, dtype, shape and offset, so it pins
-    the checkpoint's structure; the revision pins its content.
-    """
+def safetensors_header_sha256s(model_dir: Path) -> dict[str, str]:
+    """Header digests of every weight file: the single `model.safetensors` a 12B
+    checkpoint ships, or each shard the index of a 26B/31B checkpoint names, with
+    the index itself hashed in full so the shard layout is pinned too."""
     single = model_dir / "model.safetensors"
-    if not single.exists():
-        raise SystemExit("expected an unsharded model.safetensors; this size ships one")
-    with single.open("rb") as handle:
-        (header_len,) = struct.unpack("<Q", handle.read(8))
-        header = handle.read(header_len)
-    if len(header) != header_len:
+    index = model_dir / "model.safetensors.index.json"
+    if single.exists():
+        files = [single]
+    elif index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        files = [model_dir / name for name in sorted(set(weight_map.values()))]
+    else:
         raise SystemExit(
-            f"short read on the safetensors header: {len(header)} of {header_len}"
+            "expected model.safetensors or model.safetensors.index.json in the checkpoint"
         )
-    return single.name, hashlib.sha256(header).hexdigest()
+    digests = {}
+    for path in files:
+        with path.open("rb") as handle:
+            (header_len,) = struct.unpack("<Q", handle.read(8))
+            header = handle.read(header_len)
+        if len(header) != header_len:
+            raise SystemExit(
+                f"short read on the safetensors header of {path.name}: {len(header)} of {header_len}"
+            )
+        digests[f"{path.name}#header"] = hashlib.sha256(header).hexdigest()
+    if not single.exists():
+        digests[index.name] = hashlib.sha256(index.read_bytes()).hexdigest()
+    return digests
 
 
 def file_hashes(model_dir: Path) -> dict[str, str]:
@@ -77,8 +105,7 @@ def file_hashes(model_dir: Path) -> dict[str, str]:
         if not path.exists():
             raise SystemExit(f"required file missing from the checkpoint: {name}")
         hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    name, digest = safetensors_header_sha256(model_dir)
-    hashes[f"{name}#header"] = digest
+    hashes.update(safetensors_header_sha256s(model_dir))
     return hashes
 
 
@@ -163,13 +190,15 @@ def run_case(model, text_model, cuts, tokens, device):
     handles = []
 
     def record(kind, target):
+        # On the host: `--device auto` can leave the probes on different
+        # GPUs, which the stack below refuses.
         def pre(_mod, args, kwargs):
             hidden = args[0] if args else kwargs["hidden_states"]
-            captured[(kind, target)] = hidden.detach().clone()
+            captured[(kind, target)] = hidden.detach().to("cpu", copy=True)
 
         def post(_mod, _args, _kwargs, out):
             hidden = out[0] if isinstance(out, tuple) else out
-            captured[(kind, target)] = hidden.detach().clone()
+            captured[(kind, target)] = hidden.detach().to("cpu", copy=True)
 
         module = text_model.norm if target == FINAL_NORM else text_model.layers[target]
         if kind == "in":
@@ -197,6 +226,8 @@ def run_case(model, text_model, cuts, tokens, device):
 def main() -> int:
     args = parse_args()
     model_dir = Path(args.model_dir)
+    if bool(args.fingerprint_dir) != bool(args.tower):
+        raise SystemExit("--fingerprint-dir and --tower go together")
 
     config = AutoConfig.from_pretrained(str(model_dir))
     text_config = config.get_text_config()
@@ -241,9 +272,11 @@ def main() -> int:
     tensors: dict[str, torch.Tensor] = {}
     for name, tokens, probed in cases:
         case_cuts = cuts if probed else []
-        hidden, logits = run_case(model, text_model, case_cuts, tokens, args.device)
+        hidden, logits = run_case(
+            model, text_model, case_cuts, tokens, input_device(model, args.device)
+        )
         replay_hidden, replay_logits = run_case(
-            model, text_model, case_cuts, tokens, args.device
+            model, text_model, case_cuts, tokens, input_device(model, args.device)
         )
         reproducible = torch.equal(logits, replay_logits) and (
             hidden is None or torch.equal(hidden, replay_hidden)
@@ -288,8 +321,13 @@ def main() -> int:
         "embed_scale_bf16": float(
             text_model.embed_tokens.embed_scale.to(torch.bfloat16)
         ),
-        "file_sha256": file_hashes(model_dir),
+        "file_sha256": file_hashes(args.fingerprint_dir or model_dir),
     }
+    if args.fingerprint_dir:
+        manifest["reference_tower"] = {
+            "derivation": args.tower,
+            "file_sha256": file_hashes(model_dir),
+        }
     # One key, sorted: safetensors serializes its metadata map in a randomized
     # order, so a multi-key block makes two runs of this script differ byte for
     # byte while carrying identical content. Collapsing it is what lets the

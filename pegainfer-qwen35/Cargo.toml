@@ -13,6 +13,7 @@ half = { workspace = true }
 log = { workspace = true }
 pegainfer-core = { workspace = true }
 pegainfer-frontend = { workspace = true }
+pegainfer-kv-cache = { workspace = true }
 pegainfer-kernels = { workspace = true }
 pegainfer-sample = { workspace = true }
 rand = { workspace = true }
@@ -39,19 +40,11 @@ qwen35 = ["pegainfer-kernels/qwen35"]
 workspace = true
 
 [[test]]
-name = "hf_golden_gate"
-required-features = ["qwen35"]
-
-[[test]]
-name = "e2e_scheduler"
-required-features = ["qwen35"]
-
-[[test]]
 name = "sampling_behavior"
 required-features = ["qwen35"]
 
 [[test]]
-name = "chunked_prefill"
+name = "prefix_cache"
 required-features = ["qwen35"]
 
 [[test]]

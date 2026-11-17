@@ -22,9 +22,6 @@
 //! (freeing their device buffers immediately) and then holds the loader to the
 //! same full invariant: nothing resident may go unaccounted for.
 
-// Bring-up: the model build lands ahead of the decode executor that reads it.
-#![allow(dead_code)]
-
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
@@ -156,7 +153,6 @@ pub(crate) struct K3ExpertBank {
     pub(crate) w2_weight: CudaSlice<u8>,
     /// Their scale factors, i32 `[experts, moe_inter / 128, latent]`.
     pub(crate) w2_scale: CudaSlice<i32>,
-    pub(crate) local_experts: usize,
     /// Which consumer this bank was laid out for.
     pub(crate) form: K3ExpertBankForm,
 }
@@ -212,7 +208,6 @@ impl K3ExpertBank {
                     w13_scale,
                     w2_weight: regions.w2_weight,
                     w2_scale,
-                    local_experts,
                     form,
                 })
             }
@@ -260,7 +255,6 @@ impl K3ExpertBank {
                     w13_scale,
                     w2_weight: regions.w2_weight,
                     w2_scale,
-                    local_experts,
                     form,
                 })
             }
@@ -406,6 +400,7 @@ pub(crate) struct K3RankModel {
     pub(crate) layers: Vec<K3LayerWeights>,
     /// Attention-residual blocks the output mix sees.
     pub(crate) blocks: usize,
+    #[cfg(test)]
     pub(crate) vram: K3ModelVram,
 }
 
@@ -488,6 +483,7 @@ impl K3RankModel {
             w_lm,
             layers,
             blocks,
+            #[cfg(test)]
             vram,
         })
     }
@@ -783,7 +779,6 @@ mod tests {
             // repacked into MN-major i32 words.
             let local = topo.local_experts();
             let bank = &moe.experts;
-            assert_eq!(bank.local_experts, local);
             for (kind, weight, scale) in [
                 (
                     K3DeepGemmFp8Fp4Kind::W13,

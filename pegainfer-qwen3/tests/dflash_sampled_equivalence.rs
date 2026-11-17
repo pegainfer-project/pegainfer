@@ -1,8 +1,8 @@
 //! Sampled speculative decoding must be *distribution-lossless* (#512).
 //!
-//! Sampled-verify (the #589 mechanism) commits only tokens the verify pass
-//! sampled from the target model's own distribution — spec-on and spec-off
-//! differ in *how* tokens are produced, never in *what law* they follow. Token-by-token
+//! Deterministic drafts use target-sample prefix matching; sampled DFlash2
+//! proposals use their conditional probabilities for rejection sampling.
+//! Both must preserve the target sampling distribution. Token-by-token
 //! equality is meaningless for sampled decoding (each run is a fresh draw), so
 //! the gate is statistical: for a fixed prompt set and representative sampling
 //! configs, generate many independent runs per arm and compare the per-position
@@ -27,11 +27,16 @@
 //!
 //! Requires a CUDA GPU, Qwen3-4B weights, and the DFlash drafter. Set
 //! `PEGAINFER_TEST_MODEL_PATH` (target) and `PEGAINFER_DFLASH_TEST_MODEL_PATH`
-//! (drafter); skips cleanly when either is absent. Knobs:
+//! (drafter, including native DFlash2). Explicit paths must load successfully;
+//! an unconfigured local run skips when the default weights are absent. Knobs:
 //! `PEGAINFER_EQ_RUNS` (default 256 per arm), `PEGAINFER_EQ_BATCH` (default
 //! 16 concurrent identical requests per wave — the arms see the same batch
 //! shapes), `PEGAINFER_EQ_OUT` (optional JSON dump of every token matrix, for
 //! offline scrutiny).
+//!
+//! Native DFlash2 adds a long prompt that crosses its attention window during
+//! generation. Each speculative prompt must produce drafts, so a plain-decode
+//! fallback cannot pass the distribution comparison unnoticed.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -40,6 +45,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use pegainfer_frontend::engine::EosPolicy;
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::StopPolicy;
+use pegainfer_frontend::engine::Terminal;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
 use pegainfer_qwen3::DEFAULT_KV_PAGE_SIZE;
@@ -135,6 +145,56 @@ fn env_knob(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn encoded_prompts(model_path: &str, draft_path: &str) -> Vec<Vec<u32>> {
+    let tokenizer = common::load_tokenizer(model_path);
+    let mut encoded: Vec<_> = PROMPTS
+        .iter()
+        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
+        .collect();
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(draft_path).join("config.json")).expect("draft config must exist"),
+    )
+    .expect("draft config must be valid JSON");
+    if config["selector_rank"]
+        .as_u64()
+        .is_some_and(|rank| rank > 0)
+        && config["conv_kernel_size"]
+            .as_u64()
+            .is_some_and(|taps| taps > 0)
+    {
+        let window = config["transformer_layer_config"]["sliding_window"]
+            .as_u64()
+            .expect("native checkpoint must declare a sliding window")
+            as usize;
+        let block_size = config["block_size"]
+            .as_u64()
+            .expect("native checkpoint must declare a block size")
+            as usize;
+        assert!(block_size < POSITIONS, "generation must cross the window");
+        let prompt_len = window
+            .checked_sub(block_size)
+            .expect("window must exceed the draft block size");
+        let mut tokens = tokenizer
+            .encode(
+                include_str!("../../docs/models/qwen3/model-crate.md"),
+                false,
+            )
+            .expect("encode long context");
+        tokens.truncate(prompt_len);
+        assert_eq!(
+            tokens.len(),
+            prompt_len,
+            "long-context fixture is too short"
+        );
+        eprintln!(
+            "native window case: prompt={}, output={POSITIONS}, window={window}",
+            tokens.len()
+        );
+        encoded.push(tokens);
+    }
+    encoded
+}
+
 fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
     Qwen3LaunchOptions {
         device_ordinal: 0,
@@ -142,8 +202,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         cuda_graph: true,
         dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
-        // The speculative engine forces the prefix cache off; match it on the
-        // baseline so both arms take the same cold prefill path.
+        // Both arms take the same cold prefill path.
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
         memory: Qwen3MemoryOptions::new(
@@ -157,6 +216,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
         dflash_draft_model_path: draft,
+        eagle3_draft_model_path: None,
     }
 }
 
@@ -214,15 +274,30 @@ fn collect_arm(
 ) -> Vec<ConfigTokens> {
     CONFIGS
         .iter()
-        .map(|&cfg| {
+        .enumerate()
+        .map(|(config, &cfg)| {
             let params = sampling(cfg);
             encoded
                 .iter()
-                .map(|prompt_tokens| {
+                .enumerate()
+                .map(|(prompt, prompt_tokens)| {
+                    let before = engine.metrics().spec_decode.unwrap_or_default();
                     let mut rows = Vec::with_capacity(runs);
                     while rows.len() < runs {
                         let n = batch.min(runs - rows.len());
                         rows.extend(sample_wave(engine, prompt_tokens, &params, n));
+                    }
+                    if let Some(after) = engine.metrics().spec_decode {
+                        let rounds = after.num_drafts - before.num_drafts;
+                        let proposed = after.num_draft_tokens - before.num_draft_tokens;
+                        let accepted = after.num_accepted_tokens - before.num_accepted_tokens;
+                        assert!(
+                            rounds > 0 && proposed > 0,
+                            "config {config} prompt {prompt} must execute the speculative path"
+                        );
+                        eprintln!(
+                            "config {config} prompt {prompt}: rounds={rounds}, proposed={proposed}, accepted={accepted}"
+                        );
                     }
                     rows
                 })
@@ -431,11 +506,7 @@ fn dflash_sampled_equivalence_gate() {
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
-    let tokenizer = common::load_tokenizer(&model_path);
-    let encoded: Vec<Vec<u32>> = PROMPTS
-        .iter()
-        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
-        .collect();
+    let encoded = encoded_prompts(&model_path, &draft_path);
 
     // Arm A: plain decode (no draft model loaded — the spec path cannot run).
     let spec_off = {
@@ -449,7 +520,7 @@ fn dflash_sampled_equivalence_gate() {
         arm
     };
 
-    // Arm B: DFlash speculative engine; sampled requests ride chain rejection.
+    // Arm B: the checkpoint selects deterministic or probabilistic proposals.
     let spec_on = {
         let engine = EngineHarness::new(
             pegainfer_qwen3::launch(
@@ -459,6 +530,15 @@ fn dflash_sampled_equivalence_gate() {
             .expect("failed to start speculative engine"),
         );
         let arm = collect_arm(&engine, &encoded, runs, batch);
+        let counters = engine.metrics().spec_decode.expect("speculative metrics");
+        assert!(
+            counters.num_drafts > 0 && counters.num_draft_tokens > 0,
+            "sampled requests must execute the speculative path"
+        );
+        eprintln!(
+            "sampled proposals: rounds={}, proposed={}, accepted={}",
+            counters.num_drafts, counters.num_draft_tokens, counters.num_accepted_tokens
+        );
         drop(engine);
         arm
     };
@@ -483,11 +563,7 @@ fn dflash_sampled_equivalence_null_check() {
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
-    let tokenizer = common::load_tokenizer(&model_path);
-    let encoded: Vec<Vec<u32>> = PROMPTS
-        .iter()
-        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
-        .collect();
+    let encoded = encoded_prompts(&model_path, &draft_path);
 
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(
@@ -525,6 +601,7 @@ fn dflash_sampled_seeded_determinism() {
         .expect("failed to start speculative engine"),
     );
 
+    let mut stop_case = None;
     for (i, prompt) in PROMPTS.iter().enumerate() {
         let tokens = tokenizer.encode(prompt, false).expect("encode failed");
         let params = SamplingParams {
@@ -537,7 +614,75 @@ fn dflash_sampled_seeded_determinism() {
             first, second,
             "prompt {i}: a seeded spec-on request must replay byte-identically"
         );
+        if i == 0 {
+            let stop_id = first[0]
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(position, token)| !first[0][..*position].contains(token))
+                .map(|(_, &token)| token)
+                .expect("fixture needs a new token after the prefill token");
+            stop_case = Some((tokens, params, stop_id));
+        }
     }
+
+    // Different budgets retire requests while the sampled lane still holds
+    // proposal rows for its neighbours. A known stop must retain its trigger
+    // without emitting any later token from the verified block.
+    let (tokens, params, stop_id) = stop_case.expect("first prompt produced a stop fixture");
+    let mut stopped = request(tokens.clone(), params, POSITIONS);
+    stopped.stop_policy = StopPolicy::new(EosPolicy::Ignore, vec![stop_id]);
+    let before = engine.metrics().spec_decode.unwrap_or_default();
+    let streams: Vec<_> = [
+        request(
+            tokens.clone(),
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            9,
+        ),
+        request(tokens.clone(), sampling(CONFIGS[1]), 3),
+        request(tokens, sampling(CONFIGS[3]), POSITIONS),
+        stopped,
+    ]
+    .into_iter()
+    .map(|req| engine.submit(req))
+    .collect();
+    for (index, stream) in streams.into_iter().enumerate() {
+        let outcome = stream.expect_finished();
+        if index == 3 {
+            assert_eq!(outcome.tokens.last(), Some(&stop_id));
+            assert_eq!(
+                outcome.tokens.iter().position(|&token| token == stop_id),
+                Some(outcome.tokens.len() - 1),
+                "a stop token must end the emitted prefix"
+            );
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Stop,
+                    stop_cause: Some(StopCause::Token(id)),
+                    completion_tokens,
+                    ..
+                } if id == stop_id && completion_tokens == outcome.tokens.len()
+            ));
+        } else {
+            let budget = [9, 3, POSITIONS][index];
+            assert_eq!(outcome.tokens.len(), budget);
+            assert!(matches!(
+                outcome.terminal,
+                Terminal::Finished {
+                    reason: FinishReason::Length,
+                    stop_cause: None,
+                    completion_tokens,
+                    ..
+                } if completion_tokens == budget
+            ));
+        }
+    }
+    let after = engine.metrics().spec_decode.expect("speculative metrics");
+    assert!(after.num_drafts > before.num_drafts);
     drop(engine);
 }
 

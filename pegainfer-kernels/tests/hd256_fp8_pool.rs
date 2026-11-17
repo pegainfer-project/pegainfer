@@ -8,7 +8,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use pegainfer_kernels::ops::PrefillPagedPlan;
 use pegainfer_kernels::ops::batch_prefill_paged_window_hd256_into;
-use pegainfer_kernels::ops::paged_attention_batch_decode_hd256_into;
+use pegainfer_kernels::ops::paged_attention_batch_decode_into;
 use pegainfer_kernels::ops::qkv_norm_rope_paged_decode_hd256_plain_into;
 use pegainfer_kernels::ops::qkv_norm_rope_paged_prefill_hd256_plain_into;
 use pegainfer_kernels::paged_kv::KvStorage;
@@ -119,39 +119,6 @@ fn fp8_decode_prep_stores_exact_bytes_at_layout_offsets() {
     expected[k..k + HD].fill(0x40);
     expected[v..v + HD].fill(0x38);
     assert_eq!(got, expected);
-}
-
-fn constant_pool(ctx: &DeviceContext, storage: KvStorage, pages: usize) -> CudaSlice<bf16> {
-    let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, storage);
-    let values = [1.0f32, 2.0, 0.5, -1.0];
-    match storage {
-        KvStorage::Bf16 => {
-            let mut host = vec![bf16::ZERO; layout.page_stride * pages];
-            for page in 0..pages {
-                for slot in 0..PAGE_SIZE {
-                    let base = page * layout.page_stride + slot * HD;
-                    host[base..base + HD].fill(bf16::from_f32(values[slot]));
-                    let v = base + layout.kv_block_len;
-                    host[v..v + HD].fill(bf16::from_f32(values[slot + 2]));
-                }
-            }
-            ctx.stream.clone_htod(&host).expect("bf16 pool H2D")
-        }
-        KvStorage::E4m3 => {
-            let mut bytes = vec![0u8; layout.page_stride * pages];
-            for page in 0..pages {
-                for slot in 0..PAGE_SIZE {
-                    let base = page * layout.page_stride + slot * HD;
-                    bytes[base..base + HD].fill([0x38, 0x40][slot]);
-                    let v = base + layout.kv_block_len;
-                    bytes[v..v + HD].fill([0x30, 0xb8][slot]);
-                }
-            }
-            ctx.stream
-                .clone_htod(&packed_fp8(&bytes))
-                .expect("fp8 pool H2D")
-        }
-    }
 }
 
 fn e4m3_to_f32(byte: u8) -> f32 {
@@ -296,70 +263,6 @@ fn fp8_finite_window_read_matches_bf16_and_changes_the_result() {
     );
 }
 
-fn geometry_probe(ctx: &DeviceContext, prefix_rows: usize) -> Vec<u16> {
-    let pages = prefix_rows.div_ceil(PAGE_SIZE) + 1;
-    let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::E4m3);
-    let pool = constant_pool(ctx, KvStorage::E4m3, pages);
-    let (page_lists, starts, lengths, lasts) = if prefix_rows == 0 {
-        (vec![vec![0]], vec![1], vec![1], vec![2])
-    } else {
-        let prefix_pages: Vec<i32> = (0..pages as i32 - 1).collect();
-        (
-            vec![prefix_pages, vec![pages as i32 - 1]],
-            vec![0, 1],
-            vec![prefix_rows, 1],
-            vec![(prefix_rows - 1) % PAGE_SIZE + 1, 2],
-        )
-    };
-    let plan = PrefillPagedPlan::new_batch_with_cta_tile_q(
-        ctx,
-        &page_lists,
-        &lasts,
-        &starts,
-        &lengths,
-        1,
-        1,
-        HD,
-        0,
-    )
-    .expect("batch plan");
-    let q = constant_states(ctx, 0.0, prefix_rows + 1);
-    let mut output = HiddenStates::zeros(ctx, HD, prefix_rows + 1).expect("output alloc");
-    batch_prefill_paged_window_hd256_into(
-        ctx,
-        &q,
-        &pool,
-        &layout,
-        0,
-        &plan,
-        &mut output,
-        1,
-        1.0,
-        -1,
-    )
-    .expect("attention");
-    let host = output.to_host(ctx).expect("output D2H");
-    host[prefix_rows * HD..]
-        .iter()
-        .map(|&value| bf16::from_f32(value).to_bits())
-        .collect()
-}
-
-#[test]
-fn fp8_window_read_is_geometry_invariant_for_the_probed_row() {
-    let Some(ctx) = common::device_or_skip() else {
-        return;
-    };
-    let lone = geometry_probe(&ctx, 0);
-    let packed = geometry_probe(&ctx, 300);
-    if let Some(index) = lone.iter().zip(&packed).position(|(a, b)| a != b) {
-        panic!(
-            "geometry dependence at output[{index}]: lone={:#06x}, packed={:#06x}",
-            lone[index], packed[index]
-        );
-    }
-}
-
 fn varied_geometry_probe(ctx: &DeviceContext, prefix_rows: usize, pages: usize) -> Vec<u16> {
     let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::E4m3);
     let pool = semantic_pool(ctx, KvStorage::E4m3, pages);
@@ -446,7 +349,7 @@ fn decode_wrapper_without_fp8_twin_refuses_e4m3() {
     let mut output = HiddenStates::zeros(&ctx, HD, 1).expect("output");
     let meta = ctx.stream.clone_htod(&[0i32]).expect("metadata");
     let indptr = ctx.stream.clone_htod(&[0i32, 1]).expect("indptr");
-    let err = paged_attention_batch_decode_hd256_into(
+    let err = paged_attention_batch_decode_into(
         &ctx,
         &state,
         &state,
@@ -467,4 +370,38 @@ fn decode_wrapper_without_fp8_twin_refuses_e4m3() {
     )
     .expect_err("unsupported fp8 wrapper must reject");
     assert!(err.to_string().contains("has no fp8 KV path"), "{err}");
+}
+
+#[test]
+fn the_generated_windowed_prefill_refuses_e4m3() {
+    let Some(ctx) = common::device_or_skip() else {
+        return;
+    };
+    if !pegainfer_kernels::ops::gemma4_hd512_prefill_is_built() {
+        eprintln!("skipping: this build carries the stub, which refuses everything");
+        return;
+    }
+    let layout = PagedKvLayout::with_storage(1, 1, HD, PAGE_SIZE, KvStorage::E4m3);
+    let pool: CudaSlice<bf16> = ctx
+        .stream
+        .alloc_zeros(layout.page_stride / 2)
+        .expect("pool");
+    let q = HiddenStates::zeros(&ctx, HD, 1).expect("q");
+    let mut output = HiddenStates::zeros(&ctx, HD, 1).expect("output");
+    let plan =
+        PrefillPagedPlan::new_with_cta_tile_q(&ctx, &[0i32], 1, 0, 1, 1, 1, HD, 0).expect("plan");
+    let err = pegainfer_kernels::ops::gemma4_hd256_prefill_window_into(
+        &ctx,
+        &q,
+        &pool,
+        &layout,
+        0,
+        &plan,
+        &mut output,
+        1,
+        1.0,
+        1023,
+    )
+    .expect_err("a two-byte reader must refuse an e4m3 pool");
+    assert!(err.to_string().contains("two-byte rows"), "{err}");
 }

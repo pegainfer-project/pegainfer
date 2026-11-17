@@ -93,8 +93,8 @@ pub(super) fn validate_request(
             ));
         }
     }
-    if req.logprobs > 0 || req.echo {
-        return Err("GLM5.2 bring-up does not support logprobs/echo".to_owned());
+    if req.logprobs.is_some() || req.prompt_logprobs.is_some() {
+        return Err("GLM5.2 bring-up does not support completion or prompt logprobs".to_owned());
     }
     if req.lora_adapter.is_some() {
         return Err("GLM5.2 does not support LoRA adapters".to_owned());

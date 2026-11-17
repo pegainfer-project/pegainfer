@@ -1,8 +1,8 @@
 # Kimi-K2 sampling: param surface and design
 
-**TL;DR**: temperature/top_k/top_p are honored on TP1/DP8 via one batched FlashInfer pass (greedy rows keep the in-graph argmax, zero perf cost); TP8 rejects non-greedy explicitly; everything else on the OpenAI surface is documented below — nothing is silently ignored anymore (#237).
+**TL;DR**: temperature/top_k/top_p are honored on TP1/DP8 via one batched FlashInfer pass (greedy rows keep the in-graph argmax, zero perf cost); TP8 rejects non-greedy and logprobs requests at admission; everything else on the OpenAI surface is documented below, and nothing is silently ignored.
 
-Last touched: 2026-06
+Last touched: 2026-11
 
 ## Param surface (`/v1/completions`)
 
@@ -21,7 +21,7 @@ scheduler/worker.
 | `top_k` ≥ 1 | **honored** (`top_k=1` routes greedy) | rejected if non-greedy | engine |
 | `top_k` = 0 | all tokens (disabled) | — | frontend maps 0 → -1; protocol type is `u32`, negatives don't parse |
 | `seed` | **accepted, ignored** — engine seed is fixed at 42, per-request seed is dropped at `convert_sampling` | same | frontend |
-| `logprobs` | honored; for sampled rows the logprob follows the **sampled** token (reported rank is a placeholder, see PR #96) | honored (greedy only) | engine |
+| `logprobs` | honored; for sampled rows the logprob follows the **sampled** token (reported rank is a placeholder, see PR #96) | **rejected** at admission | engine |
 | `max_tokens`, `echo`, `stop` (EOS) | honored | honored | engine / frontend |
 | `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `prompt_logprobs`, custom `stop_token_ids` | **accepted, ignored** — dropped at `convert_sampling`, never reach the engine | same | frontend (all models, not kimi-specific) |
 
@@ -54,10 +54,7 @@ pegainfer one.
   draws a fresh u64 per rank per step. Ranks must not share a step seed: the
   philox subsequence inside FlashInfer is the *row index*, so same-index rows
   on two ranks with the same seed would draw identical uniforms.
-- TP8: each rank holds a vocab shard; per-shard softmax cannot express the
-  global distribution. Non-greedy requests are rejected per-request at
-  admission (one bad request must not fail the decode batch), and
-  `ensure_greedy_tp8` in the executor backstops the invariant (#226).
+- TP8: each rank holds a vocab shard, so neither a per-shard softmax nor a per-shard logsumexp is the global one. Non-greedy and logprobs requests are rejected per request at admission (one bad request must not fail the decode batch), and `ensure_tp8_row` in the executor backstops the invariant with the same `tp8_row_refusal` reason.
 
 ## Verified on 8×H200 (K2.6, TP1/DP8 PPLX, 2026-06-06)
 

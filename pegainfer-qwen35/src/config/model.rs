@@ -46,7 +46,6 @@ pub(crate) struct TextConfig {
     rope_parameters: RopeParameters,
     max_position_embeddings: Option<usize>,
     tie_word_embeddings: Option<bool>,
-    eos_token_id: u32,
 }
 
 /// Raw Qwen3.5 config as deserialized from `config.json`. Held only long enough
@@ -58,10 +57,14 @@ pub(crate) struct RawConfig {
     tie_word_embeddings: Option<bool>,
 }
 
-/// Head dims baked into the kernels; head counts are runtime parameters.
-pub(crate) const GDN_AOT_KEY_HEAD_DIM: usize = 128;
-pub(crate) const GDN_AOT_VALUE_HEAD_DIM: usize = 128;
-pub(crate) const LINEAR_CONV_MAX_KERNEL_DIM: usize = 4;
+/// Head dims baked into the kernels; head counts are runtime parameters. They
+/// are owned by the Qwen3.5 wrappers in `pegainfer_kernels::ops`, which the
+/// Qwen3.8-Flash-Next line will drive with the same numbers once it has a device
+/// path, so this module only re-exports them: a config that passes here is one
+/// the kernels can run.
+pub(crate) use pegainfer_kernels::ops::GDN_AOT_KEY_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::GDN_AOT_VALUE_HEAD_DIM;
+pub(crate) use pegainfer_kernels::ops::LINEAR_CONV_MAX_KERNEL_DIM;
 const FULL_ATTN_HEAD_DIM: usize = 256;
 
 /// Validated Qwen3.5 model configuration (text-only).
@@ -78,7 +81,8 @@ pub(crate) struct Config35 {
     pub(crate) num_hidden_layers: usize,
     pub(crate) vocab_size: usize,
     pub(crate) rms_norm_eps: f32,
-    pub(crate) eos_token_id: u32,
+    /// The checkpoint's EOS set, resolved in [`Config35::from_file`].
+    pub(crate) eos_token_ids: Vec<u32>,
 
     // Full attention params
     pub(crate) num_attention_heads: usize,
@@ -103,8 +107,13 @@ pub(crate) struct Config35 {
     /// `false` requires a top-level `lm_head.weight`; `true` reuses `embed_tokens`.
     pub(crate) tie_word_embeddings: bool,
 
-    /// Token-selection width: `vocab_size` bounded to the frontend-decodable vocab.
+    /// Token-selection width: `vocab_size` bounded to the frontend-decodable
+    /// vocab, then rounded up to the logits GEMM's tile multiple. Buffers and
+    /// the sampler arena span this width.
     pub(crate) selection_vocab: usize,
+    /// Tokenizer-decodable width: the rows past it are suppressed to -inf and
+    /// are what the argmax-vs-sample routing is measured against.
+    pub(crate) decodable_vocab: usize,
 }
 
 impl Config35 {
@@ -113,7 +122,8 @@ impl Config35 {
         let config_path = format!("{}/config.json", model_path);
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
-        let config = Self::try_from(raw)?;
+        let mut config = Self::try_from(raw)?;
+        config.eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -141,20 +151,13 @@ impl Config35 {
             .contains(&(self.num_attention_heads / self.num_key_value_heads))
     }
 
-    /// QKV projection output dimension for linear attention.
-    pub(crate) fn linear_attn_qkv_dim(&self) -> usize {
-        let q_dim = self.linear_num_key_heads * self.linear_key_head_dim;
-        let k_dim = q_dim;
-        let v_dim = self.linear_num_value_heads * self.linear_value_head_dim;
-        q_dim + k_dim + v_dim
-    }
-
     /// Z projection output dimension for linear attention.
     pub(crate) fn linear_attn_z_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
     }
 
-    /// Bound the output-selection width to the frontend-decodable vocab.
+    /// Bound the output-selection width to the frontend-decodable vocab, which
+    /// also records the semantic width the argmax-vs-sample routing uses.
     ///
     /// The frontend decodes a dense prefix of the vocab; the checkpoint may pad
     /// beyond it. Refusing a tokenizer wider than the checkpoint is the
@@ -170,7 +173,9 @@ impl Config35 {
                 vocab_size: self.vocab_size,
             });
         }
-        self.selection_vocab = effective_vocab;
+        self.decodable_vocab = effective_vocab;
+        self.selection_vocab =
+            pegainfer_core::decodable_vocab::aligned_logits_rows(effective_vocab, self.vocab_size);
         Ok(())
     }
 }
@@ -271,7 +276,7 @@ impl TryFrom<RawConfig> for Config35 {
             num_hidden_layers: t.num_hidden_layers,
             vocab_size: t.vocab_size,
             rms_norm_eps: t.rms_norm_eps as f32,
-            eos_token_id: t.eos_token_id,
+            eos_token_ids: Vec::new(),
             num_attention_heads: t.num_attention_heads,
             num_key_value_heads: t.num_key_value_heads,
             head_dim: t.head_dim,
@@ -286,6 +291,7 @@ impl TryFrom<RawConfig> for Config35 {
             layer_types,
             tie_word_embeddings,
             selection_vocab: t.vocab_size,
+            decodable_vocab: t.vocab_size,
         })
     }
 }
@@ -330,6 +336,37 @@ mod tests {
         let config = config(VALID_RAW);
         assert_eq!(config.num_full_attention_layers(), 1);
         assert_eq!(config.vocab_size, 1000);
+    }
+
+    #[test]
+    fn selection_vocab_bound_aligns_to_tile_multiple() {
+        let mut config = config(VALID_RAW);
+        config
+            .bound_selection_vocab(977)
+            .expect("977 decodes within vocab 1000");
+        // 977 -> next 128 multiple (1024) clamped to the checkpoint's rows.
+        assert_eq!(config.selection_vocab, 1000);
+        assert_eq!(config.decodable_vocab, 977);
+
+        config
+            .bound_selection_vocab(769)
+            .expect("769 decodes within vocab 1000");
+        // 769 -> 896: aligned, below the checkpoint rows, so the pad region is
+        // 769..896.
+        assert_eq!(config.selection_vocab, 896);
+        assert_eq!(config.decodable_vocab, 769);
+    }
+
+    #[test]
+    fn selection_vocab_bound_still_rejects_wider_tokenizers() {
+        let mut config = config(VALID_RAW);
+        let err = config
+            .bound_selection_vocab(1001)
+            .expect_err("a tokenizer wider than the checkpoint is rejected");
+        assert!(matches!(
+            err,
+            ConfigError::EffectiveVocabExceedsCheckpoint { .. }
+        ));
     }
 
     #[test]

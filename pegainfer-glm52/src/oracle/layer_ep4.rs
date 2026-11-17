@@ -69,7 +69,7 @@ const GLOBAL_TOKEN_BUCKETS: [usize; GLM52_DECODE_BUCKETS.len()] = {
 };
 
 #[test]
-#[ignore = "requires 4 GPUs (GB300/H200) + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4"]
+#[ignore = "requires 4 Blackwell GPUs + GLM-5.2-FP8 checkpoint + NCCL >= 2.30.4"]
 fn layer_moe_ep4_oracle_gate() -> Result<()> {
     let hidden_host = checked_hidden(
         MOE_ORACLE_SEED,
@@ -139,7 +139,7 @@ fn layer_moe_ep4_oracle_gate() -> Result<()> {
         .collect();
 
     // The DeepEP context drop is collective: rank 0 must drop BEFORE joining
-    // the expert threads (see the EP8 gate).
+    // the expert threads.
     drop(ep4);
     for (rank, handle) in handles.into_iter().enumerate() {
         handle

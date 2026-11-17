@@ -137,9 +137,6 @@ export CUDA_HOME=/usr/local/cuda
 export PEGAINFER_NCCL_ROOT=<path>
 cargo check --release -p pegainfer-glm52 --features glm52
 
-# Smoke test (no checkpoint needed — synthetic input, verify launch + shape)
-cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_smoke -- --nocapture
-
 # Oracle gate (H200 + checkpoint)
 PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
   cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture

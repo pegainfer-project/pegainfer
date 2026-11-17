@@ -235,22 +235,6 @@ impl KimiRankThreadState {
             "Kimi active decode rows {active_len} exceed decode batch size {decode_batch_size}"
         );
         let decode_arena = decode_arenas.get_mut(&device_ctx, decode_batch_size)?;
-        #[cfg(feature = "kernel-call-trace")]
-        if rank == 0 && call_trace::is_enabled() {
-            let kv_len = append_positions
-                .iter()
-                .copied()
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1);
-            for call in crate::batch_decode_trace::trace_decode_kernel_calls(
-                "",
-                decode_arena.batch_size,
-                kv_len,
-            )? {
-                call_trace::record_call(call);
-            }
-        }
         decode_arena
             .configure_batch_decode(&device_ctx, slots, append_positions, kv_pages)
             .with_context(|| format!("Kimi rank {rank} configure batch decode KV page table"))?;
@@ -369,7 +353,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let scratch = decode_arena.scratch.sampling.batch_sampling(&device_ctx)?;
             pegainfer_sample::gpu_sample_batch_into(
@@ -382,12 +366,10 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} batched decode sampling"))?
         };
 
-        let local_top1 = read_local_top1_batch_values(
+        let local_top1 = decode_arena.scratch.sampling.read_top1(
             &device_ctx,
-            &decode_arena.logits,
             active_len,
-            &mut decode_arena.scratch.sampling.top1_value_scratch,
-            &mut decode_arena.scratch.sampling.top1_out,
+            decode_arena.logits.hidden_dim,
         )?;
         let mut picks: Vec<(u32, f32)> = local_top1;
         for (sampling_row, token) in sampling_rows.iter().zip(&sampled) {
@@ -396,7 +378,7 @@ impl KimiRankThreadState {
             picks[sampling_row.row].0 = *token;
         }
 
-        let host_logits = if rows.iter().any(|r| r.logprobs > 0) {
+        let host_logits = if rows.iter().any(|r| r.logprobs.is_some()) {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi logprobs require an unsharded vocab (TP1); a vocab shard's \
@@ -413,11 +395,11 @@ impl KimiRankThreadState {
         };
         let mut reports = Vec::with_capacity(active_len);
         for (row, (local_next, local_top_logit_f32)) in picks.into_iter().enumerate() {
-            let logprob = match &host_logits {
-                Some(host) if rows[row].logprobs > 0 => pegainfer_sample::token_logprob_from_row(
+            let logprob = match (&host_logits, rows[row].logprobs) {
+                (Some(host), Some(top_k)) => pegainfer_sample::token_logprob_from_row(
                     &host[row * cache.vocab_rows..(row + 1) * cache.vocab_rows],
                     local_next,
-                    rows[row].logprobs,
+                    top_k,
                 ),
                 _ => None,
             };
@@ -627,7 +609,7 @@ impl KimiRankThreadState {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi sampling requires an unsharded vocab (TP1); a vocab shard \
-                 cannot sample the global distribution (#237, #226)"
+                 cannot sample the global distribution"
             );
             let sampling_rows = [pegainfer_sample::BatchSamplingRow {
                 row: 0,
@@ -651,7 +633,7 @@ impl KimiRankThreadState {
             .with_context(|| format!("Kimi rank {rank} prefill sampling"))?;
             local_next = sampled[0];
         }
-        let logprob = if row.logprobs > 0 {
+        let logprob = if let Some(top_k) = row.logprobs {
             ensure!(
                 cache.vocab_start == 0 && cache.vocab_rows == KIMI_K2_VOCAB,
                 "Kimi logprobs require an unsharded vocab (TP1); a vocab \
@@ -661,7 +643,7 @@ impl KimiRankThreadState {
                 .stream
                 .clone_dtoh(&logits.data)
                 .with_context(|| format!("Kimi rank {rank} D2H prefill logits"))?;
-            pegainfer_sample::token_logprob_from_row(&host, local_next, row.logprobs)
+            pegainfer_sample::token_logprob_from_row(&host, local_next, top_k)
         } else {
             None
         };

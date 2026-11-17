@@ -19,38 +19,42 @@ use clap::Subcommand;
 use cudarc::driver::sys;
 use pegainfer_cupti::profile_range_with_prepare;
 use pegainfer_kernels::tensor::DeviceContext;
-use pegainfer_qwen3::kernel_bench::AttentionDecodeCase;
-use pegainfer_qwen3::kernel_bench::AttentionKernelShape;
-use pegainfer_qwen3::kernel_bench::AttentionKernelSpec;
-use pegainfer_qwen3::kernel_bench::AttentionKernelVariant;
-use pegainfer_qwen3::kernel_bench::AttentionPrefillCase;
-use pegainfer_qwen3::kernel_bench::DecodePath;
-use pegainfer_qwen3::kernel_bench::DenseCase;
-use pegainfer_qwen3::kernel_bench::DenseKernelKind;
-use pegainfer_qwen3::kernel_bench::DevicePeakBandwidth;
-use pegainfer_qwen3::kernel_bench::GemmProjection;
-use pegainfer_qwen3::kernel_bench::HEAD_DIM;
-use pegainfer_qwen3::kernel_bench::HIDDEN_SIZE;
-use pegainfer_qwen3::kernel_bench::INTERMEDIATE_SIZE;
-use pegainfer_qwen3::kernel_bench::L2CacheClear;
-use pegainfer_qwen3::kernel_bench::NUM_KV_HEADS;
-use pegainfer_qwen3::kernel_bench::NUM_QO_HEADS;
-use pegainfer_qwen3::kernel_bench::PAGE_SIZE;
-use pegainfer_qwen3::kernel_bench::PrefillAttentionShape;
-use pegainfer_qwen3::kernel_bench::PrefillAttentionSpec;
-use pegainfer_qwen3::kernel_bench::PrefillAttentionVariant;
-use pegainfer_qwen3::kernel_bench::PrefillStage;
-use pegainfer_qwen3::kernel_bench::REPORT_ITERS;
-use pegainfer_qwen3::kernel_bench::SinglePrefillCase;
-use pegainfer_qwen3::kernel_bench::SplitKvConfig;
-use pegainfer_qwen3::kernel_bench::VOCAB_SIZE;
-use pegainfer_qwen3::kernel_bench::cache_clear_bytes;
+use pegainfer_qwen3::runtime::SplitKvConfig;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
+
+#[path = "report_support/mod.rs"]
+mod report_support;
+
+use report_support::common::DevicePeakBandwidth;
+use report_support::common::HEAD_DIM;
+use report_support::common::L2CacheClear;
+use report_support::common::NUM_KV_HEADS;
+use report_support::common::NUM_QO_HEADS;
+use report_support::common::PAGE_SIZE;
+use report_support::common::REPORT_ITERS;
+use report_support::common::cache_clear_bytes;
+use report_support::decode_attention::AttentionDecodeCase;
+use report_support::decode_attention::AttentionKernelShape;
+use report_support::decode_attention::AttentionKernelSpec;
+use report_support::decode_attention::AttentionKernelVariant;
+use report_support::decode_attention::DecodePath;
+use report_support::dense::DenseCase;
+use report_support::dense::DenseKernelKind;
+use report_support::dense::GemmProjection;
+use report_support::dense::HIDDEN_SIZE;
+use report_support::dense::INTERMEDIATE_SIZE;
+use report_support::dense::LOGITS_ROWS;
+use report_support::prefill_attention::AttentionPrefillCase;
+use report_support::prefill_attention::PrefillAttentionShape;
+use report_support::prefill_attention::PrefillAttentionSpec;
+use report_support::prefill_attention::PrefillAttentionVariant;
+use report_support::prefill_attention::PrefillStage;
+use report_support::single_prefill::SinglePrefillCase;
 
 const DEFAULT_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kernel_manifests/qwen3.toml");
 const DEFAULT_OP: &str = "paged_decode_attention";
@@ -1740,7 +1744,7 @@ fn analytic_model(case: &CaseResult) -> Option<AnalyticModel> {
     let bs = shape.batch_size as f64;
     let hidden = HIDDEN_SIZE as f64;
     let inter = INTERMEDIATE_SIZE as f64;
-    let vocab = VOCAB_SIZE as f64;
+    let vocab = LOGITS_ROWS as f64;
 
     if let Some((family, phase)) = dense_op_for(&case.op) {
         let rows = match phase {
@@ -2086,7 +2090,7 @@ mod tests {
 
     fn dense_case(op: &str, variant: &str, batch: usize, seq: Option<usize>) -> CaseResult {
         let (gemm_out_dim, gemm_in_dim) = match variant {
-            "lm_head" => (Some(VOCAB_SIZE), Some(HIDDEN_SIZE)),
+            "lm_head" => (Some(LOGITS_ROWS), Some(HIDDEN_SIZE)),
             _ => (None, None),
         };
         CaseResult {
@@ -2127,7 +2131,7 @@ mod tests {
         // activation column in and logits column out.
         let case = dense_case("decode_projection_gemm", "lm_head", 1, None);
         let model = analytic_model(&case).expect("gemm model");
-        let v = VOCAB_SIZE as f64;
+        let v = LOGITS_ROWS as f64;
         let h = HIDDEN_SIZE as f64;
         assert!((model.min_bytes - 2.0 * (v * h + h + v)).abs() < 1.0);
         assert!((model.flops - 2.0 * v * h).abs() < 1.0);

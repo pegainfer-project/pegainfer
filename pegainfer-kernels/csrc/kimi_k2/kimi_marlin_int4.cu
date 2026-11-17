@@ -1,4 +1,5 @@
 #include "../marlin/ffi.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -139,7 +140,7 @@ CUresult kimi_marlin_int4_reorder_scale_cuda(
   kimi_marlin_reorder_scale_kernel<<<grid, block, 0, stream>>>(
       weight_scale_checkpoint, weight_scale_marlin, out_dim, scale_k, total_elements);
   cudaError_t err = cudaPeekAtLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  return map_cuda_error(err);
 }
 
 CUresult kimi_marlin_int4_fuse_w13_cuda(
@@ -173,7 +174,7 @@ CUresult kimi_marlin_int4_fuse_w13_cuda(
       reinterpret_cast<const uint32_t*>(up_weight_packed_marlin),
       reinterpret_cast<uint32_t*>(w13_weight_packed_marlin), in_dim, intermediate_dim);
   cudaError_t err = cudaPeekAtLastError();
-  if (err != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  if (err != cudaSuccess) return map_cuda_error(err);
 
   size_t scale_elements =
       static_cast<size_t>(local_experts) * (in_dim / group_size) * intermediate_dim;
@@ -181,7 +182,7 @@ CUresult kimi_marlin_int4_fuse_w13_cuda(
   kimi_marlin_fuse_w13_scale_kernel<<<scale_grid, block, 0, stream>>>(
       gate_scale_marlin, up_scale_marlin, w13_scale_marlin, in_dim, intermediate_dim);
   err = cudaPeekAtLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  return map_cuda_error(err);
 }
 
 }  // extern "C"

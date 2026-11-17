@@ -223,7 +223,7 @@ fn freerun_hetero_traffic_gate() -> Result<()> {
     });
 
     // The DeepEP context drop is collective: rank 0 must drop BEFORE joining
-    // the side threads (see the EP8 gate).
+    // the side threads.
     drop(ep);
     for (rank, handle) in handles.into_iter().enumerate() {
         handle

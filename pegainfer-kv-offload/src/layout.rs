@@ -9,16 +9,11 @@ const ELEM_SIZE: usize = std::mem::size_of::<half::bf16>();
 
 /// One strided GPU arena to register as one pegaflow "layer": `num_blocks`
 /// copy units of `bytes_per_block`, sitting `block_stride_bytes` apart from
-/// `base_ptr`. A fused buffer (qwen3) contributes one arena per model layer;
-/// a model with sidecar caches (GLM5.2: MLA latent + index-K per layer, two
-/// separate allocations sharing pool block ids) contributes several arenas
-/// per model layer — pegaflow moves whatever arenas are registered under one
-/// block id together, which is what keeps sidecars in lockstep with their
-/// main cache.
+/// `base_ptr`. A fused buffer (qwen3) contributes one arena per model layer.
 ///
 /// `name` keys the arena for the whole engine lifetime (save/load fan across
 /// every registered name); it must be unique within the engine.
-pub struct KvArena {
+pub(crate) struct KvArena {
     name: String,
     base_ptr: u64,
     num_blocks: usize,
@@ -115,41 +110,6 @@ impl Registration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The GLM5.2 shape: two arenas per model layer (MLA latent + index-K
-    /// sidecar) with different copy units, sharing pool block ids. Pins the
-    /// per-arena mapping and the exact strided-reach size bound pegaflow
-    /// validates copies against.
-    #[test]
-    fn arena_registration_geometry() {
-        const MLA: usize = 656 * 64;
-        const IDXK: usize = 132 * 64;
-        let arenas = [
-            KvArena {
-                name: "0.mla".into(),
-                base_ptr: 0x1000,
-                num_blocks: 10,
-                bytes_per_block: MLA,
-                block_stride_bytes: MLA,
-            },
-            KvArena {
-                name: "0.idxk".into(),
-                base_ptr: 0x9000,
-                num_blocks: 10,
-                bytes_per_block: IDXK,
-                block_stride_bytes: IDXK,
-            },
-        ];
-        let reg = Registration::from_arenas(&arenas);
-        assert_eq!(reg.layer_names, ["0.mla", "0.idxk"]);
-        assert_eq!(reg.data_ptrs, [0x1000, 0x9000]);
-        assert_eq!(reg.segments, [1, 1]);
-        assert_eq!(reg.kv_stride_bytes, [0, 0]);
-        assert_eq!(reg.num_blocks, [10, 10]);
-        assert_eq!(reg.bytes_per_block, [MLA, IDXK]);
-        assert_eq!(reg.block_stride_bytes, [MLA, IDXK]);
-        assert_eq!(reg.size_bytes, [10 * MLA, 10 * IDXK]);
-    }
 
     /// A page-interleaved arena (the qwen3 fused layout expressed as arenas):
     /// stride exceeds the copy unit, and the size bound is the reach of the

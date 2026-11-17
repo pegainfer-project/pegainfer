@@ -4,10 +4,19 @@
 use sha2::Digest;
 use sha2::Sha256;
 
-pub(crate) const GOLDEN_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../test_data/gemma4-12b-hf-golden.safetensors"
-);
+/// A fixture path: the committed 12B file unless the named variable points
+/// the gate at a fixture dumped for another checkpoint.
+pub(crate) fn fixture_path(var: &str, default: &str) -> String {
+    std::env::var(var)
+        .unwrap_or_else(|_| format!("{}/../test_data/{default}", env!("CARGO_MANIFEST_DIR")))
+}
+
+pub(crate) fn golden_path() -> String {
+    fixture_path(
+        "PEGAINFER_GEMMA4_GOLDEN",
+        "gemma4-12b-hf-golden.safetensors",
+    )
+}
 pub(crate) const METADATA_KEY: &str = "gemma4_golden";
 
 pub(crate) fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
@@ -27,7 +36,7 @@ pub(crate) fn fixture_manifest(bytes: &[u8], key: &str) -> serde_json::Value {
 /// held against the checkpoint under test — the prologue every in-crate
 /// oracle opens with. The bytes come back because `SafeTensors` borrows them.
 pub(crate) fn golden_bytes(dir: &str) -> (Vec<u8>, serde_json::Value) {
-    let bytes = std::fs::read(GOLDEN_PATH).expect("read fixture");
+    let bytes = std::fs::read(golden_path()).expect("read fixture");
     let manifest = fixture_manifest(&bytes, METADATA_KEY);
     assert_checkpoint_matches(&manifest, dir);
     (bytes, manifest)
@@ -39,11 +48,11 @@ pub(crate) fn golden_bytes(dir: &str) -> (Vec<u8>, serde_json::Value) {
 /// degenerate distribution where the top two candidates sit within
 /// reduction-order noise, and the comparison becomes a coin flip.
 pub(crate) fn generate_fixture_prompts() -> Vec<Vec<u32>> {
-    const PATH: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../test_data/gemma4-12b-generate.safetensors"
+    let path = fixture_path(
+        "PEGAINFER_GEMMA4_GENERATE",
+        "gemma4-12b-generate.safetensors",
     );
-    let bytes = std::fs::read(PATH).expect("read generate fixture (dump on the box first)");
+    let bytes = std::fs::read(path).expect("read generate fixture (dump it first)");
     let fixture = safetensors::SafeTensors::deserialize(&bytes).expect("parse fixture");
     ["a", "b", "c"]
         .iter()

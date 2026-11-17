@@ -79,6 +79,48 @@ pub fn active_cu_stream(ctx: &DeviceContext) -> CUstream {
         .unwrap_or_else(|| ctx.stream.cu_stream())
 }
 
+/// Order `ctx.stream` producers (allocations, H2D copies, memsets) before the
+/// override stream consumes them. No-op without an override.
+pub fn fence_producers_before_override(ctx: &DeviceContext) -> Result<()> {
+    use cudarc::driver::sys;
+    if !has_stream_override() {
+        return Ok(());
+    }
+    let override_stream = active_cu_stream(ctx);
+    let producer = ctx.stream.cu_stream();
+    unsafe {
+        let mut event: sys::CUevent = std::ptr::null_mut();
+        let create = sys::cuEventCreate(
+            &raw mut event,
+            sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
+        );
+        anyhow::ensure!(
+            create == sys::CUresult::CUDA_SUCCESS,
+            "cuEventCreate (producer fence) failed: {create:?}"
+        );
+        let record = sys::cuEventRecord(event, producer);
+        let wait = if record == sys::CUresult::CUDA_SUCCESS {
+            sys::cuStreamWaitEvent(override_stream, event, 0)
+        } else {
+            record
+        };
+        let destroy = sys::cuEventDestroy_v2(event);
+        anyhow::ensure!(
+            record == sys::CUresult::CUDA_SUCCESS,
+            "cuEventRecord (producer fence) failed: {record:?}"
+        );
+        anyhow::ensure!(
+            wait == sys::CUresult::CUDA_SUCCESS,
+            "cuStreamWaitEvent (producer fence) failed: {wait:?}"
+        );
+        anyhow::ensure!(
+            destroy == sys::CUresult::CUDA_SUCCESS,
+            "cuEventDestroy (producer fence) failed: {destroy:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Poll the active stream up to a fixed cap, then synchronize that stream.
 const STREAM_SPIN_WAIT_CAP: std::time::Duration = std::time::Duration::from_millis(5);
 
@@ -555,6 +597,15 @@ pub struct HiddenStates {
 }
 
 impl HiddenStates {
+    /// The band `[col, col + width)` of every row.
+    pub fn columns(&self, col: usize, width: usize) -> Columns<'_> {
+        Columns {
+            states: self,
+            col,
+            width,
+        }
+    }
+
     pub fn as_ref(&self) -> HiddenStatesRef<'_> {
         HiddenStatesRef {
             data: &self.data,
@@ -742,6 +793,43 @@ pub struct HiddenStatesRef<'a> {
     pub data: &'a CudaSlice<bf16>,
     pub hidden_dim: usize,
     pub seq_len: usize,
+}
+
+/// The columns `[col, col + width)` of every row of a `HiddenStates`: the
+/// band one projection occupies when a row holds several, read at the row's
+/// full stride. A whole tensor is its own band from column 0.
+#[derive(Clone, Copy)]
+pub struct Columns<'a> {
+    pub states: &'a HiddenStates,
+    pub col: usize,
+    pub width: usize,
+}
+
+impl<'a> From<&'a HiddenStates> for Columns<'a> {
+    fn from(states: &'a HiddenStates) -> Self {
+        Self {
+            states,
+            col: 0,
+            width: states.hidden_dim,
+        }
+    }
+}
+
+impl Columns<'_> {
+    /// Panics unless the band lies within the row. `columns` and the public
+    /// fields accept any band, and a launch that reads `width` columns at the
+    /// row stride from `col` would otherwise run past the last row's end.
+    pub fn assert_in_row(&self, what: &str) {
+        assert!(
+            self.col
+                .checked_add(self.width)
+                .is_some_and(|end| end <= self.states.hidden_dim),
+            "{what} columns [{}..+{}) exceed the row's {}",
+            self.col,
+            self.width,
+            self.states.hidden_dim
+        );
+    }
 }
 
 #[cfg(test)]

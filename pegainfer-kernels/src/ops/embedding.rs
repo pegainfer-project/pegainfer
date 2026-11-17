@@ -6,35 +6,7 @@ use cudarc::driver::DevicePtrMut;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
-use crate::tensor::DeviceVec;
 use crate::tensor::HiddenStates;
-
-/// Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
-pub fn embedding_decode_into(
-    ctx: &DeviceContext,
-    embed: &DeviceMatrix,
-    token_id: &CudaSlice<u32>,
-    out: &mut DeviceVec,
-) -> Result<()> {
-    assert_eq!(embed.cols, out.len);
-
-    let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
-    let (token_ptr, _gt) = token_id.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-    let result = unsafe {
-        ffi::embedding_decode_cuda(
-            embed_ptr as *const ffi::Half,
-            token_ptr as *const u32,
-            out_ptr as *mut ffi::Half,
-            embed.cols as i32,
-            crate::tensor::active_cu_stream(ctx),
-        )
-    };
-    result.result()?;
-
-    Ok(())
-}
 
 /// Slice-level batched embedding gather: `out[r] = table[ids[r]]` for `rows`
 /// rows of `table.cols`. Same kernel as [`embedding_batch`], for callers whose

@@ -136,9 +136,9 @@ impl Glm52MoeExpertBank {
         ctx: &DeviceContext,
         n_experts: usize,
         mut w13_weight: CudaSlice<u8>,
-        w13_scale_f32: CudaSlice<f32>,
+        w13_scale_f32: &CudaSlice<f32>,
         mut w2_weight: CudaSlice<u8>,
-        w2_scale_f32: CudaSlice<f32>,
+        w2_scale_f32: &CudaSlice<f32>,
     ) -> Result<Self> {
         let check = |name: &str, have: usize, want: usize| -> Result<()> {
             ensure!(
@@ -167,7 +167,7 @@ impl Glm52MoeExpertBank {
             W13_N,
             W13_K,
             &mut w13_weight,
-            &w13_scale_f32,
+            w13_scale_f32,
             &mut w13_scale,
         )?;
         glm52_fp8_weight_ue8m0_prepare_launch(
@@ -176,7 +176,7 @@ impl Glm52MoeExpertBank {
             W2_N,
             W2_K,
             &mut w2_weight,
-            &w2_scale_f32,
+            w2_scale_f32,
             &mut w2_scale,
         )?;
         Ok(Self {
@@ -241,9 +241,9 @@ impl Glm52MoeExpertBank {
             ctx,
             n_experts,
             upload_u8(&w13_host)?,
-            upload_f32(&w13_scale_host)?,
+            &upload_f32(&w13_scale_host)?,
             upload_u8(&w2_host)?,
-            upload_f32(&w2_scale_host)?,
+            &upload_f32(&w2_scale_host)?,
         )
     }
 
@@ -267,9 +267,9 @@ impl Glm52MoeExpertBank {
             ctx,
             n_experts,
             regions.w13_weight,
-            crate::weights::retype_owned::<f32>(&ctx.stream, regions.w13_scale)?,
+            &crate::weights::retype_owned::<f32>(&ctx.stream, regions.w13_scale)?,
             regions.w2_weight,
-            crate::weights::retype_owned::<f32>(&ctx.stream, regions.w2_scale)?,
+            &crate::weights::retype_owned::<f32>(&ctx.stream, regions.w2_scale)?,
         )
     }
 

@@ -7,7 +7,10 @@
 # summary table on stdout.
 #
 # Usage:
-#   MODEL=/data/Qwen3-4B tools/bench/run_serving_bench.sh
+#   MODEL=/data/Qwen3-4B tools/bench/run_serving_bench.sh [bench args...]
+#
+# Bench args (dataset path, HF subset/split, warmups, ...) are passed to every
+# bench run as given.
 #
 # Optional env:
 #   MODEL            model path (required)
@@ -16,14 +19,15 @@
 #   GPU              CUDA device ordinal [default: 0]
 #   PORT             server port [default: 8000]
 #   RESULT_DIR       output directory [default: ./bench-results]
-#   DATASET          vllm-bench dataset: random | sharegpt | sonnet | speed-bench [default: random]
+#   DATASET          dataset name for the bench client: random | sharegpt | hf | ... [default: random]
 #   QPS_LIST         space-separated QPS values [default: "1 2 4 8 10 12 16"]
 #   CONCURRENCY_LIST space-separated concurrency values for spec sweep [default: "1 4 8"]
-#   INPUT_LEN        input length [default: 1024]
-#   OUTPUT_LEN       output length [default: 128]
+#   INPUT_LEN        random dataset input length [default: 1024]
+#   OUTPUT_LEN       random dataset output length [default: 128]
+#   BINARY           prebuilt pegainfer binary; given one, the build is skipped
 #   SEED             base random seed; each point derives its own from SEED + axis/value [default: 42]
 #   SECONDS_PER_RUN  seconds per QPS run [default: 60]
-#   BENCH            path to vllm-bench binary [default: vllm-bench on PATH]
+#   BENCH            vllm-bench binary, or a vllm binary to run `vllm bench serve` [default: vllm-bench, else vllm on PATH]
 #   VLLM             path to vllm binary for ENGINE=vllm [default: vllm on PATH]
 #   VLLM_EXTRA_ARGS  extra args passed to `vllm serve` [default: "--max-model-len 8192"]
 #   LABEL            engine label for result filenames [default: $ENGINE]
@@ -54,7 +58,6 @@ INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 SEED=${SEED:-42}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-60}
-BENCH=${BENCH:-vllm-bench}
 LABEL=${LABEL:-$ENGINE}
 SKIP_BUILD=${SKIP_BUILD:-0}
 
@@ -79,14 +82,33 @@ RESULT_FILES=()
 
 mkdir -p "$RESULT_DIR"
 
+BENCH=${BENCH:-$(command -v vllm-bench || command -v vllm || true)}
+if [[ -z "$BENCH" ]]; then
+  echo "FATAL: neither vllm-bench nor vllm is on PATH" >&2
+  exit 1
+fi
+BENCH_CMD=("$BENCH")
+if [[ "$(basename "$BENCH")" == "vllm" ]]; then
+  BENCH_CMD+=(bench serve)
+fi
+
+DATASET_ARGS=(--dataset-name "$DATASET")
+if [[ "$DATASET" == "random" ]]; then
+  DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
+fi
+BENCH_EXTRA_CMD=("$@")
+
 # ---- launch server ----------------------------------------------------------
 case "$ENGINE" in
   pegainfer)
-    BINARY="$REPO_ROOT/target/release/pegainfer"
-    if [[ "$SKIP_BUILD" != "1" ]]; then
-      echo "=== building pegainfer (SKIP_BUILD=1 to skip) ==="
+    if [[ -z "${BINARY:-}" && "$SKIP_BUILD" != "1" ]]; then
+      echo "=== building pegainfer (SKIP_BUILD=1 or BINARY to skip) ==="
       (cd "$REPO_ROOT" && CUDA_HOME=${CUDA_HOME:-/usr/local/cuda} cargo build --release -p pegainfer-server)
     fi
+    # Cargo resolves a relative target dir against the build's cwd, REPO_ROOT.
+    TARGET_DIR=${CARGO_TARGET_DIR:-target}
+    [[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$REPO_ROOT/$TARGET_DIR"
+    BINARY=${BINARY:-"$TARGET_DIR/release/pegainfer"}
     SERVER_EXTRA_ARGS=()
     if [[ -n "$DRAFT_MODEL" ]]; then
       SERVER_EXTRA_ARGS+=(--dflash-draft-model-path "$DRAFT_MODEL")
@@ -164,18 +186,15 @@ fi
 # ---- QPS sweep --------------------------------------------------------------
 if [[ -n "${QPS_LIST// /}" ]]; then
   echo "=== QPS sweep: qps=[$QPS_LIST] dataset=$DATASET ==="
-  DATASET_ARGS=(--dataset-name "$DATASET")
-  if [[ "$DATASET" == "random" ]]; then
-    DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
-  fi
   for QPS in $QPS_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($QPS * $SECONDS_PER_RUN))")
     point_seed qps "$QPS"
     echo "--- $LABEL $MODEL_LABEL qps=$QPS num_prompts=$NUM_PROMPTS dataset=$DATASET seed=$POINT_SEED ---"
-    "$BENCH" \
+    "${BENCH_CMD[@]}" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
       "${DATASET_ARGS[@]}" \
+      "${BENCH_EXTRA_CMD[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --request-rate "$QPS" \
       --seed "$POINT_SEED" \
@@ -193,18 +212,15 @@ fi
 # ---- Concurrency sweep (pegainfer only) ------------------------------------
 if [[ "${ENGINE}" == "pegainfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
   echo "=== spec concurrency sweep: c=[$CONCURRENCY_LIST] dataset=$DATASET ==="
-  DATASET_ARGS=(--dataset-name "$DATASET")
-  if [[ "$DATASET" == "random" ]]; then
-    DATASET_ARGS+=(--random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN")
-  fi
   for C in $CONCURRENCY_LIST; do
     NUM_PROMPTS=$(python3 -c "print(int($C * $SECONDS_PER_RUN))")
     point_seed c "$C"
     echo "--- $LABEL $MODEL_LABEL c=$C num_prompts=$NUM_PROMPTS dataset=$DATASET seed=$POINT_SEED ---"
-    "$BENCH" \
+    "${BENCH_CMD[@]}" \
       --backend openai --model "$MODEL" --port "$PORT" \
       --base-url "http://localhost:$PORT" \
       "${DATASET_ARGS[@]}" \
+      "${BENCH_EXTRA_CMD[@]}" \
       --num-prompts "$NUM_PROMPTS" \
       --max-concurrency "$C" \
       --seed "$POINT_SEED" \
@@ -215,6 +231,14 @@ if [[ "${ENGINE}" == "pegainfer" && -n "${CONCURRENCY_LIST// /}" ]]; then
       --result-filename "${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${POINT_SEED}.json"
     RESULT_FILES+=("$RESULT_DIR/${LABEL}-${MODEL_LABEL}-${DATASET}-c${C}-seed${POINT_SEED}.json")
   done
+fi
+
+METRICS_FILE="$RESULT_DIR/${LABEL}-${MODEL_LABEL}-${DATASET}-metrics.prom"
+if curl -sf "http://localhost:$PORT/metrics" > "$METRICS_FILE"; then
+  echo "metrics saved to $METRICS_FILE"
+else
+  echo "WARN: /metrics was unavailable; no metrics snapshot saved" >&2
+  rm -f "$METRICS_FILE"
 fi
 
 # ---- summary ---------------------------------------------------------------

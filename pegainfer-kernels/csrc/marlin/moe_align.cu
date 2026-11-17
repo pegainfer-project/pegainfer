@@ -9,6 +9,7 @@
 // The contract is vLLM's `moe_align_block_size`.
 
 #include "ffi.cuh"
+#include "../shared/ffi_guard.cuh"
 
 namespace {
 
@@ -205,7 +206,7 @@ CUresult marlin_moe_align_block_size_cuda(
         topk_idx, sorted_token_ids, expert_ids, num_tokens_post_padded, expert_offsets,
         route_elems, global_start, local_experts, block_size);
     cudaError_t err = cudaGetLastError();
-    return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+    return map_cuda_error(err);
   }
 
   int clear_elems = max_padded_tokens;
@@ -216,24 +217,24 @@ CUresult marlin_moe_align_block_size_cuda(
       sorted_token_ids, expert_ids, num_tokens_post_padded, expert_offsets, route_elems,
       local_experts, max_padded_tokens, max_m_blocks);
   cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return CUDA_ERROR_LAUNCH_FAILED;
+  if (err != cudaSuccess) return map_cuda_error(err);
 
   int route_blocks = (route_elems + threads - 1) / threads;
   marlin_moe_align_count_kernel<<<route_blocks, threads, 0, stream>>>(
       topk_idx, expert_offsets, route_elems, global_start, local_experts);
   err = cudaGetLastError();
-  if (err != cudaSuccess) return CUDA_ERROR_LAUNCH_FAILED;
+  if (err != cudaSuccess) return map_cuda_error(err);
 
   marlin_moe_align_prefix_kernel<<<1, 1, 0, stream>>>(
       expert_ids, num_tokens_post_padded, expert_offsets, local_experts, block_size);
   err = cudaGetLastError();
-  if (err != cudaSuccess) return CUDA_ERROR_LAUNCH_FAILED;
+  if (err != cudaSuccess) return map_cuda_error(err);
 
   int expert_blocks = (local_experts + threads - 1) / threads;
   marlin_moe_align_stable_fill_kernel<<<expert_blocks, threads, 0, stream>>>(
       topk_idx, sorted_token_ids, expert_offsets, route_elems, global_start, local_experts);
   err = cudaGetLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
+  return map_cuda_error(err);
 }
 
 }  // extern "C"

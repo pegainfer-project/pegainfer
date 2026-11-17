@@ -81,13 +81,18 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
         prompt.to_vec(),
         MAX_OUTPUT,
         SamplingParams::default(),
-        LOGPROBS,
-        false,
+        Some(LOGPROBS),
+        None,
     )
 }
 
 fn decode_item(id: u64, fed: u32) -> DecodeStepItem {
-    DecodeStepItem::new(RequestId::new(id), fed, SamplingParams::default(), LOGPROBS)
+    DecodeStepItem::new(
+        RequestId::new(id),
+        fed,
+        SamplingParams::default(),
+        Some(LOGPROBS),
+    )
 }
 
 fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
@@ -97,13 +102,18 @@ fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
 }
 
 /// Prefill `prompt`, teacher-force `DECODE_FED`, drop the request. Returns
-/// the cached-token count and the top-K logprobs at every position.
-fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(u32, f32)>>) {
+/// the executor's cached-token report and the top-K logprobs at every
+/// position. The report is `None` when no lookup ran (cache switched off) and
+/// `Some(0)` for a genuine miss, so callers assert on both.
+fn run_one(
+    ex: &mut Qwen3Executor,
+    id: u64,
+    prompt: &[u32],
+) -> (Option<usize>, Vec<Vec<(u32, f32)>>) {
     let pr = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(id, prompt)],
-            echo: false,
         })
         .expect("prefill");
     let cached = pr.requests[0].cached_tokens;
@@ -182,10 +192,7 @@ fn prefix_cache_behavior() {
     // the cache later must start cold rather than resurrecting these blocks.
     ex.set_prefix_cache_enabled(false);
     let (cached, a_cold) = run_one(&mut ex, 1, &a);
-    assert_eq!(
-        cached, 0,
-        "matching disabled must report zero cached tokens"
-    );
+    assert_eq!(cached, None, "matching disabled must run no lookup");
     let (_, b_cold) = run_one(&mut ex, 2, &b);
     let (_, c_cold) = run_one(&mut ex, 3, &c);
 
@@ -194,7 +201,8 @@ fn prefix_cache_behavior() {
     ex.set_prefix_cache_enabled(true);
     let (cached, _) = run_one(&mut ex, 4, &a);
     assert_eq!(
-        cached, 0,
+        cached,
+        Some(0),
         "cache-disabled requests must not seed a later enabled cache"
     );
     let _ = run_one(&mut ex, 5, &b);
@@ -203,19 +211,23 @@ fn prefix_cache_behavior() {
     let (cached, a_warm) = run_one(&mut ex, 11, &a);
     assert_eq!(
         cached,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "A: 3 full blocks hit, 2-token tail recomputed"
     );
     assert_close("A warm", &a_cold, &a_warm);
 
     let (cached, b_warm) = run_one(&mut ex, 12, &b);
-    assert_eq!(cached, 4 * BLOCK, "B: A's 3 blocks + B's own 4th block hit");
+    assert_eq!(
+        cached,
+        Some(4 * BLOCK),
+        "B: A's 3 blocks + B's own 4th block hit"
+    );
     assert_close("B warm (extension)", &b_cold, &b_warm);
 
     let (cached, c_warm) = run_one(&mut ex, 13, &c);
     assert_eq!(
         cached,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "C: all 4 blocks are cached but the cap must keep one block of prefill"
     );
     assert_close("C warm (full-block cap)", &c_cold, &c_warm);
@@ -227,11 +239,14 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(21, &d), prefill_item(22, &a)],
-            echo: false,
         })
         .expect("mixed prefill");
-    assert_eq!(pr.requests[0].cached_tokens, 0, "D is unseen — cold");
-    assert_eq!(pr.requests[1].cached_tokens, 3 * BLOCK, "A is warm");
+    assert_eq!(
+        pr.requests[0].cached_tokens,
+        Some(0),
+        "D is unseen — cold: a lookup ran and missed"
+    );
+    assert_eq!(pr.requests[1].cached_tokens, Some(3 * BLOCK), "A is warm");
     let d_mixed = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     let a_mixed = vec![top_logprobs(pr.requests[1].first_token_logprob.as_ref())];
     assert_close("A in mixed batch", &a_cold[..1], &a_mixed);
@@ -246,7 +261,6 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(31, &d)],
-            echo: false,
         })
         .expect("D solo prefill");
     let d_solo = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
@@ -258,7 +272,8 @@ fn prefix_cache_behavior() {
     // again so the unified-path assertions below exercise warm page reuse.
     let (cached, _) = run_one(&mut ex, 32, &b);
     assert_eq!(
-        cached, 0,
+        cached,
+        Some(0),
         "re-enabled cache starts cold after transition drain"
     );
 
@@ -267,10 +282,9 @@ fn prefix_cache_behavior() {
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(41, &b)],
-            echo: false,
         })
         .expect("B prefill for unified decode");
-    assert_eq!(pr.requests[0].cached_tokens, 4 * BLOCK);
+    assert_eq!(pr.requests[0].cached_tokens, Some(4 * BLOCK));
     let ur = ex
         .execute_unified(UnifiedPlan {
             sample_seed: 0,
@@ -280,7 +294,7 @@ fn prefix_cache_behavior() {
         .expect("unified");
     assert_eq!(
         ur.prefill_requests[0].cached_tokens,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "unified prefill matches through the same path"
     );
     let a_unified = vec![top_logprobs(

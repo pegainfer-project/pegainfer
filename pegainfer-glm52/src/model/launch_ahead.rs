@@ -18,8 +18,8 @@ use super::Glm52StepShape;
 /// A speculative next-step whole-graph replay already enqueued on the decode
 /// stream: the feed kernel advanced the device input buffers in place and
 /// the bucket graph was launched ahead, hiding the ~0.7 ms host-side
-/// `cuGraphLaunch` under the current step's execution (measured on jz-38:
-/// 5.4 µs intra-step replay gap vs 810 µs at an unhidden step boundary).
+/// `cuGraphLaunch` under the current step's execution (measured: 5.4 µs
+/// intra-step replay gap vs 810 µs at an unhidden step boundary).
 /// Consumed only when the engine's next step matches `expect` exactly;
 /// on any mismatch the full host prologue overwrites the advanced inputs and
 /// the stale replay degrades to a recompute whose rows never influence the

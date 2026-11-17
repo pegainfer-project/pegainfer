@@ -1,7 +1,10 @@
-//! The hd512 paged-KV page-id trap. One trap per binary, for the reason
-//! given in hd512_qk_rope_trap.rs.
+//! The hd512 paged-KV page-id trap. One trap per binary: `__trap()` leaves
+//! the context in a sticky error state, so anything sharing the process
+//! afterwards would fail for the wrong reason.
 //!
 //! Manual gate — CI compiles this but never runs it.
+
+#![cfg(feature = "gemma4")]
 
 mod common;
 
@@ -13,7 +16,6 @@ use pegainfer_kernels::tensor::DeviceVec;
 use pegainfer_kernels::tensor::HiddenStates;
 
 const HD: usize = 512;
-const ROTARY_DIM: usize = 128;
 const EPS: f32 = 1e-6;
 const NUM_Q_HEADS: usize = 2;
 const NUM_KV_HEADS: usize = 2;
@@ -45,8 +47,8 @@ fn paged_page_id_trap_is_visible() {
         .expect("pool alloc");
     let qn = DeviceVec::zeros(ctx, HD).expect("qn alloc");
     let kn = DeviceVec::zeros(ctx, HD).expect("kn alloc");
-    let cos_dev = DeviceVec::zeros(ctx, 4 * ROTARY_DIM).expect("cos alloc");
-    let sin_dev = DeviceVec::zeros(ctx, 4 * ROTARY_DIM).expect("sin alloc");
+    let cos_dev = DeviceVec::zeros(ctx, 4 * HD).expect("cos alloc");
+    let sin_dev = DeviceVec::zeros(ctx, 4 * HD).expect("sin alloc");
     let page_indices: CudaSlice<i32> = ctx.stream.clone_htod(&[5]).expect("page_indices H2D");
 
     let res = qk_norm_partial_rope_paged_prefill_hd512_into(
@@ -68,7 +70,6 @@ fn paged_page_id_trap_is_visible() {
         4, // cos_max_pos
         NUM_Q_HEADS,
         NUM_KV_HEADS,
-        ROTARY_DIM,
         EPS,
     );
     if res.is_ok() {

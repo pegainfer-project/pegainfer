@@ -5,17 +5,12 @@
 #include <cstddef>
 #include <cstdint>
 
-static constexpr int CUBLAS_STATUS_ERROR_OFFSET = 100000;
+#include "../shared/cublas_status.cuh"
+#include "../shared/ffi_guard.cuh"
+
 static constexpr int KIMI_SHARED_GATE_UP_M = 4096;
 static constexpr int KIMI_SHARED_GATE_UP_K = 7168;
 static constexpr int KIMI_SHARED_GATE_UP_MAX_BATCH = 64;
-
-static int cublas_status_to_error(cublasStatus_t status) {
-  if (status == CUBLAS_STATUS_SUCCESS) {
-    return static_cast<int>(cudaSuccess);
-  }
-  return CUBLAS_STATUS_ERROR_OFFSET + static_cast<int>(status);
-}
 
 struct KimiSharedGateUpLtPlan {
   int batch_size = 0;

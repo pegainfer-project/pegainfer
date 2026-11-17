@@ -6,6 +6,7 @@
 // plane per expert, which is how both checkpoints store it.
 
 #include "ffi.cuh"
+#include "../shared/ffi_guard.cuh"
 
 namespace {
 
@@ -114,7 +115,7 @@ CUresult marlin_repack_4bit_cuda(
       reinterpret_cast<const uint32_t*>(src),
       reinterpret_cast<uint32_t*>(dst), in_dim, out_dim);
   cudaError_t err = cudaPeekAtLastError();
-  return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+  return map_cuda_error(err);
 }
 
 }  // extern "C"

@@ -85,7 +85,7 @@ find_binary() {
     -type f -perm -u+x -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
   [ -n "$found" ] || die \
     "no $target binary under target/release/deps — build it in kernel-lab: \
-PEGAINFER_CUDA_SM=103 cargo test --release -p pegainfer-k3 --no-run"
+PEGAINFER_CUDA_SM=103 cargo test --release -p pegainfer-k3 --features k3 --no-run"
   echo "$found"
 }
 

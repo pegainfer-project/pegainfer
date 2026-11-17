@@ -32,3 +32,50 @@ pub(crate) fn device_or_skip() -> Option<DeviceContext> {
         }
     }
 }
+
+/// The device's SM count, queried once by the gate that hands it to a launch.
+/// Wrappers take it as an argument so no launch queries the driver.
+#[allow(dead_code)]
+pub(crate) fn sm_count(ctx: &DeviceContext) -> usize {
+    usize::try_from(
+        ctx.ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("SM count"),
+    )
+    .expect("SM count fits usize")
+}
+
+/// Deterministic junk, distinct per element, so a row read from the wrong
+/// page, layer or head cannot coincide with the right one. Not every binary
+/// that includes this module fills a buffer.
+#[allow(dead_code)]
+pub(crate) fn fill(seed: u64, n: usize) -> Vec<half::bf16> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            half::bf16::from_f32(((state >> 40) as f32 / 8_388_608.0) - 1.0)
+        })
+        .collect()
+}
+
+/// The largest absolute difference and where it is. A NaN compares false
+/// against everything, so it would leave the largest at zero: it fails here
+/// instead of passing a comparison silently.
+#[allow(dead_code)]
+pub(crate) fn worst_delta(a: &[f32], b: &[f32]) -> (f32, usize) {
+    assert_eq!(a.len(), b.len(), "compared runs differ in length");
+    let mut worst = (0.0f32, 0usize);
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        let d = (x - y).abs();
+        assert!(d.is_finite(), "element {i}: {x} against {y}");
+        if d > worst.0 {
+            worst = (d, i);
+        }
+    }
+    worst
+}

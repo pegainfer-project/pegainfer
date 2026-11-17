@@ -18,9 +18,6 @@
 //!   count and the loader uploads that prefix (same semantics as the
 //!   reference `a_log_weight_loader`).
 
-// Bring-up: the loader lands ahead of the model builder that consumes it.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -298,6 +295,7 @@ impl K3TensorContract {
             })
     }
 
+    #[cfg(test)]
     fn is_padded(&self) -> Result<bool> {
         Ok(self.resident_elements != self.element_count()?)
     }
@@ -340,6 +338,7 @@ impl K3WeightManifest {
     }
 
     /// Shard file holding `name` (checkpoint name, wrapper prefix included).
+    #[cfg(test)]
     pub(crate) fn shard_for(&self, name: &str) -> Result<&str> {
         self.weight_map
             .get(name)
@@ -347,6 +346,7 @@ impl K3WeightManifest {
             .with_context(|| format!("K3 safetensors index missing tensor {name}"))
     }
 
+    #[cfg(test)]
     pub(crate) fn rank_load_bundle(
         &self,
         rank: usize,

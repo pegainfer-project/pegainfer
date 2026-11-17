@@ -8,11 +8,9 @@
 //! (FlashInfer vs torch.topk tie-break on 1-ULP logit ties differs; exact match
 //! is impossible, so we allow 1/2048 divergence).
 //!
-//! Run (H200 + checkpoint + probes):
+//! Run (Blackwell GPU + checkpoint + probes):
 //! ```text
 //! PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
-//! PEGAINFER_DEEPGEMM_ROOT=pegainfer-kernels/third_party/DeepGEMM/deep_gemm \
-//! CUDA_HOME=/usr/local/cuda \
 //!   cargo test --release -p pegainfer-glm52 --features glm52 --lib indexer_oracle -- --ignored --nocapture
 //! ```
 //!
@@ -128,7 +126,7 @@ fn load_indexer_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52In
 }
 
 #[test]
-#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint + DeepGEMM env"]
+#[ignore = "requires a Blackwell GPU + GLM-5.2-FP8 checkpoint"]
 fn indexer_oracle_gate() -> Result<()> {
     let model_path = std::env::var_os("PEGAINFER_TEST_MODEL_PATH")
         .map_or_else(|| PathBuf::from("models/GLM-5.2-FP8"), PathBuf::from);

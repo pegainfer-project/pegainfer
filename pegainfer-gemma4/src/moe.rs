@@ -33,7 +33,7 @@ const DECODE_BLOCK: usize = 16;
 // The `thread_m_blocks = 4` tile: one weight stripe serves four times the rows.
 const PREFILL_BLOCK: usize = 64;
 // A 1024-row step's routes: below it the coarse block loses first-token
-// time (measured down to 256 slots), at it the two blocks tie on a lone
+// time, at it the two blocks tie on a lone
 // prompt, and the mixed steps a busy server prefills through gain.
 const PREFILL_MIN_SLOTS: usize = 1024 * 8;
 
@@ -110,7 +110,6 @@ pub(crate) struct MoeScratch {
     routed_down: HiddenStates,
     expert_out: HiddenStates,
     expert_offsets: CudaSlice<u32>,
-    expert_cursor: CudaSlice<u32>,
 }
 
 impl MoeScratch {
@@ -140,7 +139,6 @@ impl MoeScratch {
             routed_down: hidden(sizes.slots)?,
             expert_out: hidden(max_rows)?,
             expert_offsets: ctx.stream.alloc_zeros::<u32>(moe.num_experts + 1)?,
-            expert_cursor: ctx.stream.alloc_zeros::<u32>(1)?,
         })
     }
 
@@ -252,7 +250,6 @@ pub(crate) fn moe_into(
             expert_ids: &mut scratch.expert_ids,
             num_tokens_post_padded: &mut scratch.padded_total,
             expert_offsets: &mut scratch.expert_offsets,
-            expert_cursor: &mut scratch.expert_cursor,
         },
     )?;
 

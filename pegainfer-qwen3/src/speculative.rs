@@ -1,32 +1,42 @@
-//! Method-agnostic core of **greedy** speculative decoding for Qwen3.
+//! Shared speculative-decode plans and results for Qwen3.
 //!
 //! Speculative decoding is an optimistic-concurrency transaction over the
 //! decode loop: *propose* a span of `K` cheap draft tokens, *verify* them with a
 //! single target forward over the `K + 1` span positions, *accept* the longest
 //! prefix the target agrees with (plus one bonus token), then *commit* the
-//! accepted KV and roll back the rejected draft KV. Only the **propose** step
-//! varies between methods (n-gram lookup, DFlash draft model, EAGLE, …); verify,
-//! accept, and the KV transaction are shared.
+//! accepted KV and roll back the rejected draft KV. The target forward and KV
+//! transaction are shared; acceptance depends on the proposal distribution.
 //!
 //! This module owns the shared half. The draft/verify boundary is a **pure
 //! token span** — a model proposer's hidden states never cross it; they stay
-//! inside the proposer (see [`crate::dflash`]). DFlash is the only proposer
-//! today and is kept concrete; a proposer trait is deferred until a second
-//! implementation (n-gram / EAGLE) validates the shape.
+//! inside the proposer (see [`crate::dflash`] and [`crate::eagle3`]). Both
+//! proposers seed from target hidden states captured at prefill and verify,
+//! so they share the capture, the ready set and this transaction; only the
+//! worker lane that turns captures into drafts differs.
 //!
-//! Acceptance is [`accept_prefix_match`] for greedy and sampled requests alike
-//! (#512, the sampled-verify mechanism GLM5.2 landed in #589): the verify
+//! Deterministic proposals use [`accept_prefix_match`] for greedy and sampled
+//! requests alike (#512): the verify
 //! forward selects one *committed* token per span position — the fused argmax
 //! for a greedy request, a regular per-row sample from the target distribution
 //! for a non-greedy one — and the accepted prefix is simply the drafts that
 //! match those tokens. For a deterministic (one-hot) draft this is lossless
 //! speculative sampling: every committed token is a true sample from the
 //! target distribution; acceptance only decides how many ride one step.
+//! Sampled DFlash2 proposals instead retain their sparse q on the worker lane
+//! and use probability-ratio acceptance with residual sampling there.
 
 use anyhow::Result;
+use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::sampler::SamplingParams;
 
 use crate::executor::RequestId;
+
+/// The drafter a speculative engine loads, by checkpoint path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DraftModel<'a> {
+    DFlash(&'a str),
+    Eagle3(&'a str),
+}
 
 /// One request's verify span: the current dangling token followed by the draft
 /// candidates (`token_ids[0]` is the confirmed last token, `token_ids[1..]` are
@@ -37,14 +47,21 @@ pub(crate) struct VerifyStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_ids: Vec<u32>,
     pub(crate) params: SamplingParams,
+    pub(crate) stop_policy: StopPolicy,
 }
 
 impl VerifyStepItem {
-    pub(crate) fn new(request_id: RequestId, token_ids: Vec<u32>, params: SamplingParams) -> Self {
+    pub(crate) fn new(
+        request_id: RequestId,
+        token_ids: Vec<u32>,
+        params: SamplingParams,
+        stop_policy: StopPolicy,
+    ) -> Self {
         Self {
             request_id,
             token_ids,
             params,
+            stop_policy,
         }
     }
 
@@ -59,18 +76,23 @@ pub(crate) struct VerifyPlan<'a> {
     /// Engine step seed for the verify rows' sampler pass (same contract as
     /// decode: fresh per step; seeded rows re-mix their own request seed).
     pub sample_seed: u64,
+    /// The load gate turned drafting off for this step: every span is the
+    /// request's confirmed token alone. Carried separately from the span
+    /// length because a near-budget request's span is also one token — only
+    /// this flag says *why* the round has no drafts.
+    pub gated: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerifyRequestResult {
     pub request_id: RequestId,
-    /// Number of draft candidates accepted before the posterior bonus.
+    /// Number of accepted draft candidates retained after terminal truncation.
     pub matched_draft_tokens: usize,
-    /// Tokens to commit: the accepted draft prefix followed by the target's
-    /// posterior token at the first mismatch (or the block-end continuation
-    /// when every draft is accepted). Always `1..=K + 1` tokens, so a verify
-    /// step always makes at least one token of progress. The scheduler still
-    /// owns stop-token suppression before client emission.
+    /// Tokens to commit: the accepted draft prefix and the target's posterior
+    /// token, unless a terminal draft ends the span before the posterior.
+    /// Always `1..=K + 1` tokens. The worker truncates after the first terminal
+    /// token before recording DFlash context; the executor checks this at
+    /// commit, and the scheduler emits the typed stop cause.
     pub accepted_tokens: Vec<u32>,
 }
 
@@ -79,20 +101,37 @@ pub(crate) struct VerifyResult {
 }
 
 /// One request's draft request: the proposer continues from `current_token`.
-/// Deliberately carries no sampling params — the draft rollout is argmax
-/// regardless of the request's sampler; sampled-verify applies the request's
-/// params on the verify side only.
+/// DFlash2 uses the request's temperature for its proposal; legacy heads remain
+/// deterministic. The seed is mixed with the request-local output position.
 #[derive(Clone)]
 pub(crate) struct DraftStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) current_token: u32,
+    pub(crate) params: SamplingParams,
+    pub(crate) sample_seed: u64,
+    /// Remaining output budget when the request may be hedged (greedy
+    /// sampler), `0` otherwise. Carried through the draft seam so the draft
+    /// lane — which owns the effective branch positions — makes the final
+    /// eligibility call: a chain only survives the verify-side span clamp
+    /// when some branch position fits inside `remaining - 1` kept drafts,
+    /// and a request that cannot show its chain must not burn a hedge slot.
+    pub(crate) hedge_budget: usize,
 }
 
 impl DraftStepItem {
-    pub(crate) fn new(request_id: RequestId, current_token: u32) -> Self {
+    pub(crate) fn new(
+        request_id: RequestId,
+        current_token: u32,
+        hedge_budget: usize,
+        params: SamplingParams,
+        sample_seed: u64,
+    ) -> Self {
         Self {
             request_id,
             current_token,
+            params,
+            sample_seed,
+            hedge_budget,
         }
     }
 }
@@ -113,7 +152,7 @@ pub(crate) struct DraftResult {
     pub requests: Vec<DraftRequestResult>,
 }
 
-/// Speculative acceptance — the shared seam every method and sampler reuses.
+/// Prefix-match acceptance for deterministic proposals.
 ///
 /// * `proposed` — the `K` candidate tokens from the proposer.
 /// * `target_tokens` — the target model's *committed* token at each of the
@@ -249,6 +288,7 @@ mod tests {
             RequestId::new(7),
             vec![10, 11, 12, 13],
             SamplingParams::default(),
+            StopPolicy::default(),
         );
         let results = build_verify_results(&[req], &[11, 12, 99, 100]).expect("verify results");
         assert_eq!(results.len(), 1);
@@ -263,6 +303,7 @@ mod tests {
             RequestId::new(8),
             vec![20, 21, 22],
             SamplingParams::default(),
+            StopPolicy::default(),
         );
         let results = build_verify_results(&[req], &[21, 22, 23]).expect("verify results");
         assert_eq!(results[0].matched_draft_tokens, 2);
@@ -271,8 +312,18 @@ mod tests {
 
     #[test]
     fn batched_multi_request_splits_columns_by_span() {
-        let a = VerifyStepItem::new(RequestId::new(1), vec![5, 6], SamplingParams::default());
-        let b = VerifyStepItem::new(RequestId::new(2), vec![7, 8, 9], SamplingParams::default());
+        let a = VerifyStepItem::new(
+            RequestId::new(1),
+            vec![5, 6],
+            SamplingParams::default(),
+            StopPolicy::default(),
+        );
+        let b = VerifyStepItem::new(
+            RequestId::new(2),
+            vec![7, 8, 9],
+            SamplingParams::default(),
+            StopPolicy::default(),
+        );
         // a: posterior [6, 100] -> accept draft 6, bonus 100. b: posterior [8, 77, 0]
         // -> accept draft 8, correction 77.
         let results = build_verify_results(&[a, b], &[6, 100, 8, 77, 0]).expect("verify results");

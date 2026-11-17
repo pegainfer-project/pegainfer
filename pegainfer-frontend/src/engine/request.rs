@@ -27,6 +27,6 @@ pub struct GenerateRequest {
     /// one engine share a single tagged output channel behind this sink (see
     /// [`TokenSink`]); the frontend demuxes by tag.
     pub token_tx: TokenSink,
-    pub logprobs: usize,
-    pub echo: bool,
+    pub logprobs: Option<usize>,
+    pub prompt_logprobs: Option<usize>,
 }

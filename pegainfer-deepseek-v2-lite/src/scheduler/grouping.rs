@@ -7,7 +7,6 @@ pub(super) struct DecodePositionGroupPlan {
 }
 
 pub(super) struct DecodePositionGroup {
-    pub(super) position: usize,
     pub(super) rows: Vec<(usize, ActiveRequestState)>,
 }
 
@@ -48,7 +47,6 @@ pub(super) fn take_decode_position_groups(
     plans
         .into_iter()
         .map(|plan| DecodePositionGroup {
-            position: plan.position,
             rows: plan
                 .indices
                 .into_iter()

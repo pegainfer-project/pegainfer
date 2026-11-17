@@ -27,7 +27,7 @@ use anyhow::Result;
 use cudarc::nccl::ReduceOp;
 use cudarc::nccl::safe::Comm;
 use pegainfer_kernels::ops::KIMI_K2_EP_WORLD;
-use pegainfer_kernels::ops::KIMI_K2_ROUTER_SCALE;
+use pegainfer_kernels::ops::KIMI_K2_ROUTED_SCALING_FACTOR;
 use pegainfer_kernels::ops::KimiMarlinRouteWorkspace;
 use pegainfer_kernels::ops::KimiMarlinWna16Workspace;
 use pegainfer_kernels::ops::KimiRouterBatch;
@@ -234,7 +234,7 @@ fn forward_moe_layer_decode_normed_after_event_into(
         &scratch.mla.hidden,
         &scratch.mla.projected,
         &scratch.comm.routed_out_f32,
-        KIMI_K2_ROUTER_SCALE,
+        KIMI_K2_ROUTED_SCALING_FACTOR,
         &mut scratch.mla.normed,
     )?;
     std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
@@ -363,7 +363,7 @@ pub(super) fn forward_moe_layer_batch_into(
         ctx,
         &mut routed_out_f32,
         seq_len * KIMI_K2_HIDDEN,
-        KIMI_K2_ROUTER_SCALE,
+        KIMI_K2_ROUTED_SCALING_FACTOR,
     )?;
     pegainfer_kernels::typed_pipeline! {
         ctx = ctx, eps = KIMI_K2_RMS_NORM_EPS;

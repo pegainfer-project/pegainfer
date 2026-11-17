@@ -210,7 +210,7 @@ fn rejected_draft_content_cannot_leak() {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut feed = prompt.clone();
+    let mut feed = prompt;
     feed.extend(filler_tokens(48, 17));
 
     // Draft position 0 differs from the plain-token stream (xor keeps it in
@@ -306,12 +306,12 @@ fn packed_slot_neighbours_cannot_leak() {
 #[test]
 #[ignore = "requires a Blackwell GPU and the K3 checkpoint"]
 fn corruption_value_cannot_change_the_trajectory() {
+    const LOOKAHEAD: usize = 6;
     let (prompt, num_layers) = fixture_prompt_and_layers();
     let Some(mut executor) = executor(num_layers) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    const LOOKAHEAD: usize = 6;
     let oracle = oracle_walk(&mut executor, 0, &prompt, 48 + LOOKAHEAD);
     let mut feed = prompt.clone();
     feed.extend_from_slice(&oracle[prompt.len() - 1..prompt.len() - 1 + 48]);
@@ -364,7 +364,7 @@ fn verify_tracks_the_oracle_off_near_ties() {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
         return;
     };
-    let mut feed = prompt.clone();
+    let mut feed = prompt;
     feed.extend(filler_tokens(48, 29));
 
     // Oracle argmaxes and margins for the forced feed.
@@ -427,6 +427,7 @@ fn verify_tracks_the_oracle_off_near_ties() {
 #[test]
 #[ignore = "requires a Blackwell GPU, the K3 checkpoint and the DSpark drafter"]
 fn dspark_draft_lane_round_trips() {
+    const STEPS: usize = 48;
     let (prompt, num_layers) = fixture_prompt_and_layers();
     let Some(mut executor) = executor(num_layers) else {
         eprintln!("skipping: {CHECKPOINT_ENV} is not set to a mounted checkpoint");
@@ -444,7 +445,6 @@ fn dspark_draft_lane_round_trips() {
         .load_dspark(&dspark_path)
         .expect("the drafter should load");
 
-    const STEPS: usize = 48;
     let walk = |executor: &mut K3Executor| -> (Vec<u32>, usize, usize) {
         executor.release(0);
         let first = executor

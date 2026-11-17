@@ -13,7 +13,7 @@
 //! hash-checked: fp8 GEMM + absorbed-attention accumulation order cannot be
 //! bit-equal to the HF decompress path.
 //!
-//! Run (H200 + checkpoint):
+//! Run (Blackwell GPU + checkpoint):
 //! ```text
 //! PEGAINFER_TEST_MODEL_PATH=/data/models/GLM-5.2-FP8 \
 //!   cargo test --release -p pegainfer-glm52 --features glm52 --lib mla_oracle -- --ignored --nocapture
@@ -219,7 +219,7 @@ fn load_layer0(ctx: &DeviceContext, model_path: &Path) -> Result<Glm52MlaLayerWe
 }
 
 #[test]
-#[ignore = "requires H200 + GLM-5.2-FP8 checkpoint"]
+#[ignore = "requires a Blackwell GPU + GLM-5.2-FP8 checkpoint"]
 fn mla_oracle_gate() -> Result<()> {
     run_mla_oracle_gate(GLM52_FLASHMLA_SPARSE_TOPK, None)
 }

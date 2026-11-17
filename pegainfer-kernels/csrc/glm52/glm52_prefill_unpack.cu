@@ -57,6 +57,6 @@ extern "C" CUresult glm52_prefill_unpack_pages_cuda(
                  reinterpret_cast<cudaStream_t>(stream)>>>(
       packed, block_ids, blocks, packed_bytes, packed_block_stride, max_slots,
       unpacked);
-  return static_cast<CUresult>(cudaGetLastError());
+  return map_cuda_error(cudaGetLastError());
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }

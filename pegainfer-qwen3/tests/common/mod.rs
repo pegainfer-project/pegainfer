@@ -1,4 +1,5 @@
 pub(crate) mod harness;
+pub(crate) mod lossless;
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ fn try_load_tokenizer(model_path: &str) -> Result<DynTokenizer> {
         .map_err(|err| {
             Error::Tokenizer(format!("failed to build tokenizer resolver runtime: {err}"))
         })?
-        .block_on(ResolvedModelFiles::new(model_path))?;
+        .block_on(ResolvedModelFiles::new(model_path, None))?;
     match &files.tokenizer {
         TokenizerSource::HuggingFace(path) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
         TokenizerSource::Tiktoken(path) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),

@@ -163,12 +163,11 @@ pub(super) async fn native_pd_resolve(
 ) -> anyhow::Result<KvPrefix> {
     let chain = padded_chain(&req.prompt_tokens, anchor);
     let req_id_owned;
-    let req_id = match req.request_id.as_deref() {
-        Some(id) => id,
-        None => {
-            req_id_owned = super::anon_resolve_key("native-pd", rank);
-            &req_id_owned
-        }
+    let req_id = if let Some(id) = req.request_id.as_deref() {
+        id
+    } else {
+        req_id_owned = super::anon_resolve_key("native-pd", rank);
+        &req_id_owned
     };
     let t_start = std::time::Instant::now();
     let prefix = store

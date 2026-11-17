@@ -840,6 +840,7 @@ mod prefill_nccl_tests {
 
     /// Minimal in-process 4-rank cudarc NCCL smoke: Id share + from_rank +
     /// bf16 sum all-reduce, mirroring the prefill bring-up exactly.
+    #[allow(clippy::float_cmp)]
     #[test]
     #[ignore = "requires 4 CUDA devices"]
     fn tp4_nccl_allreduce_smoke() -> Result<()> {
@@ -877,7 +878,6 @@ mod prefill_nccl_tests {
                     let mut recv_view = recv.slice_mut(..ELEMS);
                     comm.all_reduce(&send_view, &mut recv_view, &cudarc::nccl::ReduceOp::Sum)
                         .map_err(|err| anyhow::anyhow!("allreduce: {:?}", err.0))?;
-                    drop(recv_view);
                     let host = ctx.stream.clone_dtoh(&recv)?;
                     ensure!(
                         host.iter().all(|v| v.to_f32() == 10.0),

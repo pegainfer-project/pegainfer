@@ -170,8 +170,6 @@ impl K3RankGpuWeights {
 
 pub(crate) struct K3RankLoadOutput {
     pub(crate) weights: K3RankGpuWeights,
-    pub(crate) loaded_tensor_count: usize,
-    pub(crate) loaded_total_bytes: usize,
 }
 
 pub(crate) fn load_rank_weights_to_gpu(
@@ -361,11 +359,7 @@ pub(crate) fn load_rank_weights_to_gpu(
         slowest_secs
     );
 
-    Ok(K3RankLoadOutput {
-        weights,
-        loaded_tensor_count,
-        loaded_total_bytes,
-    })
+    Ok(K3RankLoadOutput { weights })
 }
 
 fn gib(bytes: usize) -> f64 {

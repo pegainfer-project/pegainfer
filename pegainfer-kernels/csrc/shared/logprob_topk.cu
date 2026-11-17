@@ -16,6 +16,7 @@ __global__ void logprob_topk_batch_kernel(
     const int* __restrict__ picked,
     const int* __restrict__ top_k,
     float* __restrict__ out_picked_lp,
+    int* __restrict__ out_picked_rank,
     float* __restrict__ out_topk_vals,
     int* __restrict__ out_topk_ids,
     int rows,
@@ -33,19 +34,26 @@ __global__ void logprob_topk_batch_kernel(
   const __nv_bfloat16* row_x = x + static_cast<size_t>(row_indices[slot]) * n;
   int tid = threadIdx.x;
 
+  float picked_val = __bfloat162float(row_x[picked[slot]]);
   float local_max = -INFINITY;
+  int local_rank = 0;
   for (int i = tid; i < n; i += blockDim.x) {
-    local_max = fmaxf(local_max, __bfloat162float(row_x[i]));
+    float value = __bfloat162float(row_x[i]);
+    local_max = fmaxf(local_max, value);
+    local_rank += value >= picked_val;
   }
   shared_vals[tid] = local_max;
+  shared_idxs[tid] = local_rank;
   __syncthreads();
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (tid < s) {
       shared_vals[tid] = fmaxf(shared_vals[tid], shared_vals[tid + s]);
+      shared_idxs[tid] += shared_idxs[tid + s];
     }
     __syncthreads();
   }
   float row_max = shared_vals[0];
+  if (tid == 0) out_picked_rank[slot] = shared_idxs[0];
   __syncthreads();
 
   double local_sum = 0.0;
@@ -65,7 +73,7 @@ __global__ void logprob_topk_batch_kernel(
   __syncthreads();
 
   if (tid == 0) {
-    out_picked_lp[slot] = __bfloat162float(row_x[picked[slot]]) - lse;
+    out_picked_lp[slot] = picked_val - lse;
   }
 
   // Selection runs in strictly decreasing (value, -id) lexicographic order,
@@ -112,12 +120,13 @@ extern "C" {
 void logprob_topk_batch_bf16_cuda(const __nv_bfloat16* x,
                                   const int* row_indices, const int* picked,
                                   const int* top_k, float* out_picked_lp,
+                                  int* out_picked_rank,
                                   float* out_topk_vals, int* out_topk_ids,
                                   int rows, int n, int k_max,
                                   cudaStream_t stream) {
   size_t smem = LOGPROB_BLOCK * (sizeof(float) + sizeof(int));
   logprob_topk_batch_kernel<<<rows, LOGPROB_BLOCK, smem, stream>>>(
-      x, row_indices, picked, top_k, out_picked_lp, out_topk_vals, out_topk_ids,
-      rows, n, k_max);
+      x, row_indices, picked, top_k, out_picked_lp, out_picked_rank,
+      out_topk_vals, out_topk_ids, rows, n, k_max);
 }
 }

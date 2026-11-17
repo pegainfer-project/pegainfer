@@ -51,7 +51,7 @@ Marlin's "sorted+padded" format. Routing = identity `sorted_token_ids` with sent
 **Weights/scale flow**: dispatch carries per-slot f32 router weights
 (`recv_topk_weight`, same row space as `recv_x`); W2 applies them
 (`mul_topk_weights=true, top_k=1`); combine sums **unweighted**
-(`topk_weights=nullptr`, asserted upstream); `KIMI_K2_ROUTER_SCALE` is applied at
+(`topk_weights=nullptr`, asserted upstream); `KIMI_K2_ROUTED_SCALING_FACTOR` is applied at
 the residual via `kimi_residual_add_scaled_bf16` — same convention as the NCCL
 backend. Net numerics delta vs PPLX: combine output is bf16 where PPLX returned
 f32, i.e. the routed sum rounds to bf16 one step earlier. Must be re-gated on

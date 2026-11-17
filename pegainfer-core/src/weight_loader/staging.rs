@@ -176,6 +176,31 @@ impl WeightStager {
     }
 
     /// # Safety
+    /// `dst_at` must address the sum of `srcs` writable bytes still allocated
+    /// on the stager's stream, as validated by [`prepare_bytes`].
+    pub(crate) unsafe fn upload_slices_at(&mut self, srcs: &[&[u8]], dst_at: u64) -> Result<()> {
+        let mut source = 0;
+        let mut source_at = 0;
+        let mut dst_offset = 0;
+        let mut parts = Vec::new();
+        while source < srcs.len() {
+            let bytes =
+                next_contiguous_chunk(srcs, &mut source, &mut source_at, STAGE_BYTES, &mut parts);
+            let fill = |pool: &FillPool, stage: &mut [MaybeUninit<u8>]| {
+                let mut at = 0;
+                for part in &parts {
+                    pool.copy(part, &mut stage[at..at + part.len()]);
+                    at += part.len();
+                }
+            };
+            // SAFETY: the chunks partition the validated concatenated source.
+            unsafe { self.stage_chunk(bytes, dst_at + dst_offset as u64, fill) }?;
+            dst_offset += bytes;
+        }
+        Ok(())
+    }
+
+    /// # Safety
     /// `plan` must come from [`prepare_cols`] for this `src`, with its
     /// destination still allocated on the stager's stream.
     pub(crate) unsafe fn upload_cols_at(&mut self, src: &[u8], plan: &ColShardPlan) -> Result<()> {
@@ -256,9 +281,41 @@ impl WeightStager {
     }
 }
 
+/// Fills `parts` (cleared first, reused across calls) with the source slices
+/// of the next chunk of at most `limit` bytes; returns the chunk's size.
+/// `limit` is a parameter so the boundary coverage below runs on dozens of
+/// bytes instead of a STAGE_BYTES-sized fixture.
+fn next_contiguous_chunk<'a>(
+    srcs: &'a [&'a [u8]],
+    source: &mut usize,
+    source_at: &mut usize,
+    limit: usize,
+    parts: &mut Vec<&'a [u8]>,
+) -> usize {
+    parts.clear();
+    let mut bytes = 0;
+    while *source < srcs.len() && bytes < limit {
+        let src = srcs[*source];
+        if src.is_empty() {
+            *source += 1;
+            *source_at = 0;
+            continue;
+        }
+        let take = (limit - bytes).min(src.len() - *source_at);
+        parts.push(&src[*source_at..*source_at + take]);
+        bytes += take;
+        *source_at += take;
+        if *source_at == src.len() {
+            *source += 1;
+            *source_at = 0;
+        }
+    }
+    bytes
+}
+
 // Both the stager's events and `dst`'s stream-ordered allocation are only
 // ordered against work on `stream`, which must be the stager's own stream.
-fn ensure_uploadable(stream: &Arc<CudaStream>, dst: &CudaSlice<bf16>) -> Result<()> {
+fn ensure_uploadable<T>(stream: &Arc<CudaStream>, dst: &CudaSlice<T>) -> Result<()> {
     anyhow::ensure!(
         Arc::ptr_eq(dst.stream(), stream),
         "staged upload into a buffer allocated on a different stream than the stager's"
@@ -268,6 +325,26 @@ fn ensure_uploadable(stream: &Arc<CudaStream>, dst: &CudaSlice<bf16>) -> Result<
         "staged upload under a thread-local stream override is unsupported"
     );
     Ok(())
+}
+
+pub(crate) fn prepare_bytes(
+    stream: &Arc<CudaStream>,
+    srcs: &[&[u8]],
+    dst: &mut CudaSlice<u8>,
+) -> Result<u64> {
+    ensure_uploadable(stream, dst)?;
+    let bytes = srcs.iter().try_fold(0usize, |total, src| {
+        total
+            .checked_add(src.len())
+            .ok_or_else(|| anyhow::anyhow!("staged byte upload source length overflow"))
+    })?;
+    anyhow::ensure!(
+        bytes == dst.len(),
+        "staged byte upload size mismatch: {bytes} source bytes vs dst len {}",
+        dst.len()
+    );
+    let (dst_ptr, _dst_order) = dst.device_ptr_mut(stream);
+    Ok(dst_ptr)
 }
 
 /// Validates a contiguous staged upload and returns the destination device
@@ -414,5 +491,27 @@ mod tests {
                 "rows={rows} total_cols={total_cols} col_offset={col_offset} take={take}"
             );
         }
+    }
+
+    #[test]
+    fn contiguous_chunks_preserve_source_bytes() {
+        let limit = 46;
+        let first = vec![1u8; limit - 2];
+        let second = [2u8, 3, 4, 5];
+        let sources: [&[u8]; 3] = [&first, &[], &second];
+        let mut source = 0;
+        let mut source_at = 0;
+        let mut actual = Vec::new();
+        let mut sizes = Vec::new();
+        let mut parts = Vec::new();
+        while source < sources.len() {
+            let bytes =
+                next_contiguous_chunk(&sources, &mut source, &mut source_at, limit, &mut parts);
+            sizes.push(bytes);
+            actual.extend(parts.iter().copied().flatten().copied());
+        }
+        let expected: Vec<u8> = sources.into_iter().flatten().copied().collect();
+        assert_eq!(sizes, [limit, 2]);
+        assert_eq!(actual, expected);
     }
 }

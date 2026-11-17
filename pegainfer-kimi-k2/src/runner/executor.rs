@@ -4,6 +4,7 @@ mod tp8_dp1;
 use anyhow::Result;
 pub(super) use tp1_dp8::Tp1Dp8ForwardExecutor;
 pub(super) use tp8_dp1::Tp8Dp1ForwardExecutor;
+pub(super) use tp8_dp1::tp8_row_refusal;
 
 use super::worker::KimiKvStepPages;
 use super::worker::KimiOneTokenForwardReport;

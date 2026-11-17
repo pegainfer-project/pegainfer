@@ -12,7 +12,7 @@ pub struct SplitKvConfig {
 }
 
 impl SplitKvConfig {
-    pub(crate) const fn new(chunk_tokens: usize, max_chunks_per_request: usize) -> Self {
+    pub const fn new(chunk_tokens: usize, max_chunks_per_request: usize) -> Self {
         // A zero `max_chunks_per_request` divides by zero in `actual_chunk_size` (and a zero
         // `chunk_tokens` does in `active_chunks` at kv_len==0); reject loud at construction
         // (compile-time for the const sites) rather than panic mid-decode.
@@ -37,7 +37,8 @@ impl SplitKvConfig {
         kv_len.div_ceil(self.actual_chunk_size(kv_len)).max(1)
     }
 
-    pub(crate) fn label(self) -> String {
+    /// The `split_kv_{chunk}x{max}` manifest variant name.
+    pub fn label(self) -> String {
         format!(
             "split_kv_{}x{}",
             self.chunk_tokens, self.max_chunks_per_request

@@ -130,7 +130,7 @@ struct WireSlab {
 enum FleetState {
     NotStarted,
     InProgress,
-    Ready(Arc<Vec<i64>>),
+    Ready(Arc<[i64]>),
     Failed(String),
 }
 
@@ -282,7 +282,7 @@ impl K3EpRendezvous {
     /// mode. The first caller runs the whole exchange (serve or fetch, then
     /// import); everyone else blocks on its outcome. Any failure is terminal
     /// for every rank — there is no world without the table.
-    fn fleet_table(&self, rank: usize, device_ordinal: usize) -> Result<Arc<Vec<i64>>> {
+    fn fleet_table(&self, rank: usize, device_ordinal: usize) -> Result<Arc<[i64]>> {
         let bootstrap = self
             .fleet
             .as_ref()
@@ -312,7 +312,7 @@ impl K3EpRendezvous {
         let mut state = bootstrap.state.lock().expect("K3 EP bootstrap poisoned");
         match outcome {
             Ok(table) => {
-                let table = Arc::new(table);
+                let table: Arc<[i64]> = table.into();
                 *state = FleetState::Ready(table.clone());
                 bootstrap.done.notify_all();
                 Ok(table)
@@ -702,7 +702,7 @@ impl K3EpRuntime {
                 self.rank,
                 table.len()
             );
-            table.as_ref().clone()
+            table.to_vec()
         } else {
             let slabs = self.rendezvous.local_slabs(self.rank)?;
             for peer in &slabs {

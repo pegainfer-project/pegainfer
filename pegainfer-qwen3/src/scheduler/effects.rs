@@ -7,6 +7,7 @@
 //! resolve logic stay a pure function of executor results.
 
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::TokenLogprob;
 
 use super::ActiveRequestState;
@@ -27,15 +28,12 @@ pub(crate) struct PromptEchoEffect {
 }
 
 pub(crate) enum PendingEffect {
-    Finish {
-        request_id: RequestId,
-        finish_reason: FinishReason,
-    },
     EmitAndFinish {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
     Promote {
         state: ActiveRequestState,
@@ -50,15 +48,12 @@ pub(crate) enum PendingEffect {
 pub(crate) enum DecodeEffect {
     Finish {
         request_id: RequestId,
-        finish_reason: FinishReason,
-    },
-    EmitAndFinish {
-        request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
-    EmitAndContinue {
+    Continue {
         request_id: RequestId,
         token: u32,
         logprob: Option<TokenLogprob>,
@@ -68,17 +63,18 @@ pub(crate) enum DecodeEffect {
         completion_tokens: usize,
     },
     /// Commit several accepted speculative tokens and keep the request running.
-    EmitManyAndContinue {
+    ContinueMany {
         request_id: RequestId,
         tokens: Vec<u32>,
         completion_tokens: usize,
     },
     /// Commit several accepted speculative tokens, then finish — a stop token or
     /// the max-output budget was hit partway through the accepted span.
-    EmitManyAndFinish {
+    FinishMany {
         request_id: RequestId,
         tokens: Vec<u32>,
         finish_reason: FinishReason,
+        stop_cause: Option<StopCause>,
     },
 }
 
@@ -87,6 +83,17 @@ pub(crate) struct StepEffects {
     pub(crate) prompt_echoes: Vec<PromptEchoEffect>,
     pub(crate) pending: Vec<PendingEffect>,
     pub(crate) decode: Vec<DecodeEffect>,
+    /// Prefix-cache queries counted this step, token-granularity: the number of
+    /// prompt tokens looked up in the cache (summed over requests whose first
+    /// prefill chunk was resolved this step — that is where the cache is
+    /// consulted). Same unit as `prefix_hits`. Cumulative counters live on the
+    /// scheduler; this is the per-step delta.
+    pub(crate) prefix_queries: u64,
+    /// Prefix-cache hits counted this step, token-granularity: the number of
+    /// queried prompt tokens that were already cached locally. Same unit as
+    /// `prefix_queries`, so `hit_rate = hits/queries` stays in [0, 1].
+    /// Cumulative counters live on the scheduler; this is the per-step delta.
+    pub(crate) prefix_hits: u64,
 }
 
 impl StepEffects {
@@ -96,6 +103,8 @@ impl StepEffects {
             prompt_echoes: Vec::new(),
             pending: Vec::new(),
             decode: Vec::new(),
+            prefix_queries: 0,
+            prefix_hits: 0,
         }
     }
 }

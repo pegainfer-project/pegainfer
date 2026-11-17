@@ -10,16 +10,6 @@
 
 namespace {
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue || err == cudaErrorInvalidDevicePointer) {
-    return CUDA_ERROR_INVALID_VALUE;
-  }
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 // Grouped-GEMM workspace split. FlashInfer's grouped entry takes two buffers:
 // an int_buffer it carves with AlignedAllocator into eleven per-group argument
 // arrays (problem_sizes 12 B, five pointer arrays 8 B, three cute packed

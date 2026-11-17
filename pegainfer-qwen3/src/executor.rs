@@ -8,6 +8,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use crossbeam_channel as channel;
+use cudarc::driver::DevicePtr;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
 use pegainfer_core::kv_pool::KvLayout;
 use pegainfer_core::ops;
@@ -45,8 +46,16 @@ use crate::weights::ModelRuntimeConfig;
 use crate::weights::Qwen3MemoryOptions;
 use crate::weights::Qwen3Model;
 
+mod auto_hedge;
 mod dflash_lane;
-mod dflash_prefill;
+pub(crate) mod dflash_prefill;
+mod dflash_sampling;
+mod eagle3_lane;
+mod logprobs;
+use logprobs::DecodeRows;
+use logprobs::PrefillRows;
+use logprobs::build_prefill_request_results;
+use logprobs::gather_decode_logprobs;
 mod remote_fetch;
 use remote_fetch::QueryView;
 use remote_fetch::RemoteFetchAction;
@@ -56,20 +65,32 @@ mod spec;
 use dflash_lane::DFlashLaneState;
 use dflash_prefill::DFlashPrefillAction;
 use dflash_prefill::dflash_prefill_action;
+use eagle3_lane::Eagle3LaneState;
 /// The contract's request id, end to end: the wiring mints it at submit and
 /// every internal queue, effect, and KV key uses it unchanged — there is no
 /// second id space to map across.
 pub use pegainfer_frontend::engine::RequestId;
 
 use crate::dflash::DFlashDraftModel;
+use crate::eagle3::EAGLE3_CHAIN_LENGTH;
+use crate::speculative::DraftModel;
 use crate::speculative::DraftPlan;
 use crate::speculative::DraftResult;
 use crate::speculative::DraftStepItem;
 use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyRequestResult;
 use crate::speculative::VerifyResult;
 use crate::speculative::VerifyStepItem;
 use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
+
+/// Log target of the commit trace: the top two decodable tokens and logits of
+/// the forward row behind every token a prefill, decode, unified or verify
+/// step commits, which the lossless gates read to judge each token against the
+/// forward that committed it. The split-concurrent overlap steps never run with
+/// a drafter and are not traced. Trace level, so a debug run of the server
+/// never pays the device copy.
+pub const COMMIT_TRACE_TARGET: &str = "pegainfer_qwen3::committed_rows";
 
 #[derive(Clone)]
 pub struct PrefillStepItem {
@@ -77,13 +98,25 @@ pub struct PrefillStepItem {
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) max_output_tokens: usize,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
-    pub(crate) echo: bool,
+    /// Completion logprob top-k count (`None` = disabled, `Some(0)` = scored
+    /// token only).
+    pub(crate) logprobs: Option<usize>,
+    /// Prompt logprob top-k count; `Some(_)` needs all-position logits.
+    pub(crate) prompt_logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
-    /// the remaining suffix.
-    pub(crate) cached_tokens: usize,
+    /// the remaining suffix. `None` means no lookup ran (prefix caching off,
+    /// or a prompt-scoring request), which the metrics path must not count.
+    pub(crate) cached_tokens: Option<usize>,
+    /// How many of those cached tokens came from the external side (CPU
+    /// offload / P2P restore) rather than from local KV. `None` when no
+    /// connector was consulted for this request at all; `Some(0)` when it was
+    /// consulted and restored nothing. The scheduler subtracts it from
+    /// `cached_tokens` so restored blocks never count as local hits; the
+    /// external family itself is counted by the executor (see
+    /// [`ConnectorLookupCounters`]).
+    pub(crate) external_hit_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -93,6 +126,10 @@ pub struct PrefillStepItem {
     pub(crate) chunk_start: usize,
     /// Prompt tokens forwarded this step. Set by the executor.
     pub(crate) chunk_tokens: usize,
+    /// Target page IDs of the matched blocks whose draft K/V is resident and
+    /// content-tagged. Empty means no drafter restore (plain decode); the
+    /// target KV hit itself is unaffected.
+    pub(crate) capture_prefix_pages: Vec<i32>,
 }
 
 impl PrefillStepItem {
@@ -101,8 +138,8 @@ impl PrefillStepItem {
         prompt_tokens: Vec<u32>,
         max_output_tokens: usize,
         params: SamplingParams,
-        logprobs: usize,
-        echo: bool,
+        logprobs: Option<usize>,
+        prompt_logprobs: Option<usize>,
     ) -> Self {
         let chunk_tokens = prompt_tokens.len();
         Self {
@@ -111,12 +148,14 @@ impl PrefillStepItem {
             max_output_tokens,
             params,
             logprobs,
-            echo,
+            prompt_logprobs,
             lora_adapter: None,
-            cached_tokens: 0,
+            cached_tokens: None,
+            external_hit_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
+            capture_prefix_pages: Vec::new(),
         }
     }
 
@@ -151,7 +190,7 @@ pub struct DecodeStepItem {
     pub(crate) request_id: RequestId,
     pub(crate) token_id: u32,
     pub(crate) params: SamplingParams,
-    pub(crate) logprobs: usize,
+    pub(crate) logprobs: Option<usize>,
     pub(crate) lora_adapter: Option<String>,
 }
 
@@ -160,7 +199,7 @@ impl DecodeStepItem {
         request_id: RequestId,
         token_id: u32,
         params: SamplingParams,
-        logprobs: usize,
+        logprobs: Option<usize>,
     ) -> Self {
         Self {
             request_id,
@@ -178,131 +217,6 @@ impl DecodeStepItem {
     }
 }
 
-fn gather_decode_logprobs(
-    lane: &LocalQwen3Lane,
-    requests: &[DecodeStepItem],
-    logits: &HiddenStates,
-    row_offset: usize,
-    tokens: &[u32],
-) -> Result<Vec<Option<TokenLogprob>>> {
-    let wanted: Vec<usize> = requests
-        .iter()
-        .enumerate()
-        .filter(|(_, req)| req.logprobs > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let lp_requests: Vec<pegainfer_sample::LogprobRequest> = wanted
-        .iter()
-        .map(|&i| pegainfer_sample::LogprobRequest {
-            row: row_offset + i,
-            picked: tokens[row_offset + i],
-            top_k: requests[i].logprobs,
-        })
-        .collect();
-    let results =
-        pegainfer_sample::token_logprobs_batch(lane.model.device_ctx(), logits, &lp_requests)?;
-    let mut logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
-    for (i, lp) in wanted.into_iter().zip(results) {
-        logprobs[i] = Some(lp);
-    }
-    Ok(logprobs)
-}
-
-fn build_prefill_request_results(
-    lane: &LocalQwen3Lane,
-    requests: &[PrefillStepItem],
-    logits: &HiddenStates,
-    tokens: &[u32],
-    all_position_logits: Option<&HiddenStates>,
-    compute_prompt_logprobs: bool,
-) -> Result<Vec<PrefillRequestResult>> {
-    let ctx = lane.model.device_ctx();
-
-    let first_token_wanted: Vec<usize> = requests
-        .iter()
-        .enumerate()
-        .filter(|(_, req)| req.is_final_chunk() && req.logprobs > 0)
-        .map(|(i, _)| i)
-        .collect();
-    let first_token_requests: Vec<pegainfer_sample::LogprobRequest> = first_token_wanted
-        .iter()
-        .map(|&i| pegainfer_sample::LogprobRequest {
-            row: i,
-            picked: tokens[i],
-            top_k: requests[i].logprobs,
-        })
-        .collect();
-    let mut first_token_logprobs: Vec<Option<TokenLogprob>> = vec![None; requests.len()];
-    for (i, lp) in first_token_wanted
-        .into_iter()
-        .zip(pegainfer_sample::token_logprobs_batch(
-            ctx,
-            logits,
-            &first_token_requests,
-        )?)
-    {
-        first_token_logprobs[i] = Some(lp);
-    }
-
-    let mut prompt_requests: Vec<pegainfer_sample::LogprobRequest> = Vec::new();
-    if compute_prompt_logprobs && all_position_logits.is_some() {
-        let mut token_offset = 0usize;
-        for req in requests {
-            if req.echo {
-                for j in 1..req.prompt_tokens.len() {
-                    prompt_requests.push(pegainfer_sample::LogprobRequest {
-                        row: token_offset + j - 1,
-                        picked: req.prompt_tokens[j],
-                        top_k: req.logprobs,
-                    });
-                }
-            }
-            token_offset += req.chunk_tokens;
-        }
-    }
-    let mut prompt_results = match all_position_logits {
-        Some(all_logits) if !prompt_requests.is_empty() => Some(
-            pegainfer_sample::token_logprobs_batch(ctx, all_logits, &prompt_requests)?.into_iter(),
-        ),
-        _ => None,
-    };
-
-    let mut outputs = Vec::with_capacity(requests.len());
-    for (i, req) in requests.iter().enumerate() {
-        let completed = req.is_final_chunk();
-        let prompt_logprobs = if req.echo {
-            if compute_prompt_logprobs {
-                let mut echo_logprobs: Vec<Option<TokenLogprob>> =
-                    Vec::with_capacity(req.prompt_tokens.len());
-                echo_logprobs.push(None);
-                match &mut prompt_results {
-                    Some(results) => {
-                        for _ in 1..req.prompt_tokens.len() {
-                            echo_logprobs.push(results.next());
-                        }
-                    }
-                    None => echo_logprobs.resize(req.prompt_tokens.len(), None),
-                }
-                Some(echo_logprobs)
-            } else {
-                Some(vec![None; req.prompt_tokens.len()])
-            }
-        } else {
-            None
-        };
-        outputs.push(PrefillRequestResult {
-            request_id: req.request_id,
-            first_token: tokens[i],
-            first_token_logprob: first_token_logprobs[i].take(),
-            prompt_logprobs,
-            cached_tokens: req.cached_tokens,
-            completed,
-            prefill_pos: req.chunk_start + req.chunk_tokens,
-        });
-    }
-    Ok(outputs)
-}
-
 fn build_decode_request_results(
     lane: &LocalQwen3Lane,
     requests: &[DecodeStepItem],
@@ -310,7 +224,15 @@ fn build_decode_request_results(
     row_offset: usize,
     tokens: &[u32],
 ) -> Result<Vec<DecodeRequestResult>> {
-    let mut logprobs = gather_decode_logprobs(lane, requests, logits, row_offset, tokens)?;
+    let mut logprobs = gather_decode_logprobs(
+        lane.model.device_ctx(),
+        &DecodeRows {
+            requests,
+            logits,
+            tokens,
+            row_offset,
+        },
+    )?;
     Ok(requests
         .iter()
         .enumerate()
@@ -339,7 +261,15 @@ fn build_batch_decode_request_results(
         &mut lane.sample_scratch,
     )?;
 
-    let mut logprobs = gather_decode_logprobs(lane, requests, &lane.bufs.logits, 0, &tokens)?;
+    let mut logprobs = gather_decode_logprobs(
+        lane.model.device_ctx(),
+        &DecodeRows {
+            requests,
+            logits: &lane.bufs.logits,
+            row_offset: 0,
+            tokens: &tokens,
+        },
+    )?;
     Ok(requests
         .iter()
         .enumerate()
@@ -360,7 +290,6 @@ fn execute_step_on_lane(
         StepCommand::Prefill {
             requests,
             kv_views,
-            echo,
             sample_seed,
         } => {
             let prompts: Vec<&[u32]> = requests.iter().map(PrefillStepItem::as_slice).collect();
@@ -368,11 +297,16 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            // When DFlash is loaded, capture target hidden states for eligible
+            // A prefix hit already has the matched blocks' draft K/V in the
+            // paged pool; seed the request mirror before deciding eligibility
+            // so a warm request drafts exactly like a cold one.
+            lane.restore_dflash_prefix_captures(requests)?;
+            // When a drafter is loaded, capture target hidden states for eligible
             // requests so they can seed the draft model after prefill finishes.
-            let capture_requested = lane.should_capture_dflash_prefill_context(requests);
+            let capture_requested = lane.should_capture_dflash_prefill_context(requests)
+                || lane.should_capture_eagle3_prefill_context(requests);
             let capture_layer_ids = if capture_requested {
-                lane.dflash_capture_layer_ids()
+                lane.draft_capture_layer_ids()
             } else {
                 None
             };
@@ -380,27 +314,46 @@ fn execute_step_on_lane(
                 &prompts,
                 kv_views,
                 &lora_adapters,
-                *echo,
+                requests.iter().any(|req| req.prompt_logprobs.is_some()),
                 capture_layer_ids.as_deref(),
             )?;
-            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
-                requests,
-                capture_requested,
-                captured_hidden.as_ref(),
-            )?;
+            let draft_context_captured_requests = if lane.eagle3.is_some() {
+                lane.record_prefill_eagle3_context(
+                    requests,
+                    capture_requested,
+                    captured_hidden.as_ref(),
+                )?
+            } else {
+                lane.record_prefill_dflash_context(
+                    requests,
+                    kv_views,
+                    capture_requested,
+                    captured_hidden.as_ref(),
+                )?
+            };
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let rows: Vec<_> = requests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, req)| req.is_final_chunk())
+                        .map(|(i, req)| (req.request_id, i, req.chunk_start + req.chunk_tokens))
+                        .collect();
+                    lane.trace_committed_rows(&logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Prefill(PrefillResult {
                     requests: build_prefill_request_results(
-                        lane,
-                        requests,
-                        &logits,
-                        &tokens,
-                        all_position_logits.as_ref(),
-                        *echo,
+                        lane.model.device_ctx(),
+                        &PrefillRows {
+                            requests,
+                            logits: &logits,
+                            tokens: &tokens,
+                            all_position_logits: all_position_logits.as_ref(),
+                        },
                     )?,
-                    dflash_context_captured_requests,
+                    draft_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -424,8 +377,18 @@ fn execute_step_on_lane(
                 .collect();
             lane.execute_decode(&token_ids, kv_views, &lora_adapters)?;
             if collect_result {
+                let results = build_batch_decode_request_results(lane, requests, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let rows: Vec<_> = requests
+                        .iter()
+                        .zip(kv_views)
+                        .enumerate()
+                        .map(|(i, (req, view))| (req.request_id, i, view.seq_len()))
+                        .collect();
+                    lane.trace_committed_rows(&lane.bufs.logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Decode(DecodeResult {
-                    requests: build_batch_decode_request_results(lane, requests, *sample_seed)?,
+                    requests: results,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -467,14 +430,29 @@ fn execute_step_on_lane(
                     .chain(decode_requests.iter().map(|r| &r.params))
                     .collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
+                if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                    let prefill = prefill_requests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, req)| req.is_final_chunk())
+                        .map(|(i, req)| (req.request_id, i, req.chunk_start + req.chunk_tokens));
+                    let decode = decode_requests.iter().zip(decode_kv_views).enumerate().map(
+                        |(i, (req, view))| {
+                            (req.request_id, prefill_requests.len() + i, view.seq_len())
+                        },
+                    );
+                    let rows: Vec<_> = prefill.chain(decode).collect();
+                    lane.trace_committed_rows(&logits, &rows)?;
+                }
                 Ok(WorkerStepOutcome::Unified(UnifiedResult {
                     prefill_requests: build_prefill_request_results(
-                        lane,
-                        prefill_requests,
-                        &logits,
-                        &tokens,
-                        None,
-                        false,
+                        lane.model.device_ctx(),
+                        &PrefillRows {
+                            requests: prefill_requests,
+                            logits: &logits,
+                            tokens: &tokens,
+                            all_position_logits: None,
+                        },
                     )?,
                     decode_requests: build_decode_request_results(
                         lane,
@@ -592,19 +570,27 @@ fn execute_step_on_lane(
             requests,
             kv_views,
             sample_seed,
+            verify_round,
+            gated,
         } => {
             // One target forward over each request's K+1 draft span with a
             // speculative KV view. The fixed-buffer verify path computes all-
             // position logits (accept_prefix_match needs the target's committed
             // token at each span position) and captures the target hidden states
-            // (at the DFlash layers) to seed the next draft — all into reused,
+            // (at the drafter's layers) to seed the next draft — all into reused,
             // pointer-stable scratch (`VerifyGraphBuffers`).
-            let result = lane.execute_dflash_verify(requests, kv_views, *sample_seed)?;
+            let result =
+                lane.execute_draft_verify(requests, kv_views, *sample_seed, *verify_round, *gated)?;
             Ok(WorkerStepOutcome::SpeculativeVerify(result))
         }
-        StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
-            lane.execute_dflash_draft(requests)?,
-        )),
+        StepCommand::SpeculativeDraft { requests } => {
+            let result = if lane.eagle3.is_some() {
+                lane.execute_eagle3_draft(requests)?
+            } else {
+                lane.execute_dflash_draft(requests)?
+            };
+            Ok(WorkerStepOutcome::SpeculativeDraft(result))
+        }
     }
 }
 
@@ -655,7 +641,7 @@ fn tune_decode_gemm_algos(
 
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
-    let vocab = model.config().vocab_size;
+    let logits_rows = model.config().logits_rows;
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
@@ -668,7 +654,7 @@ fn tune_decode_gemm_algos(
             q_dim,
             kv_dim,
             intermediate,
-            vocab,
+            logits_rows,
         )?;
         let max_context = model.config().max_position_embeddings;
         log::info!(
@@ -718,7 +704,7 @@ fn tune_decode_gemm_algos(
         ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
-        ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
+        ops::gemm_lt_tune(ctx, &lm_head_samples, logits_rows, n)?;
     }
     Ok(())
 }
@@ -738,16 +724,16 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
     // Unified-N peak: one prefill chunk (≤ max_prefill_tokens) + (max_bucket−1) concurrent decoders;
     // rests on max_decode_batch_size == BATCH_BUCKETS.last().
     let ceiling = max_prefill_tokens + (*BATCH_BUCKETS.last().unwrap()).saturating_sub(1);
-    // lm_head (vocab×hidden) runs on the sampled-position count, not the token count: decode-only
+    // lm_head (logits_rows×hidden) runs on the sampled-position count, not the token count: decode-only
     // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
-    // echo/all-position runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
+    // all-position scoring runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
     let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
     let shapes = crate::batch_decode_buffers::decode_projection_pin_shapes(
         hidden,
         q_dim,
         kv_dim,
         intermediate,
-        model.config().vocab_size,
+        model.config().logits_rows,
     );
     // Per-shape N upper bound, in the same lm_head-last order as `shapes`: the unified-N peak for
     // every projection, the sampled-position count for lm_head.
@@ -774,7 +760,6 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
 
 pub struct PrefillPlan<'a> {
     pub requests: &'a [PrefillStepItem],
-    pub echo: bool,
     pub sample_seed: u64,
 }
 
@@ -789,6 +774,21 @@ pub struct UnifiedPlan<'a> {
     pub sample_seed: u64,
 }
 
+/// Cumulative connector (CPU offload / P2P) lookup counters, in tokens. A
+/// request's lookup is settled exactly once, whether it reaches its first
+/// prefill or leaves before it (cancelled, rejected, failed), so a lookup is
+/// never lost with the request that made it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorLookupCounters {
+    /// Prompt tokens the connector was asked about, fixed when the query was
+    /// issued: the prompt minus what sat in local KV at that moment.
+    pub queries: u64,
+    /// Of those, the tokens a committed load restored and the request's first
+    /// prefill matched. A request that leaves before its first prefill used
+    /// nothing it loaded.
+    pub hits: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrefillRequestResult {
     pub(crate) request_id: RequestId,
@@ -796,7 +796,15 @@ pub struct PrefillRequestResult {
     pub first_token_logprob: Option<TokenLogprob>,
     pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
-    pub cached_tokens: usize,
+    /// `None` when no lookup ran at all, which is the fact the /metrics
+    /// counters need: a disabled cache or a prompt-scoring request counts
+    /// nothing.
+    pub cached_tokens: Option<usize>,
+    /// How many of `cached_tokens` were restored from the external side (CPU
+    /// offload / P2P) rather than found in local KV. `None` when no
+    /// connector was consulted for this request; `Some(0)` when it was
+    /// consulted and restored nothing.
+    pub external_hit_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -814,10 +822,10 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
-    /// Requests whose DFlash target context was captured this prefill step.
+    /// Requests whose drafter target context was captured this prefill step.
     /// Empty unless speculative decoding is enabled. The executor folds these
-    /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
-    pub(crate) dflash_context_captured_requests: Vec<RequestId>,
+    /// into its `draft_ready_requests` set once the prompt is fully prefilled.
+    pub(crate) draft_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -864,9 +872,21 @@ pub(crate) trait ModelExecutor: Send {
         None
     }
 
+    /// Cumulative connector lookup counters. Zero for an executor that never
+    /// consults a connector.
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        ConnectorLookupCounters::default()
+    }
+
     /// Whether `request_id` has captured draft context and can be drafted.
     fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
         false
+    }
+
+    /// Most requests the loaded drafter proposes for in one round; `None` when
+    /// it drafts any decode batch.
+    fn max_draft_batch(&self) -> Option<usize> {
+        None
     }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
@@ -989,7 +1009,9 @@ pub struct Qwen3Executor {
     primary: RankWorker,
     workers: Vec<RankWorker>,
     loaded_lora_adapters: HashSet<String>,
-    prefix_cache_enabled: bool,
+    /// Requested prefix-cache state; read through `prefix_cache_enabled()`,
+    /// which also honours the drafter override.
+    prefix_cache_requested: bool,
     lora_options: Qwen3LoraOptions,
     /// pegaflow KV-offload bridge; `None` unless offload is opted in on the
     /// single-GPU path. Drives both the SAVE hook and the async LOAD prefetch.
@@ -1001,6 +1023,22 @@ pub struct Qwen3Executor {
     /// In-flight CPU→GPU prefetches keyed by request, parked until their load
     /// settles and the blocks register into the prefix cache.
     prefetch: HashMap<RequestId, PrefetchState>,
+    /// Requests whose connector was actually queried, whether it answered with
+    /// a hit or a miss, mapped to the prompt tokens that query covered (the
+    /// prompt minus the probe's local GPU hit at query time). The prefetch
+    /// state above is dropped on every non-carrying outcome (a scratch
+    /// prefill, a released lease, a failed load), so its absence cannot be
+    /// read as "never asked". This marker is what keeps a connector miss in
+    /// the external counters, instead of reporting only successful restores
+    /// and inflating the external hit rate. The width is kept here rather
+    /// than re-derived at admission: a request is offered to the connector
+    /// once and may stay deferred while the local cache grows, so the
+    /// admission-time match no longer describes the query that was sent.
+    /// Each entry is settled into `connector_lookups` exactly once, by
+    /// [`Qwen3Executor::settle_connector_lookup`].
+    connector_consulted: HashMap<RequestId, usize>,
+    /// Cumulative external-side lookup counters; see [`ConnectorLookupCounters`].
+    connector_lookups: ConnectorLookupCounters,
     /// Offload pure-L2 mode. When set, completed blocks are not kept for
     /// cross-request HBM reuse: the prefetch probe drains the inactive pool
     /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
@@ -1023,21 +1061,38 @@ pub struct Qwen3Executor {
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<cudarc::driver::CudaEvent>,
-    /// DFlash draft metadata; `Some` once a draft model is loaded into the
+    /// Bytes the KV budget set aside for request-owned draft state (the pool
+    /// shrink from `dflash_kv_bytes_per_token`). Zero without a drafter.
+    draft_state_budget_bytes: usize,
+    /// Per-token bytes one request's draft state owns; charged against
+    /// `draft_state_budget_bytes`.
+    draft_request_state_bytes_per_token: usize,
+    /// Per target block: the SequenceHash whose draft K/V rows are in the paged
+    /// draft pool. `None` means the block was never materialized.
+    draft_kv_tags: Vec<Option<[u8; 16]>>,
+    /// Requests whose DFlash state exists and whose draft K/V was materialized.
+    draft_state_requests: HashSet<RequestId>,
+    /// Per request, how many of its assigned blocks already carry their draft
+    /// K/V tag. The assigned list is append-only for a live sequence, so a step
+    /// tags only the tail it just registered instead of walking the prefix.
+    draft_kv_tag_cursor: HashMap<RequestId, usize>,
+    /// Draft model metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
-    speculative: Option<DFlashMeta>,
-    /// Cumulative acceptance counters for the DFlash path, set and cleared
+    speculative: Option<DraftMeta>,
+    /// Cumulative acceptance counters for the speculative path, set and cleared
     /// together with `speculative` above. Written in
     /// `execute_speculative_verify_impl`, read by `publish_load`.
     spec_decode_counters: Option<SpecDecodeCounters>,
-    /// Requests whose DFlash context is captured and ready to draft. A request
+    /// Requests whose draft context is captured and ready to draft. A request
     /// enters this set when its prompt finishes prefilling with captured target
     /// context, and leaves on retire or a plain (non-speculative) decode.
-    dflash_ready_requests: HashSet<RequestId>,
+    draft_ready_requests: HashSet<RequestId>,
     /// CUDA device ordinal this executor was built on. Used by
     /// [`enable_decode_overlap`] to create overlap streams on the correct
     /// device (the model, KV cache, and compute stream all live here).
     device_ordinal: usize,
+    /// Monotonic ID for correlating per-round speculative verify diagnostics.
+    verify_round: u64,
 }
 
 /// One request's in-flight CPU-tier KV prefetch.
@@ -1138,7 +1193,9 @@ impl Qwen3Executor {
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
         dflash_kv_bytes_per_token: usize,
+        dflash_request_state_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
+        hedge_scratch_pages: usize,
     ) -> Result<Self> {
         let (model, budget) = profile_kv_budget_on_worker(
             model,
@@ -1146,13 +1203,24 @@ impl Qwen3Executor {
             dflash_kv_bytes_per_token,
             memory_options,
         )?;
-        let kv_mgr = KvCacheManager::new(
+        // The pool was shrunk by the draft's per-token term for every pool
+        // block; that is the memory set aside for request-owned draft state.
+        // Charge each request against this budget so shared prefixes (where the
+        // pool only bills one physical copy) cannot allocate more lane state
+        // than was reserved.
+        let draft_state_budget_bytes = crate::sizing::product(&[
+            budget.num_blocks,
+            budget.block_size,
+            dflash_kv_bytes_per_token,
+        ])?;
+        let kv_mgr = KvCacheManager::new_with_scratch_pages(
             &model.device_ctx().stream,
             budget.num_layers,
             budget.num_kv_heads,
             budget.head_dim,
             budget.block_size,
             budget.num_blocks,
+            hedge_scratch_pages,
         )?;
         let device_ordinal = model.device_ctx().device_ordinal;
         let metadata = Qwen3ExecutorMetadata {
@@ -1219,11 +1287,13 @@ impl Qwen3Executor {
             )?,
             workers: Vec::new(),
             loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
+            prefix_cache_requested: true,
             lora_options: Qwen3LoraOptions::default(),
             offload,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            connector_consulted: HashMap::new(),
+            connector_lookups: ConnectorLookupCounters::default(),
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
@@ -1234,10 +1304,16 @@ impl Qwen3Executor {
             vllm_compat,
             overlap: None,
             async_prefill: None,
+            draft_state_budget_bytes,
+            draft_request_state_bytes_per_token: dflash_request_state_bytes_per_token,
+            draft_kv_tags: vec![None; total_blocks],
+            draft_state_requests: HashSet::new(),
+            draft_kv_tag_cursor: HashMap::new(),
             speculative: None,
             spec_decode_counters: None,
-            dflash_ready_requests: HashSet::new(),
+            draft_ready_requests: HashSet::new(),
             device_ordinal,
+            verify_round: 0,
         })
     }
 
@@ -1279,7 +1355,7 @@ impl Qwen3Executor {
             lora_options,
             offload_options,
             max_prefill_tokens,
-            dflash_draft_path,
+            dflash_draft_path.map(DraftModel::DFlash),
             memory_options,
             crate::DecodeOverlap::Off,
         )
@@ -1297,7 +1373,7 @@ impl Qwen3Executor {
         lora_options: Qwen3LoraOptions,
         offload_options: Qwen3OffloadOptions,
         max_prefill_tokens: usize,
-        dflash_draft_path: Option<&str>,
+        draft: Option<DraftModel<'_>>,
         memory_options: Qwen3MemoryOptions,
         decode_overlap: crate::DecodeOverlap,
     ) -> Result<Self> {
@@ -1316,6 +1392,12 @@ impl Qwen3Executor {
         let policy = pegainfer_kernels::ops::numeric_policy();
         ensure_pertoken_single_gpu(policy, device_ordinals.len())?;
         ensure_pertoken_overlap_disabled(policy, decode_overlap)?;
+
+        // Refuse unsupported draft checkpoints before loading the target, so a
+        // DSpine config fails for its own reason instead of during KV sizing.
+        if let Some(DraftModel::DFlash(path)) = draft {
+            crate::config::DFlashConfig::from_file(path)?.ensure_servable()?;
+        }
 
         if policy == NumericPolicy::PerToken {
             if enable_cuda_graph {
@@ -1345,36 +1427,96 @@ impl Qwen3Executor {
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
                     decode_overlap,
-                    dflash_enabled: dflash_draft_path.is_some(),
+                    draft_enabled: draft.is_some(),
                 },
             )?;
-            // The DFlash draft model loads after profiling but lives outside the
+            // The draft model loads after profiling but lives outside the
             // paged KV pool, so reserve its footprint up front from the draft
             // config: fixed bytes (weights + block scratch) via the margin, and
             // pool-scaling per-token bytes folded into the block budget.
-            let dflash_kv_bytes_per_token = match dflash_draft_path {
-                Some(path) => {
+            let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
+            // The draft K/V lives in a paged pool addressed by the target's
+            // block IDs; there is no separate side-cache budget.
+            let (
+                draft_kv_bytes_per_token,
+                draft_request_state_bytes_per_token,
+                hedge_scratch_pages,
+            ) = match draft {
+                Some(DraftModel::DFlash(path)) => {
                     let reservation = crate::dflash::DFlashMemoryReservation::from_path(
                         path,
-                        *BATCH_BUCKETS.last().unwrap(),
+                        model.config().logits_rows,
+                        max_verify_batch,
+                        max_prefill_tokens,
                     )?;
-                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
-                    reservation.kv_bytes_per_token
+                    memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
+                        memory_options.kv_cache_memory_margin_bytes,
+                        reservation.fixed_bytes,
+                    ])?;
+                    // Hedge-chain scratch KV pages (PEGAINFER_SPEC_HEDGE)
+                    // live in the KV buffer but outside the pool; bill them
+                    // via the margin so the profiled block budget shrinks to
+                    // fit instead of OOMing. Each chain span touches at most
+                    // `pages_per_chain` pages, and two bounds cap the spans:
+                    // the effective geometry and the expanded verify batch,
+                    // which holds at most `max_verify_batch - 1` hedge spans
+                    // at once.
+                    let geometry = dflash_lane::spec_hedge_effective(reservation.block_size);
+                    let pages_per_chain = dflash_lane::hedge_pages_per_chain(
+                        reservation.block_size,
+                        memory_options.page_size,
+                    );
+                    let pages = if reservation.uses_markov_head {
+                        geometry
+                            .chain_spans
+                            .min(max_verify_batch - 1)
+                            .saturating_mul(pages_per_chain)
+                    } else {
+                        // A plain DFlash drafter can never hedge; a nonzero
+                        // hedge env must not reserve scratch it cannot use.
+                        0
+                    };
+                    (
+                        reservation.kv_bytes_per_token,
+                        reservation.request_state_bytes_per_token,
+                        pages,
+                    )
                 }
-                None => 0,
+                Some(DraftModel::Eagle3(path)) => {
+                    let reservation = crate::eagle3::Eagle3MemoryReservation::from_path(
+                        path,
+                        max_prefill_tokens,
+                        crate::eagle3::EAGLE3_MAX_BATCH,
+                    )?;
+                    memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
+                        memory_options.kv_cache_memory_margin_bytes,
+                        reservation.fixed_bytes,
+                    ])?;
+                    (reservation.kv_bytes_per_token, 0, 0)
+                }
+                None => (0, 0, 0),
             };
+            if hedge_scratch_pages > 0 {
+                let page_bytes = model.kv_page_bytes(memory_options.page_size)?;
+                memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
+                    memory_options.kv_cache_memory_margin_bytes,
+                    crate::sizing::product(&[hedge_scratch_pages, page_bytes])?,
+                ])?;
+            }
             let mut executor = Self::single(
                 model,
                 &offload_options,
                 max_prefill_tokens,
-                dflash_kv_bytes_per_token,
+                draft_kv_bytes_per_token,
+                draft_request_state_bytes_per_token,
                 memory_options,
+                hedge_scratch_pages,
             )?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
         anyhow::ensure!(
-            dflash_draft_path.is_none(),
+            draft.is_none(),
             "speculative decoding requires the single-GPU path (got {} devices)",
             device_ordinals.len()
         );
@@ -1395,7 +1537,7 @@ impl Qwen3Executor {
                     max_loras: lora_options.max_loras,
                     max_lora_rank: lora_options.max_lora_rank,
                     decode_overlap,
-                    dflash_enabled: false,
+                    draft_enabled: false,
                 },
             )?);
         }
@@ -1582,26 +1724,52 @@ impl Qwen3Executor {
             primary,
             workers,
             loaded_lora_adapters: HashSet::new(),
-            prefix_cache_enabled: true,
+            prefix_cache_requested: true,
             lora_options,
             // Offload is single-GPU only (asserted above); never built here.
             offload: None,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
+            connector_consulted: HashMap::new(),
+            connector_lookups: ConnectorLookupCounters::default(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
             vllm_compat: None,
             overlap: None,
             async_prefill: None,
+            draft_state_budget_bytes: 0,
+            draft_request_state_bytes_per_token: 0,
+            draft_kv_tags: Vec::new(),
+            draft_state_requests: HashSet::new(),
+            draft_kv_tag_cursor: HashMap::new(),
             speculative: None,
             spec_decode_counters: None,
-            dflash_ready_requests: HashSet::new(),
+            draft_ready_requests: HashSet::new(),
             device_ordinal: device_ordinals[0],
+            verify_round: 0,
         })
     }
 
     pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         <Self as ModelExecutor>::drop_request(self, request_id)
+    }
+
+    pub fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        <Self as ModelExecutor>::connector_lookup_counters(self)
+    }
+
+    /// The one place a connector lookup reaches the counters: consume the
+    /// request's consulted marker and add its query width and `external_hits`.
+    /// Both exits a consulted request can take — its first prefill and an
+    /// early drop — pass through here, and consuming the marker makes any
+    /// later call a no-op. Returns whether a lookup was settled.
+    fn settle_connector_lookup(&mut self, request_id: RequestId, external_hits: usize) -> bool {
+        let Some(queried) = self.connector_consulted.remove(&request_id) else {
+            return false;
+        };
+        self.connector_lookups.queries += queried as u64;
+        self.connector_lookups.hits += external_hits as u64;
+        true
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -1627,14 +1795,26 @@ impl Qwen3Executor {
     /// creates duplicate primaries outside request-level capacity accounting.
     pub fn set_prefix_cache_enabled(&mut self, enabled: bool) {
         let retained_before = self.retains_completed_kv_blocks();
-        self.prefix_cache_enabled = enabled;
+        self.prefix_cache_requested = enabled;
         self.finish_retention_transition(retained_before);
+    }
+
+    /// Whether prefix reuse is actually in effect. A loaded drafter keeps it on
+    /// when it can restore its state from the target's block IDs (DFlash /
+    /// DSpark materialize draft K/V into a paged pool addressed by those IDs);
+    /// EAGLE-3 still forces it off.
+    fn prefix_cache_enabled(&self) -> bool {
+        self.prefix_cache_requested
+            && self
+                .speculative
+                .as_ref()
+                .is_none_or(|meta| meta.supports_prefix_cache)
     }
 
     /// Whether a completed request should leave its registered GPU blocks in
     /// the inactive L1 cache for a later prefix match.
     fn retains_completed_kv_blocks(&self) -> bool {
-        self.prefix_cache_enabled && !self.l1_retention_disabled
+        self.prefix_cache_enabled() && !self.l1_retention_disabled
     }
 
     /// Drain blocks retained under the old policy once when L1 retention is
@@ -1706,14 +1886,14 @@ impl Qwen3Executor {
         }
     }
 
-    /// Enable speculative decoding by loading a DFlash draft model into the
-    /// primary lane.
+    /// Enable speculative decoding by loading a draft model into the primary
+    /// lane.
     ///
     /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
-    /// is incompatible with KV offload. Disables the prefix cache: speculative
-    /// capture needs clean, uncached target hidden states for every prompt
-    /// token, and a prefix-cache hit skips the forward that would produce them.
-    pub(crate) fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+    /// is incompatible with KV offload. DFlash keeps the prefix cache on: a hit
+    /// restores its draft K/V from the target's block IDs. EAGLE-3 disables it,
+    /// because a hit skips the forward that would produce its hidden state.
+    pub(crate) fn load_draft_model(&mut self, draft: DraftModel<'_>) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
             "speculative decoding requires the single-GPU path (got {} extra ranks)",
@@ -1723,13 +1903,34 @@ impl Qwen3Executor {
             self.offload.is_none(),
             "speculative decoding is not supported together with KV offload"
         );
-        let meta = self.primary.load_dflash(draft_path.to_string())?;
+        let meta = match draft {
+            DraftModel::DFlash(path) => {
+                let meta = self.primary.load_dflash(
+                    path.to_string(),
+                    self.prefix_cache_requested,
+                    self.draft_state_budget_bytes,
+                    self.draft_request_state_bytes_per_token,
+                )?;
+                log::info!(
+                    "Qwen3 DFlash speculative decoding enabled: draft block size {}",
+                    meta.block_size
+                );
+                meta
+            }
+            DraftModel::Eagle3(path) => {
+                let meta = self.primary.load_eagle3(path.to_string())?;
+                log::info!(
+                    "Qwen3 EAGLE-3 speculative decoding enabled: {} drafts per round, \
+                     greedy batch-1 only",
+                    meta.num_spec_tokens
+                );
+                meta
+            }
+        };
         let counters = SpecDecodeCounters::new(meta.num_spec_tokens)?;
-        log::info!(
-            "Qwen3 DFlash speculative decoding enabled: draft block size {}",
-            meta.block_size
-        );
-        self.set_prefix_cache_enabled(false);
+        if !meta.supports_prefix_cache {
+            self.set_prefix_cache_enabled(false);
+        }
         self.spec_decode_counters = Some(counters);
         self.speculative = Some(meta);
         Ok(())
@@ -1843,16 +2044,58 @@ impl Qwen3Executor {
                 req.max_output_tokens,
                 req.lora_adapter.as_deref(),
             );
-            // Echo needs logits for every prompt position; cached positions
-            // are never forwarded, so echo requests prefill from scratch.
-            if self.prefix_cache_enabled && !req.echo {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+            // Prompt scoring needs logits for every prompt position; cached positions
+            // are never forwarded, so prompt-logprob requests prefill from scratch.
+            if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
+                let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                req.cached_tokens = Some(matched);
+                // A matched block is restorable only when the draft pool holds
+                // its rows for this exact content. A block produced without a
+                // drafter state (ineligible request) has no tag; a reused block
+                // has a different content tag. Either way the request keeps its
+                // target KV hit and plain-decodes.
+                let matched_blocks = matched / self.metadata.block_size;
+                let mut pages = Vec::with_capacity(matched_blocks);
+                let mut restorable = true;
+                for (page, hash) in rkv.assigned_block_hashes().into_iter().take(matched_blocks) {
+                    let tagged = page >= 0
+                        && self.draft_kv_tags.get(page as usize).and_then(|tag| *tag) == Some(hash);
+                    if !tagged {
+                        restorable = false;
+                        break;
+                    }
+                    pages.push(page);
+                }
+                if restorable {
+                    req.capture_prefix_pages = pages;
+                }
+                // What the connector restored is not a local hit. Only the
+                // blocks a load committed onto the probe (held past its GPU
+                // hit) crossed the connector; anything else in the match was
+                // local, including blocks another request registered while
+                // this one was parked. A request whose probe is already gone
+                // (a scratch prefill, a released lease) restored nothing.
+                // `None` means no connector was consulted at all, so there is
+                // no external leg to report.
+                let block_size = self.metadata.block_size;
+                let external = self.prefetch.get(&req.request_id).map_or(0, |state| {
+                    let gpu_hit = state.probe.gpu_hit_blocks();
+                    let loaded = state.probe.held_blocks() - gpu_hit;
+                    (loaded * block_size).min(matched.saturating_sub(gpu_hit * block_size))
+                });
+                if self.settle_connector_lookup(req.request_id, external) {
+                    req.external_hit_tokens = Some(external);
+                }
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
             // blocks (now held by the request's sequence), so release the
             // prefetch's separate hold.
             self.prefetch.remove(&req.request_id);
+            // A consulted request that skipped the match (prompt scoring)
+            // still asked the connector: settle it as a miss. A no-op once the
+            // branch above has settled it.
+            self.settle_connector_lookup(req.request_id, 0);
         }
         let rkv = self
             .request_kvs
@@ -1860,9 +2103,10 @@ impl Qwen3Executor {
             .expect("inserted above");
         req.chunk_start = rkv.kv_position();
         let remaining = req.prompt_tokens.len() - req.chunk_start;
-        // Echo must produce all-position logits in a single forward, so it is
-        // exempt from chunking (the scheduler never splits echo requests).
-        req.chunk_tokens = if req.echo {
+        // Prompt-logprobs requests must produce all-position logits in a
+        // single forward, so they are exempt from chunking (the scheduler
+        // never splits them).
+        req.chunk_tokens = if req.prompt_logprobs.is_some() {
             remaining
         } else {
             remaining.min(req.chunk_budget)
@@ -1889,7 +2133,38 @@ impl Qwen3Executor {
             rkv.apply_prefill(result.first_token, self.kv_mgr.pool())
         } else {
             rkv.apply_prefill_chunk(self.kv_mgr.pool())
+        }?;
+        self.tag_draft_blocks(result.request_id);
+        Ok(())
+    }
+
+    /// Tag the blocks a request registered since the previous pass. The
+    /// block's draft K/V rows were materialized before the apply, so a later
+    /// prefix match can trust the pool for exactly this content hash.
+    fn tag_draft_blocks(&mut self, request_id: RequestId) {
+        if !self.prefix_cache_enabled()
+            || !self.draft_state_requests.contains(&request_id)
+            || self.draft_kv_tags.is_empty()
+        {
+            return;
         }
+        let Some(rkv) = self.request_kvs.get(&request_id) else {
+            return;
+        };
+        let cursor = self
+            .draft_kv_tag_cursor
+            .get(&request_id)
+            .copied()
+            .unwrap_or(0);
+        let (tail, assigned) = rkv.assigned_block_hashes_from(cursor);
+        for (page, hash) in tail {
+            if page >= 0
+                && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
+            {
+                *tag = Some(hash);
+            }
+        }
+        self.draft_kv_tag_cursor.insert(request_id, assigned);
     }
 
     // ── KV-offload LOAD (async CPU-tier prefetch) ──────────────────────
@@ -2112,39 +2387,94 @@ impl Qwen3Executor {
         }
     }
 
-    fn wait_for_step_ack(
-        pending: Vec<channel::Receiver<Result<WorkerStepOutcome>>>,
-        op_name: &'static str,
-    ) -> Result<()> {
-        for recv in pending {
-            match recv
-                .recv()
-                .map_err(|_| anyhow::anyhow!("tensor-parallel {op_name} worker dropped"))??
-            {
-                WorkerStepOutcome::Ack => {}
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "tensor-parallel {op_name} worker returned unexpected payload: {}",
-                        other.kind()
-                    ));
-                }
-            }
+    /// A lost tensor-parallel rank can leave its peers in an unpaired NCCL collective,
+    /// where joining them, freeing device memory and exit's cudart teardown all block,
+    /// so that executor aborts like the pre-capture watchdog. A single rank reports the
+    /// loss and the engine shuts down.
+    fn rank_lost(&self, rank: usize, what: &str) -> anyhow::Error {
+        if !self.workers.is_empty() {
+            log::error!(
+                "FATAL: tensor-parallel rank {rank} {what}; aborting because its peers may be stuck in NCCL"
+            );
+            std::process::abort();
         }
-        Ok(())
+        worker_lost(format!("rank {rank} {what}"))
     }
 
     fn run_step(&self, step: &StepCommand) -> Result<WorkerStepOutcome> {
-        let primary = self.primary.run_step(step.clone(), true)?;
+        let primary = self
+            .primary
+            .run_step(step.clone(), true)
+            .map_err(|_| self.rank_lost(0, "step channel closed"))?;
         let mut pending = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
-            pending.push(worker.run_step(step.clone(), false)?);
+        for (index, worker) in self.workers.iter().enumerate() {
+            let response = worker
+                .run_step(step.clone(), false)
+                .map_err(|_| self.rank_lost(index + 1, "step channel closed"))?;
+            pending.push(response);
         }
-        let primary_result = primary
-            .recv()
-            .map_err(|_| anyhow::anyhow!("primary worker dropped step response"))??;
-        Self::wait_for_step_ack(pending, step.kind())?;
-        Ok(primary_result)
+        await_step_responses(&primary, &pending, step.kind())
+            .map_err(|rank| self.rank_lost(rank, "dropped its step response"))?
     }
+}
+
+/// Rank 0's step response once every peer has acked, with all ranks watched at once: a
+/// rank that dies mid step can leave the others blocked in an unpaired collective, so
+/// its closed channel returns `Err(rank)` right away, rank 0 being the primary. An error
+/// from rank 0 returns at once, and a peer error as soon as rank 0 has responded.
+fn await_step_responses(
+    primary: &channel::Receiver<Result<WorkerStepOutcome>>,
+    peers: &[channel::Receiver<Result<WorkerStepOutcome>>],
+    op_name: &'static str,
+) -> std::result::Result<Result<WorkerStepOutcome>, usize> {
+    let mut primary_outcome = None;
+    let mut waiting: Vec<usize> = (0..peers.len()).collect();
+    let mut peer_error = None;
+    while primary_outcome.is_none() || !waiting.is_empty() {
+        let mut select = channel::Select::new();
+        let primary_op = primary_outcome.is_none().then(|| select.recv(primary));
+        let peer_ops: Vec<usize> = waiting
+            .iter()
+            .map(|&peer| select.recv(&peers[peer]))
+            .collect();
+        let op = select.select();
+        let index = op.index();
+        if primary_op == Some(index) {
+            match op.recv(primary) {
+                Ok(Ok(outcome)) => primary_outcome = Some(outcome),
+                Ok(Err(error)) => return Ok(Err(error)),
+                Err(_) => return Err(0),
+            }
+        } else {
+            let slot = peer_ops
+                .iter()
+                .position(|&op_index| op_index == index)
+                .expect("the selected operation is a registered peer");
+            let peer = waiting.remove(slot);
+            match op.recv(&peers[peer]) {
+                Ok(Ok(WorkerStepOutcome::Ack)) => {}
+                Ok(Ok(other)) => {
+                    peer_error.get_or_insert_with(|| {
+                        anyhow::anyhow!(
+                            "tensor-parallel {op_name} worker returned unexpected payload: {}",
+                            other.kind()
+                        )
+                    });
+                }
+                Ok(Err(error)) => {
+                    peer_error.get_or_insert(error);
+                }
+                Err(_) => return Err(peer + 1),
+            }
+        }
+        if primary_outcome.is_some()
+            && let Some(error) = peer_error.take()
+        {
+            return Ok(Err(error));
+        }
+    }
+    let outcome = primary_outcome.expect("the loop ends after rank 0 responds");
+    Ok(Ok(outcome))
 }
 
 fn profile_kv_budget_on_worker(
@@ -2274,8 +2604,8 @@ impl ModelExecutor for Qwen3Executor {
     fn max_context_tokens(&self) -> usize {
         let target = self.metadata.config.max_position_embeddings;
         match &self.speculative {
-            // The draft's fixed-width in-fill block writes `block_size` positions
-            // past the committed length each step, so a request may use at most
+            // A draft round writes up to `block_size` positions past the
+            // committed length each step, so a request may use at most
             // `draft.max_pos - block_size` tokens before the draft cache would
             // overflow. Reject the rest at admission instead of crashing mid-prefill.
             Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
@@ -2293,6 +2623,10 @@ impl ModelExecutor for Qwen3Executor {
 
     fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
         self.spec_decode_counters
+    }
+
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        self.connector_lookups
     }
 
     fn is_stop_token(&self, token_id: u32) -> bool {
@@ -2348,10 +2682,17 @@ impl ModelExecutor for Qwen3Executor {
                 let _ = handle.wait();
             }
         }
+        // A request that leaves before its first prefill (cancelled while
+        // deferred, rejected, failed) still asked the connector: settle the
+        // lookup as a miss, since it never used what was loaded. A no-op for a
+        // request whose first prefill already settled it.
+        self.settle_connector_lookup(request_id, 0);
         self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
-            self.dflash_ready_requests.remove(&request_id);
-            self.primary.drop_dflash_request(request_id)?;
+            self.draft_ready_requests.remove(&request_id);
+            self.draft_state_requests.remove(&request_id);
+            self.draft_kv_tag_cursor.remove(&request_id);
+            self.primary.drop_draft_request(request_id)?;
         }
         Ok(())
     }
@@ -2366,7 +2707,7 @@ impl ModelExecutor for Qwen3Executor {
         let Some(offload) = self.offload.as_ref() else {
             return false;
         };
-        if !self.prefix_cache_enabled {
+        if !self.prefix_cache_enabled() {
             return false;
         }
         if self.l1_retention_disabled {
@@ -2417,6 +2758,16 @@ impl ModelExecutor for Qwen3Executor {
             .is_some_and(|c| c.consecutive_miss_windows < MISS_BREAKER_THRESHOLD);
         let park_on_loading = self.vllm_compat.is_none() || expect_remote;
         let available_blocks = self.kv_mgr.pool().available_blocks();
+        // The first-shot query below always runs (`false` = not timed out), so
+        // the connector is consulted from here on, whatever it answers. Record
+        // that before the call: a miss, an error, or a released lease must
+        // still report an external lookup, and only the early returns above
+        // stay uncounted.
+        let local_at_query = probe.gpu_hit_blocks() * self.metadata.block_size;
+        self.connector_consulted.insert(
+            request_id,
+            prompt_tokens.len().saturating_sub(local_at_query),
+        );
         let action = remote_fetch_action(
             false,
             expect_remote,
@@ -2566,7 +2917,6 @@ impl ModelExecutor for Qwen3Executor {
         let step = StepCommand::Prefill {
             requests,
             kv_views,
-            echo: plan.echo,
             sample_seed: plan.sample_seed,
         };
         let outcome = self.run_step(&step)?;
@@ -2581,6 +2931,13 @@ impl ModelExecutor for Qwen3Executor {
                 ));
             }
         };
+        // The lane created these states during the forward. Insert them before
+        // the apply so the post-apply tag pass can mark the blocks this chunk
+        // just materialized (a prefill-only turn never gets a later verify to
+        // catch up).
+        for &request_id in &result.draft_context_captured_requests {
+            self.draft_state_requests.insert(request_id);
+        }
         for req_result in &result.requests {
             self.apply_prefill_result(req_result)?;
         }
@@ -2590,18 +2947,22 @@ impl ModelExecutor for Qwen3Executor {
         if self.speculative.is_some() {
             for req_result in &result.requests {
                 let captured = result
-                    .dflash_context_captured_requests
+                    .draft_context_captured_requests
                     .contains(&req_result.request_id);
                 match dflash_prefill_action(captured, req_result.completed) {
                     DFlashPrefillAction::MarkReady => {
-                        self.dflash_ready_requests.insert(req_result.request_id);
+                        self.draft_ready_requests.insert(req_result.request_id);
+                        self.draft_state_requests.insert(req_result.request_id);
                     }
                     DFlashPrefillAction::KeepPending => {
-                        self.dflash_ready_requests.remove(&req_result.request_id);
+                        self.draft_ready_requests.remove(&req_result.request_id);
+                        self.draft_state_requests.insert(req_result.request_id);
                     }
                     DFlashPrefillAction::Drop => {
-                        self.dflash_ready_requests.remove(&req_result.request_id);
-                        self.primary.drop_dflash_request(req_result.request_id)?;
+                        self.draft_ready_requests.remove(&req_result.request_id);
+                        self.draft_state_requests.remove(&req_result.request_id);
+                        self.draft_kv_tag_cursor.remove(&req_result.request_id);
+                        self.primary.drop_draft_request(req_result.request_id)?;
                     }
                 }
             }
@@ -2673,8 +3034,10 @@ impl ModelExecutor for Qwen3Executor {
         // any captured draft context is now stale — drop it.
         if self.speculative.is_some() {
             for req_result in &result.requests {
-                if self.dflash_ready_requests.remove(&req_result.request_id) {
-                    self.primary.drop_dflash_request(req_result.request_id)?;
+                if self.draft_ready_requests.remove(&req_result.request_id) {
+                    self.draft_state_requests.remove(&req_result.request_id);
+                    self.draft_kv_tag_cursor.remove(&req_result.request_id);
+                    self.primary.drop_draft_request(req_result.request_id)?;
                 }
             }
         }
@@ -2699,7 +3062,13 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn speculative_request_ready(&self, request_id: RequestId) -> bool {
-        self.dflash_ready_requests.contains(&request_id)
+        self.draft_ready_requests.contains(&request_id)
+    }
+
+    fn max_draft_batch(&self) -> Option<usize> {
+        self.speculative
+            .as_ref()
+            .and_then(|meta| meta.max_draft_batch)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
@@ -2718,6 +3087,21 @@ impl ModelExecutor for Qwen3Executor {
                     .iter()
                     .all(|request| request.lora_adapter.is_none()),
             "LoRA prefill does not support decode-overlap"
+        );
+        // The fused forward captures no target hidden context, so a request the
+        // drafter could capture must never ride it: the request would never
+        // become draft-ready and its drafter would silently no-op for the rest
+        // of the conversation. The scheduler routes these to a dedicated
+        // prefill (a loose superset in `build_next_plan`); this is the
+        // executor's strict, fail-closed side of the same contract.
+        let stranded = dflash_prefill::capture_requests_in_unified(
+            self.speculative.is_some(),
+            plan.prefill_requests,
+        );
+        anyhow::ensure!(
+            stranded.is_empty(),
+            "capture-eligible prefill reached the unified step for {stranded:?}; \
+             route it to a dedicated prefill"
         );
 
         // 1. Create RequestKvs for prefill requests (first chunk only), clamp
@@ -2792,8 +3176,10 @@ impl ModelExecutor for Qwen3Executor {
                 // need DFlash mark-ready here.)
                 if self.speculative.is_some() {
                     for req_result in &result.decode_requests {
-                        if self.dflash_ready_requests.remove(&req_result.request_id) {
-                            self.primary.drop_dflash_request(req_result.request_id)?;
+                        if self.draft_ready_requests.remove(&req_result.request_id) {
+                            self.draft_state_requests.remove(&req_result.request_id);
+                            self.draft_kv_tag_cursor.remove(&req_result.request_id);
+                            self.primary.drop_draft_request(req_result.request_id)?;
                         }
                     }
                 }
@@ -2836,7 +3222,7 @@ impl ModelExecutor for Qwen3Executor {
                     }
                     let rx = self.primary.resolve_prefill()?;
                     rx.recv().map_err(|_| {
-                        anyhow::anyhow!("worker dropped resolve_prefill on decode-error path")
+                        worker_lost("worker dropped resolve_prefill on decode-error path")
                     })??;
                     return Err(e);
                 }
@@ -3095,8 +3481,45 @@ impl ModelExecutor for Qwen3Executor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Duration;
 
+    use crossbeam_channel as channel;
+
+    use super::WorkerStepOutcome;
+    use super::await_step_responses;
     use super::ensure_lora_capacity;
+
+    type StepResponse = anyhow::Result<WorkerStepOutcome>;
+
+    /// The lost rank `await_step_responses` reports, failing instead of hanging if it blocks.
+    fn lost_rank_within_deadline(
+        primary: channel::Receiver<StepResponse>,
+        peer: channel::Receiver<StepResponse>,
+    ) -> Option<usize> {
+        let (done_tx, done_rx) = channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(await_step_responses(&primary, &[peer], "decode").err());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a closed rank channel must end the wait")
+    }
+
+    #[test]
+    fn a_dead_peer_is_seen_while_rank_zero_is_blocked() {
+        let (_rank_zero_blocked, primary) = channel::bounded::<StepResponse>(1);
+        let (dead_peer, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_peer);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(1));
+    }
+
+    #[test]
+    fn a_dead_rank_zero_is_reported_as_rank_zero() {
+        let (dead_rank_zero, primary) = channel::bounded::<StepResponse>(1);
+        let (_peer_blocked, peer) = channel::bounded::<StepResponse>(1);
+        drop(dead_rank_zero);
+        assert_eq!(lost_rank_within_deadline(primary, peer), Some(0));
+    }
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
@@ -3140,20 +3563,25 @@ impl Drop for Qwen3Executor {
 }
 
 /// What the executor learns about the draft model after loading it on the
-/// worker: the draft block size (`K` candidates per round) and which target
-/// layers feed the draft (the worker captures these; kept for diagnostics).
+/// worker.
 #[derive(Clone, Debug)]
-struct DFlashMeta {
+struct DraftMeta {
     block_size: usize,
-    /// Max drafts proposed per verify step (`K`). The span leads with the anchor
-    /// (`[anchor, draft_1, …]`), so this is `verify_span - 1` under either block
-    /// layout — anchor-first vs anchor-drop is already folded into `verify_span()`.
+    /// Max drafts proposed per verify step (`K`), after any
+    /// `PEGAINFER_SPEC_MAX_DRAFTS` trim. The span leads with the anchor
+    /// (`[anchor, draft_1, …]`), so the span is `K + 1` under either block
+    /// layout — anchor-first vs anchor-drop is already folded into the
+    /// drafter's draft count.
     num_spec_tokens: usize,
     /// Draft's max cacheable position; with the `block_size` in-fill headroom
-    /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
+    /// this caps the speculative context to `max_position_embeddings - block_size`.
     max_position_embeddings: usize,
-    #[allow(dead_code)]
-    target_layer_ids: Vec<usize>,
+    /// See [`ModelExecutor::max_draft_batch`].
+    max_draft_batch: Option<usize>,
+    /// Whether this drafter's state can be restored on a target prefix hit.
+    /// DFlash/DSpark materialize draft K/V keyed by the target's block IDs;
+    /// EAGLE-3 still keeps the prefix cache off with a drafter.
+    supports_prefix_cache: bool,
 }
 
 struct LocalQwen3Lane {
@@ -3165,6 +3593,9 @@ struct LocalQwen3Lane {
     kv_buffer: KvBuffer,
     layout: KvLayout,
     sample_scratch: pegainfer_sample::SampleScratch,
+    /// The attention plan every unified step of an uncompiled GQA group refills
+    /// in place; `None` for a compiled group (see `unified_attention_plan`).
+    unified_plan: Option<ops::PrefillPagedPlan>,
     /// Request-local decode steps handed to `select_batch`, reused across
     /// steps to keep the sampling hot path allocation-free. All zeros until
     /// the scheduler wires generated counts through (sampling-parity 1b).
@@ -3176,7 +3607,9 @@ struct LocalQwen3Lane {
     /// DFlash draft lane (the draft model + per-request draft state). `None`
     /// unless speculative decoding is enabled; only the primary rank carries it.
     dflash: Option<DFlashLaneState>,
-    /// Fixed, pre-allocated scratch for the DFlash verify forward. Lazily built
+    /// EAGLE-3 draft lane; at most one of `dflash` and `eagle3` is loaded.
+    eagle3: Option<Eagle3LaneState>,
+    /// Fixed, pre-allocated scratch for the verify forward. Lazily built
     /// on the first verify step (its shape depends on the loaded draft model's
     /// block size and the target's capture layers). Pointer-stable for the
     /// upcoming verify CUDA Graph.
@@ -3247,7 +3680,7 @@ impl LocalQwen3Lane {
             model.local_q_dim(),
             model.local_kv_dim(),
             model.local_intermediate_size(),
-            model.config().vocab_size,
+            model.config().logits_rows,
             max_bucket,
             buf_layout.page_size,
             padding_block_id,
@@ -3255,21 +3688,26 @@ impl LocalQwen3Lane {
             model.config().max_position_embeddings,
             model.fused_decode_qkv(),
         )?;
-        let sample_scratch = pegainfer_sample::SampleScratch::new(
+        let sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
             model.device_ctx(),
-            model.config().vocab_size,
+            model.config().logits_rows,
+            model.config().decodable_vocab,
             max_bucket,
         )?;
+        let unified_plan =
+            model.unified_attention_plan(max_prefill_tokens, max_bucket, buf_layout.page_size)?;
         Ok(Self {
             model,
             kv_buffer,
             layout,
             bufs,
             sample_scratch,
+            unified_plan,
             steps_buf: Vec::new(),
             max_prefill_tokens,
             inflight_prefill: None,
             dflash: None,
+            eagle3: None,
             verify_bufs: None,
             total_blocks,
             padding_block_id,
@@ -3352,26 +3790,50 @@ impl LocalQwen3Lane {
     /// Load the DFlash draft model into this lane (primary rank only). The draft
     /// model is built here on the worker thread because it reads the co-located
     /// target model's embeddings and head.
-    fn load_dflash(&mut self, draft_path: &str) -> Result<DFlashMeta> {
+    fn load_dflash(
+        &mut self,
+        draft_path: &str,
+        prefix_cache: bool,
+        draft_state_budget_bytes: usize,
+        draft_request_state_bytes_per_token: usize,
+    ) -> Result<DraftMeta> {
         let model = DFlashDraftModel::from_safetensors_for_target(
             self.model.device_ctx(),
             draft_path,
             &self.model,
         )?;
         model.tune_gemm_algos(&self.model)?;
-        let meta = DFlashMeta {
+        let mut meta = DraftMeta {
             block_size: model.block_size(),
-            num_spec_tokens: model.verify_span().saturating_sub(1),
+            num_spec_tokens: model.effective_drafts(),
             max_position_embeddings: model.max_position_embeddings(),
-            target_layer_ids: model.target_layer_ids().to_vec(),
+            max_draft_batch: None,
+            supports_prefix_cache: false,
         };
         let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
-        self.dflash = Some(DFlashLaneState::new(
+        let lane = DFlashLaneState::new(
             self.model.device_ctx(),
             model,
             max_decode_batch_size,
-        )?);
+            self.layout.page_size,
+            self.total_blocks,
+            self.max_prefill_tokens,
+            prefix_cache,
+            draft_state_budget_bytes,
+            draft_request_state_bytes_per_token,
+        )?;
+        meta.supports_prefix_cache = true;
+        self.dflash = Some(lane);
         Ok(meta)
+    }
+
+    /// Target layers whose hidden states the loaded drafter consumes.
+    fn draft_capture_layer_ids(&self) -> Option<Vec<usize>> {
+        self.dflash_capture_layer_ids().or_else(|| {
+            self.eagle3
+                .as_ref()
+                .map(|eagle3| eagle3.aux_layers().to_vec())
+        })
     }
 
     fn bind(&self) -> Result<CublasThreadGuard> {
@@ -3397,38 +3859,44 @@ impl LocalQwen3Lane {
 
         // Build prefill result
         let results = build_prefill_request_results(
-            self,
-            &state.prefill_requests,
-            &state.prefill_logits,
-            &tokens,
-            None,
-            false,
+            self.model.device_ctx(),
+            &PrefillRows {
+                requests: &state.prefill_requests,
+                logits: &state.prefill_logits,
+                tokens: &tokens,
+                all_position_logits: None,
+            },
         )?;
 
-        // Split-concurrent prefill never runs with DFlash (capture needs the
+        // Split-concurrent prefill never runs with a drafter (capture needs the
         // synchronous result), so no context is captured here.
         Ok(PrefillResult {
             requests: results,
-            dflash_context_captured_requests: Vec::new(),
+            draft_context_captured_requests: Vec::new(),
         })
     }
 
+    fn ensure_sample_scratch_rows(&mut self, rows: usize) -> Result<()> {
+        if rows > self.sample_scratch.max_rows() {
+            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
+                self.model.device_ctx(),
+                self.model.config().logits_rows,
+                self.model.config().decodable_vocab,
+                rows,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Pick one token per logits column (batched argmax for greedy rows,
-    /// one batched sampler call for non-greedy rows). Grows the sampling
-    /// scratch when a step is wider than the decode bucket it was sized for.
+    /// one batched sampler call for non-greedy rows).
     fn select_step_tokens(
         &mut self,
         logits: &HiddenStates,
         params: &[&SamplingParams],
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
-        if params.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::new(
-                self.model.device_ctx(),
-                self.model.config().vocab_size,
-                params.len(),
-            )?;
-        }
+        self.ensure_sample_scratch_rows(params.len())?;
         self.steps_buf.clear();
         self.steps_buf.resize(params.len(), 0);
         pegainfer_sample::select_batch(
@@ -3441,12 +3909,52 @@ impl LocalQwen3Lane {
         )
     }
 
+    /// Trace committed rows under [`COMMIT_TRACE_TARGET`]. Each entry is
+    /// `(request, logits row, sequence position the row commits)`; the row
+    /// logs its top two decodable tokens and their logits, the lower id first
+    /// on an exact tie as the argmax resolves it.
+    fn trace_committed_rows(
+        &self,
+        logits: &HiddenStates,
+        rows: &[(RequestId, usize, usize)],
+    ) -> Result<()> {
+        let stride = logits.hidden_dim;
+        let vocab = self.model.config().decodable_vocab;
+        for &(request_id, row, pos) in rows {
+            let host = self
+                .model
+                .device_ctx()
+                .stream
+                .clone_dtoh(&logits.data.slice(row * stride..row * stride + vocab))?;
+            let mut best = (0usize, f32::NEG_INFINITY);
+            let mut second = (0usize, f32::NEG_INFINITY);
+            for (token, value) in host.iter().enumerate() {
+                let value = value.to_f32();
+                if value > best.1 {
+                    second = best;
+                    best = (token, value);
+                } else if value > second.1 {
+                    second = (token, value);
+                }
+            }
+            log::trace!(
+                target: COMMIT_TRACE_TARGET,
+                "committed row request={request_id} pos={pos} top={}:{} {}:{}",
+                best.0,
+                best.1,
+                second.0,
+                second.1,
+            );
+        }
+        Ok(())
+    }
+
     fn execute_prefill(
         &mut self,
         prompts: &[&[u32]],
         kv_views: &[KvView],
         lora_adapters: &[Option<&str>],
-        echo: bool,
+        all_position_logits: bool,
         capture_layer_ids: Option<&[usize]>,
     ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         self.model.batch_prefill(
@@ -3455,49 +3963,383 @@ impl LocalQwen3Lane {
             lora_adapters,
             self.kv_buffer.buffer(),
             &self.layout,
-            echo,
+            all_position_logits,
             capture_layer_ids,
         )
     }
 
-    /// DFlash verify forward over each request's `block_size`-token span, using
-    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
-    /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
-    /// replaces; the buffers are lazily built on first use.
-    fn execute_dflash_verify(
+    /// Parallel multi-chain hedge (`PEGAINFER_SPEC_HEDGE`): verify each hedged
+    /// request's greedy chain (chain A) **and** its hedge-ladder alternative
+    /// chains in one expanded forward, then commit whichever chain the target
+    /// accepts further. Each hedge chain's span KV is written to lane-owned
+    /// scratch pages via a synthesized [`KvView`] (prefix pages shared
+    /// read-only, the partial committed page copied first); on a hedge win the
+    /// touched pages are copied back into the request's reservation before
+    /// `apply_speculative`, and the winning chain's captured hidden rows are
+    /// compacted onto chain A's offsets so
+    /// `record_verify_dflash_context` sees a plain N-request layout. The KV
+    /// transaction interface is untouched. Returns `Ok(None)` when nothing is
+    /// hedgeable this round (caller falls back to the plain pass).
+    fn try_execute_hedged_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+        capture_layer_ids: &[usize],
+        sample_seed: u64,
+        verify_round: u64,
+        bufs: &mut VerifyGraphBuffers,
+    ) -> Result<Option<VerifyResult>> {
+        let page_size = self.layout.page_size;
+        let scratch_end = self.kv_buffer.num_blocks();
+        let max_batch = *BATCH_BUCKETS.last().unwrap();
+        let cap = self.dflash.as_ref().map_or(0, DFlashLaneState::hedge_cap);
+        if cap == 0 || scratch_end == self.total_blocks {
+            return Ok(None);
+        }
+
+        let ctx = self.model.device_ctx().clone();
+        // Single pass: expanded layout keeps the N chain-A spans first
+        // (offsets unchanged) and appends every accepted hedge span, walking a
+        // scratch-page cursor. `hedge_spans[slot]` = (request idx, replaced
+        // (original page, scratch page) pairs) for the winner copy-back.
+        let mut expanded: Vec<VerifyStepItem> = requests.to_vec();
+        let mut views: Vec<KvView> = kv_views.to_vec();
+        let mut hedge_spans: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+        let mut next_scratch = self.total_blocks;
+        {
+            let Some(dflash) = self.dflash.as_ref() else {
+                return Ok(None);
+            };
+            if !dflash.model.uses_markov_head() {
+                return Ok(None);
+            }
+            let drafts_start = usize::from(!dflash.model.anchor_first());
+            let pages_per_chain =
+                dflash_lane::hedge_pages_per_chain(dflash.model.block_size(), page_size);
+            // The draft round already chose the hedged requests: it built
+            // `hedge_blocks` for exactly those, so this pass only checks the
+            // verify batch and the scratch pages.
+            for (idx, req) in requests.iter().enumerate() {
+                if !req.params.is_greedy() || req.token_ids.len() < 2 {
+                    continue;
+                }
+                let Some(chains) = dflash.hedge_blocks.get(&req.request_id) else {
+                    continue;
+                };
+                let v = &kv_views[idx];
+                let committed = v.seq_len() - req.token_ids.len();
+                let first_span_page = committed / page_size;
+                let span_pages = v.page_indices().len() - first_span_page;
+                if span_pages > pages_per_chain {
+                    continue;
+                }
+                let keep = req.token_ids.len() - 1;
+                let mut added: Vec<Vec<u32>> = Vec::new();
+                for block in chains {
+                    if expanded.len() == max_batch || next_scratch + span_pages > scratch_end {
+                        break;
+                    }
+                    let mut ids = Vec::with_capacity(keep + 1);
+                    ids.push(req.token_ids[0]);
+                    ids.extend(block[drafts_start..].iter().take(keep).copied());
+                    if ids.len() != req.token_ids.len()
+                        || ids[1..] == req.token_ids[1..]
+                        || added.iter().any(|prev| prev[1..] == ids[1..])
+                    {
+                        continue;
+                    }
+                    let mut pages = v.page_indices().to_vec();
+                    let mut replaced = Vec::with_capacity(span_pages);
+                    for (k, page_slot) in (first_span_page..pages.len()).enumerate() {
+                        let orig = pages[page_slot] as usize;
+                        let scratch_page = next_scratch + k;
+                        if k == 0 && !committed.is_multiple_of(page_size) {
+                            // The hedge chain shares this page's committed
+                            // prefix rows: give it a full copy to write its
+                            // span into.
+                            self.kv_buffer.copy_page(&ctx.stream, orig, scratch_page)?;
+                        }
+                        pages[page_slot] = scratch_page as i32;
+                        replaced.push((orig, scratch_page));
+                    }
+                    next_scratch += span_pages;
+                    expanded.push(VerifyStepItem::new(
+                        req.request_id,
+                        ids.clone(),
+                        req.params,
+                        req.stop_policy.clone(),
+                    ));
+                    views.push(KvView::new(pages, v.seq_len(), page_size));
+                    hedge_spans.push((idx, replaced));
+                    added.push(ids);
+                }
+            }
+        }
+        if hedge_spans.is_empty() {
+            return Ok(None);
+        }
+
+        let spans: Vec<&[u32]> = expanded.iter().map(VerifyStepItem::as_slice).collect();
+        self.model.batch_prefill_into(
+            &spans,
+            &views,
+            self.kv_buffer.buffer(),
+            &self.layout,
+            capture_layer_ids,
+            bufs,
+        )?;
+        let params: Vec<&SamplingParams> = expanded
+            .iter()
+            .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
+            .collect();
+        let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
+        let mut all_results = build_verify_results(&expanded, &target_tokens)?;
+        let trace = std::env::var_os("PEGAINFER_TEST_LOG").is_some();
+        let raw_lengths: Vec<usize> = if trace {
+            all_results
+                .iter()
+                .map(|result| result.accepted_tokens.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Normalize every candidate before selecting a winner; a discarded
+        // suffix must not win the hedge or advance KV, hidden state or counters.
+        for (result, req) in all_results.iter_mut().zip(&expanded) {
+            spec::truncate_after_terminal(
+                result,
+                &req.stop_policy,
+                &self.model.config().stop_token_ids,
+            );
+        }
+        let (results_a, results_b) = all_results.split_at(requests.len());
+        anyhow::ensure!(
+            results_b.len() == hedge_spans.len(),
+            "hedge returned {} B results for {} hedge spans",
+            results_b.len(),
+            hedge_spans.len()
+        );
+        // Per request keep the best-accepting chain; ties keep chain A (no
+        // copies). A later chain of the same request only replaces the
+        // running winner when strictly better, so the final page/hidden
+        // copies always belong to the final winner.
+        let a_total_rows: usize = requests.iter().map(|r| r.token_ids.len()).sum();
+        let hidden_dim = bufs.captured_hidden().hidden_dim;
+        let elem = std::mem::size_of::<half::bf16>();
+        let mut final_requests: Vec<VerifyStepItem> = requests.to_vec();
+        let mut final_results: Vec<VerifyRequestResult> = results_a.to_vec();
+        let mut selected_is_b = if trace {
+            Some(vec![false; requests.len()])
+        } else {
+            None
+        };
+        let mut b_wins = 0usize;
+        let mut b_row_offset = a_total_rows;
+        // First logits row of each request's committed chain, for the verify
+        // trace: chain A's offset until a hedge chain wins.
+        let mut winner_rows: Vec<usize> = requests
+            .iter()
+            .scan(0, |row, req| {
+                let first = *row;
+                *row += req.token_ids.len();
+                Some(first)
+            })
+            .collect();
+        for (slot, (idx, replaced)) in hedge_spans.iter().enumerate() {
+            let span_len = requests[*idx].token_ids.len();
+            let res_b = &results_b[slot];
+            if res_b.accepted_tokens.len() > final_results[*idx].accepted_tokens.len() {
+                // Winning chain: canonical pages take its span KV, and its
+                // captured hidden rows land on A's row offsets in place.
+                for &(orig, scratch_page) in replaced {
+                    self.kv_buffer.copy_page(&ctx.stream, scratch_page, orig)?;
+                }
+                let a_row_offset: usize = requests[..*idx].iter().map(|r| r.token_ids.len()).sum();
+                let (hid_ptr, _guard) = bufs.captured_hidden().data.device_ptr(&ctx.stream);
+                let src = hid_ptr + (b_row_offset * hidden_dim * elem) as u64;
+                let dst = hid_ptr + (a_row_offset * hidden_dim * elem) as u64;
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        dst,
+                        src,
+                        res_b.accepted_tokens.len() * hidden_dim * elem,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("hedge hidden compaction failed: {e}"))?;
+                b_wins += 1;
+                winner_rows[*idx] = b_row_offset;
+                if let Some(selected) = selected_is_b.as_mut() {
+                    selected[*idx] = true;
+                }
+                final_requests[*idx] = expanded[requests.len() + slot].clone();
+                final_results[*idx] = res_b.clone();
+            }
+            b_row_offset += span_len;
+        }
+        let b_extra: usize = final_results
+            .iter()
+            .zip(results_a)
+            .map(|(f, a)| f.accepted_tokens.len() - a.accepted_tokens.len())
+            .sum();
+        log::debug!(
+            "Qwen3 DFlash hedge: {} chain span(s), {b_wins} win event(s), +{b_extra} committed token(s)",
+            hedge_spans.len()
+        );
+        if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+            let mut rows = Vec::new();
+            for (((req, view), &first_row), result) in requests
+                .iter()
+                .zip(kv_views)
+                .zip(&winner_rows)
+                .zip(&final_results)
+            {
+                let first_pos = view.seq_len() - req.token_ids.len() + 1;
+                rows.extend(
+                    (0..result.accepted_tokens.len())
+                        .map(|j| (req.request_id, first_row + j, first_pos + j)),
+                );
+            }
+            self.trace_committed_rows(bufs.all_logits(), &rows)?;
+        }
+
+        // The expanded forward left seq_len at A+B rows; the winner layout is
+        // exactly the N chain-A offsets.
+        bufs.captured_hidden_mut().seq_len = a_total_rows;
+        self.record_verify_dflash_context(
+            &final_requests,
+            kv_views,
+            &final_results,
+            Some(bufs.captured_hidden()),
+            verify_round,
+            // A hedged round always verifies at least one draft; a gated round
+            // cannot be hedged (its spans are one token).
+            false,
+        )?;
+        if trace {
+            for idx in 0..requests.len() {
+                let has_hedge = hedge_spans
+                    .iter()
+                    .any(|(request_idx, _)| *request_idx == idx);
+                if !has_hedge {
+                    continue;
+                }
+                let selected = if selected_is_b.as_ref().is_some_and(|selected| selected[idx]) {
+                    'B'
+                } else {
+                    'A'
+                };
+                let raw_b_lens = hedge_spans
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (request_idx, _))| *request_idx == idx)
+                    .map(|(slot, _)| raw_lengths[requests.len() + slot].to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log::debug!(
+                    "Qwen3 DFlash hedge detail round={} request={} raw_a={} raw_b_lens={} selected={} selected_len={} matched_draft={}",
+                    verify_round,
+                    requests[idx].request_id,
+                    raw_lengths[idx],
+                    raw_b_lens,
+                    selected,
+                    final_results[idx].accepted_tokens.len(),
+                    final_results[idx].matched_draft_tokens,
+                );
+            }
+        }
+        Ok(Some(VerifyResult {
+            requests: final_results,
+        }))
+    }
+
+    /// Verify forward over each request's draft span, using
+    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation),
+    /// lazily built on first use. Numerically equivalent to the
+    /// `batch_prefill(all_position_logits=true)` verify path it replaces.
+    fn execute_draft_verify(
         &mut self,
         requests: &[VerifyStepItem],
         kv_views: &[KvView],
         sample_seed: u64,
+        verify_round: u64,
+        gated: bool,
     ) -> Result<VerifyResult> {
-        let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
-            anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
-        })?;
         // Verify span = anchor + drafts: `block_size` for DFlash, `block_size + 1`
-        // for DSpark (anchor-first). The graph buffers + replay shape key off this.
-        let verify_span = self
-            .dflash
-            .as_ref()
-            .expect("DFlash present when capture layers exist")
-            .model
-            .verify_span();
+        // for DSpark (anchor-first), shortened by a `PEGAINFER_SPEC_MAX_DRAFTS`
+        // trim; the EAGLE-3 chain plus its anchor. The graph buffers + replay
+        // shape key off this.
+        let (capture_layer_ids, verify_span, max_batch) = if let Some(dflash) = &self.dflash {
+            (
+                dflash.model.target_layer_ids().to_vec(),
+                dflash.model.effective_drafts() + 1,
+                *BATCH_BUCKETS.last().unwrap(),
+            )
+        } else if let Some(eagle3) = &self.eagle3 {
+            (
+                eagle3.aux_layers().to_vec(),
+                EAGLE3_CHAIN_LENGTH + 1,
+                crate::eagle3::EAGLE3_MAX_BATCH,
+            )
+        } else {
+            anyhow::bail!("speculative verify requested but no draft model is loaded");
+        };
 
         if self.verify_bufs.is_none() {
-            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            // Page lists are authored by reference: with the prefix cache on,
+            // several active requests can list the same shared pages, so the
+            // batch's total is bounded by `max_batch * pages-per-context`, not
+            // by the physical pool size. A hedged request repeats its list
+            // once per chain, bounded by the expanded verify batch.
+            let per_request_pages = self
+                .model
+                .config()
+                .max_position_embeddings
+                .div_ceil(self.layout.page_size)
+                .saturating_add(2);
+            let base_pages = self
+                .total_blocks
+                .max(max_batch.saturating_mul(per_request_pages));
+            let hedge_dup = self.dflash.as_ref().map_or(0, |dflash| {
+                if dflash.hedge_cap() == 0 {
+                    0
+                } else {
+                    dflash.hedge_branch_count().min(max_batch - 1)
+                }
+            });
             self.verify_bufs = Some(VerifyGraphBuffers::new(
                 &self.model,
                 max_batch,
                 verify_span,
                 capture_layer_ids.len(),
-                self.total_blocks,
+                base_pages.saturating_mul(hedge_dup.saturating_add(1)),
             )?);
         }
 
         // Take the buffers out of `self` so the forward (borrows `&self.model`,
         // `&mut bufs`) and the subsequent sampling (`&mut self.sample_scratch`)
-        // and context record (`&mut self.dflash`) don't alias a `self` borrow.
+        // and context record (`&mut self.dflash` / `&mut self.eagle3`) don't
+        // alias a `self` borrow.
         let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
         let result = (|| -> Result<VerifyResult> {
+            if self.dflash.as_ref().is_some_and(|d| d.hedge_cap() > 0) {
+                if let Some(result) = self.try_execute_hedged_verify(
+                    requests,
+                    kv_views,
+                    &capture_layer_ids,
+                    sample_seed,
+                    verify_round,
+                    &mut bufs,
+                )? {
+                    return Ok(result);
+                }
+                // Fell back to the plain pass: whatever the draft prepared,
+                // this round executed unhedged — the controller must not book
+                // ladder cost to a chain count that never ran a verify span.
+                if let Some(dflash) = self.dflash.as_mut() {
+                    dflash.clear_round_chains();
+                }
+            }
             let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
             self.model.batch_prefill_into(
                 &spans,
@@ -3508,24 +4350,62 @@ impl LocalQwen3Lane {
                 &mut bufs,
             )?;
 
-            // One committed token per span row, each row governed by ITS
-            // request's params — argmax rows batch through the fused path,
-            // sampled rows ride the regular batched sampler (sampled-verify,
-            // #512). Steps stay zeroed exactly like the plain-decode call:
-            // when sampling-parity 1b wires request-local decode steps
-            // through, verify rows must move with it (row k of a span is the
-            // request's step `completion + k`) or seeded replay breaks.
-            let params: Vec<&SamplingParams> = requests
-                .iter()
-                .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
-                .collect();
-            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
-            let request_results = build_verify_results(requests, &target_tokens)?;
-            self.record_verify_dflash_context(
-                requests,
-                &request_results,
-                Some(bufs.captured_hidden()),
-            )?;
+            // A gated step has no proposal; never consume a prior round's q.
+            if gated && let Some(dflash) = self.dflash.as_mut() {
+                dflash.proposal_rows.clear();
+            }
+            let mut request_results =
+                if let Some(results) = self.sample_selector_verify(requests, bufs.all_logits())? {
+                    results
+                } else {
+                    let params: Vec<&SamplingParams> = requests
+                        .iter()
+                        .flat_map(|req| std::iter::repeat_n(&req.params, req.as_slice().len()))
+                        .collect();
+                    let target_tokens =
+                        self.select_step_tokens(bufs.all_logits(), &params, sample_seed)?;
+                    build_verify_results(requests, &target_tokens)?
+                };
+            // Apply the request policy before recording target hidden states;
+            // otherwise a suffix discarded by terminal handling would leak
+            // into the next draft context and acceptance counters.
+            for (req, result) in requests.iter().zip(&mut request_results) {
+                spec::truncate_after_terminal(
+                    result,
+                    &req.stop_policy,
+                    &self.model.config().stop_token_ids,
+                );
+            }
+            if log::log_enabled!(target: COMMIT_TRACE_TARGET, log::Level::Trace) {
+                let mut first_row = 0;
+                let mut rows = Vec::new();
+                for ((req, view), result) in requests.iter().zip(kv_views).zip(&request_results) {
+                    let span = req.token_ids.len();
+                    let first_pos = view.seq_len() - span + 1;
+                    rows.extend(
+                        (0..result.accepted_tokens.len())
+                            .map(|j| (req.request_id, first_row + j, first_pos + j)),
+                    );
+                    first_row += span;
+                }
+                self.trace_committed_rows(bufs.all_logits(), &rows)?;
+            }
+            if self.eagle3.is_some() {
+                self.record_verify_eagle3_context(
+                    requests,
+                    &request_results,
+                    bufs.captured_hidden(),
+                )?;
+            } else {
+                self.record_verify_dflash_context(
+                    requests,
+                    kv_views,
+                    &request_results,
+                    Some(bufs.captured_hidden()),
+                    verify_round,
+                    gated,
+                )?;
+            }
             Ok(VerifyResult {
                 requests: request_results,
             })
@@ -3568,6 +4448,7 @@ impl LocalQwen3Lane {
             decode_views,
             decode_lora_adapters,
             &mut self.bufs,
+            self.unified_plan.as_mut(),
             self.kv_buffer.buffer(),
             &self.layout,
         )
@@ -3599,7 +4480,6 @@ enum StepCommand {
     Prefill {
         requests: Vec<PrefillStepItem>,
         kv_views: Vec<KvView>,
-        echo: bool,
         sample_seed: u64,
     },
     Decode {
@@ -3627,15 +4507,18 @@ enum StepCommand {
     },
     /// Speculative verify: one target forward over each request's `K + 1` draft
     /// span (with a speculative KV view), capturing target hidden states for the
-    /// next draft round. Each position selects the request's *committed* token —
-    /// argmax for greedy rows, a regular sample for non-greedy rows — and the
-    /// tokens drive [`accept_prefix_match`] (sampled-verify, #512).
+    /// next draft round. Sampled DFlash2 proposals use probability-aware
+    /// acceptance; other proposals use [`accept_prefix_match`] against the
+    /// target sampler output.
     SpeculativeVerify {
         requests: Vec<VerifyStepItem>,
         kv_views: Vec<KvView>,
         sample_seed: u64,
+        verify_round: u64,
+        /// The load gate turned drafting off for this step (see `VerifyPlan`).
+        gated: bool,
     },
-    /// Speculative draft: roll the DFlash draft model forward one block per
+    /// Speculative draft: roll the loaded draft model forward one round per
     /// request. Uses the draft's own KV — no target KV views.
     SpeculativeDraft { requests: Vec<DraftStepItem> },
 }
@@ -3682,11 +4565,23 @@ enum WorkerCommand {
     /// thread because it reads the co-located target model).
     LoadDflash {
         draft_path: String,
-        resp: channel::Sender<Result<DFlashMeta>>,
+        /// Allocate the paged draft K/V pool. False with `--no-prefix-cache`
+        /// (the request mirror is still materialized for the draft forward).
+        prefix_cache: bool,
+        /// Bytes reserved for request-owned draft state (see
+        /// `Qwen3Executor::draft_state_budget_bytes`).
+        draft_state_budget_bytes: usize,
+        draft_request_state_bytes_per_token: usize,
+        resp: channel::Sender<Result<DraftMeta>>,
     },
-    /// Drop a request's DFlash draft state (request retired, or it fell back to
-    /// a plain decode that advanced the sequence outside the speculative path).
-    DropDflash {
+    /// Load the EAGLE-3 draft model into the primary lane, for the same reason.
+    LoadEagle3 {
+        draft_path: String,
+        resp: channel::Sender<Result<DraftMeta>>,
+    },
+    /// Drop a request's draft state (request retired, or it fell back to a
+    /// plain decode that advanced the sequence outside the speculative path).
+    DropDraft {
         request_id: RequestId,
         resp: channel::Sender<Result<()>>,
     },
@@ -3755,6 +4650,29 @@ impl WorkerStepOutcome {
     }
 }
 
+/// A rank's worker thread is gone (it panicked or exited), so the executor can
+/// never run another step. The scheduler reports it as fatal.
+#[derive(Debug)]
+pub(crate) struct WorkerLost(String);
+
+impl WorkerLost {
+    pub(crate) fn caused(error: &anyhow::Error) -> bool {
+        error.chain().any(<dyn std::error::Error>::is::<Self>)
+    }
+}
+
+impl std::fmt::Display for WorkerLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorkerLost {}
+
+pub(crate) fn worker_lost(what: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(WorkerLost(what.into()))
+}
+
 struct RankWorker {
     tx: channel::Sender<WorkerCommand>,
     handle: Option<thread::JoinHandle<()>>,
@@ -3804,12 +4722,28 @@ impl RankWorker {
                                     let result = lane.resolve_inflight_prefill();
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::LoadDflash { draft_path, resp } => {
-                                    let result = lane.load_dflash(&draft_path);
+                                WorkerCommand::LoadDflash {
+                                    draft_path,
+                                    prefix_cache,
+                                    draft_state_budget_bytes,
+                                    draft_request_state_bytes_per_token,
+                                    resp,
+                                } => {
+                                    let result = lane.load_dflash(
+                                        &draft_path,
+                                        prefix_cache,
+                                        draft_state_budget_bytes,
+                                        draft_request_state_bytes_per_token,
+                                    );
                                     let _ = resp.send(result);
                                 }
-                                WorkerCommand::DropDflash { request_id, resp } => {
+                                WorkerCommand::LoadEagle3 { draft_path, resp } => {
+                                    let result = lane.load_eagle3(&draft_path);
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::DropDraft { request_id, resp } => {
                                     lane.drop_dflash_request(request_id);
+                                    lane.drop_eagle3_request(request_id);
                                     let _ = resp.send(Ok(()));
                                 }
                                 WorkerCommand::Precapture { phase, resp } => {
@@ -3856,7 +4790,7 @@ impl RankWorker {
                 collect_result,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("tensor-parallel worker step channel closed"))?;
+            .map_err(|_| worker_lost("tensor-parallel worker step channel closed"))?;
         Ok(resp_rx)
     }
 
@@ -3891,17 +4825,26 @@ impl RankWorker {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
-            .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
+            .map_err(|_| worker_lost("worker channel closed on resolve_prefill"))?;
         Ok(resp_rx)
     }
 
     /// Load the DFlash draft model into this worker's lane and return its
     /// metadata. Blocks until the worker finishes loading.
-    fn load_dflash(&self, draft_path: String) -> Result<DFlashMeta> {
+    fn load_dflash(
+        &self,
+        draft_path: String,
+        prefix_cache: bool,
+        draft_state_budget_bytes: usize,
+        draft_request_state_bytes_per_token: usize,
+    ) -> Result<DraftMeta> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(WorkerCommand::LoadDflash {
                 draft_path,
+                prefix_cache,
+                draft_state_budget_bytes,
+                draft_request_state_bytes_per_token,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("worker channel closed on load_dflash"))?;
@@ -3910,18 +4853,33 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("worker dropped load_dflash response"))?
     }
 
-    /// Drop a request's DFlash state. Blocks until the worker acknowledges.
-    fn drop_dflash_request(&self, request_id: RequestId) -> Result<()> {
+    /// Load the EAGLE-3 draft model into this worker's lane and return its
+    /// metadata. Blocks until the worker finishes loading.
+    fn load_eagle3(&self, draft_path: String) -> Result<DraftMeta> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
-            .send(WorkerCommand::DropDflash {
+            .send(WorkerCommand::LoadEagle3 {
+                draft_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on load_eagle3"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped load_eagle3 response"))?
+    }
+
+    /// Drop a request's draft state. Blocks until the worker acknowledges.
+    fn drop_draft_request(&self, request_id: RequestId) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DropDraft {
                 request_id,
                 resp: resp_tx,
             })
-            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_dflash"))?;
+            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_draft"))?;
         resp_rx
             .recv()
-            .map_err(|_| anyhow::anyhow!("worker dropped drop_dflash response"))?
+            .map_err(|_| anyhow::anyhow!("worker dropped drop_draft response"))?
     }
 
     fn load_lora_adapter(

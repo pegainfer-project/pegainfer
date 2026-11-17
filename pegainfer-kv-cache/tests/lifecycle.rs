@@ -107,28 +107,6 @@ fn page_boundary_crossing() {
 }
 
 #[test]
-fn kv_view_desc_has_correct_layout() {
-    let mgr = make_manager(10);
-    let mut req = mgr.pool().new_request(vec![1; 5], 1, None);
-
-    req.schedule_prefill(5, mgr.pool())
-        .expect("schedule_prefill");
-    let view = req.prefill_view(5);
-    let desc = view.desc(mgr.buffer());
-
-    assert_eq!(desc.seq_len(), 5);
-    assert_eq!(desc.last_page_len(), 5);
-    assert_eq!(desc.num_pages(), 1);
-    assert_eq!(desc.layout().page_size, 16);
-    assert_eq!(desc.layout().num_layers, 1);
-    assert!(!desc.buffer().is_empty());
-    assert_eq!(desc.page_indices().len(), 1);
-
-    req.apply_prefill(42, mgr.pool()).expect("apply_prefill");
-    req.release().expect("release");
-}
-
-#[test]
 fn padding_block_id_is_stable() {
     let mgr = make_manager(10);
     let pid = mgr.pool().padding_block_id();

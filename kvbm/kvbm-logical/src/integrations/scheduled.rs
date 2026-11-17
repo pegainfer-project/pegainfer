@@ -437,10 +437,23 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         &mut self,
         manager: &BlockManager<T>,
     ) -> Result<usize, ScheduleError> {
+        self.match_and_add_prefix_up_to(manager, usize::MAX)
+    }
+
+    /// Match and add at most `requested_max_blocks` prefix blocks.
+    ///
+    /// This is useful for hybrid models whose auxiliary state
+    /// may only be restorable at a boundary shorter than the longest KV hit.
+    pub fn match_and_add_prefix_up_to(
+        &mut self,
+        manager: &BlockManager<T>,
+        requested_max_blocks: usize,
+    ) -> Result<usize, ScheduleError> {
         self.require_idle()?;
 
         let bs = self.inner.block_size();
-        let max_blocks = self.inner.num_input_tokens().saturating_sub(1) / bs;
+        let max_blocks =
+            (self.inner.num_input_tokens().saturating_sub(1) / bs).min(requested_max_blocks);
         let count = self
             .inner
             .match_and_add_prefix(manager, max_blocks)
@@ -636,13 +649,12 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
             }
         };
 
+        // The forward computed KV for the existing dangling token. Register
+        // that token before appending the newly sampled, still-dangling token.
+        self.inner.complete_and_register_pending(manager);
+
         let crossed = self.inner.append_token(token);
         let block_completed = crossed.is_some();
-
-        // Always stage pending completions — handles both:
-        // 1. Blocks completed during prefill's token append (deferred staging)
-        // 2. Block just completed by this decode token
-        self.inner.complete_and_register_pending(manager);
 
         self.kv_position += 1;
         self.state = SequenceState::Idle;
@@ -740,17 +752,39 @@ impl<T: BlockMetadata> SchedulableSequence<T> {
         }
 
         // Append accepted tokens one at a time, tracking boundary crossings
+        // Append the accepted span in two parts. The verifier forwarded the
+        // current dangling token plus every accepted draft, so those rows have
+        // KV and their blocks may be registered. The last accepted token is the
+        // verifier's newly sampled token (or a terminal draft): its KV was not
+        // forwarded in this step. Leave it dangling exactly like `apply_decode`
+        // and do not register a block it completes — `match_blocks` must never
+        // see a row that was never written. The next apply registers it after
+        // the forward catches up.
+        let (forwarded, dangling) = match accepted.split_last() {
+            Some((last, rest)) => (rest, Some(*last)),
+            None => (accepted, None),
+        };
         let mut block_completed = false;
-        for &token in accepted {
+        for &token in forwarded {
             let crossed = self.inner.append_token(token);
             if crossed.is_some() {
                 block_completed = true;
             }
         }
 
-        // Stage and register all pending completions (including any from
-        // prefill's deferred staging and blocks just completed above)
+        // Registers the pre-existing dangling token (forwarded by this step)
+        // and every accepted token above.
         self.inner.complete_and_register_pending(manager);
+
+        if let Some(token) = dangling {
+            let crossed = self.inner.append_token(token);
+            if crossed.is_some() {
+                block_completed = true;
+            }
+            // Stage, but do not register: this keeps the completed block out of
+            // the LIFO drop below while leaving it invisible to prefix matching.
+            self.inner.stage_pending();
+        }
 
         self.kv_position += accepted.len();
 
@@ -1545,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_block_completed() {
+    fn test_decode_defers_dangling_boundary_registration() {
         let manager = create_test_manager::<TestMeta>(20);
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, kv=4, assigned=1, unassigned=0
@@ -1559,6 +1593,10 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(100, &manager).unwrap();
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
+        assert_eq!(seq.assigned_blocks(), 1);
+
+        seq.schedule_decode(&manager).unwrap();
+        seq.apply_decode(100, &manager).unwrap();
         assert_eq!(seq.assigned_blocks(), 2);
     }
 
@@ -1613,7 +1651,7 @@ mod tests {
         seq.schedule_decode(&manager).unwrap();
         let outcome = seq.apply_decode(102, &manager).unwrap(); // total=8, crosses boundary
         assert_eq!(outcome, DecodeOutcome::BlockCompleted);
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         // Next schedule_decode should allocate 1 gen block
         seq.schedule_decode(&manager).unwrap();
@@ -1623,7 +1661,7 @@ mod tests {
                 blocks_allocated: 1
             }
         );
-        assert_eq!(seq.unassigned_blocks(), 1);
+        assert_eq!(seq.unassigned_blocks(), 2);
     }
 
     #[test]
@@ -1767,6 +1805,35 @@ mod tests {
         assert_eq!(seq.assigned_blocks(), 3); // block 0 + blocks 1,2 registered
     }
 
+    /// The last accepted token is the verifier's newly sampled token; its KV
+    /// was never forwarded. A block it completes must stay staged, not become
+    /// matchable, and the next apply registers it after the forward.
+    #[test]
+    fn test_speculative_bonus_block_is_staged_not_registered() {
+        let manager = create_test_manager::<TestMeta>(20);
+        let mut seq = prefilled_seq(6, 20, &manager);
+        // Prefill 6: block 0 (0..4) complete; block 1 (4..8) holds 4,5 + the
+        // dangling anchor. Five accepted tokens land at 7..11; the last one
+        // completes block 2 (8..12).
+        seq.schedule_speculative(5, &manager).unwrap();
+        let outcome = seq
+            .apply_speculative(&[100, 101, 102, 103, 104], &manager)
+            .unwrap();
+        assert_eq!(outcome, DecodeOutcome::BlockCompleted);
+        assert_eq!(seq.kv_position(), 11);
+        assert_eq!(seq.tail_tokens(), 1);
+        assert_eq!(seq.assigned_blocks(), 2); // blocks 0,1 only
+        assert_eq!(seq.staged_blocks(), 1); // block 2 completed by the bonus
+
+        // The next forward registers it, then the new token is dangling.
+        seq.schedule_decode(&manager).unwrap();
+        seq.apply_decode(200, &manager).unwrap();
+        assert_eq!(seq.assigned_blocks(), 3);
+        assert_eq!(seq.staged_blocks(), 0);
+        assert_eq!(seq.kv_position(), 12);
+        assert_eq!(seq.tail_tokens(), 1);
+    }
+
     // =========================================================================
     // Revert
     // =========================================================================
@@ -1797,12 +1864,12 @@ mod tests {
         let mut seq = prefilled_seq(4, 10, &manager);
         // After prefill: total=5, assigned=1, unassigned=0
 
-        // Decode until boundary at total=8 → unassigned drops to 0
+        // Decode until boundary at total=8
         for _ in 0..3 {
             seq.schedule_decode(&manager).unwrap();
             seq.apply_decode(100, &manager).unwrap();
         }
-        assert_eq!(seq.unassigned_blocks(), 0);
+        assert_eq!(seq.unassigned_blocks(), 1);
 
         let avail_before = manager.available_blocks();
         seq.schedule_decode(&manager).unwrap();

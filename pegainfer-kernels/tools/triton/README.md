@@ -91,7 +91,7 @@ Run the focused GPU tests for the active Triton-backed paths:
 
 ```bash
 cargo test --release -p pegainfer-qwen35 --features qwen35 recurrent::tests::conv1d_prefill_handoff_matches_single_prefill -- --nocapture
-PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --test e2e_scheduler -- --nocapture
+PEGAINFER_TEST_MODEL_PATH=/path/to/Qwen3.5-4B cargo test --release -p pegainfer-qwen35 --features qwen35 --lib scheduler::e2e_tests::test_e2e_qwen35_scheduler -- --exact --test-threads=1 --nocapture
 ```
 
 ## Common failures

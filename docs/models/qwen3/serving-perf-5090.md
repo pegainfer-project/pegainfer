@@ -1,8 +1,8 @@
 # Qwen3-4B serving perf tuning record (RTX 5090)
 
-**TL;DR**: Tuning history for the QPS sweep numbers in [serving-performance.md](serving-performance.md). The mid-band gap closed with unified-step attention fusion: decode rows enter the prefill plan as qo_len=1 entries, one varlen attention call per layer, and the dispatch honors the plan's cta_tile_q (the kernel silently re-deriving its own tile size cost ~3ms/step). Earlier fixes: batched step tail (#345), chunked prefill (default now 1024), cuBLAS ≥ 13 (12.9 has a 50–100% GEMM cliff at N=1025 — build with `CUDA_HOME=/usr/local/cuda-13.x`), cublasLt per-shape algo tuning (which also re-enabled buckets 8/16), split-KV decode attention ≤bs32, two-stage argmax.
+**TL;DR**: Tuning history for the QPS sweep numbers in [serving-performance.md](serving-performance.md). The mid-band gap closed with unified-step attention fusion: decode rows enter the prefill plan as qo_len=1 entries, one varlen attention call per layer, and the dispatch honors the plan's cta_tile_q (the kernel silently re-deriving its own tile size cost ~3ms/step). Earlier fixes: batched step tail (#345), chunked prefill (default now 1024), cuBLAS ≥ 13 (12.9 has a 50–100% GEMM cliff at N=1025 — build with `CUDA_HOME=/usr/local/cuda-13.x`), cublasLt per-shape algo tuning (which also re-enabled buckets 8/16), split-KV decode attention ≤bs32, two-stage argmax. The per-shape tuning result can also be carried across boots by an opt-in file store (`PEGAINFER_GEMM_LT_CACHE`).
 
-Last touched: 2026-06
+Last touched: 2026-09
 
 ## Setup
 
@@ -23,9 +23,21 @@ After the CUDA 13.1 rebuild: unified step 60.8 → 47.1ms, QPS1 TTFT 64 → 50ms
 
 At QPS1 the TPOT integrand is the decode step itself (43% of steps run bs≥2 from Poisson overlap). Three fixes, decode step (ctx1024, p50): bs1 6.51→5.96ms, bs2 7.02→6.53, bs4 8.11→6.72:
 
-- **cublasLt per-shape algo tuning**: cuBLAS's default heuristic leaves 4–6% bandwidth on the table for every small-N decode GEMM (in-graph kernel times match Lt heuristic[0] exactly; the best candidate is 1.40–1.52 TB/s vs default's 1.28–1.48). `gemm_lt_tune` times all candidates at executor startup — on real weights rotated across all 36 layers so the loop stays L2-cold — and caches the winner per (M,N,K); GEMMs with N ≤ `GEMM_LT_MAX_N` (32) consult the cache, untuned shapes fall back to the old paths.
+- **cublasLt per-shape algo tuning**: cuBLAS's default heuristic leaves 4–6% bandwidth on the table for every small-N decode GEMM (in-graph kernel times match Lt heuristic[0] exactly; the best candidate is 1.40–1.52 TB/s vs default's 1.28–1.48). `gemm_lt_tune` times all candidates at executor startup — on real weights rotated across all 36 layers so the loop stays L2-cold — and caches the winner per (M,N,K); GEMMs with N ≤ `GEMM_LT_MAX_N` (32) consult the cache, untuned shapes fall back to the old paths. The table dies with the process; **Cross-process algo store** below carries it across boots.
 - **Split-KV decode attention bs≤2 → bs≤4, chunk 256 → 64 tokens**: the non-partitioned kernel runs one CTA per request×head = 8 CTAs at bs1 on 170 SMs. 64-token chunks measured fastest (32 is past the merge-overhead knee).
 - **Two-stage batched greedy argmax**: tile-parallel partials + per-row finalize; the single-block-per-row kernel cost 91–191µs/step over the 151936 vocab.
+
+## Cross-process algo store (opt-in)
+
+`gemm_lt_tune`'s table lives in the process, so every boot re-searches shapes an earlier boot already paid for. Setting `PEGAINFER_GEMM_LT_CACHE=<file>` carries a winner across processes. Unset, the tuning path is byte-identical to before and no file is touched.
+
+- **Path**: a file, created if it does not exist (its directory is not). The variable is read once per process; the file is opened per shape — looked up before that shape's search starts, appended one line when it finishes. Failing to open it, for any reason, is a miss: it costs start-up time, never a result.
+- **Sharing**: a record's key is GPU name, compute capability, SM count, CUDA runtime version, driver version, cublasLt version, `M/N/K`, dtype, layout, and the workspace cap the algo was chosen under. One file can therefore back many processes and several machines; a record written by other hardware or another toolchain simply does not match. Writers append whole lines with `O_APPEND` and the last matching record wins, so concurrent boots need no lock; a torn tail is rejected on read, and the next append starts a fresh line rather than gluing onto it. Append atomicity across a shared filesystem is that filesystem's to promise, not ours — but a record that lands garbled is rejected on read, so the worst it costs is a search that had already been paid for once.
+- **Invalidation**: a CUDA, cublasLt, or driver upgrade changes the key, so records written before it become misses — with one gap worth knowing. The driver field comes from `cudaDriverGetVersion`, which reports the CUDA level the installed driver supports and not its build number, so a driver update that keeps the same level (`570.86` to `570.124`, say) leaves the key identical and the old winners in play. Nothing re-times them: a stored algo is checked for validity, never for being still the fastest. If you want the ranking re-derived after a driver update, delete the file — it costs one tuning pass. A record whose key still matches but whose algo no longer validates against the live descriptors — or no longer fits the workspace — prints `gemm_lt_tune: stored algo rejected for [<key>]; retuning` and re-tunes, appending the new winner; a stale file therefore costs one re-tune, not a wrong answer. Deleting the file is always safe.
+- **Adoption is verified, not trusted**: the stored bytes are an opaque `cublasLtMatmulAlgo_t` another process wrote, so they are put through `cublasLtMatmulAlgoCheck` against this process's descriptors and launched once before being published — the same "the tuned kernel has already executed" precondition CUDA-Graph capture leans on.
+- **Not consulted under `--batch-invariant`**: that selects `Pin`, which pins the heuristic top without timing.
+
+Measured on Qwen3-4B, single sm_89 card, 40 stored records, warm `ready`, over five order-rotated pairs of one binary whose arms differ only in whether the store is there to be read: median −657 ms (−33.4%), 5/5, the present arm holding 1309–1316 ms against 1957–2070 ms absent. Against the flat-20 tuner two steps back, warm ready goes 2560 ms → ~1965 ms with the repeat budget → ~1312 ms here.
 
 ## #345 root cause: per-request step tail
 

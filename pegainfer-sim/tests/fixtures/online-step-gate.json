@@ -1,0 +1,28 @@
+{
+  "schema_version": 3,
+  "calibration": {
+    "manifest": "online-step-gate.manifest.json",
+    "sha256": "f18277d0f85667cb6e6d7ab6f1c08113ffb3c56e90eaeaba5ea223cb4da9a8f0"
+  },
+  "scheduler": {
+    "policy": "vllm_v1",
+    "max_num_seqs": 2,
+    "max_num_batched_tokens": 4,
+    "max_model_len": 16,
+    "prefill": {
+      "mode": "chunked",
+      "max_chunk_tokens": 2
+    }
+  },
+  "predictor": {
+    "coverage": {
+      "decode_reqs": [0, 2],
+      "sum_decode_ctx_tokens": [0, 4],
+      "prefill_tokens_in_step": [0, 4]
+    },
+    "model": {
+      "kind": "fixed_step",
+      "duration_us": 1000
+    }
+  }
+}

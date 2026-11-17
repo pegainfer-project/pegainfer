@@ -1,0 +1,259 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+
+use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::PromptEcho;
+use pegainfer_frontend::engine::RequestId;
+use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::StepReceiver;
+use pegainfer_frontend::engine::StopCause;
+use pegainfer_frontend::engine::Terminal;
+use pegainfer_frontend::engine::TokenLogprob;
+
+pub(super) struct Drained {
+    pub(super) tokens: usize,
+    pub(super) cached: usize,
+    pub(super) finish: FinishReason,
+    pub(super) stop_cause: Option<StopCause>,
+    pub(super) ids: Vec<u32>,
+    pub(super) logprobs: Vec<Option<TokenLogprob>>,
+    pub(super) prompt_echo: Option<PromptEcho>,
+}
+
+pub(super) struct StepCollector {
+    steps: StepReceiver,
+    buffered: HashMap<RequestId, VecDeque<RequestUpdate>>,
+    finished: HashSet<RequestId>,
+}
+
+/// A request the scheduler refused or failed before scheduling sends no
+/// further update, so waiting for its Scheduled would block until the
+/// stream closes at shutdown, which the waiting test never reaches.
+fn ended_before_scheduled(id: RequestId, terminal: &Terminal) -> ! {
+    match terminal {
+        Terminal::Rejected { reason, .. } => {
+            panic!("request {id:?} was rejected before it was scheduled: {reason}")
+        }
+        Terminal::Failed { message, .. } => {
+            panic!("request {id:?} failed before it was scheduled: {message}")
+        }
+        Terminal::Finished { reason, .. } => {
+            panic!("request {id:?} finished before it was scheduled: {reason:?}")
+        }
+    }
+}
+
+impl StepCollector {
+    pub(super) fn new(steps: StepReceiver) -> Self {
+        Self {
+            steps,
+            buffered: HashMap::new(),
+            finished: HashSet::new(),
+        }
+    }
+
+    fn ingest(&mut self, update: RequestUpdate) {
+        assert!(
+            !self.finished.contains(&update.id),
+            "update after terminal for {}",
+            update.id
+        );
+        assert_eq!(update.tokens.len(), update.logprobs.len());
+        if update.terminal.is_some() {
+            self.finished.insert(update.id);
+        }
+        self.buffered
+            .entry(update.id)
+            .or_default()
+            .push_back(update);
+    }
+
+    fn next_for(&mut self, id: RequestId) -> RequestUpdate {
+        loop {
+            if let Some(update) = self.buffered.get_mut(&id).and_then(VecDeque::pop_front) {
+                return update;
+            }
+            let step = self
+                .steps
+                .blocking_recv()
+                .expect("step stream closed while awaiting an update");
+            for update in step.updates {
+                self.ingest(update);
+            }
+        }
+    }
+
+    pub(super) fn wait_scheduled(&mut self, id: RequestId) {
+        let mut held = Vec::new();
+        loop {
+            let update = self.next_for(id);
+            if let Some(terminal) = &update.terminal
+                && update.scheduled.is_none()
+            {
+                ended_before_scheduled(id, terminal);
+            }
+            let scheduled = update.scheduled.is_some();
+            held.push(update);
+            if scheduled {
+                let queue = self.buffered.entry(id).or_default();
+                for update in held.into_iter().rev() {
+                    queue.push_front(update);
+                }
+                return;
+            }
+        }
+    }
+
+    pub(super) fn wait_scheduled_together(&mut self, ids: &[RequestId]) {
+        loop {
+            let step = self
+                .steps
+                .blocking_recv()
+                .expect("step stream closed before the admission burst");
+            for update in &step.updates {
+                if let Some(terminal) = &update.terminal
+                    && update.scheduled.is_none()
+                    && ids.contains(&update.id)
+                {
+                    ended_before_scheduled(update.id, terminal);
+                }
+            }
+            let any = ids.iter().any(|id| {
+                step.updates
+                    .iter()
+                    .any(|update| update.id == *id && update.scheduled.is_some())
+            });
+            let all = ids.iter().all(|id| {
+                step.updates
+                    .iter()
+                    .any(|update| update.id == *id && update.scheduled.is_some())
+            });
+            for update in step.updates {
+                self.ingest(update);
+            }
+            if any {
+                assert!(all, "the admission cohort split across scheduler steps");
+                return;
+            }
+        }
+    }
+
+    pub(super) fn wait_tokens(&mut self, id: RequestId, wanted: usize) {
+        let mut seen = 0;
+        let mut held = Vec::new();
+        while seen < wanted {
+            let update = self.next_for(id);
+            seen += update.tokens.len();
+            assert!(
+                update.terminal.is_none(),
+                "request finished before {wanted} tokens"
+            );
+            held.push(update);
+        }
+        let queue = self.buffered.entry(id).or_default();
+        for update in held.into_iter().rev() {
+            queue.push_front(update);
+        }
+    }
+
+    pub(super) fn drain(&mut self, id: RequestId, name: &str) -> Drained {
+        let mut tokens = 0;
+        let mut cached = 0;
+        let mut ids = Vec::new();
+        let mut logprobs = Vec::new();
+        let mut prompt_echo = None;
+        loop {
+            let update = self.next_for(id);
+            cached = update.cached_tokens.unwrap_or(cached);
+            tokens += update.tokens.len();
+            ids.extend(update.tokens);
+            logprobs.extend(update.logprobs);
+            if let Some(echo) = update.prompt_echo {
+                assert!(prompt_echo.is_none(), "{name}: the prompt was echoed twice");
+                prompt_echo = Some(echo);
+            }
+            match update.terminal {
+                Some(Terminal::Finished {
+                    reason,
+                    stop_cause,
+                    completion_tokens,
+                    ..
+                }) => {
+                    assert_eq!(completion_tokens, tokens, "{name}: completion count");
+                    return Drained {
+                        tokens,
+                        cached,
+                        finish: reason,
+                        stop_cause,
+                        ids,
+                        logprobs,
+                        prompt_echo,
+                    };
+                }
+                Some(Terminal::Rejected { reason, .. }) => {
+                    panic!("{name}: rejected: {reason}")
+                }
+                Some(Terminal::Failed { message, .. }) => panic!("{name}: failed: {message}"),
+                None => {}
+            }
+        }
+    }
+
+    pub(super) fn terminal(&mut self, id: RequestId) -> Terminal {
+        loop {
+            if let Some(terminal) = self.next_for(id).terminal {
+                return terminal;
+            }
+        }
+    }
+
+    /// The request's terminal if one has already arrived, without waiting. A
+    /// gate that asserts an engine *stopped* has to fail rather than block, and
+    /// [`Self::terminal`] waits on a stream that a stopped engine has closed.
+    pub(super) fn try_terminal(&mut self, id: RequestId) -> Option<Terminal> {
+        self.pump_available();
+        let queue = self.buffered.get_mut(&id)?;
+        let terminal = queue.iter().position(|update| update.terminal.is_some())?;
+        queue
+            .drain(..=terminal)
+            .next_back()
+            .and_then(|update| update.terminal)
+    }
+
+    pub(super) fn pump_available(&mut self) {
+        while let Ok(step) = self.steps.try_recv() {
+            for update in step.updates {
+                self.ingest(update);
+            }
+        }
+    }
+
+    pub(super) fn buffered_tokens(&mut self, id: RequestId) -> usize {
+        self.pump_available();
+        self.buffered.get(&id).map_or(0, |updates| {
+            updates.iter().map(|update| update.tokens.len()).sum()
+        })
+    }
+
+    pub(super) fn saw_scheduled(&mut self, id: RequestId) -> bool {
+        self.pump_available();
+        self.buffered
+            .get(&id)
+            .is_some_and(|updates| updates.iter().any(|update| update.scheduled.is_some()))
+    }
+
+    pub(super) fn terminals_after_close(&mut self, id: RequestId) -> Vec<Terminal> {
+        while let Some(step) = self.steps.blocking_recv() {
+            for update in step.updates {
+                self.ingest(update);
+            }
+        }
+        self.buffered
+            .remove(&id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|update| update.terminal)
+            .collect()
+    }
+}

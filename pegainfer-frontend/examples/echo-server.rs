@@ -223,6 +223,7 @@ async fn main() -> Result<()> {
         std::future::ready(Ok(engine)),
         &shared.model_path,
         served_model_name,
+        vllm::ParserSelection::Auto,
         shared.port,
         None,
         plan.scheduler_partition_count,

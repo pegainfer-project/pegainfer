@@ -268,7 +268,6 @@ fn tiny_manifest() -> KimiK2WeightManifest {
         });
     }
     KimiK2WeightManifest {
-        text_tensor_count: 208_215,
         token_embedding: top("language_model.model.embed_tokens.weight"),
         final_norm: top("language_model.model.norm.weight"),
         lm_head: top("language_model.lm_head.weight"),

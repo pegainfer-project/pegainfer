@@ -25,6 +25,7 @@ use crate::config::GLM52_Q_B_OUT;
 use crate::config::GLM52_Q_LORA_RANK;
 use crate::config::GLM52_ROUTED_EXPERTS;
 use crate::config::GLM52_VOCAB;
+use crate::fp8::FP8_BLOCK;
 
 mod context;
 mod load;
@@ -44,7 +45,6 @@ const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
 /// chain's shim contract check.
 pub(crate) const GLM52_EP_RANKS: usize = 8;
 const GLM52_LOCAL_EXPERTS: usize = GLM52_ROUTED_EXPERTS / GLM52_EP_RANKS;
-const FP8_BLOCK_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Expert packed placement: routed-expert tensors are written into their FINAL
@@ -59,11 +59,11 @@ const FP8_BLOCK_SIZE: usize = 128;
 const EXPERT_PROJ_W13_BYTES: usize = GLM52_EXPERT_INTERMEDIATE * GLM52_HIDDEN; // one of gate|up
 const EXPERT_W13_WEIGHT_STRIDE: usize = 2 * EXPERT_PROJ_W13_BYTES;
 const EXPERT_PROJ_W13_SCALE_BYTES: usize =
-    GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK_SIZE) * GLM52_HIDDEN.div_ceil(FP8_BLOCK_SIZE) * 4;
+    GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK) * GLM52_HIDDEN.div_ceil(FP8_BLOCK) * 4;
 const EXPERT_W13_SCALE_STRIDE: usize = 2 * EXPERT_PROJ_W13_SCALE_BYTES;
 const EXPERT_W2_WEIGHT_STRIDE: usize = GLM52_HIDDEN * GLM52_EXPERT_INTERMEDIATE;
 const EXPERT_W2_SCALE_STRIDE: usize =
-    GLM52_HIDDEN.div_ceil(FP8_BLOCK_SIZE) * GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK_SIZE) * 4;
+    GLM52_HIDDEN.div_ceil(FP8_BLOCK) * GLM52_EXPERT_INTERMEDIATE.div_ceil(FP8_BLOCK) * 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) enum Glm52ExpertRegionKind {
@@ -630,7 +630,7 @@ fn projection_contract(
     if name.ends_with(&format!("{stem}.weight_scale_inv")) {
         return Some(contract(
             Dtype::F32,
-            [rows.div_ceil(FP8_BLOCK_SIZE), cols.div_ceil(FP8_BLOCK_SIZE)],
+            [rows.div_ceil(FP8_BLOCK), cols.div_ceil(FP8_BLOCK)],
         ));
     }
     None

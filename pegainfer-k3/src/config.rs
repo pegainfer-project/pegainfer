@@ -12,10 +12,6 @@
 //! launched with. Both live in `K3RoutedExperts` / `K3MoeTopo` rather than in
 //! a config struct.
 
-// Bring-up: the constants below are the K3 architecture contract, consumed
-// piecewise by the loader, the model builder and the executor as those land.
-#![allow(dead_code)]
-
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
@@ -90,9 +86,6 @@ pub(crate) const K3_SITU_BETA: f64 = 4.0;
 pub(crate) const K3_SITU_LINEAR_BETA: f64 = 25.0;
 
 const K3_RMS_NORM_EPS: f64 = 1.0e-5;
-/// The f32 the GPU norm kernels consume (every RMSNorm in the model shares the
-/// one checkpoint eps that `probe_config_json` validates).
-pub(crate) const K3_RMS_EPS: f32 = K3_RMS_NORM_EPS as f32;
 
 /// Routed-expert counts this loader accepts. The two published K3 text towers
 /// differ in this number alone — every other architecture constant, tensor

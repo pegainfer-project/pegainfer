@@ -1,0 +1,25 @@
+diff --git a/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py b/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+--- a/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
++++ b/flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+@@ -5,2 +5,3 @@
+ import cutlass.cute as cute
++import cuda.bindings.driver as cuda
+ import cutlass.pipeline as pipeline
+@@ -673,3 +674,3 @@
+                     (self.D, self.D, num_sab_heads, total_checkpoints),
+-                    order=(0, 1, 2, 3),
++                    order=(1, 0, 2, 3),  # OpenInfer [H,K,V]: V is contiguous.
+                 )
+@@ -1232,3 +1233,4 @@
+         state_layout = cute.make_ordered_layout(
+-            (self.D, self.D, num_sab_heads, num_seqs), order=(0, 1, 2, 3)
++            (self.D, self.D, num_sab_heads, num_seqs),
++            order=(1, 0, 2, 3),  # OpenInfer [H,K,V]: V is contiguous.
+         )
+@@ -1473,4 +1475,4 @@
+         checkpoint_every_n_tokens: cutlass.Int32,
+-        grid_x: int,
+-        stream,
++        grid_x: cutlass.Int32,
++        stream: cuda.CUstream,
+     ):

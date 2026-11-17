@@ -16,6 +16,7 @@
 // defined via build.rs.
 
 #include "../common.cuh"
+#include "../shared/ffi_guard.cuh"
 
 #include <cuda.h>
 #include <cstdint>
@@ -100,7 +101,7 @@ CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_si
         if (attr_err != cudaSuccess) {
             fprintf(stderr, "glm52_deepgemm_mqa: cudaFuncSetAttribute failed: %s\n",
                     cudaGetErrorString(attr_err));
-            return CUDA_ERROR_LAUNCH_FAILED;
+            return map_cuda_error(attr_err);
         }
     }
 
@@ -119,7 +120,7 @@ CUresult launch_aot(const void* func, dim3 grid_dim, dim3 block_dim, int smem_si
     const cudaError_t err = cudaLaunchKernelExC(&config, func, args);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm52_deepgemm_mqa: launch failed: %s\n", cudaGetErrorString(err));
-        return CUDA_ERROR_LAUNCH_FAILED;
+        return map_cuda_error(err);
     }
     return CUDA_SUCCESS;
 }
@@ -136,7 +137,7 @@ CUresult launch_aot_plain(const void* func, dim3 grid_dim, dim3 block_dim, int s
         if (attr_err != cudaSuccess) {
             fprintf(stderr, "glm52_deepgemm_mqa: cudaFuncSetAttribute failed: %s\n",
                     cudaGetErrorString(attr_err));
-            return CUDA_ERROR_LAUNCH_FAILED;
+            return map_cuda_error(attr_err);
         }
     }
     cudaLaunchConfig_t config = {};
@@ -147,7 +148,7 @@ CUresult launch_aot_plain(const void* func, dim3 grid_dim, dim3 block_dim, int s
     const cudaError_t err = cudaLaunchKernelExC(&config, func, args);
     if (err != cudaSuccess) {
         fprintf(stderr, "glm52_deepgemm_mqa: launch failed: %s\n", cudaGetErrorString(err));
-        return CUDA_ERROR_LAUNCH_FAILED;
+        return map_cuda_error(err);
     }
     return CUDA_SUCCESS;
 }

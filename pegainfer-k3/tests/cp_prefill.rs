@@ -29,7 +29,7 @@
 //! comparison).
 //!
 //! ```text
-//! cargo test --release -p pegainfer-k3 --test cp_prefill \
+//! cargo test --release -p pegainfer-k3 --features k3 --test cp_prefill \
 //!   cp4_prefill_matches_cp1 -- --ignored --nocapture
 //! ```
 
@@ -87,7 +87,9 @@ fn checkpoint() -> PathBuf {
 }
 
 fn config() -> K3ExecutorConfig {
-    let mut config = K3ExecutorConfig::default().from_env();
+    let mut config = K3ExecutorConfig::default()
+        .from_env()
+        .expect("K3 environment overrides");
     // `PEGAINFER_K3_CP_PROMPT` raises the serving ceiling with the prompt:
     // the 16896-token MegaMoE protocol maximum makes CP4 span 64k prompts in
     // one superstep, and the gate must be able to follow it up.

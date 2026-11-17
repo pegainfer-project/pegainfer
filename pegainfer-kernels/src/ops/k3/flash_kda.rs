@@ -9,8 +9,8 @@
 //! The C ABI shim (`csrc/k3/k3_flash_kda.cu`) pins the one configuration this
 //! engine uses: `D = 128`, f32 recurrent state carried in and out, one
 //! sequence per call. The gate math is applied in-kernel from the
-//! pre-activation projection — `decay = exp(lower_bound * sigmoid(exp(A_log)
-//! * (g + dt_bias)))`, the same formula the sequential TileLang core spells —
+//! pre-activation projection — `decay = exp(lower_bound * sigmoid(exp(A_log) *
+//! (g + dt_bias)))`, the same formula the sequential TileLang core spells —
 //! and q/k are L2-normalized in-kernel (f32 chain, where the TileLang core
 //! deliberately mirrors the reference's bf16 chain: chunked prefill is a
 //! noise-floor path, not a bitwise one).
@@ -57,7 +57,7 @@ pub struct K3FlashKdaSpan {
 /// [heads]` and `dt_bias [heads * 128]` are f32 weights. `state_in` /
 /// `state_out` are read at their span rows — one `[heads, 128, 128]` f32
 /// recurrent row each — and the addressed rows may not alias.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 pub fn k3_flash_kda_fwd_launch(
     ctx: &DeviceContext,
     t_total: usize,
@@ -186,7 +186,7 @@ pub fn k3_flash_kda_fwd_launch(
 /// token output is not computed (a CP middle rank discards it). Operand
 /// contract otherwise matches [`k3_flash_kda_fwd_launch`] at span zero;
 /// `state_out_d` and `state_out_m` may not alias.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
 pub fn k3_flash_kda_fwd_md_launch(
     ctx: &DeviceContext,
     t_total: usize,

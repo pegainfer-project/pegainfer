@@ -6,6 +6,14 @@ use super::Half;
 // Kimi K2 private kernels (feature `kimi-k2`).
 // Sources: csrc/kimi_k2/*.cu (+ vendored vllm-marlin headers).
 unsafe extern "C" {
+    pub fn kimi_pack_top1_packets_cuda(
+        ids: *const i32,
+        values: *const Half,
+        packets: *mut core::ffi::c_void,
+        rows: i32,
+        stream: CUstream,
+    ) -> i32;
+
     pub fn kimi_add_f32_bf16_to_bf16_cuda(
         a: *const f32,
         b: *const Half,

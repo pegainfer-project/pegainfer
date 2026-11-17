@@ -2,6 +2,8 @@
 // `pegainfer-kernels/qwen35`, which need Python + Triton at build time.
 // Without the feature this compiles to an empty crate so plain workspace
 // builds stay Python-free.
+// Submodule `use self::*` globs are the established module-tree convention.
+#![allow(clippy::wildcard_imports)]
 #![cfg(feature = "qwen35")]
 
 mod batch_decode;
@@ -10,17 +12,21 @@ pub(crate) mod config;
 mod decode_buffers;
 mod executor;
 mod ffi;
+mod flashinfer_gdn;
 mod logprobs;
 pub mod model_line;
 mod ops;
 mod prefill;
 pub mod prefill_buffers;
+mod prefix_cache;
 pub(crate) mod recurrent;
 pub(crate) mod recurrent_state;
 mod scheduler;
 #[cfg(test)]
-#[path = "../tests/common/model_fixture.rs"]
 mod test_fixture;
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_fixture_common;
 mod tp_executor;
 mod unified_forward;
 mod weights;
@@ -30,7 +36,7 @@ use std::path::Path;
 use anyhow::Result;
 use anyhow::anyhow;
 pub(crate) use config::probe_config_json;
-use pegainfer_frontend::engine::EngineHandle;
+use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
@@ -96,18 +102,41 @@ pub enum Qwen35DecodeOverlap {
     SharedSm,
 }
 
+/// GDN prefill implementation requested when loading Qwen3.5.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum Qwen35GdnBackend {
+    /// Use the existing Triton implementation, irrespective of linked candidates.
+    Triton,
+    /// Use the build-linked SM120/Hv32/TP1 candidate; unsupported loads fail.
+    #[value(name = "flashinfer-candidate")]
+    FlashInferCandidate,
+}
+
+impl std::fmt::Display for Qwen35GdnBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Triton => "triton",
+            Self::FlashInferCandidate => "flashinfer-candidate",
+        })
+    }
+}
+
+/// TP decode runs CUDA Graphs when `cuda_graph` is set AND the rank-local
+/// decode GQA group has a compiled kernel (`tp-design.md` P2c gate); otherwise
+/// TP keeps the batched eager path.
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
     max_batch: usize,
     max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     start_engine_with_capacity_and_policy(
         model_path,
         options,
         max_batch,
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
+        0,
     )
 }
 
@@ -117,13 +146,36 @@ pub struct Qwen35LaunchOptions {
     device_ordinal: usize,
     /// Tensor-parallel world size; `> 1` uses devices `0..tp_size`.
     tp_size: usize,
-    /// TP Phase 1 supports eager-only multi-GPU execution.
+    /// TP decode captures CUDA Graphs when the rank-local decode GQA group has
+    /// a compiled kernel; uncompiled groups stay on the eager path.
     cuda_graph: bool,
     max_batch: usize,
     max_prefill_tokens: usize,
+    gdn_backend: Qwen35GdnBackend,
+    prefix_cache_mib: usize,
 }
 
 impl Qwen35LaunchOptions {
+    /// Configure the runtime and optional per-rank snapshot budget.
+    pub fn new(
+        device_ordinal: usize,
+        tp_size: usize,
+        cuda_graph: bool,
+        max_batch: usize,
+        max_prefill_tokens: usize,
+        prefix_cache_mib: usize,
+    ) -> Self {
+        Self {
+            device_ordinal,
+            tp_size,
+            cuda_graph,
+            max_batch,
+            max_prefill_tokens,
+            prefix_cache_mib,
+            gdn_backend: Qwen35GdnBackend::Triton,
+        }
+    }
+
     fn device_ordinals(&self) -> Result<Vec<usize>> {
         anyhow::ensure!(self.tp_size >= 1, "Qwen3.5 tp_size must be >= 1");
         Ok(if self.tp_size == 1 {
@@ -140,9 +192,9 @@ pub fn launch_with_options_policy_and_overlap(
     options: Qwen35LaunchOptions,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
-) -> Result<EngineHandle> {
+) -> Result<Engine> {
     let device_ordinals = options.device_ordinals()?;
-    start_engine_with_capacity_policy_and_overlap(
+    start_engine_with_backend(
         model_path,
         EngineLoadOptions {
             enable_cuda_graph: options.cuda_graph,
@@ -155,21 +207,8 @@ pub fn launch_with_options_policy_and_overlap(
         options.max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
-    )
-}
-
-pub fn start_engine_with_capacity(
-    model_path: &Path,
-    options: EngineLoadOptions,
-    max_batch: usize,
-    max_prefill_tokens: usize,
-) -> Result<EngineHandle> {
-    start_engine_with_capacity_and_policy(
-        model_path,
-        options,
-        max_batch,
-        max_prefill_tokens,
-        Qwen35SchedulerPolicy::Off,
+        options.gdn_backend,
+        options.prefix_cache_mib,
     )
 }
 
@@ -179,7 +218,8 @@ pub(crate) fn start_engine_with_capacity_and_policy(
     max_batch: usize,
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
-) -> Result<EngineHandle> {
+    prefix_cache_mib: usize,
+) -> Result<Engine> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
         options,
@@ -187,7 +227,39 @@ pub(crate) fn start_engine_with_capacity_and_policy(
         max_prefill_tokens,
         scheduler_policy,
         Qwen35DecodeOverlap::Off,
+        prefix_cache_mib,
     )
+}
+
+/// Launch rules every caller meets. The CLI checks them before anything loads,
+/// and the launch checks them again for callers that skip the CLI.
+pub(crate) fn check_launch(
+    max_batch: usize,
+    tensor_parallel: bool,
+    scheduler_policy: Qwen35SchedulerPolicy,
+    decode_overlap: Qwen35DecodeOverlap,
+) -> Result<()> {
+    anyhow::ensure!(
+        (1..=MAX_DECODE_BATCH).contains(&max_batch),
+        "Qwen3.5 --max-batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
+    );
+    if decode_overlap == Qwen35DecodeOverlap::SharedSm {
+        anyhow::ensure!(
+            max_batch <= MAX_SHARED_SM_DECODE_BATCH,
+            "Qwen3.5 --decode-overlap=stream requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}, got {max_batch}; larger decode buckets still fall back to the prefill GEMM handle"
+        );
+    }
+    if tensor_parallel {
+        anyhow::ensure!(
+            decode_overlap == Qwen35DecodeOverlap::Off,
+            "Qwen3.5 --decode-overlap is single-GPU only; tensor parallelism has no prefill/decode overlap"
+        );
+        anyhow::ensure!(
+            scheduler_policy != Qwen35SchedulerPolicy::Auto,
+            "Qwen3.5 --qwen35-scheduler-policy=auto is single-GPU only; tensor parallelism uses the fixed off policy"
+        );
+    }
+    Ok(())
 }
 
 pub fn start_engine_with_capacity_policy_and_overlap(
@@ -197,43 +269,50 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
-) -> Result<EngineHandle> {
-    anyhow::ensure!(
-        (1..=MAX_DECODE_BATCH).contains(&max_batch),
-        "Qwen3.5 max_batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
-    );
+    prefix_cache_mib: usize,
+) -> Result<Engine> {
+    start_engine_with_backend(
+        model_path,
+        options,
+        max_batch,
+        max_prefill_tokens,
+        scheduler_policy,
+        decode_overlap,
+        Qwen35GdnBackend::Triton,
+        prefix_cache_mib,
+    )
+}
+
+fn start_engine_with_backend(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    max_batch: usize,
+    max_prefill_tokens: usize,
+    scheduler_policy: Qwen35SchedulerPolicy,
+    decode_overlap: Qwen35DecodeOverlap,
+    gdn_backend: Qwen35GdnBackend,
+    prefix_cache_mib: usize,
+) -> Result<Engine> {
     let EngineLoadOptions {
         enable_cuda_graph,
         device_ordinals,
         seed,
         ..
     } = options;
-    anyhow::ensure!(
-        scheduler_policy == Qwen35SchedulerPolicy::Off
-            || decode_overlap == Qwen35DecodeOverlap::Off,
-        "Qwen3.5 --decode-overlap=stream requires --qwen35-scheduler-policy=off"
-    );
-    if decode_overlap == Qwen35DecodeOverlap::SharedSm {
-        anyhow::ensure!(
-            max_batch <= MAX_SHARED_SM_DECODE_BATCH,
-            "Qwen3.5 --decode-overlap=stream currently requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}; larger decode buckets still fall back to the prefill GEMM handle"
-        );
-    }
+    check_launch(
+        max_batch,
+        device_ordinals.len() > 1,
+        scheduler_policy,
+        decode_overlap,
+    )?;
+    let prefix_snapshot_bytes = prefix_cache_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("Qwen3.5 prefix-cache MiB budget overflows usize"))?;
     if device_ordinals.len() > 1 {
         anyhow::ensure!(
-            decode_overlap == Qwen35DecodeOverlap::Off,
-            "Qwen3.5 decode overlap is supported on a single GPU only"
+            gdn_backend == Qwen35GdnBackend::Triton,
+            "Qwen3.5 flashinfer-candidate requires TP world_size=1"
         );
-        if scheduler_policy == Qwen35SchedulerPolicy::Auto {
-            return Err(anyhow!(
-                "Qwen3.5 TP uses the fixed off scheduler policy; --qwen35-scheduler-policy=auto is single-GPU only"
-            ));
-        }
-        if enable_cuda_graph {
-            return Err(anyhow!(
-                "Qwen3.5 TP Phase 1 supports eager execution only; disable CUDA Graph"
-            ));
-        }
         let model_path = model_path
             .to_str()
             .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
@@ -243,6 +322,8 @@ pub fn start_engine_with_capacity_policy_and_overlap(
             &device_ordinals,
             max_batch,
             max_prefill_tokens,
+            enable_cuda_graph,
+            prefix_snapshot_bytes,
         );
     }
 
@@ -263,7 +344,17 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     let model_path = model_path
         .to_str()
         .ok_or_else(|| anyhow!("model path must be valid UTF-8"))?;
-    let model = weights::Qwen35Model::from_safetensors(model_path, device_ordinal, max_batch)?;
+    let model = weights::Qwen35Model::from_safetensors_with_runtime_and_capacity(
+        model_path,
+        weights::ModelRuntimeConfig {
+            enable_cuda_graph,
+            device_ordinal,
+            gdn_backend,
+            tensor_parallel: None,
+            prefix_snapshot_bytes,
+        },
+        max_batch,
+    )?;
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
@@ -281,11 +372,9 @@ mod tests {
     use pegainfer_frontend::engine::EngineLoadOptions;
     use pegainfer_frontend::engine::EpBackend;
 
-    use super::MAX_SHARED_SM_DECODE_BATCH;
     use super::Qwen35DecodeOverlap;
     use super::Qwen35LaunchOptions;
     use super::Qwen35SchedulerPolicy;
-    use super::start_engine_with_capacity_and_policy;
     use super::start_engine_with_capacity_policy_and_overlap;
 
     #[test]
@@ -296,6 +385,8 @@ mod tests {
             cuda_graph: false,
             max_batch: 1,
             max_prefill_tokens: 1,
+            gdn_backend: super::Qwen35GdnBackend::Triton,
+            prefix_cache_mib: 0,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();
@@ -305,29 +396,6 @@ mod tests {
     #[test]
     fn scheduler_policy_defaults_to_off() {
         assert_eq!(Qwen35SchedulerPolicy::default(), Qwen35SchedulerPolicy::Off);
-    }
-
-    #[test]
-    fn tp_rejects_auto_scheduler_policy_before_loading_model() {
-        let err = start_engine_with_capacity_and_policy(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: false,
-                device_ordinals: vec![0, 1],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            1,
-            1,
-            Qwen35SchedulerPolicy::Auto,
-        )
-        .err()
-        .expect("scheduler policy validation should reject TP launch")
-        .to_string();
-
-        assert!(err.contains("scheduler policy"));
-        assert!(err.contains("single-GPU only"));
     }
 
     #[test]
@@ -345,58 +413,12 @@ mod tests {
             1,
             Qwen35SchedulerPolicy::Off,
             Qwen35DecodeOverlap::SharedSm,
+            0,
         )
         .err()
         .expect("decode-overlap validation should reject TP launch")
         .to_string();
 
-        assert!(err.contains("single GPU"));
-    }
-
-    #[test]
-    fn auto_policy_rejects_decode_overlap_before_loading_model() {
-        let err = start_engine_with_capacity_policy_and_overlap(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            1,
-            1,
-            Qwen35SchedulerPolicy::Auto,
-            Qwen35DecodeOverlap::SharedSm,
-        )
-        .err()
-        .expect("decode-overlap validation should reject auto policy")
-        .to_string();
-
-        assert!(err.contains("scheduler-policy=off"));
-    }
-
-    #[test]
-    fn shared_sm_rejects_unsafe_decode_bucket_before_loading_model() {
-        let err = start_engine_with_capacity_policy_and_overlap(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: true,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            MAX_SHARED_SM_DECODE_BATCH + 1,
-            1,
-            Qwen35SchedulerPolicy::Off,
-            Qwen35DecodeOverlap::SharedSm,
-        )
-        .err()
-        .expect("decode-overlap validation should reject unsafe decode bucket")
-        .to_string();
-
-        assert!(err.contains("max-batch"));
-        assert!(err.contains(&MAX_SHARED_SM_DECODE_BATCH.to_string()));
+        assert!(err.contains("single-GPU only"));
     }
 }

@@ -168,14 +168,12 @@ fn push_top_level(config: &Config, tensors: &mut Vec<TensorRequirement>) {
         Dtype::BF16,
         [config.vocab_size, config.hidden_size],
     );
-    if !config.tie_word_embeddings {
-        push_req(
-            tensors,
-            "lm_head.weight",
-            Dtype::BF16,
-            [config.vocab_size, config.hidden_size],
-        );
-    }
+    push_req(
+        tensors,
+        "lm_head.weight",
+        Dtype::BF16,
+        [config.vocab_size, config.hidden_size],
+    );
     push_req(
         tensors,
         "model.norm.weight",

@@ -6,26 +6,21 @@ use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
+use crate::ops::KIMI_K2_EXPERT_INTERMEDIATE;
+use crate::ops::KIMI_K2_HIDDEN;
+use crate::ops::KIMI_K2_INT4_GROUP_SIZE;
+use crate::ops::KIMI_K2_ROUTED_EXPERTS;
+use crate::ops::KIMI_K2_TOPK;
 use crate::ops::marlin_face::MarlinAlignBuffers;
 use crate::ops::marlin_face::MarlinGemmBuffers;
 use crate::ops::marlin_face::launch_marlin_align;
 use crate::ops::marlin_face::launch_marlin_gemm;
-#[cfg(test)]
-use crate::tensor::AxisSpec;
 use crate::tensor::DeviceContext;
 use crate::tensor::GpuTensor;
-#[cfg(test)]
-#[cfg(test)]
-use crate::tensor::TensorSpec;
 
-pub const KIMI_K2_HIDDEN: usize = 7168;
-pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
 pub const KIMI_K2_SHARED_GATE_UP: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
-const KIMI_K2_ROUTED_EXPERTS: usize = 384;
 pub const KIMI_K2_EP_WORLD: usize = 8;
 pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WORLD;
-pub const KIMI_K2_TOPK: usize = 8;
-pub const KIMI_K2_INT4_GROUP_SIZE: usize = 32;
 
 pub fn kimi_add_f32_bf16_to_bf16<const DIM: usize>(
     ctx: &DeviceContext,
@@ -342,64 +337,8 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    #[cfg(test)]
-    fn weight_packed_checkpoint_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "u8",
-            "expert_major_int4_packed_checkpoint_offset_binary",
-            [
-                AxisSpec::named("local_expert", self.packed_shape.experts),
-                AxisSpec::named("out", self.packed_shape.rows),
-                AxisSpec::named("packed_in_over_2", self.packed_shape.cols),
-            ],
-        )
-    }
-
-    #[must_use]
     fn marlin_packed_u32_elements(&self) -> usize {
         self.local_experts * (self.logical_shape.in_dim / 16) * (self.logical_shape.out_dim * 2)
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    fn weight_packed_marlin_uint4b8_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "u32",
-            "expert_major_int4_packed_marlin_uint4b8_noact",
-            [
-                AxisSpec::named("local_expert", self.local_experts),
-                AxisSpec::named("in_tile16", self.logical_shape.in_dim / 16),
-                AxisSpec::named("out_x2", self.logical_shape.out_dim * 2),
-            ],
-        )
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    fn weight_scale_checkpoint_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "bf16",
-            "expert_major_group_scale_checkpoint",
-            [
-                AxisSpec::named("local_expert", self.scale_shape.experts),
-                AxisSpec::named("out", self.scale_shape.rows),
-                AxisSpec::named("in_group", self.scale_shape.cols),
-            ],
-        )
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    fn weight_scale_marlin_permuted_spec(&self) -> TensorSpec {
-        TensorSpec::named(
-            "bf16",
-            "expert_major_group_scale_marlin_group_major_perm64",
-            [
-                AxisSpec::named("local_expert", self.scale_shape.experts),
-                AxisSpec::named("in_group", self.scale_shape.cols),
-                AxisSpec::named("out", self.scale_shape.rows),
-            ],
-        )
     }
 }
 
@@ -1499,56 +1438,6 @@ mod tests {
         );
         assert_eq!(manifest.packed_shape.elements(), 48 * 7168 * (2048 / 2));
         assert_eq!(manifest.scale_shape.elements(), 48 * 7168 * (2048 / 32));
-    }
-
-    #[test]
-    fn int4_scale_specs_distinguish_checkpoint_and_marlin_layouts() {
-        let manifest = KimiInt4WeightManifest::ep8(
-            KimiInt4ExpertRole::W1Gate,
-            0,
-            KimiInt4NibbleOrder::LowThenHigh,
-        );
-
-        let checkpoint = manifest.weight_scale_checkpoint_spec();
-        assert_eq!(checkpoint.layout, "expert_major_group_scale_checkpoint");
-        assert_eq!(checkpoint.axes[1].name, "out");
-        assert_eq!(checkpoint.axes[2].name, "in_group");
-
-        let marlin = manifest.weight_scale_marlin_permuted_spec();
-        assert_eq!(
-            marlin.layout,
-            "expert_major_group_scale_marlin_group_major_perm64"
-        );
-        assert_eq!(marlin.axes[1].name, "in_group");
-        assert_eq!(marlin.axes[2].name, "out");
-    }
-
-    #[test]
-    fn int4_packed_specs_distinguish_checkpoint_and_marlin_layouts() {
-        let manifest = KimiInt4WeightManifest::ep8(
-            KimiInt4ExpertRole::W2Down,
-            0,
-            KimiInt4NibbleOrder::LowThenHigh,
-        );
-
-        let checkpoint = manifest.weight_packed_checkpoint_spec();
-        assert_eq!(
-            checkpoint.layout,
-            "expert_major_int4_packed_checkpoint_offset_binary"
-        );
-        assert_eq!(checkpoint.axes[1].name, "out");
-        assert_eq!(checkpoint.axes[2].name, "packed_in_over_2");
-
-        let marlin = manifest.weight_packed_marlin_uint4b8_spec();
-        assert_eq!(
-            marlin.layout,
-            "expert_major_int4_packed_marlin_uint4b8_noact"
-        );
-        assert_eq!(marlin.dtype, "u32");
-        assert_eq!(marlin.axes[1].name, "in_tile16");
-        assert_eq!(marlin.axes[1].size, KIMI_K2_EXPERT_INTERMEDIATE / 16);
-        assert_eq!(marlin.axes[2].name, "out_x2");
-        assert_eq!(marlin.axes[2].size, KIMI_K2_HIDDEN * 2);
         assert_eq!(
             manifest.marlin_packed_u32_elements() * std::mem::size_of::<u32>(),
             manifest.packed_shape.elements()

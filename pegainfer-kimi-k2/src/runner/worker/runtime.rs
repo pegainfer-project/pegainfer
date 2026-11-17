@@ -321,34 +321,3 @@ pub(super) fn launch_local_top1_batch(
     }
     Ok(())
 }
-
-pub(super) fn read_local_top1_batch_values(
-    ctx: &DeviceContext,
-    logits: &HiddenStates,
-    active_rows: usize,
-    top1_values: &mut CudaSlice<half::bf16>,
-    out: &mut CudaSlice<i32>,
-) -> Result<Vec<(u32, f32)>> {
-    ctx.sync()?;
-    let top_ids = ctx
-        .stream
-        .clone_dtoh(&*out)
-        .map_err(|err| anyhow::anyhow!("D2H Kimi batched top1 ids read failed: {err}"))?;
-    let top_values = ctx
-        .stream
-        .clone_dtoh(&*top1_values)
-        .map_err(|err| anyhow::anyhow!("D2H Kimi batched top1 values read failed: {err}"))?;
-    let mut rows = Vec::with_capacity(active_rows);
-    for row in 0..active_rows {
-        let top_id = top_ids[row];
-        ensure!(
-            top_id >= 0 && (top_id as usize) < logits.hidden_dim,
-            "Kimi batched local top1 id {} at row {} out of logits range {}",
-            top_id,
-            row,
-            logits.hidden_dim
-        );
-        rows.push((top_id as u32, top_values[row].to_f32()));
-    }
-    Ok(rows)
-}

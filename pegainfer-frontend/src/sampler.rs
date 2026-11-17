@@ -7,9 +7,10 @@ pub struct SamplingParams {
     /// tokens with `p < min_p * p_max` are masked. `0.0` disables (the
     /// default); valid range is [0, 1).
     pub min_p: f32,
-    /// Per-request sampling seed. `Some` makes the request's sampled tokens a
-    /// pure function of (seed, request step, distribution) — independent of
-    /// batch composition — so a fixed-seed request replays identically.
+    /// Per-request sampling seed, handed to the engine as the request gave
+    /// it. What a seed replays is the engine's promise: a fixed seed gives
+    /// the same tokens for the same request where the engine's draw depends
+    /// on nothing else, or at the same batch layout where it does.
     pub seed: Option<u64>,
     pub ignore_eos: bool,
 }

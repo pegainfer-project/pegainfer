@@ -3,6 +3,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprob {
     pub logprob: f32,
+    /// Count of vocabulary logits >= this token's logit, including ties (vLLM convention).
+    pub rank: u32,
     pub top_logprobs: Vec<(u32, f32)>,
 }
 

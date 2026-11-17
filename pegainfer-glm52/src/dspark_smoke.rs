@@ -9,7 +9,7 @@
 //!
 //! Run (single GPU):
 //! ```text
-//! cargo test --release -p pegainfer-glm52 --lib \
+//! cargo test --release -p pegainfer-glm52 --features glm52 --lib \
 //!   dspark_propose_smoke -- --nocapture --ignored
 //! ```
 

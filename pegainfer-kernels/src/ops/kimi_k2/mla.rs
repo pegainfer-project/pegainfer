@@ -6,21 +6,25 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::ops::KIMI_K2_KV_LORA_RANK;
+use crate::ops::KIMI_K2_Q_LORA_RANK;
+use crate::ops::KIMI_K2_QK_NOPE_HEAD_DIM;
+use crate::ops::KIMI_K2_QK_ROPE_HEAD_DIM;
+use crate::ops::KIMI_K2_V_HEAD_DIM;
 use crate::tensor::DeviceContext;
 use crate::tensor::GpuTensor;
 use crate::tensor::NormWeight;
 
 pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
-pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = 192;
-pub const KIMI_K2_MLA_V_HEAD_DIM: usize = 128;
-pub const KIMI_K2_MLA_ROPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM;
-const KIMI_K2_MLA_Q_LORA_RANK: usize = 1536;
-pub const KIMI_K2_MLA_KV_LORA_RANK: usize = 512;
-pub const KIMI_K2_MLA_KV_A_OUT: usize = 576;
+pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = KIMI_K2_QK_NOPE_HEAD_DIM + KIMI_K2_QK_ROPE_HEAD_DIM;
+pub const KIMI_K2_MLA_V_HEAD_DIM: usize = KIMI_K2_V_HEAD_DIM;
+pub const KIMI_K2_MLA_ROPE_DIM: usize = KIMI_K2_QK_ROPE_HEAD_DIM;
+pub const KIMI_K2_MLA_KV_LORA_RANK: usize = KIMI_K2_KV_LORA_RANK;
+pub const KIMI_K2_MLA_KV_A_OUT: usize = KIMI_K2_KV_LORA_RANK + KIMI_K2_QK_ROPE_HEAD_DIM;
 pub const KIMI_K2_MLA_KV_B_LOCAL_OUT_TP8: usize = 2048;
 pub const KIMI_K2_MLA_Q_LOCAL_OUT_TP8: usize = KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_Q_HEAD_DIM;
 pub const KIMI_K2_MLA_O_LOCAL_IN_TP8: usize = KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_V_HEAD_DIM;
-pub const KIMI_K2_MLA_QKV_A_OUT: usize = KIMI_K2_MLA_Q_LORA_RANK + KIMI_K2_MLA_KV_A_OUT;
+pub const KIMI_K2_MLA_QKV_A_OUT: usize = KIMI_K2_Q_LORA_RANK + KIMI_K2_MLA_KV_A_OUT;
 pub const KIMI_K2_MLA_ABS_Q_LOCAL_OUT_TP8: usize =
     KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_KV_LORA_RANK;
 pub const KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8: usize =
@@ -139,7 +143,7 @@ pub(super) fn validate_paged_layout(
 pub fn kimi_mla_split_qkv_a(
     ctx: &DeviceContext,
     qkv_a: &GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
-    q_a: &mut GpuTensor<KIMI_K2_MLA_Q_LORA_RANK>,
+    q_a: &mut GpuTensor<KIMI_K2_Q_LORA_RANK>,
     compressed: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
     k_rope: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
 ) -> Result<()> {
@@ -174,9 +178,9 @@ pub fn kimi_mla_split_qkv_a(
 pub fn kimi_mla_split_qkv_a_norm(
     ctx: &DeviceContext,
     qkv_a: &GpuTensor<KIMI_K2_MLA_QKV_A_OUT>,
-    q_a_weight: &NormWeight<KIMI_K2_MLA_Q_LORA_RANK>,
+    q_a_weight: &NormWeight<KIMI_K2_Q_LORA_RANK>,
     ckv_weight: &NormWeight<KIMI_K2_MLA_KV_LORA_RANK>,
-    q_a_normed: &mut GpuTensor<KIMI_K2_MLA_Q_LORA_RANK>,
+    q_a_normed: &mut GpuTensor<KIMI_K2_Q_LORA_RANK>,
     ckv_normed: &mut GpuTensor<KIMI_K2_MLA_KV_LORA_RANK>,
     k_rope: &mut GpuTensor<KIMI_K2_MLA_ROPE_DIM>,
     eps: f32,

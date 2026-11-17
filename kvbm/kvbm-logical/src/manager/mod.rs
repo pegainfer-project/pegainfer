@@ -156,6 +156,12 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         matched
     }
 
+    /// Return the point-in-time length of the contiguous prefix held by live
+    /// block references. Inactive blocks are not promoted or kept alive.
+    pub fn active_prefix_len(&self, seq_hash: &[SequenceHash]) -> usize {
+        self.store.active_prefix_len(seq_hash)
+    }
+
     /// Scatter-gather scan: finds all blocks matching any hash, without
     /// stopping on misses.
     pub fn scan_matches(

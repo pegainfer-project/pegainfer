@@ -210,8 +210,8 @@ fn flash_kda_segment_sweep() {
     // fleet. T=270336 needs ~56 GiB (operands + workspace) — any idle GB300
     // fits it in one operand set.
     let ts = [
-        14usize, 64, 132, 224, 264, 528, 1056, 2112, 4224, 8448, 16896, 33792, 67584, 135168,
-        270336,
+        14usize, 64, 132, 224, 264, 528, 1056, 2112, 4224, 8448, 16896, 33792, 67584, 135_168,
+        270_336,
     ];
 
     eprintln!("FlashKDA fwd sweep: heads={FULL_HEADS} d={D} (bf16 in/out, f32 state)");
@@ -250,7 +250,7 @@ fn flash_kda_segment_sweep() {
             16.0 * c14 / c224
         );
     }
-    for chunk in [4224usize, 8448, 16896, 270336] {
+    for chunk in [4224usize, 8448, 16896, 270_336] {
         eprintln!(
             "\nCP local-shape split of a {chunk}-token whale chunk (not end-to-end KCP; ideal = cost(chunk)/c):"
         );

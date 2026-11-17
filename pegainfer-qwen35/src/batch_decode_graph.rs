@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use pegainfer_core::cuda_graph::CudaGraphState;
-use pegainfer_core::kv_pool::KvPool;
 use pegainfer_core::tensor::DeviceContext;
 
 use super::config::Config35;
@@ -62,24 +61,22 @@ impl BatchDecodeGraphState {
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
-        kv_pool: &KvPool,
+        page_size: usize,
+        padding_page_id: i32,
         max_batch: usize,
     ) -> Result<Self> {
-        let padding_page_id = kv_pool.padding_page_id();
-        let max_total_pages = kv_pool.capacity_pages();
-
         let buffers = BatchDecodeBuffers35::new(
             ctx,
             config,
             geometry,
             max_batch,
-            max_total_pages,
+            page_size,
             padding_page_id,
         )?;
 
         let mut slot_states = Vec::with_capacity(max_batch);
         for _ in 0..max_batch {
-            slot_states.push(RecurrentState::new(ctx, config)?);
+            slot_states.push(RecurrentState::new(ctx, config, geometry)?);
         }
         let linear_pointer_tables = {
             let mut slot_refs: Vec<&mut RecurrentState> = slot_states.iter_mut().collect();
@@ -116,16 +113,56 @@ impl BatchDecodeGraphState {
         src: &RecurrentState,
         slot_idx: usize,
     ) -> Result<()> {
-        let dst = &mut self.slot_states[slot_idx];
-        for (dst_layer, src_layer) in dst.layers.iter_mut().zip(src.layers.iter()) {
+        self.slot_states[slot_idx]
+            .copy_from(ctx, src)
+            .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))
+    }
+
+    /// D2D move slot `from` into slot `to`, leaving `to` as the canonical
+    /// state. Used by TP slot compaction when a mid-batch request retires:
+    /// the last occupied slot moves into the vacated slot so decode rows stay
+    /// dense (`0..bs`). Slot `from` keeps stale bytes afterwards; admission
+    /// overwrites it (`copy_state_to_slot`), and padding rows may clobber it —
+    /// both benign by design.
+    pub(crate) fn move_slot_within(
+        &mut self,
+        ctx: &DeviceContext,
+        from: usize,
+        to: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            from != to,
+            "TP slot compaction move {from} -> {to} is a no-op"
+        );
+        anyhow::ensure!(
+            from < self.slot_states.len() && to < self.slot_states.len(),
+            "TP slot compaction move {from} -> {to} exceeds {} slots",
+            self.slot_states.len()
+        );
+        let (lo, hi) = (from.min(to), from.max(to));
+        let (left, right) = self.slot_states.split_at_mut(hi);
+        let (src, dst) = if from < to {
+            (&left[from], &mut right[0])
+        } else {
+            (&right[0], &mut left[lo])
+        };
+        anyhow::ensure!(
+            src.layers.len() == dst.layers.len(),
+            "TP slot compaction layer count mismatch: {} vs {}",
+            src.layers.len(),
+            dst.layers.len()
+        );
+        for (src_layer, dst_layer) in src.layers.iter().zip(dst.layers.iter_mut()) {
             ctx.stream
                 .memcpy_dtod(&src_layer.state, &mut dst_layer.state)
-                .map_err(|e| anyhow::anyhow!("copy recurrent state to slot {slot_idx}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("move recurrent state slot {from} -> {to}: {e}"))?;
             ctx.stream
                 .memcpy_dtod(&src_layer.conv_state.data, &mut dst_layer.conv_state.data)
-                .map_err(|e| anyhow::anyhow!("copy conv state to slot {slot_idx}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("move conv state slot {from} -> {to}: {e}"))?;
         }
-        dst.seq_len = src.seq_len;
+        let seq_len = src.seq_len;
+        let dst = &mut self.slot_states[to];
+        dst.seq_len = seq_len;
         Ok(())
     }
 }

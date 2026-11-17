@@ -24,8 +24,8 @@ fn e4m3_bytes(len: usize, seed: &mut u64) -> Vec<u8> {
     (0..len)
         .map(|_| {
             *seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let magnitude = ((*seed >> 33) % 127) as u8;
             let sign = ((*seed >> 17) & 1) as u8;
             magnitude | (sign << 7)
@@ -37,8 +37,8 @@ fn scales(len: usize, seed: &mut u64) -> Vec<f32> {
     (0..len)
         .map(|_| {
             *seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             0.5 + ((*seed >> 40) as f32 / (1u64 << 24) as f32)
         })
         .collect()

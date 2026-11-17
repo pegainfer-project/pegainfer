@@ -52,7 +52,7 @@ pub(super) fn precapture_step_graphs(
             .map(|(rank, worker)| {
                 let pool = &pools[if mirrored { 0 } else { rank }];
                 let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
+                worker.step_async(&inputs, shape, kv, flags, Vec::new(), 0)
             })
             .collect::<anyhow::Result<Vec<_>>>()
             .context("GLM5.2 graph pre-capture submit")?;

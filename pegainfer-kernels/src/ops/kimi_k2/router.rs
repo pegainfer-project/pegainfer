@@ -6,16 +6,15 @@ use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
+use crate::ops::KIMI_K2_HIDDEN;
+use crate::ops::KIMI_K2_ROUTED_EXPERTS;
+use crate::ops::KIMI_K2_TOPK;
 use crate::tensor::DeviceContext;
 use crate::tensor::GpuTensor;
 use crate::tensor::GpuWeight;
 
-const KIMI_K2_ROUTER_HIDDEN: usize = 7168;
-const KIMI_K2_ROUTER_EXPERTS: usize = 384;
-const KIMI_K2_ROUTER_TOPK: usize = 8;
 const KIMI_K2_ROUTER_N_GROUP: usize = 1;
 const KIMI_K2_ROUTER_TOPK_GROUP: usize = 1;
-pub const KIMI_K2_ROUTER_SCALE: f32 = 2.827;
 const KIMI_K2_ROUTER_WEIGHT_SCALE: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,9 +30,9 @@ pub struct KimiRouterConfig {
 impl KimiRouterConfig {
     pub const fn kimi_k2() -> Self {
         Self {
-            hidden_dim: KIMI_K2_ROUTER_HIDDEN,
-            n_experts: KIMI_K2_ROUTER_EXPERTS,
-            topk: KIMI_K2_ROUTER_TOPK,
+            hidden_dim: KIMI_K2_HIDDEN,
+            n_experts: KIMI_K2_ROUTED_EXPERTS,
+            topk: KIMI_K2_TOPK,
             n_group: KIMI_K2_ROUTER_N_GROUP,
             topk_group: KIMI_K2_ROUTER_TOPK_GROUP,
             route_scale: KIMI_K2_ROUTER_WEIGHT_SCALE,
@@ -109,7 +108,7 @@ fn validate_kimi_router_shapes<const DIM: usize>(
     config: KimiRouterConfig,
     batch: KimiRouterBatch,
     hidden: &GpuTensor<DIM>,
-    _gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
+    _gate_weight: &GpuWeight<KIMI_K2_ROUTED_EXPERTS, KIMI_K2_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
     logits: &CudaSlice<f32>,
     output: &KimiRouterOutput<'_>,
@@ -129,10 +128,10 @@ fn validate_kimi_router_shapes<const DIM: usize>(
         batch.padded_tokens
     );
     ensure!(
-        config.n_experts == KIMI_K2_ROUTER_EXPERTS && config.hidden_dim == KIMI_K2_ROUTER_HIDDEN,
+        config.n_experts == KIMI_K2_ROUTED_EXPERTS && config.hidden_dim == KIMI_K2_HIDDEN,
         "Kimi router config must match typed gate weight [{}, {}], got [{}, {}]",
-        KIMI_K2_ROUTER_EXPERTS,
-        KIMI_K2_ROUTER_HIDDEN,
+        KIMI_K2_ROUTED_EXPERTS,
+        KIMI_K2_HIDDEN,
         config.n_experts,
         config.hidden_dim
     );
@@ -184,7 +183,7 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
     config: KimiRouterConfig,
     batch: KimiRouterBatch,
     hidden: &GpuTensor<DIM>,
-    gate_weight: &GpuWeight<KIMI_K2_ROUTER_EXPERTS, KIMI_K2_ROUTER_HIDDEN>,
+    gate_weight: &GpuWeight<KIMI_K2_ROUTED_EXPERTS, KIMI_K2_HIDDEN>,
     e_score_correction_bias: &CudaSlice<f32>,
     logits: &mut CudaSlice<f32>,
     output: &mut KimiRouterOutput<'_>,
@@ -231,6 +230,7 @@ pub fn kimi_router_noaux_tc_launch<const DIM: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ops::KIMI_K2_ROUTED_SCALING_FACTOR;
 
     fn test_config() -> KimiRouterConfig {
         KimiRouterConfig {
@@ -239,7 +239,7 @@ mod tests {
             topk: 4,
             n_group: 1,
             topk_group: 1,
-            route_scale: KIMI_K2_ROUTER_SCALE,
+            route_scale: KIMI_K2_ROUTED_SCALING_FACTOR,
         }
     }
 

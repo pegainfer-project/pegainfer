@@ -1,0 +1,100 @@
+# SECURITY: the Labeler calls this from pull_request_target, which gives fork PRs a
+# write token, so never check out or run PR code.
+
+name: Needs rebase
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "47 */6 * * *"
+  workflow_call:
+    inputs:
+      pr:
+        description: The pull request to check. Every open one is checked when unset.
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: Label conflicting PRs
+    runs-on: ubuntu-latest
+    concurrency:
+      group: needs-rebase-${{ inputs.pr || 'scan' }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Add or remove the needs-rebase label
+        uses: actions/github-script@v9.0.0
+        env:
+          PR: ${{ inputs.pr }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const only = Number(process.env.PR) || null;
+            const comment =
+              'This pull request has merge conflicts with main. Please rebase it so it can be reviewed and merged.';
+            const query = `query($owner: String!, $repo: String!, $after: String) {
+              repository(owner: $owner, name: $repo) {
+                pullRequests(states: OPEN, first: 100, after: $after) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { number mergeable labels(first: 100) { nodes { name } } }
+                }
+              }
+            }`;
+
+            async function openPulls() {
+              const pulls = [];
+              let after = null;
+              do {
+                const page = (await github.graphql(query, { owner, repo, after })).repository.pullRequests;
+                pulls.push(...page.nodes);
+                after = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+              } while (after);
+              return pulls;
+            }
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            // Mergeability can lag a push to main without reading UNKNOWN, so label from a second read.
+            await openPulls();
+            await sleep(60_000);
+
+            let unknown = null;
+            for (let attempt = 0; attempt < 10; attempt++) {
+              if (unknown) {
+                core.info(`Mergeability not computed yet for ${[...unknown].join(', ')}, retrying in 30 s`);
+                await sleep(30_000);
+              }
+              const pulls = (await openPulls()).filter(
+                (pr) => (only === null || pr.number === only) && (unknown === null || unknown.has(pr.number)),
+              );
+              unknown = new Set();
+              for (const pr of pulls) {
+                const labels = pr.labels.nodes.map((label) => label.name);
+                // actions/stale counts any label change as activity, so touching a
+                // stale PR would restart its close countdown.
+                if (labels.includes('stale')) continue;
+                const marked = labels.includes('needs-rebase');
+                if (pr.mergeable === 'UNKNOWN') {
+                  unknown.add(pr.number);
+                } else if (pr.mergeable === 'CONFLICTING' && !marked) {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ['needs-rebase'] });
+                  await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body: comment });
+                  core.info(`#${pr.number}: added needs-rebase`);
+                } else if (pr.mergeable === 'MERGEABLE' && marked) {
+                  try {
+                    await github.rest.issues.removeLabel({ owner, repo, issue_number: pr.number, name: 'needs-rebase' });
+                  } catch (error) {
+                    // A concurrent run removed it first.
+                    if (error.status !== 404) throw error;
+                  }
+                  core.info(`#${pr.number}: removed needs-rebase`);
+                }
+              }
+              if (unknown.size === 0) return;
+            }
+            core.warning(`Mergeability never resolved for ${[...unknown].join(', ')}`);

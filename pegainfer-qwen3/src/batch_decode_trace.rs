@@ -90,7 +90,7 @@ pub fn trace_decode_kernel_calls(
         model.local_q_dim(),
         model.local_kv_dim(),
         model.local_intermediate_size(),
-        model.config().vocab_size,
+        model.config().logits_rows,
         batch_size,
         layout.page_size,
         kv_mgr.pool().padding_block_id(),
@@ -106,7 +106,7 @@ pub fn trace_decode_kernel_calls(
             model.local_q_dim(),
             model.local_kv_dim(),
             model.local_intermediate_size(),
-            model.config().vocab_size,
+            model.config().logits_rows,
         )?;
     }
     let token_ids = vec![0_u32; batch_size];
