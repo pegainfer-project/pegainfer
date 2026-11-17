@@ -636,7 +636,7 @@ def run_direct_diagnostic(args: argparse.Namespace, out_dir: Path) -> list[dict[
                 "batch_size": batch_size,
                 "artifact": display_path(artifact),
                 "command": redact_command(cmd),
-                "env": ["PEGAINFER_DSV2_LITE_EP_BACKEND"],
+                "env": benchmark_server_env(env),
             }
             try:
                 run_capture(cmd, env=env, timeout=args.command_timeout_s)
@@ -1015,6 +1015,9 @@ BENCHMARK_SERVER_ENV_KEYS = (
     "PEGAINFER_DSV2_LITE_HOST_STAGED_EXPERT_BATCH",
     "PEGAINFER_DSV2_LITE_NCCL_EXPERT_BATCH",
     "PEGAINFER_DSV2_LITE_NCCL_ROUTER",
+    "PEGAINFER_DSV2_LITE_DECODE_ATTENTION",
+    "PEGAINFER_DSV2_LITE_NVTX",
+    "PEGAINFER_DSV2_LITE_GRAPH_PROBE_TRACE",
     "CUDA_VISIBLE_DEVICES",
 )
 
@@ -1421,11 +1424,14 @@ def run_pegainfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
             "claim_bucket": CLAIM_HTTP,
             "server_command": redact_command(cmd),
             "server_log": display_path(log_path),
+            "server_env": benchmark_server_env(env),
             "cells": [],
         }
         try:
             with ManagedServer(cmd, env, log_path) as server:
                 wait_for_server(server, spec, port, args.model_id, args.server_ready_timeout_s)
+                if spec.ep_backend == "nccl" and server.process is not None:
+                    row["nccl_runtime"] = process_nccl_runtime(server.process.pid)
                 for concurrency in args.concurrency:
                     out = out_dir / "pegainfer_trace" / spec.name / f"c{concurrency}.json"
                     trace_cmd = [
@@ -2139,7 +2145,62 @@ def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> 
         reasons.append("nccl_version_changed")
     if gpu_probe_projection(current_meta) != gpu_probe_projection(baseline_meta):
         reasons.append("gpu_probe_changed")
+    if nccl_runtime_projection(nested_get(current_meta, ("versions", "nccl_runtime"))) != nccl_runtime_projection(
+        nested_get(baseline_meta, ("versions", "nccl_runtime"))
+    ):
+        reasons.append("nccl_runtime_changed")
+    current_config = execution_configuration_map(summary)
+    baseline_config = execution_configuration_map(baseline)
+    for key in sorted(current_config.keys() & baseline_config.keys()):
+        if current_config[key] != baseline_config[key]:
+            reasons.append(f"execution_configuration_changed:{key}")
     return reasons
+
+
+def execution_configuration_map(summary: dict[str, Any]) -> dict[str, Any]:
+    configurations = {}
+    for section, command_field, env_field, identity, ignored_flags in (
+        ("direct_diagnostic_batch", "command", "env", ("backend", "batch_size"), {"--out"}),
+        ("http_concurrency_pressure", "server_command", "server_env", ("engine",), {"--port"}),
+        ("pegainfer_trace_pass", "server_command", "server_env", ("engine",), {"--port"}),
+    ):
+        for row in summary.get(section, []) or []:
+            if not isinstance(row, dict):
+                continue
+            key = f"{section}:" + "/".join(str(row.get(field)) for field in identity)
+            configurations[key] = {
+                "command": execution_command_projection(row.get(command_field), ignored_flags),
+                "env": row.get(env_field),
+                "nccl_runtime": nccl_runtime_projection(row.get("nccl_runtime")),
+            }
+    return configurations
+
+
+def execution_command_projection(command: Any, ignored_flags: set[str]) -> Any:
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+        return command
+    projected = []
+    index = 0
+    while index < len(command):
+        part = command[index]
+        flag = part.split("=", 1)[0]
+        if flag in ignored_flags:
+            index += 1 if "=" in part else 2
+            continue
+        # Relocating a launcher does not change its flags or the version probe.
+        projected.append(Path(part).name if index == 0 else part)
+        index += 1
+    return projected
+
+
+def nccl_runtime_projection(runtime: Any) -> dict[str, Any] | None:
+    if not isinstance(runtime, dict):
+        return None
+    # Process IDs, mapped addresses and library installation paths vary by run.
+    return {
+        key: runtime.get(key)
+        for key in ("available", "exit_code", "version_code", "version")
+    }
 
 
 def version_probe_projection(metadata_payload: dict[str, Any], probe_name: str) -> Any:
@@ -2407,7 +2468,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
             summarized_http_rows,
             existing_summary.get("http_concurrency_pressure", []),
             ("engine",),
-            ("label", "family", "server_command", "server_log", "server_env"),
+            ("label", "family", "server_command", "server_log", "server_env", "nccl_runtime"),
         ),
         preserved_failed_rows(existing_summary.get("http_concurrency_pressure", [])),
         ("engine",),
@@ -2471,7 +2532,7 @@ def summarize_existing(args: argparse.Namespace) -> dict[str, Any]:
             trace_rows,
             existing_summary.get("pegainfer_trace_pass", []),
             ("engine",),
-            ("server_command", "server_log"),
+            ("server_command", "server_log", "server_env", "nccl_runtime"),
         ),
         preserved_failed_rows(existing_summary.get("pegainfer_trace_pass", [])),
         ("engine",),
