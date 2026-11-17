@@ -93,6 +93,7 @@ pub fn k3_mul_sigmoid_batched_launch(
 
 /// K3's situ activation: `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)` in f32,
 /// landing bf16 once. The two betas are compiled in.
+#[allow(clippy::many_single_char_names)]
 pub fn k3_situ_batched_launch(
     ctx: &DeviceContext,
     b: usize,

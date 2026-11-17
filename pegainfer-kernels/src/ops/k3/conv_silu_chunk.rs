@@ -53,7 +53,7 @@ pub fn k3_conv_silu_chunk_launch(
         "K3 conv chunk commits {commit_rows} of {tokens} rows"
     );
     ensure!(
-        inner % 8 == 0,
+        inner.is_multiple_of(8),
         "K3 conv chunk needs an 8-column-aligned width, got {inner}"
     );
     ensure!(
