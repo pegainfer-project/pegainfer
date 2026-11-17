@@ -444,6 +444,15 @@ unsafe extern "C" {
         bs: i32,
         stream: CUstream,
     ) -> i32;
+    /// The same activation over a gate_up pair interleaved into adjacent
+    /// columns (`gate` at `2 * j`, `up` at `2 * j + 1`).
+    pub fn silu_mul_fused_interleaved_cuda(
+        gate_up: *const Half,
+        out: *mut Half,
+        intermediate_size: i32,
+        bs: i32,
+        stream: CUstream,
+    ) -> i32;
     pub fn split_qkv_cuda(
         qkv: *const Half,
         q: *mut Half,
