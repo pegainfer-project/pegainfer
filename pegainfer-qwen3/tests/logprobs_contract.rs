@@ -1,4 +1,5 @@
 //! Real scheduler/executor gate; skips when default model weights are absent.
+#![cfg(feature = "cuda")]
 #[path = "common/harness.rs"]
 mod harness;
 

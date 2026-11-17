@@ -14,6 +14,7 @@
 //! `PEGAINFER_TEST_MODEL_PATH` + `PEGAINFER_DFLASH_TEST_MODEL_PATH`; skips when
 //! either is absent. Single-stream only — throughput under load is a separate
 //! `vllm bench serve` A/B.
+#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use std::path::PathBuf;
