@@ -89,6 +89,12 @@ The common failure mode is a kernel with a healthy p50 but a large p99/max. That
 
 Use the checked-in helper `tools/nsys_tail_stats.py` on exported sqlite traces when tail behavior matters. It emits separate kernel and CUDA API tables sorted by total time and by tail score, so a trace review can call out both steady-state cost and rare stalls.
 
+```bash
+python3 tools/nsys_tail_stats.py target/profiling/trace.sqlite --out target/profiling/tails.md
+```
+
+The helper opens the input trace read-only. A missing trace fails instead of creating an empty SQLite file and reporting an empty profile. The report output must differ from the input trace; `--out` cannot overwrite the trace through the same path, a symlink, or a hard link.
+
 For keep/revert decisions, a profile that only reports p50 or avg is incomplete. The minimum acceptable evidence is the tail table plus a clear statement of whether the profile includes prompt, steady decode, HTTP/frontend, or profiler overhead.
 
 ## Standard Optimization Profiles

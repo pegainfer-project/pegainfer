@@ -208,7 +208,7 @@ def markdown_table(rows: list[dict[str, float | int | str]], limit: int) -> str:
 
 
 def render_report(sqlite_path: Path, limit: int) -> str:
-    with sqlite3.connect(sqlite_path) as conn:
+    with sqlite3.connect(sqlite_path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
         kernel_rows = summarize(collect_kernel_durations(conn))
         api_rows = summarize(collect_api_durations(conn))
 
@@ -243,7 +243,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("sqlite", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--limit", type=int, default=18)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (
+        args.out
+        and args.sqlite.exists()
+        and args.out.exists()
+        and args.out.samefile(args.sqlite)
+    ):
+        parser.error("--out must not refer to the input SQLite trace")
+    return args
 
 
 def main() -> None:
