@@ -33,7 +33,9 @@ tikv-jemallocator = "0.6"
 
 [features]
 # Qwen3-4B is the default model line: pure Rust + CUDA, no Python at build time.
-default = ["qwen3"]
+default = ["cuda", "qwen3"]
+cuda = ["pegainfer-core/cuda", "pegainfer-qwen3?/cuda"]
+rocm = ["pegainfer-core/rocm", "pegainfer-qwen3?/rocm"]
 qwen3 = ["dep:pegainfer-qwen3"]
 deepseek-v2-lite = [
   "dep:pegainfer-deepseek-v2-lite",

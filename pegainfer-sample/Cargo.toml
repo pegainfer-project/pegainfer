@@ -10,7 +10,7 @@ anyhow = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 pegainfer-frontend = { workspace = true }
-pegainfer-kernels = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

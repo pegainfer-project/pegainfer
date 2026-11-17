@@ -4,6 +4,7 @@
 //! `RLIMIT_FSIZE` produces a real short write rather than an imitation of one.
 //! `SIGXFSZ` has to be ignored first or the kernel kills the process instead of
 //! letting the write return.
+#![cfg(feature = "cuda")]
 use std::ffi::CString;
 use std::fs;
 use std::sync::Mutex;

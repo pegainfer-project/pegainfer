@@ -23,9 +23,9 @@ libloading = "0.9"
 log = { workspace = true }
 memmap2 = { workspace = true }
 nvtx = { workspace = true }
-pegainfer-core = { workspace = true }
+pegainfer-core = { workspace = true, features = ["cuda"] }
 pegainfer-frontend = { workspace = true }
-pegainfer-kernels = { workspace = true, optional = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"], optional = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

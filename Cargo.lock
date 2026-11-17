@@ -3658,6 +3658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-device"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "pegainfer-build",
+]
+
+[[package]]
 name = "pegainfer-frontend"
 version = "0.1.0"
 dependencies = [
@@ -3761,10 +3770,12 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
+ "pegainfer-device",
  "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tvm-ffi",
 ]
 
@@ -3850,9 +3861,11 @@ dependencies = [
  "half",
  "hex",
  "log",
+ "memmap2",
  "pegainfer-bench",
  "pegainfer-core",
  "pegainfer-cupti",
+ "pegainfer-device",
  "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-kv-cache",

@@ -1,6 +1,7 @@
 //! Production-envelope guard: under Pin the {M,K} algo is pinned and reused for every N; this
 //! verifies it serves the swept Qwen3-4B envelope — Unified at N=101/201/513/1024/1279 and
 //! pure-Decode at bs=256 (exactly these points, not all N) — a shape it can't serve would bail.
+#![cfg(feature = "cuda")]
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::pin_served;

@@ -37,6 +37,7 @@
 //! Native DFlash2 adds a long prompt that crosses its attention window during
 //! generation. Each speculative prompt must produce drafts, so a plain-decode
 //! fallback cannot pass the distribution comparison unnoticed.
+#![cfg(feature = "cuda")]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;

@@ -3,6 +3,23 @@
 //! its model crate; this file only wires detection, CLI validation, and the
 //! serve path selection together.
 
+#[cfg(all(
+    feature = "rocm",
+    any(
+        feature = "cuda",
+        feature = "qwen35",
+        feature = "qwen4",
+        feature = "gemma4",
+        feature = "glm52",
+        feature = "k3",
+        feature = "kimi-k2",
+        feature = "deepseek-v2-lite"
+    )
+))]
+compile_error!(
+    "the ROCm first release supports only qwen3; disable default features and select rocm,qwen3"
+);
+
 use std::time::Instant;
 
 use anyhow::Context;
@@ -261,6 +278,19 @@ async fn main() -> anyhow::Result<()> {
                 None,
                 plan.scheduler_partition_count,
                 shutdown,
+            )
+            .await
+        } else if let Some(extend_router) = plan.extend_router {
+            pegainfer_frontend::vllm::serve_with_router_extension(
+                engine,
+                &model_path,
+                served_model_name.into_iter().collect(),
+                tool_call_parser,
+                port,
+                None,
+                plan.scheduler_partition_count,
+                shutdown,
+                extend_router,
             )
             .await
         } else {

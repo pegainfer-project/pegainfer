@@ -37,6 +37,7 @@ mod history;
 mod lora;
 mod reasoning_effort;
 mod request_contract;
+pub use request_contract::greedy_text_routes;
 mod wire;
 
 use bridge::LocalEngineBridge;

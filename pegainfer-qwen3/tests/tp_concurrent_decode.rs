@@ -3,6 +3,7 @@
 //! under concurrent serving.
 //! Worker threads fold each request stream; the main thread collects results
 //! against a deadline so a deadlock fails instead of wedging the run.
+#![cfg(feature = "cuda")]
 
 use std::mem::ManuallyDrop;
 use std::path::Path;

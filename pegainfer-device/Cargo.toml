@@ -1,0 +1,19 @@
+[package]
+name = "pegainfer-device"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[features]
+default = []
+rocm = []
+
+[dependencies]
+anyhow = { workspace = true }
+half = { workspace = true }
+
+[build-dependencies]
+pegainfer-build = { workspace = true }
+
+[lints]
+workspace = true

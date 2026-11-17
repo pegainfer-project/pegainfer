@@ -1,3 +1,5 @@
+#![cfg(feature = "cuda")]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;

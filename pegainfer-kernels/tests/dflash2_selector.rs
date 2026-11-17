@@ -1,5 +1,6 @@
 //! Actual GPU selector gates. Binary-fraction fixtures keep the CPU equation
 //! exact while asymmetric codebooks expose row/operand/predecessor mistakes.
+#![cfg(feature = "cuda")]
 #![allow(
     clippy::float_cmp,
     reason = "Binary-fraction fixtures require exact scores"

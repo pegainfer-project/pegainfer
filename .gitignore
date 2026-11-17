@@ -3,6 +3,7 @@
 /models
 /datasets/
 /.venv/
+/.venv-rocm/
 __pycache__/
 *.py[cod]
 /bench_results/

@@ -1,6 +1,7 @@
 [workspace]
 default-members = ["pegainfer-server"]
 members = [
+  "pegainfer-device",
   "pegainfer-frontend",
   "pegainfer-sim",
   "pegainfer-server",
@@ -120,19 +121,20 @@ nvtx = "1.3.0"
 oneshot = "0.1.11"
 pegainfer-bench = { path = "pegainfer-bench" }
 pegainfer-build = { path = "pegainfer-build" }
-pegainfer-core = { path = "pegainfer-core" }
+pegainfer-device = { path = "pegainfer-device" }
+pegainfer-core = { path = "pegainfer-core", default-features = false }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
 pegainfer-frontend = { path = "pegainfer-frontend" }
 pegainfer-gemma4 = { path = "pegainfer-gemma4" }
 pegainfer-glm52 = { path = "pegainfer-glm52" }
 pegainfer-k3 = { path = "pegainfer-k3" }
-pegainfer-kernels = { path = "pegainfer-kernels" }
+pegainfer-kernels = { path = "pegainfer-kernels", default-features = false }
 pegainfer-kimi-k2 = { path = "pegainfer-kimi-k2" }
 pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
 pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
 pegainfer-kv-store = { path = "pegainfer-kv-store" }
-pegainfer-qwen3 = { path = "pegainfer-qwen3" }
+pegainfer-qwen3 = { path = "pegainfer-qwen3", default-features = false }
 pegainfer-qwen35 = { path = "pegainfer-qwen35" }
 pegainfer-qwen4 = { path = "pegainfer-qwen4" }
 pegainfer-sample = { path = "pegainfer-sample" }

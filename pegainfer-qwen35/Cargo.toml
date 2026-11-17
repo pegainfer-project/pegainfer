@@ -11,10 +11,10 @@ clap = { workspace = true }
 cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
-pegainfer-core = { workspace = true }
+pegainfer-core = { workspace = true, features = ["cuda"] }
 pegainfer-frontend = { workspace = true }
 pegainfer-kv-cache = { workspace = true }
-pegainfer-kernels = { workspace = true }
+pegainfer-kernels = { workspace = true, features = ["cuda"] }
 pegainfer-sample = { workspace = true }
 rand = { workspace = true }
 safetensors = { workspace = true }
