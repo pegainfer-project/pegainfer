@@ -36,16 +36,6 @@ pub struct ModelOptions {
     pub slots: usize,
     pub chunk_size: usize,
 }
-impl Default for ModelOptions {
-    fn default() -> Self {
-        Self {
-            device: 0,
-            max_context: 4096,
-            slots: 4,
-            chunk_size: 128,
-        }
-    }
-}
 #[derive(Clone, Copy, Debug)]
 pub struct TokenInput {
     pub token: u32,

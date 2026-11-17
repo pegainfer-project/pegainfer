@@ -107,10 +107,10 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
     let mut model = Model::load(
         path,
         ModelOptions {
+            device: 0,
             max_context: 512,
             slots: 4,
             chunk_size: 128,
-            ..Default::default()
         },
     )?;
     let mut stats = Stats::default();

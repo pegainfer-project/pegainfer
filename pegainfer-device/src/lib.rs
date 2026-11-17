@@ -73,23 +73,12 @@ impl Device {
     pub fn new(ordinal: usize) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
         check(unsafe { pgi_create(i32::try_from(ordinal)?, &raw mut raw) })?;
-        let device = Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 raw,
                 lock: Mutex::new(()),
             }),
-        };
-        let info = device.info()?;
-        let arch = info.arch.split(':').next().unwrap_or("");
-        ensure!(
-            matches!(
-                arch,
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1200" | "gfx1201"
-            ),
-            "unsupported ROCm architecture {}",
-            info.arch
-        );
-        Ok(device)
+        })
     }
     /// # Safety
     /// Native code must use this device's stream, retain no host pointers,
