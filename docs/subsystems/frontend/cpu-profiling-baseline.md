@@ -58,7 +58,7 @@ cargo run --release -p pegainfer-sim -- \
 ### Run benchmark
 
 ```bash
-python3 scripts/bench_http_serving.py \
+python3 scripts/bench/serving.py \
   --base-url http://127.0.0.1:8732 \
   --model /tmp/pegainfer-sim-model \
   --num-requests 200 \
@@ -78,7 +78,7 @@ In a separate terminal after starting the server and confirming it responds:
 SIM_PID=$(pgrep -f "target/release/pegainfer-sim")
 perf stat -p $SIM_PID \
   -e cycles,instructions,cache-references,cache-misses,branch-misses,task-clock,context-switches,cpu-migrations \
-  -- timeout 15 python3 scripts/bench_http_serving.py \
+  -- timeout 15 python3 scripts/bench/serving.py \
     --base-url http://127.0.0.1:8732 \
     --model /tmp/pegainfer-sim-model \
     --num-requests 200 \
@@ -89,7 +89,7 @@ perf stat -p $SIM_PID \
 
 # Function-level hotspot capture
 perf record -g -p $SIM_PID -o /tmp/sim-perf.data -- \
-  timeout 10 python3 scripts/bench_http_serving.py \
+  timeout 10 python3 scripts/bench/serving.py \
     --base-url http://127.0.0.1:8732 \
     --model /tmp/pegainfer-sim-model \
     --num-requests 100 \

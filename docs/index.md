@@ -261,6 +261,6 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
-| `conventions/bench-regression.md` | **Retired 2026-08**: in-process `bench_serving` snapshot gate deleted with the frontend consolidation; HTTP-based benching (`scripts/bench_http_serving.py`, vllm-bench) replaces it. Doc keeps the conventions (per-GPU snapshots, p50-only thresholds) for a future rebuilt gate. |
+| `conventions/bench-regression.md` | **Retired 2026-08**: in-process `bench_serving` snapshot gate deleted with the frontend consolidation; HTTP-based benching (`scripts/bench/serving.py`, vllm-bench) replaces it. Doc keeps the conventions (per-GPU snapshots, p50-only thresholds) for a future rebuilt gate. |
 | `conventions/coding-style.md` | Testing principle: prefer integration tests, don't test what E2E catches. |
 | `conventions/migration-defense.md` | 重写/迁移 PR 红线：旧防御结构（序号/计数/等待/断言/guard）逐条注明接班人——继承、替代、或结构性论证废除；测试断言跟人走。出自 #830 复盘。 |

@@ -15,7 +15,7 @@ All models use two profiles that isolate the prefill and decode paths:
 
 No mixed-workload profiles. Mixed performance can be inferred from the two pure paths, and mixed data is hard to attribute.
 
-pegainfer: `scripts/bench_http_serving.py --prompt-words <in> --max-tokens <out>` against a running server (see [profiling-guide](profiling-guide.md)). vLLM: `vllm bench serve` (see [bench-vs-vllm](bench-vs-vllm.md)).
+pegainfer: `scripts/bench/serving.py --prompt-words <in> --max-tokens <out>` against a running server (see [profiling-guide](profiling-guide.md)). vLLM: `vllm bench serve` (see [bench-vs-vllm](bench-vs-vllm.md)).
 
 ## Per-Model Doc Structure
 

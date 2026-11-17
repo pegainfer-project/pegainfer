@@ -4,7 +4,7 @@
 >
 > **Last touched:** 2026-09. Qwen3.5 runtime code lives in top-level `pegainfer-qwen35`. Current accuracy coverage is the crate-local HF logits gate in [accuracy.md](accuracy.md); run `scheduler::e2e_tests` when scheduler request-flow behavior changes. The old exact-text e2e/regen baseline was retired by the HF logits gate in `docs/models/qwen35/accuracy.md`.
 
-Historical command logs below keep the command paths that were actually run at the time (the in-process `bench_serving` bin they reference is retired as of 2026-08). For new Qwen3.5 accuracy tests, follow [accuracy.md](accuracy.md); for serving benchmarks, use HTTP-level benching (`scripts/bench_http_serving.py` / vllm-bench, see [profiling-guide](../../playbooks/profiling-guide.md)).
+Historical command logs below keep the command paths that were actually run at the time (the in-process `bench_serving` bin they reference is retired as of 2026-08). For new Qwen3.5 accuracy tests, follow [accuracy.md](accuracy.md); for serving benchmarks, use HTTP-level benching (`scripts/bench/serving.py` / vllm-bench, see [profiling-guide](../../playbooks/profiling-guide.md)).
 
 ## Goal
 

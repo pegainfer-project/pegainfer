@@ -12,7 +12,7 @@
   - `docs/subsystems/frontend/cpu-profiling-baseline.md` — old path at c=16 added ~150ms TTFT over a 5ms floor; no single CPU hotspot.
   - `docs/subsystems/frontend/sim-step-contract.md` — sim now emits one token per request per step and parks ≤1ms.
 - **Relevant history**:
-  - Previous baseline used Python `bench_http_serving.py` at c=16, not rust vllm-bench, and ran on the legacy per-request tokio tasks.
+  - Previous baseline used Python `scripts/bench/serving.py` at c=16, not rust vllm-bench, and ran on the legacy per-request tokio tasks.
 - **Plan**:
   1. Start `pegainfer-sim` with TTFT=0 / TPOT=0 so any latency is frontend + scheduler-loop overhead.
   2. Smoke with rust `vllm-bench`.

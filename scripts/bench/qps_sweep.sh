@@ -6,7 +6,7 @@
 # Usage:
 #   MODEL=/data/Qwen3-4B PORT=8000 ENGINE=pegainfer RESULT_DIR=/data/bench \
 #   QPS_LIST="1 2 4 8 16" INPUT_LEN=1024 OUTPUT_LEN=128 SEED=42 \
-#   VLLM=.venv/bin/vllm tools/bench/qps_sweep.sh
+#   VLLM=.venv/bin/vllm scripts/bench/qps_sweep.sh
 set -euo pipefail
 
 MODEL=${MODEL:?model path}

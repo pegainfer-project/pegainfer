@@ -81,7 +81,7 @@ Benching is HTTP-level (the in-process `bench_serving` bin is retired — it
 bypassed the real serving path). With the server from step 5 still running:
 
 ```bash
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --num-requests 8 --concurrency 2 --max-tokens 32
 ```
 
@@ -109,7 +109,7 @@ RUST_LOG=info cargo run -r -- --model-path models/Qwen3.5-4B --port 8000
 Benchmark (server running with that model):
 
 ```bash
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3.5-4B --num-requests 8 --concurrency 2 --max-tokens 32
 ```
 

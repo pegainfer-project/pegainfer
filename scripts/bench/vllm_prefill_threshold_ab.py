@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bench_http_common import (
+from common import (
     current_commit,
     detect_hardware_toolchain,
     model_fingerprint,
@@ -45,7 +45,7 @@ from bench_http_common import (
 
 
 SCRIPT_PATH = Path(__file__).resolve()
-REPO_ROOT = SCRIPT_PATH.parent.parent
+REPO_ROOT = SCRIPT_PATH.parents[2]
 PRIVATE_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_~.-])/(?:home|root|tmp|mnt|workspace)(?:/[^\s\"'<>`]+)+"
 )

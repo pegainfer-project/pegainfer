@@ -6,7 +6,7 @@
 
 ## Implementation Summary
 
-`scripts/bench_dsv2lite_vllm_matrix.py` now emits two audit artifacts beside the existing `summary.json` for both fresh benchmark runs and `--summarize-only` rebuilds:
+`scripts/bench/dsv2lite_vllm_matrix.py` now emits two audit artifacts beside the existing `summary.json` for both fresh benchmark runs and `--summarize-only` rebuilds:
 
 | File | Role |
 | --- | --- |
@@ -22,9 +22,9 @@ The regression summary emits `comparability.claim_marker: "no directional claim"
 CPU-only checks:
 
 ```bash
-python3 -m py_compile scripts/bench_dsv2lite_vllm_matrix.py
-python3 -m unittest tests/test_bench_dsv2lite_vllm_matrix.py
-python3 scripts/bench_dsv2lite_vllm_matrix.py --plan-only --baseline-summary target/benchmarks/previous/summary.json
+python3 -m py_compile scripts/bench/dsv2lite_vllm_matrix.py
+python3 -m unittest scripts/bench/tests/test_dsv2lite_vllm_matrix.py
+python3 scripts/bench/dsv2lite_vllm_matrix.py --plan-only --baseline-summary target/benchmarks/previous/summary.json
 ```
 
 The final unit run passed `59` tests. The new coverage includes `--summarize-only` manifest/regression emission, public-safe external model paths, artifact-bundle-relative manifest paths, no-baseline `no directional claim`, failed setup resolution and preservation, baseline-present/current-missing direct/http/trace rows, dynamic GPU telemetry drift, stable GPU identity changes, NCCL version drift, and noisy HTTP cells blocking directional claims.
@@ -33,8 +33,8 @@ The final unit run passed `59` tests. The new coverage includes `--summarize-onl
 
 ### PR #617 review follow-up
 
-- `scripts/bench_dsv2lite_vllm_matrix.py`: added section-scoped comparability reasons for added/missing direct diagnostic rows, HTTP pressure cells, and PegaInfer trace cells.
-- `tests/test_bench_dsv2lite_vllm_matrix.py`: added a CPU-only regression test for the maintainer-reported case where the baseline contains `nccl/batch1`, `pegainfer-nccl/c1` HTTP, and `pegainfer-nccl/c1` trace rows but the current summary omits them.
+- `scripts/bench/dsv2lite_vllm_matrix.py`: added section-scoped comparability reasons for added/missing direct diagnostic rows, HTTP pressure cells, and PegaInfer trace cells.
+- `scripts/bench/tests/test_dsv2lite_vllm_matrix.py`: added a CPU-only regression test for the maintainer-reported case where the baseline contains `nccl/batch1`, `pegainfer-nccl/c1` HTTP, and `pegainfer-nccl/c1` trace rows but the current summary omits them.
 - Validation: `py_compile`, unit tests, and the documented plan-only command all passed locally.
 
 ## Debrief
