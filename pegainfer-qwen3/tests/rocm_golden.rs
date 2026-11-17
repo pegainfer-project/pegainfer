@@ -1,71 +1,22 @@
 //! Independent committed HF-golden gate for the production ROCm executor.
 #![cfg(feature = "rocm")]
+#[path = "common/hf_golden.rs"]
+mod hf_golden;
+
 use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
+use hf_golden::Golden;
+use hf_golden::HEAD_K;
+use hf_golden::MARGIN_TOL;
+use hf_golden::MEAN_TOL;
+use hf_golden::P99_TOL;
 use pegainfer_qwen3::rocm::Model;
 use pegainfer_qwen3::rocm::ModelOptions;
 use pegainfer_qwen3::rocm::TokenInput;
-use safetensors::SafeTensors;
 
-struct Golden {
-    prompts: Vec<i64>,
-    lengths: Vec<i64>,
-    tails: Vec<i64>,
-    ids: Vec<i64>,
-    logprobs: Vec<f32>,
-    sequences: usize,
-    decode: usize,
-    k: usize,
-}
-fn i64s(t: &safetensors::tensor::TensorView<'_>) -> Vec<i64> {
-    if t.dtype() == safetensors::Dtype::I32 {
-        return t
-            .data()
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as i64)
-            .collect();
-    }
-    assert_eq!(t.dtype(), safetensors::Dtype::I64);
-    t.data()
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
-        .collect()
-}
-impl Golden {
-    fn read(path: PathBuf) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-        let t = SafeTensors::deserialize(&bytes)?;
-        let prompts = t.tensor("prompt_tokens")?;
-        let tails = t.tensor("decode_tokens")?;
-        let ids = t.tensor("topk_ids")?;
-        let lp = t.tensor("topk_logprobs")?;
-        ensure!(lp.dtype() == safetensors::Dtype::F32, "golden dtype");
-        Ok(Self {
-            prompts: i64s(&prompts),
-            lengths: i64s(&t.tensor("prompt_lens")?),
-            tails: i64s(&tails),
-            ids: i64s(&ids),
-            logprobs: lp
-                .data()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect(),
-            sequences: tails.shape()[0],
-            decode: tails.shape()[1],
-            k: ids.shape()[2],
-        })
-    }
-    fn prompt(&self, s: usize) -> Vec<u32> {
-        let offset = self.lengths[..s].iter().sum::<i64>() as usize;
-        self.prompts[offset..offset + self.lengths[s] as usize]
-            .iter()
-            .map(|&x| x as u32)
-            .collect()
-    }
-}
 #[derive(Default)]
 struct Stats {
     delta: Vec<f32>,
@@ -89,36 +40,37 @@ impl Stats {
                 .sum::<f64>()
                 .ln();
         let mut top = (0..logits.len()).collect::<Vec<_>>();
-        top.select_nth_unstable_by(8, |&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
-        top[..8].sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        top.select_nth_unstable_by(HEAD_K, |&a, &b| {
+            logits[b].total_cmp(&logits[a]).then(a.cmp(&b))
+        });
+        top[..HEAD_K].sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
         ensure!(
             prediction as usize == top[0],
             "GPU argmax/tie rule differs from CPU at seq={seq} step={step}"
         );
-        let base = (seq * (g.decode + 1) + step) * g.k;
-        let reference = &g.ids[base..base + g.k];
-        let lp = &g.logprobs[base..base + g.k];
+        let reference = g.topk(seq, step);
         let chosen = reference
             .iter()
-            .position(|&x| x == top[0] as i64)
+            .position(|&(id, _)| id as usize == top[0])
             .with_context(|| {
                 format!(
-                    "argmax {} absent from HF top64 at seq={seq} step={step}",
-                    top[0]
+                    "argmax {} absent from HF top{} at seq={seq} step={step}",
+                    top[0],
+                    reference.len()
                 )
             })?;
+        let regret = reference[0].1 - reference[chosen].1;
         ensure!(
-            lp[0] - lp[chosen] <= 0.20,
-            "regret {} > .20 at seq={seq} step={step}",
-            lp[0] - lp[chosen]
+            regret <= MARGIN_TOL,
+            "regret {regret} > {MARGIN_TOL} at seq={seq} step={step}"
         );
-        for &token in &top[..8] {
-            let at = reference
+        for &token in &top[..HEAD_K] {
+            let &(_, hf) = reference
                 .iter()
-                .position(|&x| x == token as i64)
+                .find(|&&(id, _)| id as usize == token)
                 .context("engine head token absent from HF reference")?;
             self.delta
-                .push(((logits[token] as f64 - lse) - lp[at] as f64).abs() as f32);
+                .push(((logits[token] as f64 - lse) - hf as f64).abs() as f32);
         }
         self.positions += 1;
         Ok(())
@@ -133,7 +85,7 @@ impl Stats {
             self.delta.len(),
             self.delta.last().unwrap()
         );
-        ensure!(mean <= 0.06 && p99 <= 0.20, "HF golden gate failed");
+        ensure!(mean <= MEAN_TOL && p99 <= P99_TOL, "HF golden gate failed");
         Ok(())
     }
 }
@@ -145,18 +97,13 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
     );
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-    let size = match (
-        config["hidden_size"].as_u64(),
-        config["num_hidden_layers"].as_u64(),
-    ) {
-        (Some(1024), Some(28)) => "0.6b",
-        (Some(2560), Some(36)) => "4b",
-        _ => anyhow::bail!("first release golden requires 0.6B or 4B"),
-    };
-    let g = Golden::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../test_data/qwen3-{size}-hf-golden.safetensors")),
-    )?;
+    let size = config["hidden_size"]
+        .as_u64()
+        .zip(config["num_hidden_layers"].as_u64())
+        .and_then(|(hidden, layers)| hf_golden::size_name(hidden, layers))
+        .filter(|size| matches!(*size, "0.6b" | "4b"))
+        .context("first release golden requires 0.6B or 4B")?;
+    let g = Golden::load_path(&hf_golden::default_fixture_path(size));
     let mut model = Model::load(
         path,
         ModelOptions {
@@ -168,7 +115,7 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
     )?;
     let mut stats = Stats::default();
     let mut repeat = Vec::new();
-    for seq in 0..g.sequences {
+    for seq in 0..g.num_seqs {
         model.reset_slot(0)?;
         let prompt = g.prompt(seq);
         let mut prediction = 0;
@@ -189,8 +136,8 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
             repeat = first.clone();
         }
         stats.add(&g, seq, 0, &first, prediction)?;
-        for step in 0..g.decode {
-            let token = g.tails[seq * g.decode + step] as u32;
+        for step in 0..g.decode_len {
+            let token = g.decode(seq, step);
             let ids = model.forward(
                 &[TokenInput {
                     token,
@@ -222,8 +169,8 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
         "fixed-shape replay is nondeterministic"
     );
     let mut stats = Stats::default();
-    for base in (0..g.sequences).step_by(4) {
-        let count = 4.min(g.sequences - base);
+    for base in (0..g.num_seqs).step_by(4) {
+        let count = 4.min(g.num_seqs - base);
         let prompts = (0..count).map(|i| g.prompt(base + i)).collect::<Vec<_>>();
         let mut cursors = vec![0; count];
         for slot in 0..count {
@@ -262,10 +209,10 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
                 stats.add(&g, base + slot, 0, logits, prediction)?;
             }
         }
-        for step in 0..g.decode {
+        for step in 0..g.decode_len {
             let input = (0..count)
                 .map(|slot| TokenInput {
-                    token: g.tails[(base + slot) * g.decode + step] as u32,
+                    token: g.decode(base + slot, step),
                     slot,
                     position: prompts[slot].len() + step,
                 })
@@ -279,18 +226,18 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
     stats.finish(&format!("{size} ragged batch4"))?;
     let mut stats = Stats::default();
     let mut mixed_steps = 0;
-    for base in (0..g.sequences).step_by(4) {
-        let count = 4.min(g.sequences - base);
+    for base in (0..g.num_seqs).step_by(4) {
+        let count = 4.min(g.num_seqs - base);
         // Interleave fixture lengths instead of grouping adjacent length bands.
         let seqs = (0..count)
-            .map(|s| (base / 4 + s * (g.sequences / 4)) % g.sequences)
+            .map(|s| (base / 4 + s * (g.num_seqs / 4)) % g.num_seqs)
             .collect::<Vec<_>>();
         let prompts = seqs.iter().map(|&s| g.prompt(s)).collect::<Vec<_>>();
         let mut cursors = vec![0; count];
         for slot in 0..count {
             model.reset_slot(slot)?;
         }
-        while (0..count).any(|s| cursors[s] < prompts[s].len() + g.decode) {
+        while (0..count).any(|s| cursors[s] < prompts[s].len() + g.decode_len) {
             let mut input = Vec::new();
             let mut outputs = Vec::new();
             let mut scored = Vec::new();
@@ -313,11 +260,11 @@ fn hf_golden_sequential_and_ragged_batches() -> Result<()> {
                         outputs.push(input.len() - 1);
                         scored.push((seqs[slot], 0));
                     }
-                } else if cursor < prompt_len + g.decode {
+                } else if cursor < prompt_len + g.decode_len {
                     decode = true;
                     let step = cursor - prompt_len;
                     input.push(TokenInput {
-                        token: g.tails[seqs[slot] * g.decode + step] as u32,
+                        token: g.decode(seqs[slot], step),
                         slot,
                         position: cursor,
                     });
