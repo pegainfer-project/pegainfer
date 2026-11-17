@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/bench_dsv2lite_http_soak.py."""
+"""Regression tests for scripts/bench/dsv2lite_soak.py."""
 
 from __future__ import annotations
 
@@ -13,16 +13,16 @@ from types import SimpleNamespace
 
 
 SCRIPT_PATH = (
-    Path(__file__).resolve().parents[1] / "scripts" / "bench_dsv2lite_http_soak.py"
+    Path(__file__).resolve().parents[1] / "dsv2lite_soak.py"
 )
 SCRIPTS_DIR = SCRIPT_PATH.parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-SPEC = importlib.util.spec_from_file_location("bench_dsv2lite_http_soak", SCRIPT_PATH)
+SPEC = importlib.util.spec_from_file_location("dsv2lite_soak", SCRIPT_PATH)
 assert SPEC and SPEC.loader
-bench_dsv2lite_http_soak = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench_dsv2lite_http_soak
-SPEC.loader.exec_module(bench_dsv2lite_http_soak)
+dsv2lite_soak = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = dsv2lite_soak
+SPEC.loader.exec_module(dsv2lite_soak)
 
 
 def args(**overrides: object) -> SimpleNamespace:
@@ -49,7 +49,7 @@ def args(**overrides: object) -> SimpleNamespace:
         "required_trace_coverage": 1.0,
         "contract_name": "dsv2-lite-http-soak",
         "contract_description": "soak",
-        "claim_boundary": bench_dsv2lite_http_soak.DEFAULT_CLAIM_BOUNDARY,
+        "claim_boundary": dsv2lite_soak.DEFAULT_CLAIM_BOUNDARY,
         "no_ignore_eos": False,
         "skip_clean_followup": False,
         "stop_on_failure": False,
@@ -60,7 +60,7 @@ def args(**overrides: object) -> SimpleNamespace:
 
 
 def resource(wall_s: float, rss_kib: int, gpu_mib: list[int]):
-    return bench_dsv2lite_http_soak.ResourceSample(
+    return dsv2lite_soak.ResourceSample(
         wall_s=wall_s,
         rss_kib=rss_kib,
         gpu_memory_used_mib=gpu_mib,
@@ -166,7 +166,7 @@ def bucket_record(
     timeouts: int = 0,
     returncode: int = 0,
 ) -> dict[str, object]:
-    record = bench_dsv2lite_http_soak.bucket_record(
+    record = dsv2lite_soak.bucket_record(
         bucket_index=0,
         concurrency=concurrency,
         report_path=Path(f"bucket-c{concurrency}.json"),
@@ -181,7 +181,7 @@ def bucket_record(
 def clean_followup_record(
     *, completed: int = 1, failed: int = 0, timeouts: int = 0, returncode: int = 0
 ) -> dict[str, object]:
-    record = bench_dsv2lite_http_soak.bucket_record(
+    record = dsv2lite_soak.bucket_record(
         bucket_index=-1,
         concurrency=1,
         report_path=Path("clean_followup.json"),
@@ -196,7 +196,7 @@ def clean_followup_record(
 def passing_summary(
     *, backend: str = "host-staged", runtime: str = "host-staged"
 ) -> dict[str, object]:
-    return bench_dsv2lite_http_soak.build_summary(
+    return dsv2lite_soak.build_summary(
         args(
             backend=backend,
             backend_runtime_version=runtime,
@@ -215,7 +215,7 @@ def passing_summary(
 
 class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
     def test_leaf_command_locks_soak_workload_and_provenance(self) -> None:
-        command = bench_dsv2lite_http_soak.build_leaf_command(
+        command = dsv2lite_soak.build_leaf_command(
             args(),
             out=Path("bucket.json"),
             concurrency=8,
@@ -244,7 +244,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             path = Path(tmp) / "bucket.json"
             path.write_text('{"ok": true}\n', encoding="utf-8")
 
-            record = bench_dsv2lite_http_soak.bucket_record(
+            record = dsv2lite_soak.bucket_record(
                 bucket_index=0,
                 concurrency=4,
                 report_path=path,
@@ -270,7 +270,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             first_path.write_text('{"leaf": 0}\n', encoding="utf-8")
             second_path.write_text('{"leaf": 1}\n', encoding="utf-8")
 
-            record = bench_dsv2lite_http_soak.aggregate_bucket_record(
+            record = dsv2lite_soak.aggregate_bucket_record(
                 bucket_index=0,
                 concurrency=4,
                 leaf_runs=[
@@ -308,7 +308,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertEqual(record["terminal_reasons"], {"completed_length": 16})
 
     def test_backend_summary_reports_drift_and_clean_followup_gate(self) -> None:
-        first = bench_dsv2lite_http_soak.bucket_record(
+        first = dsv2lite_soak.bucket_record(
             bucket_index=0,
             concurrency=4,
             report_path=Path("bucket0.json"),
@@ -318,7 +318,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             resource_after=resource(10.0, 110, [1100, 1100]),
         )
         mark_artifact_loaded(first, "a" * 64)
-        last = bench_dsv2lite_http_soak.bucket_record(
+        last = dsv2lite_soak.bucket_record(
             bucket_index=1,
             concurrency=4,
             report_path=Path("bucket1.json"),
@@ -328,7 +328,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             resource_after=resource(20.0, 120, [1200, 1200]),
         )
         mark_artifact_loaded(last, "b" * 64)
-        followup = bench_dsv2lite_http_soak.bucket_record(
+        followup = dsv2lite_soak.bucket_record(
             bucket_index=-1,
             concurrency=1,
             report_path=Path("clean_followup.json"),
@@ -339,7 +339,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         )
         mark_artifact_loaded(followup, "c" * 64)
 
-        summary = bench_dsv2lite_http_soak.build_summary(
+        summary = dsv2lite_soak.build_summary(
             args(concurrency=[4], duration_s=8.0, required_trace_coverage=1.0),
             buckets=[first, last],
             resources=[
@@ -369,7 +369,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         bucket = bucket_record()
         bucket["trace_coverage"]["token_timing_coverage_ratio"] = 0.5
 
-        summary = bench_dsv2lite_http_soak.build_summary(
+        summary = dsv2lite_soak.build_summary(
             args(concurrency=[4], required_trace_coverage=1.0),
             buckets=[bucket],
             resources=[],
@@ -383,7 +383,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertFalse(summary["soak_gate"]["trace_coverage_passed"])
 
     def test_backend_summary_fails_leaf_command_error(self) -> None:
-        summary = bench_dsv2lite_http_soak.build_summary(
+        summary = dsv2lite_soak.build_summary(
             args(concurrency=[4], required_trace_coverage=1.0),
             buckets=[bucket_record(returncode=1)],
             resources=[],
@@ -397,7 +397,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         self.assertFalse(summary["soak_gate"]["leaf_commands_passed"])
 
     def test_backend_summary_fails_empty_or_missing_bucket(self) -> None:
-        summary = bench_dsv2lite_http_soak.build_summary(
+        summary = dsv2lite_soak.build_summary(
             args(concurrency=[4, 8], required_trace_coverage=None),
             buckets=[bucket_record(concurrency=4)],
             resources=[],
@@ -444,7 +444,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         ]
         for name, case_args, clean_followup, failed_gate in cases:
             with self.subTest(name=name):
-                summary = bench_dsv2lite_http_soak.build_summary(
+                summary = dsv2lite_soak.build_summary(
                     case_args,
                     buckets=[bucket_record(concurrency=4)],
                     resources=[],
@@ -462,7 +462,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
             first_path = Path(tmp) / "bucket0000_leaf000.json"
             missing_path = Path(tmp) / "bucket0000_leaf001.json"
             first_path.write_text('{"leaf": 0}\n', encoding="utf-8")
-            bucket = bench_dsv2lite_http_soak.aggregate_bucket_record(
+            bucket = dsv2lite_soak.aggregate_bucket_record(
                 bucket_index=0,
                 concurrency=4,
                 leaf_runs=[
@@ -481,7 +481,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
                 resource_after=resource(10.0, 120, [1100, 1110]),
             )
 
-        summary = bench_dsv2lite_http_soak.build_summary(
+        summary = dsv2lite_soak.build_summary(
             args(concurrency=[4], duration_s=10.0, required_trace_coverage=1.0),
             buckets=[bucket],
             resources=[],
@@ -499,7 +499,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         first = {"resource_after": {"gpu_memory_used_mib": [10000, 8000]}}
         last = {"resource_after": {"gpu_memory_used_mib": [10000, 9000]}}
 
-        drift = bench_dsv2lite_http_soak.drift_summary([first, last])
+        drift = dsv2lite_soak.drift_summary([first, last])
 
         self.assertEqual(drift["gpu_memory_max_mib"]["median_delta_pct"], 0.0)
         self.assertEqual(drift["gpu_memory_total_mib"]["median_delta_pct"], 1000 / 18000 * 100)
@@ -509,10 +509,10 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         host = passing_summary()
         nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
 
-        missing = bench_dsv2lite_http_soak.build_combined_report(
+        missing = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host)]
         )
-        full = bench_dsv2lite_http_soak.build_combined_report(
+        full = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
         )
 
@@ -530,7 +530,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
         nccl["soak_gate"]["passed"] = False
 
-        report = bench_dsv2lite_http_soak.build_combined_report(
+        report = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
         )
 
@@ -542,7 +542,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         nccl = passing_summary(backend="nccl", runtime="NCCL 2.26.2")
         nccl["metadata"]["model_revision"] = "different-model-rev"
 
-        report = bench_dsv2lite_http_soak.build_combined_report(
+        report = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
         )
 
@@ -555,7 +555,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         nccl = copy.deepcopy(nccl)
         nccl["workload"]["duration_s"] = 120.0
 
-        report = bench_dsv2lite_http_soak.build_combined_report(
+        report = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
         )
 
@@ -569,7 +569,7 @@ class BenchDsv2LiteHttpSoakTests(unittest.TestCase):
         nccl = copy.deepcopy(nccl)
         nccl["metadata"]["backend_runtime_version"] = "nccl"
 
-        report = bench_dsv2lite_http_soak.build_combined_report(
+        report = dsv2lite_soak.build_combined_report(
             "DeepSeek-V2-Lite", [(Path("host.json"), host), (Path("nccl.json"), nccl)]
         )
 

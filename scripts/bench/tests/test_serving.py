@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/bench_http_serving.py."""
+"""Regression tests for scripts/bench/serving.py."""
 
 from __future__ import annotations
 
@@ -17,15 +17,15 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_http_serving.py"
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "serving.py"
 SCRIPTS_DIR = SCRIPT_PATH.parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-SPEC = importlib.util.spec_from_file_location("bench_http_serving", SCRIPT_PATH)
+SPEC = importlib.util.spec_from_file_location("serving", SCRIPT_PATH)
 assert SPEC and SPEC.loader
-bench_http_serving = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench_http_serving
-SPEC.loader.exec_module(bench_http_serving)
+serving = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = serving
+SPEC.loader.exec_module(serving)
 
 
 class DoneOnlyHandler(BaseHTTPRequestHandler):
@@ -76,10 +76,10 @@ class BenchHttpServingTests(unittest.TestCase):
 
     def test_percentile_uses_r7_linear_interpolation(self) -> None:
         self.assertEqual(
-            bench_http_serving.percentile([1.0, 2.0, 100.0, 101.0], 50), 51.0
+            serving.percentile([1.0, 2.0, 100.0, 101.0], 50), 51.0
         )
         self.assertAlmostEqual(
-            bench_http_serving.percentile([1.0, 2.0, 100.0, 101.0], 95),
+            serving.percentile([1.0, 2.0, 100.0, 101.0], 95),
             100.85,
         )
 
@@ -91,7 +91,7 @@ class BenchHttpServingTests(unittest.TestCase):
         ]
         DoneOnlyHandler.chunk_delay_s = 0.08
 
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-trickle-timeout",
             url=self.url,
@@ -115,7 +115,7 @@ class BenchHttpServingTests(unittest.TestCase):
         ]
         DoneOnlyHandler.chunk_delay_s = 0.01
 
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-byte-trickle-timeout",
             url=self.url,
@@ -133,7 +133,7 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertLess(result.latency_ms, 250.0)
 
     def test_token_timing_requires_chunk_token_parity(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="req-coalesced",
             prompt_words=1,
@@ -161,7 +161,7 @@ class BenchHttpServingTests(unittest.TestCase):
             server_trace={"completion_tokens": 3},
         )
 
-        bench_http_serving.finalize_token_timing(result)
+        serving.finalize_token_timing(result)
 
         self.assertFalse(result.token_timing_valid)
         self.assertIsNone(result.tpot_ms)
@@ -180,13 +180,13 @@ class BenchHttpServingTests(unittest.TestCase):
             },
         }
 
-        gate = bench_http_serving.build_retention_gate(report)
+        gate = serving.build_retention_gate(report)
 
         self.assertFalse(gate["passed"])
         self.assertFalse(gate["trace_coverage_passed"])
 
     def test_done_only_stream_fails_when_tokens_requested(self) -> None:
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-empty",
             url=self.url,
@@ -209,7 +209,7 @@ class BenchHttpServingTests(unittest.TestCase):
             b'data: {"choices":[{"text":"complete","finish_reason":"length"}]}\n\n'
         )
 
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-truncated-stream",
             url=self.url,
@@ -235,7 +235,7 @@ class BenchHttpServingTests(unittest.TestCase):
             b"data: [DONE]\n\n"
         )
 
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-finish-error",
             url=self.url,
@@ -257,7 +257,7 @@ class BenchHttpServingTests(unittest.TestCase):
             b'data: {"error":{"message":"generation failed"}}\n\ndata: [DONE]\n\n'
         )
 
-        result = bench_http_serving.request_once(
+        result = serving.request_once(
             index=0,
             request_id="req-payload-error",
             url=self.url,
@@ -303,7 +303,7 @@ class BenchHttpServingTests(unittest.TestCase):
             },
         )()
 
-        results, _wall_s = bench_http_serving.run_batch(args, measured=True)
+        results, _wall_s = serving.run_batch(args, measured=True)
         bodies = sorted(
             DoneOnlyHandler.request_bodies, key=lambda body: str(body["request_id"])
         )
@@ -328,7 +328,7 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertTrue(all("seed" not in body for body in bodies))
 
     def test_server_trace_log_is_attached_by_vllm_completion_id_prefix(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-1",
             prompt_words=16,
@@ -361,8 +361,8 @@ class BenchHttpServingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
             path.write_text(line, encoding="utf-8")
-            traces = bench_http_serving.load_server_traces(path)
-            bench_http_serving.attach_server_traces([result], traces)
+            traces = serving.load_server_traces(path)
+            serving.attach_server_traces([result], traces)
 
         self.assertIsNotNone(result.server_trace)
         assert result.server_trace is not None
@@ -386,10 +386,10 @@ class BenchHttpServingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
             path.write_text(stale, encoding="utf-8")
-            offset = bench_http_serving.server_log_offset(path)
+            offset = serving.server_log_offset(path)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(current)
-            traces = bench_http_serving.load_server_traces(
+            traces = serving.load_server_traces(
                 path,
                 start_offset=offset,
             )
@@ -419,16 +419,16 @@ class BenchHttpServingTests(unittest.TestCase):
                 timeout=5.0,
             )
 
-        with mock.patch.object(bench_http_serving.uuid, "uuid4") as uuid4:
+        with mock.patch.object(serving.uuid, "uuid4") as uuid4:
             uuid4.side_effect = [
                 SimpleNamespace(hex="first"),
                 SimpleNamespace(hex="second"),
             ]
-            first_results, _ = bench_http_serving.run_batch(
+            first_results, _ = serving.run_batch(
                 make_args(),
                 measured=True,
             )
-            second_results, _ = bench_http_serving.run_batch(
+            second_results, _ = serving.run_batch(
                 make_args(),
                 measured=True,
             )
@@ -443,7 +443,7 @@ class BenchHttpServingTests(unittest.TestCase):
         )
 
     def test_server_stream_error_log_marks_request_failed(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-0",
             prompt_words=16,
@@ -478,8 +478,8 @@ class BenchHttpServingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
             path.write_text(lines, encoding="utf-8")
-            traces = bench_http_serving.load_server_traces(path)
-            bench_http_serving.attach_server_traces([result], traces)
+            traces = serving.load_server_traces(path)
+            serving.attach_server_traces([result], traces)
 
         self.assertFalse(result.ok)
         self.assertIn("server generation error", result.error or "")
@@ -487,7 +487,7 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertIn("server_error", result.server_trace)
 
     def test_stale_server_trace_is_not_attached(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-0",
             prompt_words=16,
@@ -519,12 +519,12 @@ class BenchHttpServingTests(unittest.TestCase):
             }
         }
 
-        bench_http_serving.attach_server_traces([result], stale)
+        serving.attach_server_traces([result], stale)
 
         self.assertIsNone(result.server_trace)
 
     def test_server_trace_zero_completion_tokens_marks_request_failed(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-0",
             prompt_words=16,
@@ -556,15 +556,15 @@ class BenchHttpServingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "server.log"
             path.write_text(line, encoding="utf-8")
-            traces = bench_http_serving.load_server_traces(path)
-            bench_http_serving.attach_server_traces([result], traces)
+            traces = serving.load_server_traces(path)
+            serving.attach_server_traces([result], traces)
 
         self.assertFalse(result.ok)
         self.assertIn("completion_tokens=0", result.error or "")
 
     def test_mixed_workload_report_records_input_and_output_tokens(self) -> None:
         results = [
-            bench_http_serving.RequestResult(
+            serving.RequestResult(
                 index=0,
                 request_id="bench-0",
                 prompt_words=16,
@@ -593,7 +593,7 @@ class BenchHttpServingTests(unittest.TestCase):
                 top_p=1.0,
                 server_trace={"prompt_tokens": 22, "completion_tokens": 4},
             ),
-            bench_http_serving.RequestResult(
+            serving.RequestResult(
                 index=1,
                 request_id="bench-1",
                 prompt_words=128,
@@ -645,7 +645,7 @@ class BenchHttpServingTests(unittest.TestCase):
                 "timeout": 5.0,
             },
         )()
-        report = bench_http_serving.build_report(args, results, wall_s=2.0)
+        report = serving.build_report(args, results, wall_s=2.0)
 
         self.assertEqual(report["summary"]["input_tokens_total"], 187)
         self.assertEqual(report["summary"]["output_tokens_total"], 12)
@@ -676,7 +676,7 @@ class BenchHttpServingTests(unittest.TestCase):
         self.assertEqual(report["requests"][1]["temperature"], 0.8)
 
     def test_output_token_throughput_is_unavailable_without_server_trace(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-0",
             prompt_words=16,
@@ -717,7 +717,7 @@ class BenchHttpServingTests(unittest.TestCase):
                 "timeout": 5.0,
             },
         )()
-        report = bench_http_serving.build_report(args, [result], wall_s=2.0)
+        report = serving.build_report(args, [result], wall_s=2.0)
 
         self.assertIsNone(report["summary"]["output_tokens_total"])
         self.assertIsNone(report["summary"]["output_tokens_per_s"])
@@ -758,7 +758,7 @@ class BenchHttpServingTests(unittest.TestCase):
             },
         )
 
-        summary = bench_http_serving.summarize_trace_ms([first, second])
+        summary = serving.summarize_trace_ms([first, second])
 
         self.assertEqual(summary["active_set_size_max"], 4)
         self.assertEqual(summary["decode_batch_size_max"], 4)
@@ -779,7 +779,7 @@ class BenchHttpServingTests(unittest.TestCase):
             server_trace={"batch_decode_steps": 4},
         )
 
-        summary = bench_http_serving.summarize_trace_ms([legacy])
+        summary = serving.summarize_trace_ms([legacy])
 
         self.assertIsNone(summary["decode_steps"]["batched_request_steps_total"])
         self.assertIsNone(summary["decode_steps"]["singleton_request_steps_total"])
@@ -794,7 +794,7 @@ class BenchHttpServingTests(unittest.TestCase):
             },
         )
 
-        summary = bench_http_serving.summarize_trace_ms([trace])
+        summary = serving.summarize_trace_ms([trace])
 
         self.assertEqual(summary["decode_steps"]["batched_request_steps_total"], 3)
         self.assertEqual(summary["decode_steps"]["singleton_request_steps_total"], 2)
@@ -803,7 +803,7 @@ class BenchHttpServingTests(unittest.TestCase):
         )
 
     def test_contract_report_records_hashes_and_full_trace_gate(self) -> None:
-        result = bench_http_serving.RequestResult(
+        result = serving.RequestResult(
             index=0,
             request_id="bench-0",
             prompt_words=64,
@@ -863,7 +863,7 @@ class BenchHttpServingTests(unittest.TestCase):
             timeout=240.0,
         )
 
-        report = bench_http_serving.build_report(args, [result], wall_s=2.0)
+        report = serving.build_report(args, [result], wall_s=2.0)
 
         self.assertEqual(report["report_intent"], "http_serving_slo")
         self.assertEqual(report["contract"]["backend"], "host-staged")
@@ -882,7 +882,7 @@ class BenchHttpServingTests(unittest.TestCase):
             server_trace={"server_error": "request failed"},
         )
 
-        trace = bench_http_serving.summarize_trace_ms([result])
+        trace = serving.summarize_trace_ms([result])
 
         self.assertEqual(trace["attached_server_records"], 1)
         self.assertEqual(trace["server_error_records"], 1)

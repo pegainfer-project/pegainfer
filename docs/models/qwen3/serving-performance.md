@@ -119,18 +119,18 @@ The current workload entry point is:
 
 ```bash
 # pegainfer Qwen3-4B QPS sweep
-MODEL=/data/Qwen3-4B GPU=0 tools/bench/run_serving_bench.sh
+MODEL=/data/Qwen3-4B GPU=0 scripts/bench/serving_suite.sh
 
 # vLLM Qwen3-4B QPS sweep (for comparison)
 ENGINE=vllm MODEL=/data/Qwen3-4B GPU=0 \
-  VLLM=~/develop/xingming/.venv/bin/vllm tools/bench/run_serving_bench.sh
+  VLLM=~/develop/xingming/.venv/bin/vllm scripts/bench/serving_suite.sh
 
 # pegainfer Qwen3-4B + DSpark concurrency sweep
 MODEL=/data/Qwen3-4B DRAFT_MODEL=/data/dspark_qwen3_4b_block7 GPU=0 \
-  QPS_LIST="" CONCURRENCY_LIST="1 4 8" tools/bench/run_serving_bench.sh
+  QPS_LIST="" CONCURRENCY_LIST="1 4 8" scripts/bench/serving_suite.sh
 
 # Qwen3-8B
-MODEL=/data/Qwen3-8B GPU=0 tools/bench/run_serving_bench.sh
+MODEL=/data/Qwen3-8B GPU=0 scripts/bench/serving_suite.sh
 ```
 
-Warm TTFT sweep: `tools/bench/warm_ttft_sweep.py`. Build with `CUDA_HOME=/usr/local/cuda-13.1` (cuBLAS 12.9 has a GEMM cliff at N=1025; see [serving-perf-5090.md](serving-perf-5090.md) for the tuning history).
+Warm TTFT sweep: `scripts/bench/warm_ttft.py`. Build with `CUDA_HOME=/usr/local/cuda-13.1` (cuBLAS 12.9 has a GEMM cliff at N=1025; see [serving-perf-5090.md](serving-perf-5090.md) for the tuning history).

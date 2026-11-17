@@ -4,7 +4,7 @@
 
 ## What replaced the tool
 
-- `scripts/bench_http_serving.py` — OpenAI-compatible HTTP harness (streaming TTFT/ITL/TPOT, QPS, error rate, deterministic output hashes) against a running server.
+- `scripts/bench/serving.py` — OpenAI-compatible HTTP harness (streaming TTFT/ITL/TPOT, QPS, error rate, deterministic output hashes) against a running server.
 - External `vllm-bench` for multi-turn load tests.
 
 Both measure the *real* serving path (HTTP + bridge + engine), which the deleted in-process tool never did.

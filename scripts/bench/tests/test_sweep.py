@@ -1,4 +1,4 @@
-"""Regression tests for scripts/bench_http_sweep.py."""
+"""Regression tests for scripts/bench/sweep.py."""
 
 from __future__ import annotations
 
@@ -12,13 +12,16 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_http_sweep.py"
-SPEC = importlib.util.spec_from_file_location("bench_http_sweep", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "sweep.py"
+# sweep.py imports common.py from its own directory.
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+SPEC = importlib.util.spec_from_file_location("sweep", SCRIPT_PATH)
 assert SPEC is not None
-bench_http_sweep = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench_http_sweep
+sweep = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = sweep
 assert SPEC.loader is not None
-SPEC.loader.exec_module(bench_http_sweep)
+SPEC.loader.exec_module(sweep)
 
 
 def args_for(sampling_mode: str) -> SimpleNamespace:
@@ -74,8 +77,8 @@ def report_with_hashes(
             "completed": len(hashes),
             "failed": 0,
             "timeouts": 0,
-            "combined_output_hash": bench_http_sweep.combined_output_hash(hashes),
-            "output_hash_distribution": bench_http_sweep.value_counts(hashes),
+            "combined_output_hash": sweep.combined_output_hash(hashes),
+            "output_hash_distribution": sweep.value_counts(hashes),
             "qps": 1.0,
             "input_tokens_per_s": 2.0,
             "output_tokens_per_s": 3.0,
@@ -166,7 +169,7 @@ def retained_leaf_report(
             "top_k": args.top_k,
             "top_p": args.top_p,
             "sampling_mode": args.sampling_mode,
-            "sampling_profiles": bench_http_sweep.sampling_profiles(args),
+            "sampling_profiles": sweep.sampling_profiles(args),
             "ignore_eos": not args.no_ignore_eos,
             "timeout_s": args.timeout,
             "timeout_kind": "absolute_request_deadline",
@@ -184,7 +187,7 @@ def retained_leaf_report(
             "model_fingerprint": {},
             "server_binary_sha256": None,
             "backend_runtime_version": args.backend_runtime_version,
-            "hardware_toolchain": bench_http_sweep.detect_hardware_toolchain(),
+            "hardware_toolchain": sweep.detect_hardware_toolchain(),
             "benchmark_artifact": str(artifact),
         }
     )
@@ -202,7 +205,7 @@ class BenchHttpSweepTests(unittest.TestCase):
             stale_cell.write_text('{"passed": true}\n', encoding="utf-8")
             unrelated.write_text("{}\n", encoding="utf-8")
 
-            summary_path = bench_http_sweep.prepare_summary_path(out_dir)
+            summary_path = sweep.prepare_summary_path(out_dir)
 
             self.assertEqual(summary_path, stale)
             self.assertFalse(stale.exists())
@@ -218,12 +221,12 @@ class BenchHttpSweepTests(unittest.TestCase):
             stale = args.out_dir / "pw8_c2_mt4_r0.json"
             stale.write_text('{"stale": true}\n', encoding="utf-8")
             with mock.patch.object(
-                bench_http_sweep.subprocess,
+                sweep.subprocess,
                 "run",
                 return_value=SimpleNamespace(returncode=1),
             ):
                 with self.assertRaises(FileNotFoundError):
-                    bench_http_sweep.run_one(args, 8, 2, 4, 0)
+                    sweep.run_one(args, 8, 2, 4, 0)
 
             self.assertFalse(stale.exists())
 
@@ -235,10 +238,10 @@ class BenchHttpSweepTests(unittest.TestCase):
                 report = report_with_hashes(["a", "b"])
                 artifact = Path(tmp) / f"repeat-{repeat}.json"
                 report["metadata"]["benchmark_artifact"] = str(artifact)
-                bench_http_sweep.write_json(artifact, report)
+                sweep.write_json(artifact, report)
                 reports.append(report)
 
-            summary = bench_http_sweep.build_summary(args, reports)
+            summary = sweep.build_summary(args, reports)
 
         self.assertEqual(len(summary["leaf_artifacts"]), 2)
         self.assertTrue(
@@ -257,18 +260,18 @@ class BenchHttpSweepTests(unittest.TestCase):
             for repeat in range(args.repeats):
                 path = Path(tmp) / f"repeat-{repeat}.json"
                 report = retained_leaf_report(args, ["a", "b"], path)
-                bench_http_sweep.write_json(path, report)
+                sweep.write_json(path, report)
                 reports.append(report)
                 paths.append(path)
-            summary = bench_http_sweep.build_summary(args, reports)
+            summary = sweep.build_summary(args, reports)
 
-            passed = bench_http_sweep.verify_summary_leaf_artifacts(summary)
+            passed = sweep.verify_summary_leaf_artifacts(summary)
             reports[0]["summary"]["qps"] = 99.0
-            bench_http_sweep.write_json(paths[0], reports[0])
-            summary["leaf_artifacts"][0]["sha256"] = bench_http_sweep.sha256_file(
+            sweep.write_json(paths[0], reports[0])
+            summary["leaf_artifacts"][0]["sha256"] = sweep.sha256_file(
                 paths[0]
             )
-            failed = bench_http_sweep.verify_summary_leaf_artifacts(summary)
+            failed = sweep.verify_summary_leaf_artifacts(summary)
 
         self.assertTrue(passed["passed"])
         self.assertFalse(failed["passed"])
@@ -286,17 +289,17 @@ class BenchHttpSweepTests(unittest.TestCase):
             for repeat in range(args.repeats):
                 path = Path(tmp) / f"repeat-{repeat}.json"
                 report = retained_leaf_report(args, ["a", "b"], path)
-                bench_http_sweep.write_json(path, report)
+                sweep.write_json(path, report)
                 reports.append(report)
                 paths.append(path)
-            summary = bench_http_sweep.build_summary(args, reports)
+            summary = sweep.build_summary(args, reports)
 
             reports[0]["metadata"]["server_binary_sha256"] = "f" * 64
-            bench_http_sweep.write_json(paths[0], reports[0])
-            summary["leaf_artifacts"][0]["sha256"] = bench_http_sweep.sha256_file(
+            sweep.write_json(paths[0], reports[0])
+            summary["leaf_artifacts"][0]["sha256"] = sweep.sha256_file(
                 paths[0]
             )
-            failed = bench_http_sweep.verify_summary_leaf_artifacts(summary)
+            failed = sweep.verify_summary_leaf_artifacts(summary)
 
         self.assertFalse(failed["passed"])
         self.assertIn(
@@ -311,14 +314,14 @@ class BenchHttpSweepTests(unittest.TestCase):
             request["tpot_ms"] = None
             request["itl_ms"] = []
 
-        self.assertTrue(bench_http_sweep.metric_sample_counts_pass(report))
+        self.assertTrue(sweep.metric_sample_counts_pass(report))
 
     def test_nonzero_child_returncode_fails_cell(self) -> None:
         args = args_for("single")
         report = report_with_hashes(["a", "b"])
         report["metadata"]["benchmark_returncode"] = 1
 
-        summary = bench_http_sweep.build_summary(args, [report, copy.deepcopy(report)])
+        summary = sweep.build_summary(args, [report, copy.deepcopy(report)])
 
         self.assertFalse(summary["correctness_gate"]["passed"])
         self.assertFalse(summary["rows"][0]["benchmark_commands_passed"])
@@ -329,7 +332,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         report = report_with_hashes(["a", "b"])
         del report["metadata"]["benchmark_returncode"]
 
-        summary = bench_http_sweep.build_summary(args, [report, copy.deepcopy(report)])
+        summary = sweep.build_summary(args, [report, copy.deepcopy(report)])
 
         self.assertFalse(summary["correctness_gate"]["passed"])
         self.assertFalse(summary["rows"][0]["benchmark_commands_passed"])
@@ -363,7 +366,7 @@ class BenchHttpSweepTests(unittest.TestCase):
                 }
             )
 
-        summary = bench_http_sweep.build_summary(args, [first, second])
+        summary = sweep.build_summary(args, [first, second])
 
         row = summary["rows"][0]
         self.assertTrue(summary["correctness_gate"]["passed"])
@@ -377,7 +380,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         self.assertTrue(row["trace_coverage_passed"])
         self.assertEqual(row["ttft_ms"]["p95_summary"]["median"], 115.0)
         self.assertEqual(
-            bench_http_sweep.noisy_cell_marker([first]),
+            sweep.noisy_cell_marker([first]),
             "insufficient_repeats",
         )
 
@@ -391,7 +394,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         args.server_log = Path("server.log")
         args.mixed_prompt_shape = False
 
-        summary = bench_http_sweep.build_startup_failure_summary(
+        summary = sweep.build_startup_failure_summary(
             args, "server failed before communicator creation"
         )
 
@@ -402,7 +405,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         self.assertEqual(summary["run_errors"][0]["phase"], "server_startup")
 
     def test_mixed_sampling_does_not_require_repeat_hash_stability(self) -> None:
-        summary = bench_http_sweep.build_summary(
+        summary = sweep.build_summary(
             args_for("mixed-greedy-sampled"),
             [
                 report_with_hashes(
@@ -426,7 +429,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         )
 
     def test_mixed_sampling_requires_sampled_requests(self) -> None:
-        summary = bench_http_sweep.build_summary(
+        summary = sweep.build_summary(
             args_for("mixed-greedy-sampled"),
             [
                 report_with_hashes(["greedy-a"], labels=["greedy"]),
@@ -440,7 +443,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         self.assertFalse(summary["rows"][0]["passed"])
 
     def test_mixed_sampling_requires_greedy_hash_stability(self) -> None:
-        summary = bench_http_sweep.build_summary(
+        summary = sweep.build_summary(
             args_for("mixed-greedy-sampled"),
             [
                 report_with_hashes(
@@ -458,7 +461,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         self.assertFalse(summary["rows"][0]["passed"])
 
     def test_mixed_sampling_still_requires_output_evidence(self) -> None:
-        summary = bench_http_sweep.build_summary(
+        summary = sweep.build_summary(
             args_for("mixed-greedy-sampled"),
             [
                 report_with_hashes(["greedy", "sampled"], labels=["greedy", "sampled"]),
@@ -473,7 +476,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         self.assertFalse(summary["rows"][0]["passed"])
 
     def test_single_sampling_requires_repeat_hash_stability(self) -> None:
-        summary = bench_http_sweep.build_summary(
+        summary = sweep.build_summary(
             args_for("single"),
             [report_with_hashes(["a", "b"]), report_with_hashes(["c", "d"])],
         )
@@ -487,7 +490,7 @@ class BenchHttpSweepTests(unittest.TestCase):
         report = report_with_hashes(["a", "b"])
         report["summary"]["output_hash_distribution"] = {"forged": 2}
 
-        summary = bench_http_sweep.build_summary(args, [report, copy.deepcopy(report)])
+        summary = sweep.build_summary(args, [report, copy.deepcopy(report)])
 
         self.assertFalse(summary["correctness_gate"]["passed"])
         self.assertFalse(summary["rows"][0]["hash_manifests_consistent"])

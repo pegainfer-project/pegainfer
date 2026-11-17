@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bench_http_common import (
+from common import (
     artifact_command,
     combined_output_hash,
     numeric_summary,
@@ -22,12 +22,12 @@ from bench_http_common import (
     value_counts,
     write_json,
 )
-from bench_http_sweep import verify_summary_leaf_artifacts
+from sweep import verify_summary_leaf_artifacts
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-SWEEP = SCRIPT_DIR / "bench_http_sweep.py"
+REPO_ROOT = SCRIPT_DIR.parents[1]
+SWEEP = SCRIPT_DIR / "sweep.py"
 BACKENDS = ("host-staged", "nccl")
 PROFILE_SCHEMA_VERSION = 1
 NCCL_VERSION_PATTERNS = (

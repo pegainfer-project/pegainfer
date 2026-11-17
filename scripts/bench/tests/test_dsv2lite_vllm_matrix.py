@@ -1,4 +1,4 @@
-"""Regression tests for scripts/bench_dsv2lite_vllm_matrix.py."""
+"""Regression tests for scripts/bench/dsv2lite_vllm_matrix.py."""
 
 from __future__ import annotations
 
@@ -13,21 +13,24 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_dsv2lite_vllm_matrix.py"
-SPEC = importlib.util.spec_from_file_location("bench_dsv2lite_vllm_matrix", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "dsv2lite_vllm_matrix.py"
+SPEC = importlib.util.spec_from_file_location("dsv2lite_vllm_matrix", SCRIPT_PATH)
 assert SPEC is not None
 bench_matrix = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bench_matrix
 assert SPEC.loader is not None
 SPEC.loader.exec_module(bench_matrix)
 
-HTTP_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_http_serving.py"
-HTTP_SPEC = importlib.util.spec_from_file_location("bench_http_serving_for_matrix", HTTP_SCRIPT_PATH)
+HTTP_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "serving.py"
+# serving.py imports common.py from its own directory.
+if str(HTTP_SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(HTTP_SCRIPT_PATH.parent))
+HTTP_SPEC = importlib.util.spec_from_file_location("serving_for_matrix", HTTP_SCRIPT_PATH)
 assert HTTP_SPEC is not None
-bench_http_serving = importlib.util.module_from_spec(HTTP_SPEC)
-sys.modules[HTTP_SPEC.name] = bench_http_serving
+serving = importlib.util.module_from_spec(HTTP_SPEC)
+sys.modules[HTTP_SPEC.name] = serving
 assert HTTP_SPEC.loader is not None
-HTTP_SPEC.loader.exec_module(bench_http_serving)
+HTTP_SPEC.loader.exec_module(serving)
 
 
 class BenchDsv2LiteMatrixTests(unittest.TestCase):
@@ -79,7 +82,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             }
             trace.update(trace_overrides)
             measured.append(
-                bench_http_serving.RequestResult(
+                serving.RequestResult(
                     index=index,
                     request_id=f"bench-{index}",
                     prompt_words=64,
@@ -117,7 +120,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             ignore_eos=True,
             timeout=900.0,
         )
-        return bench_http_serving.build_report(args, measured, wall_s=102.4)
+        return serving.build_report(args, measured, wall_s=102.4)
 
     def valid_http_payload(self, **overrides):
         payload = {

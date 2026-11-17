@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bench_http_common import (
+from common import (
     artifact_command,
     combined_output_hash,
     current_commit,
@@ -27,8 +27,8 @@ from bench_http_common import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-BENCH = SCRIPT_DIR / "bench_http_serving.py"
+REPO_ROOT = SCRIPT_DIR.parents[1]
+BENCH = SCRIPT_DIR / "serving.py"
 BACKENDS = ("host-staged", "nccl")
 DEFAULT_CONTRACT_NAME = "dsv2-lite-http-soak"
 DEFAULT_CONTRACT_DESCRIPTION = (

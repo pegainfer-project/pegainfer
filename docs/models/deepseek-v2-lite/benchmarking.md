@@ -1,6 +1,6 @@
 # DeepSeek-V2-Lite Verification And Benchmarking
 
-> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, `bench_dsv2lite_http_slo.py` for retained HTTP SLO evidence, and `bench_dsv2lite_http_soak.py` for issue #465 sustained HTTP soak evidence. These artifacts still answer different questions, and none of them alone proves production readiness.
+> **TL;DR:** Use `e2e_ep2` for correctness, `dsv2_lite_ep2_decode_attribution` for direct decode diagnostics, `scripts/bench/dsv2lite_slo.py` for retained HTTP SLO evidence, and `scripts/bench/dsv2lite_soak.py` for issue #465 sustained HTTP soak evidence. These artifacts still answer different questions, and none of them alone proves production readiness.
 >
 > Last touched: 2026-07
 
@@ -10,8 +10,8 @@
 | --- | --- | --- | --- |
 | Correctness / integration | `pegainfer-deepseek-v2-lite/tests/e2e_ep2.rs` | EP2 load, host-staged/NCCL generation, request isolation, output tokens/text/hashes, route and collective accounting | Latency, throughput, SLO, soak, production readiness |
 | Direct diagnostic | `dsv2_lite_ep2_decode_attribution` | Fixed-shape CPU/CUDA section timing, route/collective counters, graph-readiness diagnostics | HTTP behavior, client pressure, serving SLO |
-| HTTP serving SLO | `scripts/bench_dsv2lite_http_slo.py` over the shared HTTP harness | Streaming TTFT/TPOT/ITL, request/output throughput, failures/timeouts, server trace coverage, output hashes, repeat spread | Direct-kernel attribution, sustained soak, production readiness |
-| Soak / production readiness | `scripts/bench_dsv2lite_http_soak.py` | Sustained request completion, first/last-quartile tail and throughput drift, RSS/VRAM drift, terminal reasons, clean follow-up recovery | Direct decode attribution, vLLM parity, multi-node recovery, or production readiness by itself |
+| HTTP serving SLO | `scripts/bench/dsv2lite_slo.py` over the shared HTTP harness | Streaming TTFT/TPOT/ITL, request/output throughput, failures/timeouts, server trace coverage, output hashes, repeat spread | Direct-kernel attribution, sustained soak, production readiness |
+| Soak / production readiness | `scripts/bench/dsv2lite_soak.py` | Sustained request completion, first/last-quartile tail and throughput drift, RSS/VRAM drift, terminal reasons, clean follow-up recovery | Direct decode attribution, vLLM parity, multi-node recovery, or production readiness by itself |
 
 ## Correctness Gate
 
@@ -54,7 +54,7 @@ The artifact has `kind=deepseek_v2_lite_direct_decode_attribution` plus model, b
 
 ## Retained HTTP SLO Profiles
 
-The profile definitions and six-child aggregate gate live in `scripts/bench_dsv2lite_http_slo.py`. The model runner calls the generic `bench_http_sweep.py`, which calls `bench_http_serving.py`; neither generic harness imports model-specific contracts.
+The profile definitions and six-child aggregate gate live in `scripts/bench/dsv2lite_slo.py`. The model runner calls the generic `scripts/bench/sweep.py`, which calls `scripts/bench/serving.py`; neither generic harness imports model-specific contracts.
 
 | Profile | Workload | Default timeout | Intended use |
 | --- | --- | ---: | --- |
@@ -99,7 +99,7 @@ These are remote-GPU templates. Replace metadata/path placeholders; `PROFILE` is
 
 ```bash
 # Template: run one retained profile/backend contract.
-python3 scripts/bench_dsv2lite_http_slo.py run \
+python3 scripts/bench/dsv2lite_slo.py run \
   --profile PROFILE --backend BACKEND \
   --base-url http://127.0.0.1:18000 \
   --server-log artifacts/bench/dsv2-lite/RUN_ID/BACKEND/server.log \
@@ -109,7 +109,7 @@ python3 scripts/bench_dsv2lite_http_slo.py run \
   --out-dir artifacts/bench/dsv2-lite/RUN_ID/BACKEND/PROFILE_SLUG
 
 # Template: combine the six passing backend/profile summaries into one report.
-python3 scripts/bench_dsv2lite_http_slo.py combine \
+python3 scripts/bench/dsv2lite_slo.py combine \
   --summary artifacts/bench/dsv2-lite/RUN_ID/host-staged/short/sweep_summary.json \
   --summary artifacts/bench/dsv2-lite/RUN_ID/host-staged/mixed/sweep_summary.json \
   --summary artifacts/bench/dsv2-lite/RUN_ID/host-staged/long/sweep_summary.json \
@@ -134,13 +134,13 @@ A cell is `noisy` when repeat spread exceeds 10% of the median for TTFT/TPOT/ITL
 
 ## Sustained HTTP Soak
 
-Issue #465 uses `scripts/bench_dsv2lite_http_soak.py`. It reuses the generic streaming `/v1/completions` leaf benchmark inside fixed time buckets, then writes a backend-level `soak_summary.json` and an optional host-staged/NCCL combined report. A failed soak is still useful evidence when the JSON keeps the failing leaf artifact, server log pointer, terminal reasons, and clean follow-up result.
+Issue #465 uses `scripts/bench/dsv2lite_soak.py`. It reuses the generic streaming `/v1/completions` leaf benchmark inside fixed time buckets, then writes a backend-level `soak_summary.json` and an optional host-staged/NCCL combined report. A failed soak is still useful evidence when the JSON keeps the failing leaf artifact, server log pointer, terminal reasons, and clean follow-up result.
 
 The default retained shape is greedy, ignore-EOS, `prompt_words=64`, `max_tokens=64`, concurrency `4,8`, and no production latency budget. Tune `--duration-s`, `--bucket-s`, and `--num-requests` for the validation host; `--bucket-s` controls the target wall-clock window per bucket, while `--num-requests` controls each leaf chunk launched continuously inside that window. The summary records actual elapsed time, bucket count, and leaf count.
 
 ```bash
 # Template: run one backend soak after the server is ready.
-python3 scripts/bench_dsv2lite_http_soak.py run \
+python3 scripts/bench/dsv2lite_soak.py run \
   --backend BACKEND \
   --base-url http://127.0.0.1:18000 \
   --server-log artifacts/bench/dsv2-lite/RUN_ID/BACKEND/server.log \
@@ -159,7 +159,7 @@ python3 scripts/bench_dsv2lite_http_soak.py run \
   --out-dir artifacts/bench/dsv2-lite/RUN_ID/BACKEND/soak
 
 # Template: combine host-staged and NCCL backend summaries.
-python3 scripts/bench_dsv2lite_http_soak.py combine \
+python3 scripts/bench/dsv2lite_soak.py combine \
   --summary artifacts/bench/dsv2-lite/RUN_ID/host-staged/soak/soak_summary.json \
   --summary artifacts/bench/dsv2-lite/RUN_ID/nccl/soak/soak_summary.json \
   --out artifacts/bench/dsv2-lite/RUN_ID/retained_soak_report.json
@@ -186,8 +186,8 @@ The combined host-staged/NCCL report hard-fails when either backend is missing, 
 These commands were last run on 2026-10-18:
 
 ```bash
-python3 -m py_compile scripts/bench_http_common.py scripts/bench_http_serving.py scripts/bench_http_sweep.py scripts/bench_dsv2lite_http_slo.py scripts/bench_dsv2lite_http_soak.py
-python3 -m unittest -v tests/test_bench_http_common.py tests/test_bench_http_serving.py tests/test_bench_http_sweep.py tests/test_bench_dsv2lite_http_slo.py tests/test_bench_dsv2lite_http_soak.py
+python3 -m py_compile scripts/bench/common.py scripts/bench/serving.py scripts/bench/sweep.py scripts/bench/dsv2lite_slo.py scripts/bench/dsv2lite_soak.py
+python3 -m unittest -v scripts/bench/tests/test_common.py scripts/bench/tests/test_serving.py scripts/bench/tests/test_sweep.py scripts/bench/tests/test_dsv2lite_slo.py scripts/bench/tests/test_dsv2lite_soak.py
 cargo fmt --all --check
 cargo metadata --locked --no-deps --format-version 1
 ```

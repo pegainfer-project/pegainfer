@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from bench_http_common import (
+from common import (
     artifact_command,
     combined_output_hash,
     current_commit,
@@ -25,8 +25,8 @@ from bench_http_common import (
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
-BENCH = SCRIPT_DIR / "bench_http_serving.py"
+REPO_ROOT = SCRIPT_DIR.parents[1]
+BENCH = SCRIPT_DIR / "serving.py"
 PERCENTILES = ("p50", "p95", "p99")
 TRACE_COVERAGE_FIELDS = (
     "traced_requests",

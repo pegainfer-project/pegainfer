@@ -16,7 +16,7 @@ Temporary instrumentation (reverted from the tree — re-add to re-measure):
 1. In `Qwen3Executor::run_step` (executor.rs), bracket the worker round trip with `Instant` and accumulate to a global ns counter (this is "GPU busy" — the step ends in a sync, so this ≈ forward+sample).
 2. In `scheduler_loop` (scheduler.rs), bracket per step: `pre` (top-of-loop → before `execute_plan`), `exec` (`execute_plan`), `resolve` (`resolve_step`), `apply` (`apply_effects`). Capture decode batch = `active.len()` before the step. Flush an `info!` summary every ~2s.
 
-Drive load over HTTP: `scripts/bench_http_serving.py --concurrency 128 --num-requests 384 --prompt-words 32 --max-tokens 256 --temperature 0`.
+Drive load over HTTP: `scripts/bench/serving.py --concurrency 128 --num-requests 384 --prompt-words 32 --max-tokens 256 --temperature 0`.
 
 `bubble = pre + exec_cpu + resolve + apply`, where `exec_cpu = exec − run_step(global)`.
 

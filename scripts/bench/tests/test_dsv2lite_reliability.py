@@ -1,4 +1,4 @@
-"""Regression tests for scripts/bench_dsv2lite_http_reliability.py."""
+"""Regression tests for scripts/bench/dsv2lite_reliability.py."""
 
 from __future__ import annotations
 
@@ -10,16 +10,16 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "bench_dsv2lite_http_reliability.py"
-SPEC = importlib.util.spec_from_file_location("bench_dsv2lite_http_reliability", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "dsv2lite_reliability.py"
+SPEC = importlib.util.spec_from_file_location("dsv2lite_reliability", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
-bench_dsv2lite_http_reliability = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench_dsv2lite_http_reliability
-SPEC.loader.exec_module(bench_dsv2lite_http_reliability)
+dsv2lite_reliability = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = dsv2lite_reliability
+SPEC.loader.exec_module(dsv2lite_reliability)
 
 
 def _result(request_id: str, kind: str, ok: bool, reason: str):
-    return bench_dsv2lite_http_reliability.finish_result(
+    return dsv2lite_reliability.finish_result(
         request_id,
         kind,
         ok,
@@ -50,7 +50,7 @@ class ReliabilityGateTests(unittest.TestCase):
     def test_trace_terminal_reason_overrides_client_disconnect_label(self):
         disconnected = _result("disconnect", "disconnect_early_bytes", False, "disconnected")
         disconnected.trace = _trace("disconnect", "error")
-        disconnected.terminal_reason = bench_dsv2lite_http_reliability.normalize_trace_terminal_reason(
+        disconnected.terminal_reason = dsv2lite_reliability.normalize_trace_terminal_reason(
             "error"
         )
         completed = _result("ok", "neighbor_success", True, "completed")
@@ -58,7 +58,7 @@ class ReliabilityGateTests(unittest.TestCase):
         follow = _result("follow", "clean_follow_up", True, "completed")
         follow.trace = _trace("follow", "completed_length", active=1)
 
-        scenario = bench_dsv2lite_http_reliability.build_scenario(
+        scenario = dsv2lite_reliability.build_scenario(
             "cancel_disconnect",
             [disconnected, completed],
             follow,
@@ -80,7 +80,7 @@ class ReliabilityGateTests(unittest.TestCase):
         follow = _result("follow", "clean_follow_up", True, "completed")
         follow.trace = _trace("follow", "completed_length", active=1)
 
-        scenario = bench_dsv2lite_http_reliability.build_scenario(
+        scenario = dsv2lite_reliability.build_scenario(
             "invalid_requests",
             [completed],
             follow,
@@ -103,7 +103,7 @@ class ReliabilityGateTests(unittest.TestCase):
             timeout=180.0,
         )
 
-        report = bench_dsv2lite_http_reliability.dry_run_report(args)
+        report = dsv2lite_reliability.dry_run_report(args)
 
         self.assertTrue(report["passed"])
         self.assertTrue(report["summary"]["passed"])

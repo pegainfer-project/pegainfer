@@ -11,7 +11,7 @@ an early disconnect can leave the previous request decoding and inflate the
 next sample's TTFT.
 
 Usage:
-  python tools/bench/warm_ttft_sweep.py \
+  python scripts/bench/warm_ttft.py \
       --base-url http://localhost:8000 --model /data/Qwen3-4B \
       --tokenizer /data/Qwen3-4B --lengths 256,512,1024,2048,4096,8192,16384 \
       --samples 20 --seed 42 --output results.json

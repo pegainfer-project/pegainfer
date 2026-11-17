@@ -7,7 +7,7 @@ Last touched: 2026-09
 ## Setup
 
 - RTX 5090, `/data/Qwen3-4B`, dev checkout `~/develop/xingming/pegainfer` on the 5090 box.
-- Workload: `vllm bench serve`, random dataset, in=1024 / out=128, Poisson arrivals, seed 42, 60s per QPS point (`tools/bench/qps_sweep.sh`).
+- Workload: `vllm bench serve`, random dataset, in=1024 / out=128, Poisson arrivals, seed 42, 60s per QPS point (`scripts/bench/qps_sweep.sh`).
 - Reference: vLLM 0.22.1, `--max-model-len 8192 --no-enable-prefix-caching`, defaults otherwise (max_num_seqs=256, max_num_batched_tokens=2048 chunked prefill, decode-priority). Verified from v0.22.1 source: vLLM does **not** lock batch size at 128; observed ~129 concurrency is KV-capacity-bound.
 - Results: 5090 `/data/xingming/bench/20260611-tune/{vllm-ref,oi-chunk512,oi-chunk1024,oi-chunk2048,oi-final,oi-default2048}/`.
 

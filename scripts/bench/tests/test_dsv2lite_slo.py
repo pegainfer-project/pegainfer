@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/bench_dsv2lite_http_slo.py."""
+"""Regression tests for scripts/bench/dsv2lite_slo.py."""
 
 from __future__ import annotations
 
@@ -13,11 +13,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 
-SCRIPT_PATH = (
-    Path(__file__).resolve().parents[1] / "scripts" / "bench_dsv2lite_http_slo.py"
-)
+SCRIPT_PATH = Path(__file__).resolve().parents[1] / "dsv2lite_slo.py"
 BENCHMARKING_DOC = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[3]
     / "docs"
     / "models"
     / "deepseek-v2-lite"
@@ -26,15 +24,15 @@ BENCHMARKING_DOC = (
 SCRIPTS_DIR = SCRIPT_PATH.parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-SPEC = importlib.util.spec_from_file_location("bench_dsv2lite_http_slo", SCRIPT_PATH)
+SPEC = importlib.util.spec_from_file_location("dsv2lite_slo", SCRIPT_PATH)
 assert SPEC and SPEC.loader
-bench_dsv2lite_http_slo = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench_dsv2lite_http_slo
-SPEC.loader.exec_module(bench_dsv2lite_http_slo)
+dsv2lite_slo = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = dsv2lite_slo
+SPEC.loader.exec_module(dsv2lite_slo)
 TEST_COMMIT = (
-    bench_dsv2lite_http_slo.subprocess.check_output(
+    dsv2lite_slo.subprocess.check_output(
         ["git", "rev-parse", "--short=12", "HEAD"],
-        cwd=Path(__file__).resolve().parents[1],
+        cwd=Path(__file__).resolve().parents[3],
         text=True,
     )
     .strip()
@@ -44,7 +42,7 @@ TEST_COMMIT = (
 
 def valid_summary(
     backend: str,
-    profile: bench_dsv2lite_http_slo.SloProfile,
+    profile: dsv2lite_slo.SloProfile,
     *,
     commit: str = TEST_COMMIT,
 ) -> dict[str, object]:
@@ -108,7 +106,7 @@ def valid_summary(
             "greedy_output_hashes_by_repeat": [[] for _ in range(profile.repeats)],
             "sampled_output_hashes_by_repeat": [[] for _ in range(profile.repeats)],
             "combined_output_hashes": [
-                bench_dsv2lite_http_slo.combined_output_hash(
+                dsv2lite_slo.combined_output_hash(
                     ["hash"] * profile.num_requests
                 )
                 for _ in range(profile.repeats)
@@ -222,26 +220,26 @@ def all_summaries() -> list[tuple[Path, dict[str, object]]]:
             Path(backend) / profile.name / "sweep_summary.json",
             valid_summary(backend, profile),
         )
-        for backend in bench_dsv2lite_http_slo.BACKENDS
-        for profile in bench_dsv2lite_http_slo.PROFILES.values()
+        for backend in dsv2lite_slo.BACKENDS
+        for profile in dsv2lite_slo.PROFILES.values()
     ]
 
 
 class BenchDsv2LiteHttpSloTests(unittest.TestCase):
     def test_commit_validation_rejects_non_head_commit(self) -> None:
         with self.assertRaises(SystemExit):
-            bench_dsv2lite_http_slo.validate_commit("000000000000")
+            dsv2lite_slo.validate_commit("000000000000")
 
     def test_leaf_artifact_verification_aggregates_child_failures(self) -> None:
         summaries = [(Path("summary.json"), {"leaf_artifacts": []})]
         with mock.patch.object(
-            bench_dsv2lite_http_slo,
+            dsv2lite_slo,
             "verify_summary_leaf_artifacts",
             return_value={"passed": True, "checked": 3, "failures": []},
         ):
-            passed = bench_dsv2lite_http_slo.verify_leaf_artifacts(summaries)
+            passed = dsv2lite_slo.verify_leaf_artifacts(summaries)
         with mock.patch.object(
-            bench_dsv2lite_http_slo,
+            dsv2lite_slo,
             "verify_summary_leaf_artifacts",
             return_value={
                 "passed": False,
@@ -249,7 +247,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
                 "failures": ["rows.recomputed"],
             },
         ):
-            failed = bench_dsv2lite_http_slo.verify_leaf_artifacts(summaries)
+            failed = dsv2lite_slo.verify_leaf_artifacts(summaries)
 
         self.assertTrue(passed["passed"])
         self.assertEqual(passed["checked"], 3)
@@ -258,7 +256,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
 
     def test_documented_run_templates_include_required_provenance_flags(self) -> None:
         text = BENCHMARKING_DOC.read_text(encoding="utf-8")
-        marker = "python3 scripts/bench_dsv2lite_http_slo.py run"
+        marker = "python3 scripts/bench/dsv2lite_slo.py run"
         blocks = [section.split("\n\n", 1)[0] for section in text.split(marker)[1:]]
 
         self.assertEqual(len(blocks), 1)
@@ -272,7 +270,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             "--server-binary",
         ):
             self.assertIn(flag, blocks[0])
-        for profile in bench_dsv2lite_http_slo.PROFILES:
+        for profile in dsv2lite_slo.PROFILES:
             self.assertIn(profile, text)
 
     def test_profile_command_locks_complete_workload(self) -> None:
@@ -292,7 +290,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             out_dir=Path("artifacts/long"),
         )
 
-        command = bench_dsv2lite_http_slo.build_sweep_command(args)
+        command = dsv2lite_slo.build_sweep_command(args)
 
         self.assertEqual(command[command.index("--prompt-words") + 1], "2048")
         self.assertEqual(command[command.index("--max-tokens") + 1], "64")
@@ -309,7 +307,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             command[command.index("--backend-runtime-version") + 1], "2.26.2"
         )
         self.assertEqual(
-            bench_dsv2lite_http_slo.PROFILES[
+            dsv2lite_slo.PROFILES[
                 "dsv2-lite-short-decode-heavy"
             ].num_requests,
             32,
@@ -318,10 +316,10 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
     def test_retained_report_requires_all_fixed_children(self) -> None:
         summaries = all_summaries()
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
-        missing = bench_dsv2lite_http_slo.build_retained_slo_report(
+        missing = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries[:-1]
         )
 
@@ -339,7 +337,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         drifted = copy.deepcopy(summaries)
         drifted[0][1]["workload"]["timeout_s"] = 241.0
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", drifted
         )
 
@@ -353,7 +351,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[0][1]["rows"][0]["ttft_ms"] = {}
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -367,7 +365,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[0][1]["rows"][0]["failed"] = [1] * 3
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -381,7 +379,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[0] = (summaries[0][0], [])
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -395,7 +393,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[0][1]["rows"].append(copy.deepcopy(summaries[0][1]["rows"][0]))
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -409,7 +407,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[0][1]["rows"][0]["ttft_ms"]["p50_summary"]["median"] = 2.0
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -430,7 +428,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             "samples": 3,
         }
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -446,7 +444,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         row["output_hash_distribution"] = {"forged": 96}
         row["combined_output_hashes"] = ["forged"] * 3
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -467,7 +465,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             )
 
             with self.assertRaises(Exception):
-                bench_dsv2lite_http_slo.combine(args)
+                dsv2lite_slo.combine(args)
 
             self.assertFalse(output.exists())
 
@@ -475,7 +473,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[-1][1]["metadata"]["commit"] = "different"
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -487,7 +485,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
         summaries = all_summaries()
         summaries[-1][1]["metadata"]["model_revision"] = "different-model-revision"
 
-        report = bench_dsv2lite_http_slo.build_retained_slo_report(
+        report = dsv2lite_slo.build_retained_slo_report(
             "DeepSeek-V2-Lite", summaries
         )
 
@@ -502,7 +500,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            version = bench_dsv2lite_http_slo.detect_backend_runtime_version(
+            version = dsv2lite_slo.detect_backend_runtime_version(
                 server_log, "nccl"
             )
 
@@ -517,7 +515,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            version = bench_dsv2lite_http_slo.detect_backend_runtime_version(
+            version = dsv2lite_slo.detect_backend_runtime_version(
                 server_log, "nccl"
             )
 
@@ -545,7 +543,7 @@ class BenchDsv2LiteHttpSloTests(unittest.TestCase):
             out_dir=Path("artifacts/startup-failure"),
         )
 
-        command = bench_dsv2lite_http_slo.build_sweep_command(args)
+        command = dsv2lite_slo.build_sweep_command(args)
 
         self.assertEqual(
             command[command.index("--backend-runtime-version") + 1], "2.25.1"

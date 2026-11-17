@@ -1,6 +1,6 @@
 # GPU Profiling Guide
 
-> **TL;DR:** For benchmarking, drive the HTTP server with `scripts/bench_http_serving.py` or vllm-bench (the in-process `bench_serving` bin is retired). For profiling, wrap the *server* in `nsys`, drive load over HTTP, analyze totals with `nsys stats`, and always inspect `std/p95/p99/max` tails before making optimization decisions. This document covers pitfalls and diagnostic paths, not CLI reference.
+> **TL;DR:** For benchmarking, drive the HTTP server with `scripts/bench/serving.py` or vllm-bench (the in-process `bench_serving` bin is retired). For profiling, wrap the *server* in `nsys`, drive load over HTTP, analyze totals with `nsys stats`, and always inspect `std/p95/p99/max` tails before making optimization decisions. This document covers pitfalls and diagnostic paths, not CLI reference.
 >
 > **Status:** Active.
 
@@ -20,7 +20,7 @@ nsys profile --force-overwrite=true --cuda-graph-trace=node \
   cargo run -r -- --model-path models/Qwen3-4B --port 8000
 
 # Shell 2: drive the load, then Ctrl-C the server to finalize the trace
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --num-requests 8 --concurrency 2 --max-tokens 256
 ```
 
@@ -98,11 +98,11 @@ Two load shapes isolate prefill and decode paths for per-model optimization
 
 ```bash
 # Prefill-heavy: TTFT dominates, decode negligible
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --prompt-words 2048 --max-tokens 1
 
 # Decode-heavy: TPOT dominates, prefill negligible
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --prompt-words 1 --max-tokens 128
 ```
 
@@ -112,11 +112,11 @@ If TPOT degrades significantly as context grows (sweep `--prompt-words` while ho
 
 ```bash
 # Against the ctx_short server run
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --prompt-words 1 --max-tokens 128
 
 # Against the ctx_long server run
-python3 scripts/bench_http_serving.py --base-url http://localhost:8000 \
+python3 scripts/bench/serving.py --base-url http://localhost:8000 \
   --model models/Qwen3-4B --prompt-words 2048 --max-tokens 128
 ```
 

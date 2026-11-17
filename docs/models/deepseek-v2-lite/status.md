@@ -24,9 +24,9 @@ Last touched: 2026-10
 | First mixed-request serving gate | Available | Issue #281 adds greedy-only request admission, FCFS deferral, explicit request-local rejection/error/finish events, and one owned `DecodeCache` per active request. The 2026-06-23 2x RTX 5090 run passed HF / host-staged / NCCL exactness and the mixed-serving E2E for host-staged and NCCL. |
 | Long-shape NCCL collectives | Available | Issue #280 chunks large bf16 dense-exchange and f32 combine all-reduces. The 2026-06-24 2x RTX 5090 NCCL checks preserve HF / host-staged / NCCL exactness and complete 24/64/128-word direct long-shape probes. |
 | HTTP trace and measured MoE throughput optimization | HTTP and direct evidence | Issue #280 logs DeepSeek-V2-Lite `pegainfer_http_trace` records and batches same-position decode subgroups. Issue #464 extends phase/decode-step attribution, groups host-staged and NCCL routes by stable `(owner_rank, global_expert)`, and moves the NCCL gate GEMM to a bitwise-matched CUDA logits kernel while keeping host top-k/softmax. Diagnostic serial/host rollback switches remain available for retained A/B and emergency rollback; they are not production tuning knobs. |
-| HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench_dsv2lite_http_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
+| HTTP reliability lifecycle gate | Available | Issue #453 adds `scripts/bench/dsv2lite_reliability.py`, which drives real streaming `/v1/completions` scenarios for client cancel/disconnect, unsupported params, active-cap overload, mixed short/long prompts with adjacent failures, and clean follow-up recovery. The 2026-07-04 2x RTX 5090 host-staged and NCCL runs both passed with terminal trace coverage, stable output hashes, active/pending/decode maxima, and healthy final scheduler baselines. |
 | Retained HTTP serving SLO report | Retained HTTP evidence | Issue #466 adds model-owned short/mixed/long profiles on the shared HTTP benchmark scripts. The current retained run covered all six host-staged/NCCL children with zero failures/timeouts and full trace coverage. The #466 follow-up fixed NCCL no-selector readiness by discovering a compatible Python-wheel NCCL runtime from `PATH`; the short NCCL c1 HTTP smoke now reaches readiness and completes without startup failure or layer-1 illegal address. This is HTTP pressure/SLO evidence only; command details and artifact hashes live in `benchmarking.md`. |
-| Sustained HTTP soak report | Retained soak evidence | Issue #465 adds `scripts/bench_dsv2lite_http_soak.py`, which reuses the shared HTTP leaf benchmark inside fixed time buckets, then retains backend-level and host-staged/NCCL combined JSON. The 2026-10-18 2x GH200 run covered host-staged and NCCL, as a 120-second smoke and a 30-minute retained run per concurrency, with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.30.7` selected through `PEGAINFER_NCCL_LIB_DIR`, so this is sustained HTTP soak evidence for that runtime contract, not a default-runtime speed claim or production-readiness claim. Current tooling also fails missing duration coverage, capped retained runs, missing leaf artifacts, missing clean follow-up, failed child gates, provenance drift, contract drift, and missing/generic runtime boundaries. |
+| Sustained HTTP soak report | Retained soak evidence | Issue #465 adds `scripts/bench/dsv2lite_soak.py`, which reuses the shared HTTP leaf benchmark inside fixed time buckets, then retains backend-level and host-staged/NCCL combined JSON. The 2026-10-18 2x GH200 run covered host-staged and NCCL, as a 120-second smoke and a 30-minute retained run per concurrency, with zero failures/timeouts, full required trace coverage, clean follow-up recovery, output hashes, resource samples, and first/last-quartile drift fields. The NCCL row used NCCL `2.30.7` selected through `PEGAINFER_NCCL_LIB_DIR`, so this is sustained HTTP soak evidence for that runtime contract, not a default-runtime speed claim or production-readiness claim. Current tooling also fails missing duration coverage, capped retained runs, missing leaf artifacts, missing clean follow-up, failed child gates, provenance drift, contract drift, and missing/generic runtime boundaries. |
 | Retained vLLM comparison matrix | Snapshot complete with clean failed setup rows and supplemental validation rows | The retained matrix for tracking issue #279 keeps HF/host/NCCL correctness, PegaInfer direct diagnostic batch, `vllm bench serve` HTTP pressure, PegaInfer trace rows, and failed setup rows separate. The 2026-06-28 clean full matrix passed HF / host-staged / NCCL correctness plus PegaInfer host-staged/NCCL direct, HTTP pressure, and trace rows; stock vLLM TP2 and TP2+EP2 failed during setup on the target FlashInfer SM120 path. A separate FlashInfer #3633-equivalent validation completed vLLM TP2 and TP2+EP2 under the same HTTP client/workload contract. |
 | vLLM production parity | Not claimed | The vLLM TP2 / TP2+EP2 rows are gap-finding evidence from a documented contract. The supplemental validation run is not serving parity or a stock-install claim. |
 
@@ -54,7 +54,7 @@ The Rust E2E accepts the known HF-confirmed RTX 5090 and A800 hash pairs for thi
 
 ### Issue #466 Retained HTTP SLO Report
 
-The retained SLO layer uses model-owned `scripts/bench_dsv2lite_http_slo.py` over the generic `bench_http_serving.py` and `bench_http_sweep.py` harnesses. The model line owns three fixed contracts:
+The retained SLO layer uses model-owned `scripts/bench/dsv2lite_slo.py` over the generic `scripts/bench/serving.py` and `scripts/bench/sweep.py` harnesses. The model line owns three fixed contracts:
 
 | Contract | Shape | Boundary |
 | --- | --- | --- |
@@ -72,7 +72,7 @@ The current-source #466 aggregate is retained under `artifacts/bench/dsv2-lite/<
 
 ### Issue #465 Retained HTTP Soak Report
 
-The retained soak layer uses model-owned `scripts/bench_dsv2lite_http_soak.py` over the generic `bench_http_serving.py` leaf runner. The current retained run used commit `56b9d1f00f500f07e18ff28b92c1a9a955775b5d`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x GH200 120GB, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, and full required trace coverage: a smoke at 120-second duration with 60-second buckets, then the retained run at 1800-second duration with 300-second buckets. Both backends passed `soak_gate.passed=true` in both phases. Command details and artifact hashes live in `benchmarking.md`.
+The retained soak layer uses model-owned `scripts/bench/dsv2lite_soak.py` over the generic `scripts/bench/serving.py` leaf runner. The current retained run used commit `56b9d1f00f500f07e18ff28b92c1a9a955775b5d`, model revision `604d5664dddd88a0433dbae533b7fe9472482de0`, 2x GH200 120GB, `prompt_words=64`, `max_tokens=64`, greedy sampling, ignore-EOS, concurrency `4,8`, and full required trace coverage: a smoke at 120-second duration with 60-second buckets, then the retained run at 1800-second duration with 300-second buckets. Both backends passed `soak_gate.passed=true` in both phases. Command details and artifact hashes live in `benchmarking.md`.
 
 | Backend | Runtime boundary | Completed | Failed/timeouts | Buckets / leafs | Combined output hash | Boundary |
 | --- | --- | ---: | ---: | ---: | --- | --- |
@@ -151,7 +151,7 @@ PegaInfer streaming currently makes the client-side TPOT fields near-zero in thi
 
 ### Issue #280 HTTP Trace, Subgroup Decode, And Long Prompts
 
-Retained 2026-06-24 evidence on 2x RTX 5090, NCCL EP2 with chunked large collectives, release `pegainfer-server --features deepseek-v2-lite`, `/v1/completions`, `temperature=0`, `ignore_eos=true`, `max_tokens=16`, `num_requests=8`, `repeats=3`, with server logs consumed by `scripts/bench_http_serving.py`.
+Retained 2026-06-24 evidence on 2x RTX 5090, NCCL EP2 with chunked large collectives, release `pegainfer-server --features deepseek-v2-lite`, `/v1/completions`, `temperature=0`, `ignore_eos=true`, `max_tokens=16`, `num_requests=8`, `repeats=3`, with server logs consumed by `scripts/bench/serving.py`.
 
 This is HTTP serving evidence for request-level trace attribution, completed/failed/timeout accounting, output hash stability, and same-position decode subgroups. It does not prove vLLM parity, production EP readiness, or acceptable long-prompt latency.
 
@@ -210,7 +210,7 @@ This table is a no-regression and trace-coverage record. It is not a throughput 
 
 ### Issue #453 HTTP Reliability Gate
 
-The #453 runner is `scripts/bench_dsv2lite_http_reliability.py`. It uses standard-library HTTP streaming against `/v1/completions`, parses `pegainfer_http_trace` from the server log, and writes one JSON artifact with per-scenario counts, output hashes, trace coverage, active/pending/decode maxima, terminal reasons, final healthy-baseline status, and clean follow-up results.
+The #453 runner is `scripts/bench/dsv2lite_reliability.py`. It uses standard-library HTTP streaming against `/v1/completions`, parses `pegainfer_http_trace` from the server log, and writes one JSON artifact with per-scenario counts, output hashes, trace coverage, active/pending/decode maxima, terminal reasons, final healthy-baseline status, and clean follow-up results.
 
 Scenarios covered by the runner:
 
@@ -231,9 +231,9 @@ Strict failure rules:
 Validation completed for the runner schema, runner false-positive guards, scheduler accounting, the shared token-sink cancel/disconnect contract, host-staged/NCCL E2E exactness, and live host-staged/NCCL HTTP reliability:
 
 ```bash
-python3 scripts/bench_dsv2lite_http_reliability.py --dry-run --out <artifact>.json
-python3 -m py_compile scripts/bench_dsv2lite_http_reliability.py tests/test_bench_dsv2lite_http_reliability.py
-python3 -m unittest tests.test_bench_dsv2lite_http_reliability
+python3 scripts/bench/dsv2lite_reliability.py --dry-run --out <artifact>.json
+python3 -m py_compile scripts/bench/dsv2lite_reliability.py scripts/bench/tests/test_dsv2lite_reliability.py
+python3 -m unittest scripts/bench/tests/test_dsv2lite_reliability.py
 cargo test --release -p pegainfer-engine --lib token_sink -- --nocapture
 cargo test --release -p pegainfer-vllm-frontend --lib abort -- --nocapture
 cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --lib scheduler -- --nocapture
@@ -241,7 +241,7 @@ PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite PEGAINFER_DSV2_LITE_EP_BACKEND
 PEGAINFER_TEST_MODEL_PATH=models/DeepSeek-V2-Lite PEGAINFER_DSV2_LITE_EP_BACKEND=nccl cargo test --release -p pegainfer-deepseek-v2-lite --features deepseek-v2-lite --test e2e_ep2 -- --nocapture
 ```
 
-The local dry-run passed all four scenarios and emits deterministic JSON. `tests/test_bench_dsv2lite_http_reliability.py` passed and verifies that the runner fails when a client-observed disconnect lacks a matching scheduler terminal reason or when trace fields are missing. `cargo test --release -p pegainfer-engine --lib token_sink -- --nocapture` passed and verifies explicit cancel versus closed receiver behavior. `cargo test --release -p pegainfer-vllm-frontend --lib abort -- --nocapture` passed and verifies that frontend aborts drop late tokens and classify disconnect before the first client-visible token separately from cancel after token output. The DSV2-Lite scheduler lifecycle subset passed `23 passed; 0 failed`; host-staged and NCCL `e2e_ep2` each passed `1 passed; 0 failed`. The SM120 NCCL validation used an NCCL 2.30.7 runtime library.
+The local dry-run passed all four scenarios and emits deterministic JSON. `scripts/bench/tests/test_dsv2lite_reliability.py` passed and verifies that the runner fails when a client-observed disconnect lacks a matching scheduler terminal reason or when trace fields are missing. `cargo test --release -p pegainfer-engine --lib token_sink -- --nocapture` passed and verifies explicit cancel versus closed receiver behavior. `cargo test --release -p pegainfer-vllm-frontend --lib abort -- --nocapture` passed and verifies that frontend aborts drop late tokens and classify disconnect before the first client-visible token separately from cancel after token output. The DSV2-Lite scheduler lifecycle subset passed `23 passed; 0 failed`; host-staged and NCCL `e2e_ep2` each passed `1 passed; 0 failed`. The SM120 NCCL validation used an NCCL 2.30.7 runtime library.
 
 Retained 2026-07-04 live HTTP reliability artifacts from real `/v1/completions` traffic:
 

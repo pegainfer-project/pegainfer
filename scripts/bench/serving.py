@@ -27,7 +27,7 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
-from bench_http_common import (
+from common import (
     artifact_command,
     combined_output_hash,
     current_commit,

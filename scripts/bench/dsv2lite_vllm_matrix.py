@@ -28,14 +28,13 @@ import statistics
 import subprocess
 import sys
 import time
-import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL_PATH = Path("models/DeepSeek-V2-Lite")
 DEFAULT_MODEL_ID = "DeepSeek-V2-Lite"
 DEFAULT_CONCURRENCY = [1, 4, 8]
@@ -1429,7 +1428,7 @@ def run_pegainfer_trace_pass(args: argparse.Namespace, out_dir: Path) -> list[di
                 for concurrency in args.concurrency:
                     out = out_dir / "pegainfer_trace" / spec.name / f"c{concurrency}.json"
                     trace_cmd = [
-                        sys.executable, "scripts/bench_http_serving.py",
+                        sys.executable, "scripts/bench/serving.py",
                         "--base-url", f"http://127.0.0.1:{port}",
                         "--model", args.model_id,
                         "--num-requests", str(args.num_prompts),

@@ -7,7 +7,7 @@
 # summary table on stdout.
 #
 # Usage:
-#   MODEL=/data/Qwen3-4B tools/bench/run_serving_bench.sh [bench args...]
+#   MODEL=/data/Qwen3-4B scripts/bench/serving_suite.sh [bench args...]
 #
 # Bench args (dataset path, HF subset/split, warmups, ...) are passed to every
 # bench run as given.
@@ -34,15 +34,15 @@
 #
 # Examples:
 #   # pegainfer Qwen3-4B QPS sweep
-#   MODEL=/data/Qwen3-4B GPU=7 tools/bench/run_serving_bench.sh
+#   MODEL=/data/Qwen3-4B GPU=7 scripts/bench/serving_suite.sh
 #
 #   # pegainfer Qwen3-4B + DSpark concurrency sweep
 #   MODEL=/data/Qwen3-4B DRAFT_MODEL=/data/dspark_qwen3_4b_block7 GPU=7 \
-#     QPS_LIST="" CONCURRENCY_LIST="1 4 8" tools/bench/run_serving_bench.sh
+#     QPS_LIST="" CONCURRENCY_LIST="1 4 8" scripts/bench/serving_suite.sh
 #
 #   # vLLM Qwen3-4B QPS sweep
 #   ENGINE=vllm MODEL=/data/Qwen3-4B GPU=7 \
-#     VLLM=~/develop/xingming/.venv/bin/vllm tools/bench/run_serving_bench.sh
+#     VLLM=~/develop/xingming/.venv/bin/vllm scripts/bench/serving_suite.sh
 set -euo pipefail
 
 MODEL=${MODEL:?MODEL (model path) is required}
@@ -244,6 +244,6 @@ fi
 # ---- summary ---------------------------------------------------------------
 echo ""
 echo "=== results summary ==="
-"$SCRIPT_DIR/summarize_qps_sweep.py" "${RESULT_FILES[@]}"
+"$SCRIPT_DIR/qps_summary.py" "${RESULT_FILES[@]}"
 echo ""
 echo "results saved to $RESULT_DIR"

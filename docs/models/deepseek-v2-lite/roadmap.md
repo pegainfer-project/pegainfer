@@ -24,8 +24,8 @@ The first three can be green while the fourth is only a retained baseline. A pas
 | HF and EP2 correctness | Retained | `hf-accuracy-gate.md`, `e2e_ep2.rs` | Correctness only |
 | Direct decode attribution | Retained | `decode-attribution-gate.md` | Direct diagnostic only |
 | HTTP lifecycle reliability | Retained | `status.md`, issue #453 | Failure isolation and recovery scenarios, no long-duration claim |
-| HTTP SLO report | Retained for #466 | `benchmarking.md`, `bench_dsv2lite_http_slo.py` | Fixed host-staged/NCCL HTTP contracts retained; no soak or production claim |
-| Sustained soak | Retained baseline for #465 | `benchmarking.md`, `bench_dsv2lite_http_soak.py` | Fixed short-shape host-staged/NCCL soak retained; runtime/provenance gates are hard, drift is reported, not a ratified production budget |
+| HTTP SLO report | Retained for #466 | `benchmarking.md`, `scripts/bench/dsv2lite_slo.py` | Fixed host-staged/NCCL HTTP contracts retained; no soak or production claim |
+| Sustained soak | Retained baseline for #465 | `benchmarking.md`, `scripts/bench/dsv2lite_soak.py` | Fixed short-shape host-staged/NCCL soak retained; runtime/provenance gates are hard, drift is reported, not a ratified production budget |
 | Long-prefill scheduling | Open | issue #452 | Current long smoke records the boundary; it does not close latency work |
 | Device attention and KV | Done for NCCL decode | issue #635, `device-attention.md` | Prefill stays on the host |
 
