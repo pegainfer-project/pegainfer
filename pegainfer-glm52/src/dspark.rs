@@ -615,6 +615,8 @@ impl Glm52DsparkModel {
                             row_offset,
                             block,
                             k_tail,
+                            0,
+                            tail_len,
                             &layer.q_norm,
                             &layer.k_norm,
                             &self.cos_cache,

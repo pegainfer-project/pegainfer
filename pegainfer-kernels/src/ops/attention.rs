@@ -814,10 +814,9 @@ pub fn qk_norm_rope_batch_decode_into(
 
 /// QK RMSNorm + RoPE for one DFlash request's draft block.
 ///
-/// `q` is a row sub-range of a batched buffer: `q_row_offset` rows precede this
-/// request's `q_seq_len` query rows. The kernel still sees a single-request Q
-/// shape — we just advance the device pointer to the request's slice. `k` is the
-/// request's own varlen tail scratch (whole buffer), so it needs no offset.
+/// Q and K are row ranges of their backing buffers. Only these ranges are
+/// normalized and rotated, so a newly projected K tail can be processed without
+/// touching the committed prefix already in the cache.
 #[allow(clippy::too_many_arguments)]
 pub fn dflash_qk_norm_rope_into(
     ctx: &DeviceContext,
@@ -825,6 +824,8 @@ pub fn dflash_qk_norm_rope_into(
     q_row_offset: usize,
     q_seq_len: usize,
     k: &mut HiddenStates,
+    k_row_offset: usize,
+    k_seq_len: usize,
     q_norm_weight: &DeviceVec,
     k_norm_weight: &DeviceVec,
     cos_cache: &DeviceVec,
@@ -840,17 +841,13 @@ pub fn dflash_qk_norm_rope_into(
     assert_eq!(k.hidden_dim, num_kv_heads * head_dim);
     assert_eq!(q_norm_weight.len, head_dim);
     assert_eq!(k_norm_weight.len, head_dim);
-    assert!(
-        q_row_offset + q_seq_len <= q.seq_len,
-        "dflash_qk_norm_rope q row range [{}..{}) exceeds seq_len {}",
-        q_row_offset,
-        q_row_offset + q_seq_len,
-        q.seq_len
-    );
+    let q_byte_offset = checked_row_offset(q, q_row_offset, q_seq_len, "dflash_qk_norm_rope q")?;
+    let k_byte_offset = checked_row_offset(k, k_row_offset, k_seq_len, "dflash_qk_norm_rope k")?;
 
     let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
-    let q_ptr = q_ptr + (q_row_offset * q.hidden_dim * std::mem::size_of::<bf16>()) as u64;
+    let q_ptr = q_ptr + q_byte_offset;
     let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let k_ptr = k_ptr + k_byte_offset;
     let (qn_ptr, _gqn) = q_norm_weight.data.device_ptr(&ctx.stream);
     let (kn_ptr, _gkn) = k_norm_weight.data.device_ptr(&ctx.stream);
     let (cos_ptr, _gc) = cos_cache.data.device_ptr(&ctx.stream);
@@ -868,7 +865,7 @@ pub fn dflash_qk_norm_rope_into(
             num_kv_heads as i32,
             head_dim as i32,
             q_seq_len as i32,
-            k.seq_len as i32,
+            k_seq_len as i32,
             q_start_pos as i32,
             k_start_pos as i32,
             rms_eps,

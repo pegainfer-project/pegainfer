@@ -45,6 +45,9 @@ use crate::ffi;
 use crate::ops::checked_i32;
 use crate::ops::gemm_into_checked;
 use crate::ops::silu_mul_batch_into;
+use crate::paged_kv::KvFormat;
+use crate::paged_kv::KvStorage;
+use crate::paged_kv::PagedKvLayout;
 use crate::tensor::DeviceContext;
 use crate::tensor::DeviceMatrix;
 use crate::tensor::DeviceVec;
@@ -359,6 +362,117 @@ pub fn qsa_indexer_select_into(
     }
     .result()
     .map_err(|err| anyhow::anyhow!("QSA indexer select launch failed: {err}"))
+}
+
+/// The attention heads the sparse attention kernel compiles: 24 query heads in
+/// two K/V groups at head dim 256, over pages of 16 tokens.
+const QSA_HEADS: usize = 24;
+const QSA_KV_HEADS: usize = 2;
+const QSA_HEAD_DIM: usize = 256;
+const QSA_PAGE: usize = 16;
+
+/// Gated QSA attention for `rows` consecutive query rows of one sequence, the
+/// first at `first_position`, over the tokens `mask` keeps: one byte per (row,
+/// token) with row stride `mask_stride`, as [`qsa_indexer_select_into`] writes
+/// it. Semantics: `csrc/qwen4/qwen4_qsa_sparse_attention.cu`.
+///
+/// `q_full` and `q_prepped` are the dense attention entry's `q_proj` output
+/// and prepped query, and `out` its gated output; rows `row..row + rows` of all
+/// three are this call's, so a call can replace the dense result of the rows
+/// past the indexer budget in place. The entry must already have written these
+/// rows' K/V: the kernel reads the sequence's keys and values from `pool`, one
+/// layer in `layout`, in pages contiguous from `first_page`.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_sparse_attention_into(
+    ctx: &DeviceContext,
+    q_full: &HiddenStates,
+    q_prepped: &HiddenStates,
+    row: usize,
+    rows: usize,
+    first_position: usize,
+    pool: &CudaSlice<bf16>,
+    layout: &PagedKvLayout,
+    first_page: usize,
+    mask: &CudaSlice<u8>,
+    mask_stride: usize,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    if rows == 0 {
+        return Ok(());
+    }
+    let width = QSA_HEADS * QSA_HEAD_DIM;
+    ensure!(
+        q_full.hidden_dim == 2 * width && q_prepped.hidden_dim == width && out.hidden_dim == width,
+        "QSA attention wants q_proj {} wide and q/out {width} wide, got {}, {} and {}",
+        2 * width,
+        q_full.hidden_dim,
+        q_prepped.hidden_dim,
+        out.hidden_dim
+    );
+    let end = row + rows;
+    ensure!(
+        end <= q_full.seq_len && end <= q_prepped.seq_len && end <= out.seq_len,
+        "QSA attention rows {row}..{end} run past q_proj ({}), q ({}) or out ({})",
+        q_full.seq_len,
+        q_prepped.seq_len,
+        out.seq_len
+    );
+    ensure!(
+        layout.num_layers == 1
+            && layout.num_kv_heads == QSA_KV_HEADS
+            && layout.head_dim == QSA_HEAD_DIM
+            && layout.page_size == QSA_PAGE
+            && matches!(layout.storage, KvStorage::Bf16)
+            && matches!(layout.format, KvFormat::Split),
+        "QSA attention reads one bf16 split layer of {QSA_KV_HEADS} heads at {QSA_HEAD_DIM} \
+         in pages of {QSA_PAGE}, got {layout:?}"
+    );
+    let kv_len = first_position + rows;
+    let pages = first_page + kv_len.div_ceil(QSA_PAGE);
+    ensure!(
+        pool.len() >= pages.saturating_mul(layout.page_stride),
+        "QSA attention reads {pages} pages of {} elements from a pool of {}",
+        layout.page_stride,
+        pool.len()
+    );
+    ensure!(
+        kv_len <= mask_stride && mask.len() >= rows.saturating_mul(mask_stride),
+        "QSA attention over {kv_len} tokens needs a mask of {rows} rows of at least that \
+         many bytes, got stride {mask_stride} and {} bytes",
+        mask.len()
+    );
+    let rows_i32 = checked_i32(rows, "QSA attention rows")?;
+    let first_position = checked_i32(first_position, "QSA attention first position")?;
+    let first_page = checked_i32(first_page, "QSA attention first page")?;
+    let mask_stride = checked_i32(mask_stride, "QSA attention mask stride")?;
+    let page_stride = i64::try_from(layout.page_stride)?;
+    let kv_block_len = i64::try_from(layout.kv_block_len)?;
+    let q_full = q_full.data.slice(row * 2 * width..end * 2 * width);
+    let q_prepped = q_prepped.data.slice(row * width..end * width);
+    let mut out = out.data.slice_mut(row * width..end * width);
+    let (q_full_ptr, _q_full_guard) = q_full.device_ptr(&ctx.stream);
+    let (q_ptr, _q_guard) = q_prepped.device_ptr(&ctx.stream);
+    let (pool_ptr, _pool_guard) = pool.device_ptr(&ctx.stream);
+    let (mask_ptr, _mask_guard) = mask.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_qsa_sparse_attention_cuda(
+            q_full_ptr as *const ffi::Half,
+            q_ptr as *const ffi::Half,
+            pool_ptr as *const ffi::Half,
+            mask_ptr as *const u8,
+            out_ptr as *mut ffi::Half,
+            rows_i32,
+            first_position,
+            first_page,
+            page_stride,
+            kv_block_len,
+            mask_stride,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("QSA attention launch failed: {err}"))
 }
 
 fn ensure_finite(value: f32, what: &str) -> Result<()> {
@@ -760,9 +874,19 @@ pub fn hc_mix_into(
     Ok(())
 }
 
-/// The checkpoint's MoE block geometry. Frozen with the line: the routing
-/// kernel is compiled for the expert count and top-k, and the shared branch's
-/// shapes are asserted against these widths before any launch.
+/// Pairs one warp owns in the tiled route-metadata kernels. The scratch is
+/// sized from the same number, so the two must move together.
+const ROUTE_CHUNK_PAIRS: usize = 256;
+/// Pair count where the tiled route metadata overtakes the sequential kernel.
+/// The sequential kernel's cost is `2 * experts * pairs` comparisons on one SM;
+/// the tiled path's is a function of `pairs` plus three launches, so it wins
+/// once there are enough pairs and loses on the decode-sized batches. The
+/// measured crossover is recorded in `docs/models/qwen4/bring-up.md`.
+const ROUTE_TILED_MIN_PAIRS: usize = 256;
+
+/// The MoE block geometry: `hidden`, `moe_intermediate` and
+/// `shared_intermediate` are data-driven; `experts` and `top_k` are frozen
+/// because the routing kernels are compiled for them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen4MoeGeometry {
     /// `text_config.hidden_size`.
@@ -801,6 +925,40 @@ impl Qwen4MoeGeometry {
             "MoE geometry {self:?} carries a zero width"
         );
         Ok(())
+    }
+}
+
+/// Caller-owned scratch for [`qwen4_moe_route_meta_into`]'s tiled path: the
+/// per-chunk expert histogram the placement pass turns into slot offsets, one
+/// `experts`-long row per `ROUTE_CHUNK_PAIRS` pair chunk. Only the tiled path
+/// reads it, so a small-token caller still allocates it with the batch.
+pub struct Qwen4RouteMetaScratch {
+    hist: CudaSlice<i32>,
+}
+
+impl Qwen4RouteMetaScratch {
+    pub fn new(ctx: &DeviceContext, geometry: &Qwen4MoeGeometry, tokens: usize) -> Result<Self> {
+        geometry.validate()?;
+        let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
+            anyhow!(
+                "MoE route meta scratch: {tokens} tokens x top-{} overflows usize",
+                geometry.top_k
+            )
+        })?;
+        // `.max(1)`: an empty batch still gets a legal (unused) buffer.
+        let chunks = pairs.div_ceil(ROUTE_CHUNK_PAIRS).max(1);
+        let entries = chunks.checked_mul(geometry.experts).ok_or_else(|| {
+            anyhow!(
+                "MoE route meta scratch: {chunks} chunks x {} experts overflows usize",
+                geometry.experts
+            )
+        })?;
+        Ok(Self {
+            hist: ctx
+                .stream
+                .alloc_zeros::<i32>(entries)
+                .map_err(|err| anyhow!("MoE route meta scratch: {err}"))?,
+        })
     }
 }
 
@@ -1056,6 +1214,13 @@ pub fn qwen4_moe_combine_into(
 /// `experts + 1` slot offsets, `gather_rows` the token of each of the
 /// `tokens * top_k` slots and `route_slot` the slot of each (token, pick) pair,
 /// so expert `e` owns slots `indptr[e]..indptr[e + 1]` in pick order.
+///
+/// Dispatches between two kernels that produce the same output bit for bit:
+/// below [`ROUTE_TILED_MIN_PAIRS`] pairs the single-CTA sequential kernel, whose
+/// one launch beats the tiled path's three when there are few pairs, above it
+/// the tiled histogram/scan/placement path, whose work grows with the pair
+/// count rather than with `experts * pairs`. `scratch` is only read on the
+/// tiled path.
 pub fn qwen4_moe_route_meta_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
@@ -1064,7 +1229,59 @@ pub fn qwen4_moe_route_meta_into(
     indptr: &mut CudaSlice<i32>,
     gather_rows: &mut CudaSlice<i32>,
     route_slot: &mut CudaSlice<i32>,
+    scratch: &mut Qwen4RouteMetaScratch,
 ) -> Result<()> {
+    let shape = check_route_meta(geometry, ids, tokens, indptr, gather_rows, route_slot)?;
+    if shape.pairs < ROUTE_TILED_MIN_PAIRS {
+        return launch_route_meta_sequential(ctx, &shape, ids, indptr, gather_rows, route_slot);
+    }
+    let chunks = shape.pairs.div_ceil(ROUTE_CHUNK_PAIRS);
+    let hist_entries = scratch.hist.len();
+    ensure!(
+        hist_entries >= chunks * geometry.experts,
+        "MoE route meta: scratch holds {hist_entries} i32, needs {} for {chunks} chunks of {} \
+         experts",
+        chunks * geometry.experts,
+        geometry.experts
+    );
+    let (ids_ptr, _ids_guard) = ids.device_ptr(&ctx.stream);
+    let (indptr_ptr, _indptr_guard) = indptr.device_ptr_mut(&ctx.stream);
+    let (gather_ptr, _gather_guard) = gather_rows.device_ptr_mut(&ctx.stream);
+    let (slot_ptr, _slot_guard) = route_slot.device_ptr_mut(&ctx.stream);
+    let (hist_ptr, _hist_guard) = scratch.hist.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_route_meta_tiled_cuda(
+            ids_ptr as *const i32,
+            indptr_ptr as *mut i32,
+            gather_ptr as *mut i32,
+            slot_ptr as *mut i32,
+            hist_ptr as *mut i32,
+            shape.rows,
+            shape.top_k,
+            shape.experts,
+            hist_entries as i64,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN MoE route meta (tiled) launch failed: {err}"))
+}
+
+struct RouteMetaShape {
+    rows: i32,
+    top_k: i32,
+    experts: i32,
+    pairs: usize,
+}
+
+fn check_route_meta(
+    geometry: &Qwen4MoeGeometry,
+    ids: &CudaSlice<i32>,
+    tokens: usize,
+    indptr: &CudaSlice<i32>,
+    gather_rows: &CudaSlice<i32>,
+    route_slot: &CudaSlice<i32>,
+) -> Result<RouteMetaShape> {
     geometry.validate()?;
     let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
         anyhow!(
@@ -1085,9 +1302,22 @@ pub fn qwen4_moe_route_meta_into(
         indptr.len(),
         geometry.experts + 1
     );
-    let rows = checked_i32(tokens, "MoE route meta tokens")?;
-    let top_k = checked_i32(geometry.top_k, "MoE route meta top_k")?;
-    let experts = checked_i32(geometry.experts, "MoE route meta experts")?;
+    Ok(RouteMetaShape {
+        rows: checked_i32(tokens, "MoE route meta tokens")?,
+        top_k: checked_i32(geometry.top_k, "MoE route meta top_k")?,
+        experts: checked_i32(geometry.experts, "MoE route meta experts")?,
+        pairs,
+    })
+}
+
+fn launch_route_meta_sequential(
+    ctx: &DeviceContext,
+    shape: &RouteMetaShape,
+    ids: &CudaSlice<i32>,
+    indptr: &mut CudaSlice<i32>,
+    gather_rows: &mut CudaSlice<i32>,
+    route_slot: &mut CudaSlice<i32>,
+) -> Result<()> {
     let (ids_ptr, _ids_guard) = ids.device_ptr(&ctx.stream);
     let (indptr_ptr, _indptr_guard) = indptr.device_ptr_mut(&ctx.stream);
     let (gather_ptr, _gather_guard) = gather_rows.device_ptr_mut(&ctx.stream);
@@ -1098,9 +1328,9 @@ pub fn qwen4_moe_route_meta_into(
             indptr_ptr as *mut i32,
             gather_ptr as *mut i32,
             slot_ptr as *mut i32,
-            rows,
-            top_k,
-            experts,
+            shape.rows,
+            shape.top_k,
+            shape.experts,
             active_cu_stream(ctx),
         )
     }
@@ -1108,11 +1338,11 @@ pub fn qwen4_moe_route_meta_into(
     .map_err(|err| anyhow!("Qwen3.8-FN MoE route meta launch failed: {err}"))
 }
 
-/// Sum each token's routed expert outputs with its routing weights:
-/// `expert_out[t] = sum_j weights[t, j] * down_out[route_slot[t, j]]`.
-///
-/// `down_out` holds one row per slot (`tokens * top_k` rows of `hidden`), as the
-/// expert GEMMs left them; `weights` is the router's `[tokens, top_k]` output.
+/// The routed-expert combine: `out[t] = sum_j w[t, j] * down_out[route_slot[t, j]]`,
+/// accumulated in f32 in ascending `j` and rounded once. A grid-stride kernel
+/// over `tokens * hidden` elements; its access pattern already runs near the
+/// card's bandwidth, so a vectorized variant buys little (see
+/// `docs/models/qwen4/bring-up.md`).
 pub fn qwen4_moe_weighted_combine_into(
     ctx: &DeviceContext,
     geometry: &Qwen4MoeGeometry,
@@ -1121,30 +1351,8 @@ pub fn qwen4_moe_weighted_combine_into(
     route_slot: &CudaSlice<i32>,
     expert_out: &mut HiddenStates,
 ) -> Result<()> {
-    geometry.validate()?;
     let tokens = expert_out.seq_len;
-    let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
-        anyhow!(
-            "MoE combine: {tokens} tokens x top-{} overflows usize",
-            geometry.top_k
-        )
-    })?;
-    ensure!(
-        expert_out.hidden_dim == geometry.hidden && down_out.hidden_dim == geometry.hidden,
-        "MoE weighted combine: expert_out {} / down_out {} columns, the geometry has {}",
-        expert_out.hidden_dim,
-        down_out.hidden_dim,
-        geometry.hidden
-    );
-    ensure!(
-        down_out.seq_len >= pairs && weights.len() >= pairs && route_slot.len() >= pairs,
-        "MoE weighted combine: down_out {} rows / weights {} / route_slot {} hold fewer than {pairs}",
-        down_out.seq_len,
-        weights.len(),
-        route_slot.len()
-    );
-    down_out.checked_extent("MoE weighted combine down_out")?;
-    expert_out.checked_extent("MoE weighted combine expert_out")?;
+    check_weighted_combine(geometry, tokens, down_out, weights, route_slot, expert_out)?;
     if tokens == 0 {
         return Ok(());
     }
@@ -1169,6 +1377,40 @@ pub fn qwen4_moe_weighted_combine_into(
     }
     .result()
     .map_err(|err| anyhow!("Qwen3.8-FN MoE weighted combine launch failed: {err}"))
+}
+
+fn check_weighted_combine(
+    geometry: &Qwen4MoeGeometry,
+    tokens: usize,
+    down_out: &HiddenStates,
+    weights: &CudaSlice<bf16>,
+    route_slot: &CudaSlice<i32>,
+    expert_out: &HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    let pairs = tokens.checked_mul(geometry.top_k).ok_or_else(|| {
+        anyhow!(
+            "MoE combine: {tokens} tokens x top-{} overflows usize",
+            geometry.top_k
+        )
+    })?;
+    ensure!(
+        expert_out.hidden_dim == geometry.hidden && down_out.hidden_dim == geometry.hidden,
+        "MoE weighted combine: expert_out {} / down_out {} columns, the geometry has {}",
+        expert_out.hidden_dim,
+        down_out.hidden_dim,
+        geometry.hidden
+    );
+    ensure!(
+        down_out.seq_len >= pairs && weights.len() >= pairs && route_slot.len() >= pairs,
+        "MoE weighted combine: down_out {} rows / weights {} / route_slot {} hold fewer than {pairs}",
+        down_out.seq_len,
+        weights.len(),
+        route_slot.len()
+    );
+    down_out.checked_extent("MoE weighted combine down_out")?;
+    expert_out.checked_extent("MoE weighted combine expert_out")?;
+    Ok(())
 }
 
 /// The checkpoint's PLE block geometry. Frozen with the line: `pegainfer-qwen4`
@@ -1471,6 +1713,129 @@ fn grouped_norm(
     status
         .result()
         .map_err(|err| anyhow!("PLE block grouped norm launch failed: {err}"))
+}
+
+/// Caller-owned scratch for [`qwen4_moe_grouped_gemm_into`]: CUTLASS's per-group
+/// problem, pointer and leading-dimension arrays, which a device kernel fills
+/// from `indptr` so the host never reads the routing result.
+pub struct Qwen4GroupedGemmScratch {
+    args: CudaSlice<u8>,
+    threadblocks: usize,
+}
+
+impl Qwen4GroupedGemmScratch {
+    pub fn new(ctx: &DeviceContext, geometry: &Qwen4MoeGeometry) -> Result<Self> {
+        geometry.validate()?;
+        let experts = checked_i32(geometry.experts, "MoE grouped GEMM experts")?;
+        let bytes = unsafe { ffi::qwen4_moe_grouped_args_bytes(experts) };
+        ensure!(
+            bytes > 0,
+            "MoE grouped GEMM: {experts} groups need no argument scratch"
+        );
+        let threadblocks = unsafe { ffi::qwen4_moe_grouped_threadblocks() };
+        ensure!(
+            threadblocks > 0,
+            "MoE grouped GEMM: CUTLASS scheduled {threadblocks} CTAs"
+        );
+        Ok(Self {
+            args: ctx
+                .stream
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|err| anyhow!("MoE grouped GEMM scratch: {err}"))?,
+            threadblocks: threadblocks as usize,
+        })
+    }
+}
+
+/// One grouped GEMM over the experts: `out[indptr[e]..indptr[e + 1]] =
+/// x[indptr[e]..indptr[e + 1]] @ weight[e * n..(e + 1) * n]^T` for every expert
+/// `e`, in one launch.
+///
+/// `x` is the gathered `[pairs, k]` activation, `weight` the `[experts * n, k]`
+/// expert bank, `out` the `[pairs, n]` slot output and `indptr` the routing
+/// offsets — ascending, `indptr[experts] <= x.seq_len`, which the caller owns:
+/// the kernel turns them into pointers on the device and never checks them.
+/// `n` is the per-expert output width. The grouping is read on the
+/// device, so this replaces `experts` cuBLAS launches and the `indptr` copy to
+/// the host; `scratch` carries the CUTLASS grid size the device reported.
+///
+/// Numerics are a bound against the per-expert GEMMs, not bitwise: both
+/// accumulate in f32, but CUTLASS's tile order splits the K reduction
+/// differently. The MoE block gate measures the bound at real geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_moe_grouped_gemm_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    x: &HiddenStates,
+    weight: &DeviceMatrix,
+    n: usize,
+    indptr: &CudaSlice<i32>,
+    scratch: &mut Qwen4GroupedGemmScratch,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    ensure!(
+        weight.rows == geometry.experts * n && weight.cols == x.hidden_dim,
+        "MoE grouped GEMM: weight is {}x{}, needs {}x{}",
+        weight.rows,
+        weight.cols,
+        geometry.experts * n,
+        x.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == n && out.seq_len == x.seq_len,
+        "MoE grouped GEMM: out is {}x{}, needs {}x{}",
+        out.seq_len,
+        out.hidden_dim,
+        x.seq_len,
+        n
+    );
+    ensure!(
+        indptr.len() > geometry.experts,
+        "MoE grouped GEMM: indptr holds {} i32, needs {}",
+        indptr.len(),
+        geometry.experts + 1
+    );
+    // The kernel moves operands and the epilogue in 8-element (16 B) vectors,
+    // so both strides must be whole vectors.
+    ensure!(
+        n.is_multiple_of(8) && x.hidden_dim.is_multiple_of(8),
+        "MoE grouped GEMM: n {n} and k {} must be multiples of 8",
+        x.hidden_dim
+    );
+    x.checked_extent("MoE grouped GEMM x")?;
+    out.checked_extent("MoE grouped GEMM out")?;
+    if x.seq_len == 0 {
+        return Ok(());
+    }
+    let pairs = checked_i32(x.seq_len, "MoE grouped GEMM pairs")?;
+    let experts = checked_i32(geometry.experts, "MoE grouped GEMM experts")?;
+    let n = checked_i32(n, "MoE grouped GEMM n")?;
+    let k = checked_i32(x.hidden_dim, "MoE grouped GEMM k")?;
+    let threadblocks = checked_i32(scratch.threadblocks, "MoE grouped GEMM threadblocks")?;
+    let args_bytes = scratch.args.len();
+    let (x_ptr, _x_guard) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _w_guard) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+    let (indptr_ptr, _indptr_guard) = indptr.device_ptr(&ctx.stream);
+    let (args_ptr, _args_guard) = scratch.args.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_grouped_gemm_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            indptr_ptr as *const i32,
+            args_ptr as *mut core::ffi::c_void,
+            args_bytes,
+            experts,
+            n,
+            k,
+            threadblocks,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN MoE grouped GEMM ({pairs} pairs) launch failed: {err}"))
 }
 
 #[cfg(test)]

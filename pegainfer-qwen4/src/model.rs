@@ -44,6 +44,15 @@ pub struct ModelState {
     pub layers: Vec<LayerState>,
 }
 
+impl ModelState {
+    /// Return `slot` to a fresh state on every loaded layer.
+    pub fn reset(&mut self, ctx: &DeviceContext, slot: usize) -> Result<()> {
+        self.layers
+            .iter_mut()
+            .try_for_each(|layer| layer.reset(ctx, slot))
+    }
+}
+
 /// Which slots a forward advances: one prompt in a slot, or one token in each
 /// of a batch of slots.
 #[derive(Clone, Copy)]

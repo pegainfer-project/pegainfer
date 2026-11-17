@@ -7,6 +7,8 @@
 
 mod config;
 #[cfg(feature = "qwen4")]
+pub mod engine;
+#[cfg(feature = "qwen4")]
 pub mod layer;
 #[cfg(any(feature = "qwen4", test))]
 mod manifest;

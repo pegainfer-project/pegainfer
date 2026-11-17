@@ -33,6 +33,10 @@
 //! 16 concurrent identical requests per wave — the arms see the same batch
 //! shapes), `PEGAINFER_EQ_OUT` (optional JSON dump of every token matrix, for
 //! offline scrutiny).
+//!
+//! Native DFlash2 adds a long prompt that crosses its attention window during
+//! generation. Each speculative prompt must produce drafts, so a plain-decode
+//! fallback cannot pass the distribution comparison unnoticed.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -141,6 +145,56 @@ fn env_knob(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn encoded_prompts(model_path: &str, draft_path: &str) -> Vec<Vec<u32>> {
+    let tokenizer = common::load_tokenizer(model_path);
+    let mut encoded: Vec<_> = PROMPTS
+        .iter()
+        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
+        .collect();
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(draft_path).join("config.json")).expect("draft config must exist"),
+    )
+    .expect("draft config must be valid JSON");
+    if config["selector_rank"]
+        .as_u64()
+        .is_some_and(|rank| rank > 0)
+        && config["conv_kernel_size"]
+            .as_u64()
+            .is_some_and(|taps| taps > 0)
+    {
+        let window = config["transformer_layer_config"]["sliding_window"]
+            .as_u64()
+            .expect("native checkpoint must declare a sliding window")
+            as usize;
+        let block_size = config["block_size"]
+            .as_u64()
+            .expect("native checkpoint must declare a block size")
+            as usize;
+        assert!(block_size < POSITIONS, "generation must cross the window");
+        let prompt_len = window
+            .checked_sub(block_size)
+            .expect("window must exceed the draft block size");
+        let mut tokens = tokenizer
+            .encode(
+                include_str!("../../docs/models/qwen3/model-crate.md"),
+                false,
+            )
+            .expect("encode long context");
+        tokens.truncate(prompt_len);
+        assert_eq!(
+            tokens.len(),
+            prompt_len,
+            "long-context fixture is too short"
+        );
+        eprintln!(
+            "native window case: prompt={}, output={POSITIONS}, window={window}",
+            tokens.len()
+        );
+        encoded.push(tokens);
+    }
+    encoded
+}
+
 fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
     Qwen3LaunchOptions {
         device_ordinal: 0,
@@ -148,8 +202,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         cuda_graph: true,
         dump_graph_png: None,
         offload: Qwen3OffloadOptions::disabled(),
-        // The speculative engine forces the prefix cache off; match it on the
-        // baseline so both arms take the same cold prefill path.
+        // Both arms take the same cold prefill path.
         no_prefix_cache: true,
         max_prefill_tokens: DEFAULT_MAX_PREFILL_TOKENS,
         memory: Qwen3MemoryOptions::new(
@@ -221,15 +274,30 @@ fn collect_arm(
 ) -> Vec<ConfigTokens> {
     CONFIGS
         .iter()
-        .map(|&cfg| {
+        .enumerate()
+        .map(|(config, &cfg)| {
             let params = sampling(cfg);
             encoded
                 .iter()
-                .map(|prompt_tokens| {
+                .enumerate()
+                .map(|(prompt, prompt_tokens)| {
+                    let before = engine.metrics().spec_decode.unwrap_or_default();
                     let mut rows = Vec::with_capacity(runs);
                     while rows.len() < runs {
                         let n = batch.min(runs - rows.len());
                         rows.extend(sample_wave(engine, prompt_tokens, &params, n));
+                    }
+                    if let Some(after) = engine.metrics().spec_decode {
+                        let rounds = after.num_drafts - before.num_drafts;
+                        let proposed = after.num_draft_tokens - before.num_draft_tokens;
+                        let accepted = after.num_accepted_tokens - before.num_accepted_tokens;
+                        assert!(
+                            rounds > 0 && proposed > 0,
+                            "config {config} prompt {prompt} must execute the speculative path"
+                        );
+                        eprintln!(
+                            "config {config} prompt {prompt}: rounds={rounds}, proposed={proposed}, accepted={accepted}"
+                        );
                     }
                     rows
                 })
@@ -438,11 +506,7 @@ fn dflash_sampled_equivalence_gate() {
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
-    let tokenizer = common::load_tokenizer(&model_path);
-    let encoded: Vec<Vec<u32>> = PROMPTS
-        .iter()
-        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
-        .collect();
+    let encoded = encoded_prompts(&model_path, &draft_path);
 
     // Arm A: plain decode (no draft model loaded — the spec path cannot run).
     let spec_off = {
@@ -499,11 +563,7 @@ fn dflash_sampled_equivalence_null_check() {
     let runs = env_knob("PEGAINFER_EQ_RUNS", 256);
     let batch = env_knob("PEGAINFER_EQ_BATCH", 16);
 
-    let tokenizer = common::load_tokenizer(&model_path);
-    let encoded: Vec<Vec<u32>> = PROMPTS
-        .iter()
-        .map(|p| tokenizer.encode(p, false).expect("encode failed"))
-        .collect();
+    let encoded = encoded_prompts(&model_path, &draft_path);
 
     let engine = EngineHarness::new(
         pegainfer_qwen3::launch(

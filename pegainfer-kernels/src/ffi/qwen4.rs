@@ -65,6 +65,28 @@ unsafe extern "C" {
         budget: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// Gated attention for `rows` consecutive query rows of one sequence over
+    /// the tokens `mask` keeps, reading the sequence's K/V pages from
+    /// `first_page` on. See `ops::qsa_sparse_attention_into` for the contract.
+    ///
+    /// The geometry is compiled in: 24 query and 2 K/V heads at head dim 256,
+    /// pages of 16 tokens, and at most 2051 kept tokens a row (the device traps
+    /// past that).
+    pub fn qwen4_qsa_sparse_attention_cuda(
+        q_full: *const Half,
+        q_prepped: *const Half,
+        pool: *const Half,
+        mask: *const u8,
+        out: *mut Half,
+        rows: i32,
+        first_position: i32,
+        first_page: i32,
+        page_stride: i64,
+        kv_block_len: i64,
+        mask_stride: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
 
 unsafe extern "C" {
@@ -216,6 +238,49 @@ unsafe extern "C" {
         tokens: i32,
         top_k: i32,
         hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// The same ordering as [`qwen4_moe_route_meta_cuda`] as a histogram, an
+    /// exclusive scan and a deterministic placement, with work proportional to
+    /// the pair count instead of `experts * pairs`. `chunk_hist` is
+    /// `ceil(pairs / 256) * experts` i32 of scratch (the scan leaves the
+    /// per-chunk prefix there). Bit-identical output.
+    pub fn qwen4_moe_route_meta_tiled_cuda(
+        ids: *const i32,
+        indptr: *mut i32,
+        gather_rows: *mut i32,
+        route_slot: *mut i32,
+        chunk_hist: *mut i32,
+        rows: i32,
+        top_k: i32,
+        experts: i32,
+        chunk_hist_entries: i64,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Bytes the grouped GEMM's per-group argument scratch needs for `experts`
+    /// groups.
+    pub fn qwen4_moe_grouped_args_bytes(experts: i32) -> usize;
+
+    /// The CTA count the grouped kernel schedules with on this device.
+    pub fn qwen4_moe_grouped_threadblocks() -> i32;
+
+    /// One grouped GEMM over the experts: group `e` multiplies the activation
+    /// rows `indptr[e]..indptr[e + 1]` of `x` against weight slab `e` and
+    /// writes the same row range of `out`. `args` is
+    /// `qwen4_moe_grouped_args_bytes(experts)` bytes of scratch.
+    pub fn qwen4_moe_grouped_gemm_cuda(
+        x: *const Half,
+        w: *const Half,
+        out: *mut Half,
+        indptr: *const i32,
+        args: *mut core::ffi::c_void,
+        args_bytes: usize,
+        experts: i32,
+        n: i32,
+        k: i32,
+        threadblocks: i32,
         stream: CUstream,
     ) -> CUresult;
 }

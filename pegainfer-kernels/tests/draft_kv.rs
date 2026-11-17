@@ -16,10 +16,8 @@ use pegainfer_kernels::ops::draft_kv_scatter_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
-/// Small integers only: bf16 represents integers up to 256 exactly, so the
-/// assertions below are exact-equality, not tolerance-based. Buffer, row and
-/// column each own a disjoint digit, so a copy that mixes any of them up
-/// changes the value.
+/// Deterministic buffer/row/column patterns. Expectations use the same bf16
+/// conversion, so the copy checks need no numerical tolerance.
 fn host_rows(buffer: usize, rows: usize, hidden: usize) -> Vec<bf16> {
     (0..rows * hidden)
         .map(|i| {
@@ -41,17 +39,25 @@ fn pairs<'a>(
 /// in the reverse order. `hidden` selects the 16-byte path when it is a
 /// multiple of eight and the element path otherwise.
 ///
-/// The copy is bitwise and every value is an exactly representable integer, so
-/// the comparisons below are exact.
+/// Compare the copied values exactly against the bf16 source rows.
 #[allow(clippy::float_cmp)]
-fn roundtrip(ctx: &DeviceContext, hidden: usize, rows: usize, buffers: usize) {
+fn roundtrip(
+    ctx: &DeviceContext,
+    hidden: usize,
+    rows: usize,
+    buffers: usize,
+    source_row_offset: usize,
+) {
     const SLOTS: usize = 8;
     assert!(rows < SLOTS, "leave an unused slot for the tail check");
 
-    let src_hosts: Vec<Vec<bf16>> = (0..buffers).map(|b| host_rows(b, rows, hidden)).collect();
+    let source_rows = source_row_offset + rows + 1;
+    let src_hosts: Vec<Vec<bf16>> = (0..buffers)
+        .map(|b| host_rows(b, source_rows, hidden))
+        .collect();
     let srcs: Vec<HiddenStates> = src_hosts
         .iter()
-        .map(|host| HiddenStates::from_host(ctx, host, hidden, rows).expect("src H2D"))
+        .map(|host| HiddenStates::from_host(ctx, host, hidden, source_rows).expect("src H2D"))
         .collect();
     let mut pools: Vec<HiddenStates> = (0..buffers)
         .map(|_| HiddenStates::zeros(ctx, hidden, SLOTS).expect("pool alloc"))
@@ -65,15 +71,23 @@ fn roundtrip(ctx: &DeviceContext, hidden: usize, rows: usize, buffers: usize) {
     locs_host.push((SLOTS - 2) as i32);
     let locs: CudaSlice<i32> = ctx.stream.clone_htod(&locs_host).expect("locs H2D");
 
-    draft_kv_scatter_into(ctx, &mut pairs(&srcs, &mut pools), &locs, rows).expect("scatter launch");
+    draft_kv_scatter_into(
+        ctx,
+        &mut pairs(&srcs, &mut pools),
+        source_row_offset,
+        &locs,
+        rows,
+    )
+    .expect("scatter launch");
 
     for (buffer, pool) in pools.iter().enumerate() {
         let pool_host = pool.to_host(ctx).expect("pool D2H");
         for slot in 0..SLOTS {
             let written = (0..rows).find(|&i| locs_host[i] as usize == slot);
             for col in 0..hidden {
-                let expected =
-                    written.map_or(0.0, |row| src_hosts[buffer][row * hidden + col].to_f32());
+                let expected = written.map_or(0.0, |row| {
+                    src_hosts[buffer][(source_row_offset + row) * hidden + col].to_f32()
+                });
                 let got = pool_host[slot * hidden + col];
                 assert_eq!(
                     got, expected,
@@ -102,7 +116,7 @@ fn roundtrip(ctx: &DeviceContext, hidden: usize, rows: usize, buffers: usize) {
     for (buffer, mirror) in mirrors.iter().enumerate() {
         let mirror_host = mirror.to_host(ctx).expect("mirror D2H");
         for j in 0..rows {
-            let source_row = rows - 1 - j;
+            let source_row = source_row_offset + rows - 1 - j;
             for col in 0..hidden {
                 let expected = src_hosts[buffer][source_row * hidden + col].to_f32();
                 let got = mirror_host[j * hidden + col];
@@ -124,9 +138,11 @@ fn scatter_and_gather_vector_path() {
         return;
     };
     // The drafter's kv_dim (heads x head_dim) is a multiple of eight.
-    roundtrip(&ctx, 1024, 5, 1);
-    roundtrip(&ctx, 1024, 1, 1);
-    roundtrip(&ctx, 8, 7, 1);
+    roundtrip(&ctx, 1024, 5, 1, 0);
+    roundtrip(&ctx, 1024, 1, 1, 0);
+    roundtrip(&ctx, 8, 7, 1, 0);
+    // Verify materialization appends after an existing prefix, not from row 0.
+    roundtrip(&ctx, 1024, 5, 1, 3);
 }
 
 #[test]
@@ -135,8 +151,8 @@ fn scatter_and_gather_element_path() {
         return;
     };
     // A stride that is not a multiple of eight has no 16-byte-aligned rows.
-    roundtrip(&ctx, 12, 5, 1);
-    roundtrip(&ctx, 7, 3, 1);
+    roundtrip(&ctx, 12, 5, 1, 0);
+    roundtrip(&ctx, 7, 3, 1, 2);
 }
 
 #[test]
@@ -145,8 +161,8 @@ fn one_launch_covers_every_draft_buffer() {
         return;
     };
     // Five layers x (K, V) is the drafter's whole set in one launch.
-    roundtrip(&ctx, 1024, 4, 10);
-    roundtrip(&ctx, 12, 3, 5);
+    roundtrip(&ctx, 1024, 4, 10, 3);
+    roundtrip(&ctx, 12, 3, 5, 0);
 }
 
 #[test]
@@ -157,6 +173,6 @@ fn zero_rows_is_a_no_op() {
     let mut src = HiddenStates::zeros(&ctx, 1024, 4).expect("src alloc");
     let mut pool = HiddenStates::zeros(&ctx, 1024, 4).expect("pool alloc");
     let locs: CudaSlice<i32> = ctx.stream.clone_htod(&[0i32, 1, 2, 3]).expect("locs H2D");
-    draft_kv_scatter_into(&ctx, &mut [(&src, &mut pool)], &locs, 0).expect("empty scatter");
+    draft_kv_scatter_into(&ctx, &mut [(&src, &mut pool)], 0, &locs, 0).expect("empty scatter");
     draft_kv_gather_into(&ctx, &mut [(&pool, &mut src)], &locs, 0).expect("empty gather");
 }

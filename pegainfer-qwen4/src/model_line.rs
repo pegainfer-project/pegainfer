@@ -1,7 +1,6 @@
-//! This line's [`ModelLine`] implementation.
-//!
-//! There is no text graph, no weights loader and no step yet, so detection
-//! succeeds and `launch` refuses rather than serving a partial model.
+//! This line's [`ModelLine`] implementation. `launch` serves the model across
+//! every visible card; a build without the `qwen4` feature has no device code
+//! and refuses.
 
 use pegainfer_frontend::engine::LaunchedEngine;
 use pegainfer_frontend::model_line::LaunchContext;
@@ -26,8 +25,16 @@ impl ModelLine for Qwen4Line {
             .map_err(|error| error.to_string())
     }
 
+    #[cfg(feature = "qwen4")]
+    fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
+        crate::engine::launch(ctx.model_path).map(LaunchedEngine::Stepped)
+    }
+
+    #[cfg(not(feature = "qwen4"))]
     fn launch(&self, _ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        anyhow::bail!("this qwen4_exp checkpoint is detected, but inference is not implemented yet")
+        anyhow::bail!(
+            "this qwen4_exp checkpoint is detected, but this build has no qwen4 device code"
+        )
     }
 }
 

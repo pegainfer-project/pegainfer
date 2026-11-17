@@ -3923,6 +3923,7 @@ dependencies = [
  "pegainfer-core",
  "pegainfer-frontend",
  "pegainfer-kernels",
+ "pegainfer-sample",
  "safetensors",
  "serde",
  "serde_json",

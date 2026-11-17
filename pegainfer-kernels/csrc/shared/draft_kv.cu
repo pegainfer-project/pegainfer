@@ -7,10 +7,9 @@ namespace {
 
 // The drafter's dense K/V mirrors and the paged pool are `2 * layers` tensors
 // with the same row count, so one launch copies every buffer a call names. The
-// restore gathers all of them at once; the materialize folds a layer's K and V
-// into one launch (its per-layer scratch is reused, so the layers themselves
-// cannot share a launch). The pair table travels in the launch parameters, so
-// no device-side staging is needed.
+// restore gathers all of them at once; materialize scatters each layer's K and
+// V together after projecting them into the dense mirror. The pair table
+// travels in the launch parameters, so no device-side staging is needed.
 constexpr int kDraftKvMaxPairs = 32;
 
 struct DraftKvPair {
