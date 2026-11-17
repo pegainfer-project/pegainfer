@@ -33,21 +33,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
-    /// Merge the column span `[off, off + n)` of each row's `P [b, split_k, nt]`
-    /// f32 partial and land `O [b, n]` bf16 once. `split_k = 1` is the
-    /// single-partial case a framework GEMM produces.
-    pub fn k3_land_batched(
-        p: *const f32,
-        o: *mut c_void,
-        b: i32,
-        nt: i32,
-        n: i32,
-        off: i32,
-        split_k: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// `k3_land_batched` followed by the round-before-scale norm against the
+    /// The matmul landing (`k3_land_cuda`) followed by the round-before-scale norm against the
     /// shared gamma `G [n]`.
     pub fn k3_land_rms_norm_rbs_batched(
         p: *const f32,
@@ -58,37 +44,6 @@ unsafe extern "C" {
         n: i32,
         off: i32,
         split_k: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// `O = A + Bt` in bf16 addition, all `[b, n]`.
-    pub fn k3_add2_batched(
-        a: *const c_void,
-        bt: *const c_void,
-        o: *mut c_void,
-        b: i32,
-        n: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// `O = A * bf16(sigmoid(Bt))`, the MLA sigmoid output gate. All `[b, n]`.
-    pub fn k3_mul_sigmoid_batched(
-        a: *const c_void,
-        bt: *const c_void,
-        o: *mut c_void,
-        b: i32,
-        n: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// K3's situ activation `4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)`, computed
-    /// in f32 and landed bf16 once. All `[b, n]`.
-    pub fn k3_situ_batched(
-        g: *const c_void,
-        u: *const c_void,
-        o: *mut c_void,
-        b: i32,
-        n: i32,
         stream: CUstream,
     ) -> i32;
 
@@ -134,20 +89,6 @@ unsafe extern "C" {
         num_heads: i32,
         head_dim: i32,
         split_k_gate: i32,
-        stream: CUstream,
-    ) -> i32;
-
-    /// `kda_core`'s tail on its own: per (row, head) f32 rms_norm of the bf16
-    /// attention landing `X` times the o_norm gamma `Go [head_dim]`, landed
-    /// once, times the bf16 sigmoid of the output gate `G2`. eps compiled in.
-    pub fn k3_o_norm_gate_batched(
-        x: *const c_void,
-        g2: *const c_void,
-        go: *const f32,
-        out: *mut c_void,
-        b: i32,
-        num_heads: i32,
-        head_dim: i32,
         stream: CUstream,
     ) -> i32;
 
