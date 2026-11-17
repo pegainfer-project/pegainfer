@@ -160,19 +160,22 @@ mod tests {
     #[test]
     fn resolves_standard_and_versioned_wheel_libraries() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("lib")).unwrap();
-        let versioned = temp.path().join("lib/librocblas.so.5");
+        // `library` returns canonical paths, and the temp root may sit behind a symlink.
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("lib")).unwrap();
+        let versioned = root.join("lib/librocblas.so.5");
         std::fs::write(&versioned, b"library fixture").unwrap();
-        assert_eq!(library(temp.path(), "rocblas"), versioned);
-        std::os::unix::fs::symlink(&versioned, temp.path().join("lib/librocblas.so")).unwrap();
-        assert_eq!(library(temp.path(), "rocblas"), versioned);
+        assert_eq!(library(&root, "rocblas"), versioned);
+        std::os::unix::fs::symlink(&versioned, root.join("lib/librocblas.so")).unwrap();
+        assert_eq!(library(&root, "rocblas"), versioned);
     }
     #[test]
     fn resolves_lib64_sdk_layout() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("lib64")).unwrap();
-        let path = temp.path().join("lib64/libamdhip64.so");
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("lib64")).unwrap();
+        let path = root.join("lib64/libamdhip64.so");
         std::fs::write(&path, b"library fixture").unwrap();
-        assert_eq!(library(temp.path(), "amdhip64"), path);
+        assert_eq!(library(&root, "amdhip64"), path);
     }
 }
