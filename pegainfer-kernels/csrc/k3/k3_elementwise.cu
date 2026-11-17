@@ -195,14 +195,6 @@ __global__ void o_norm_gate_kernel(const uint4* __restrict__ x, const uint4* __r
   }
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 template <typename Kernel>
@@ -217,7 +209,7 @@ CUresult launch_binary(Kernel kernel, const void* a, const void* bt, void* o, in
   kernel<<<(unsigned)blocks, kThreads, 0, stream>>>(
       static_cast<const uint4*>(a), static_cast<const uint4*>(bt), static_cast<uint4*>(o),
       total_vec);
-  return map_cuda_error(cudaGetLastError());
+  return consume_last_cuda_error();
 }
 
 }  // namespace
@@ -264,7 +256,7 @@ CUresult k3_o_norm_gate_cuda(const void* x, const void* g2, const float* go, voi
   o_norm_gate_kernel<<<(unsigned)blocks, kThreads, 0, stream>>>(
       static_cast<const uint4*>(x), static_cast<const uint4*>(g2),
       reinterpret_cast<const float4*>(go), static_cast<uint4*>(out), rows, eps);
-  return map_cuda_error(cudaGetLastError());
+  return consume_last_cuda_error();
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 

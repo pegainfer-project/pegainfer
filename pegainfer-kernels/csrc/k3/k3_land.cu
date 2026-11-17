@@ -82,14 +82,6 @@ __global__ void land_scalar_kernel(const float* __restrict__ P,
   }
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 }  // namespace
@@ -123,7 +115,7 @@ CUresult k3_land_cuda(const float* p, void* o, int b, int nt, int n, int off,
                          kThreads, 0, stream>>>(p, out, nt, n, off, split_k,
                                                 total);
   }
-  return map_cuda_error(cudaGetLastError());
+  return consume_last_cuda_error();
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 

@@ -151,14 +151,6 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-CUresult map_cuda_error(cudaError_t err) {
-  if (err == cudaSuccess) return CUDA_SUCCESS;
-  if (err == cudaErrorInvalidValue) return CUDA_ERROR_INVALID_VALUE;
-  if (err == cudaErrorMemoryAllocation) return CUDA_ERROR_OUT_OF_MEMORY;
-  if (err == cudaErrorNotSupported) return CUDA_ERROR_NOT_SUPPORTED;
-  return CUDA_ERROR_LAUNCH_FAILED;
-}
-
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 }  // namespace
@@ -189,7 +181,7 @@ CUresult k3_conv_silu_chunk_cuda(const float* p, const float* cw,
       p, cw, static_cast<const __nv_bfloat16*>(carry),
       static_cast<__nv_bfloat16*>(y), static_cast<__nv_bfloat16*>(next),
       tokens, commit_rows, inner);
-  return map_cuda_error(cudaGetLastError());
+  return consume_last_cuda_error();
   PEGAINFER_FFI_GUARD_END(CUDA_ERROR_UNKNOWN)
 }
 
