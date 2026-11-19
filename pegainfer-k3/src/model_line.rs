@@ -250,7 +250,7 @@ impl ModelLine for K3Line {
         let cli = cli(ctx);
         let ep_size = ep_size(&cli)?;
         let ranks = local_ranks(&cli, ep_size)?;
-        let eos_token_ids = pegainfer_core::eos::eos_token_ids(ctx.model_path, K3_VOCAB)?;
+        let eos_token_ids = pegainfer_frontend::eos::eos_token_ids(ctx.model_path, K3_VOCAB)?;
         let mut config = K3ExecutorConfig::default().from_env()?.for_ep(ep_size);
         config.weight_staging = cli.k3_weight_staging;
         warn_if_loader_cpu_starved(ranks.len(), config.weight_staging);

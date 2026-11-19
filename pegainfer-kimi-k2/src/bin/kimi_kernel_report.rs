@@ -73,7 +73,7 @@ struct KernelReport {
 }
 
 fn main() -> Result<()> {
-    pegainfer_core::logging::init_default();
+    pegainfer_frontend::logging::init_default();
     match Cli::parse().command {
         Command::Run(args) => run(args),
         Command::Trace(args) => trace(args),

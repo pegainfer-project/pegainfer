@@ -325,7 +325,8 @@ impl Config {
                 config.num_key_value_heads,
             );
         }
-        config.stop_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
+        config.stop_token_ids =
+            pegainfer_frontend::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 

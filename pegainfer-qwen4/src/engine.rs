@@ -265,7 +265,7 @@ pub fn launch(model_path: &Path) -> Result<Engine> {
         devices.len()
     );
     let model = SplitModel::load(model_path, &devices, &layers, SLOTS, MAX_TOKENS)?;
-    let eos = pegainfer_core::eos::eos_token_ids(model_path, g.vocab)?;
+    let eos = pegainfer_frontend::eos::eos_token_ids(model_path, g.vocab)?;
     let scheduler = Qwen4Scheduler {
         model,
         eos,

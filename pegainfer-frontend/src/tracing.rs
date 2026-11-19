@@ -96,7 +96,7 @@ pub fn init() {
         fastrace::set_reporter(reporter, fastrace::collector::Config::default());
         // Only now, with a reporter actually installed, do request paths start
         // building spans. Until this flips, `Span::root` is skipped entirely.
-        pegainfer_frontend::tracing_state::set_enabled(true);
+        crate::tracing_state::set_enabled(true);
         log::info!("request tracing enabled: exporting OTLP spans to {endpoint}");
     });
 }

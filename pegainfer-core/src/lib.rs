@@ -4,13 +4,10 @@
 pub mod cpu_topology;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;
-pub mod decodable_vocab;
-pub mod eos;
 #[cfg(feature = "cuda")]
 pub mod ffi;
 #[cfg(feature = "cuda")]
 pub mod kv_pool;
-pub mod logging;
 #[cfg(feature = "cuda")]
 pub mod ops;
 #[cfg(feature = "cuda")]
@@ -19,7 +16,6 @@ pub mod page_pool;
 pub mod rope;
 #[cfg(feature = "cuda")]
 pub mod tensor;
-pub mod tracing;
 #[cfg(feature = "cuda")]
 pub mod weight_loader;
 

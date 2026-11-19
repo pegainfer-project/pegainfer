@@ -9,10 +9,17 @@
 //! `dynamo`) translates that
 //! contract to a concrete HTTP serving stack. `model_line` is the seam the
 //! server binary uses to dispatch a detected model to its crate.
+//!
+//! The process and checkpoint helpers every line needs whatever device it runs
+//! on (`logging`, `tracing`, `eos`, `decodable_vocab`) live here too.
 
+pub mod decodable_vocab;
 pub mod engine;
+pub mod eos;
+pub mod logging;
 pub mod model_line;
 pub mod parallel;
 pub mod sampler;
+pub mod tracing;
 pub mod tracing_state;
 pub mod vllm;

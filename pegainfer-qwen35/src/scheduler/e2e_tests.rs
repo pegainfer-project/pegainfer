@@ -631,7 +631,7 @@ fn candidate_e2e_qwen35_shared_sm_last_decoder() {
 }
 
 fn run_shared_sm_last_decoder(acceptance: &GdnAcceptance) {
-    pegainfer_core::logging::init_default();
+    pegainfer_frontend::logging::init_default();
     let Some(model_path) = acceptance
         .model_path("test_e2e_qwen35_shared_sm_last_decoder")
         .expect("model prerequisite")

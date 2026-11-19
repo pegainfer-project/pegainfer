@@ -67,7 +67,8 @@ impl Config {
         let content = fs::read_to_string(&config_path)?;
         let mut config: Self = serde_json::from_str(&content)?;
         config.validate_lite()?;
-        config.eos_token_ids = pegainfer_core::eos::eos_token_ids(&model_path, config.vocab_size)?;
+        config.eos_token_ids =
+            pegainfer_frontend::eos::eos_token_ids(&model_path, config.vocab_size)?;
         Ok(config)
     }
 

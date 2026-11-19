@@ -482,7 +482,7 @@ struct GenerationPolicy {
 }
 
 fn generation_policy(dir: &str, vocab: usize) -> Result<GenerationPolicy> {
-    let eos = pegainfer_core::eos::eos_token_ids(dir, vocab)?;
+    let eos = pegainfer_frontend::eos::eos_token_ids(dir, vocab)?;
     let path = format!("{dir}/generation_config.json");
     let json: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?,
