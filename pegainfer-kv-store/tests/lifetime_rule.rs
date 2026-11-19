@@ -1,13 +1,21 @@
-//! Decision-A oracle for issue #1120: what does a request actually draw over
-//! its lifetime?
+//! Lifetime-rule oracle for issue #1120: what does a request actually draw
+//! over its lifetime?
 //!
-//! Drives the same `schedule_*`/`apply_*` sequences each scheduler drives and
-//! measures the peak resident draw (`base - available_blocks()`), then compares
-//! it with the two competing lifetime rules:
+//! Drives kv-store's `schedule_*`/`apply_*` sequences (whole and chunked
+//! prefill, plain decode, speculative verify) and measures the peak resident
+//! draw (`base - available_blocks()`), then compares it with the two
+//! competing rules:
 //!
 //! - `Special`: `ceil((prompt if max_tokens <= 1 else prompt + max_tokens) / bs)`
-//!   (qwen3 `scheduler.rs:328`, qwen35 `plan.rs:174`)
-//! - `Always`: `ceil((prompt + max_tokens) / bs)` (kimi, glm52, kv-store pool)
+//!   (qwen3 `scheduler.rs:328`, qwen35 `plan.rs:174`; the rule now shared
+//!   through `pegainfer_kv_store::lifetime_blocks`)
+//! - `Always`: `ceil((prompt + max_tokens) / bs)` (the old Kimi/GLM5.2
+//!   copies, and the pool before this change)
+//!
+//! Not modeled here: prefix matching (it only lowers the draw), external
+//! anchor promotion and pad-to-boundary (covered by pool unit tests), and a
+//! real scheduler's speculative span planning (the bound still holds because
+//! `generated + span <= max_tokens`).
 //!
 //! The one-token question is whether kvbm provisions a page for the dangling
 //! first generated token when the request finishes after prefill. The tests

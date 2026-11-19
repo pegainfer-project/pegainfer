@@ -283,11 +283,15 @@ fn admission_sheds_rear_prefix_holds_when_the_front_cannot_fit() {
 
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::new();
-    let mut front = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
+    // max_tokens 2 keeps the front at four blocks: a one-token completion
+    // is three blocks and would fit the three pages the rear hold leaves.
+    let mut front = request(vec![2; 3 * PAGE], SamplingParams::default(), 2);
     let (front_tx, _front_rx) = TokenSink::standalone();
     front.token_tx = front_tx;
     pending.push_back(plain(front));
-    let mut rear = request(vec![9], SamplingParams::default(), 1);
+    // Two-block lifetime so it stays queued after the front takes four of
+    // the five usable blocks (the shed is what the test observes).
+    let mut rear = request(vec![9], SamplingParams::default(), PAGE);
     let (rear_tx, _rear_rx) = TokenSink::standalone();
     rear.token_tx = rear_tx;
     pending.push_back(Resolved::Plain {
@@ -323,6 +327,48 @@ fn admission_sheds_rear_prefix_holds_when_the_front_cannot_fit() {
             assert_eq!(prefix.hit_tokens(), 0, "queued holds were shed, not kept");
         }
     }
+}
+
+#[test]
+fn admission_rejects_a_front_the_pool_could_never_hold() {
+    // Lifetime 9 against a 3-block per-request ceiling: a permanent denial,
+    // not a budget wait — the queue must not park behind it.
+    let pool = Arc::new(BlockPool::new(PAGE, 4));
+    let (store, _rt) = test_store(&pool);
+    let mut impossible = request(vec![20, 21, 22], SamplingParams::default(), PAGE * 8);
+    let (tx, mut rx) = TokenSink::standalone();
+    impossible.token_tx = tx;
+
+    let mut slots: RankSlots = std::array::from_fn(|_| None);
+    let mut pending = VecDeque::from([plain(impossible)]);
+    let mut pending_resets = Vec::new();
+    admit_from_queue(
+        0,
+        &mut pending,
+        &mut slots,
+        &pool,
+        3,
+        &store,
+        true,
+        false,
+        false,
+        &mut pending_resets,
+    )
+    .expect("a permanent denial is not an admission error");
+
+    assert!(
+        pending.is_empty(),
+        "an impossible request is rejected, not queued"
+    );
+    assert_eq!(slots.iter().flatten().count(), 0, "no slot forms");
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Scheduled { .. }))
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok((_, pegainfer_frontend::engine::TokenEvent::Rejected { .. }))
+    ));
 }
 
 #[test]
@@ -669,7 +715,9 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
     // otherwise park the whole queue.
     let pool = Arc::new(BlockPool::new(PAGE, 4));
     let (store, _rt) = test_store(&pool);
-    let mut stalled = request(vec![20, 21, 22], SamplingParams::default(), PAGE * 8);
+    // Admissible by pool capacity (2 of 3 blocks) but stalled by the rank
+    // budget passed below, so the queue keeps its front.
+    let mut stalled = request(vec![20, 21, 22], SamplingParams::default(), PAGE);
     let (stalled_tx, _stalled_rx) = TokenSink::standalone();
     stalled.token_tx = stalled_tx;
     let handoff = NativeMtpHandoff {
@@ -937,6 +985,9 @@ fn full_lifetime_reservation_covers_kvbm_peak_draw() {
         (127, 2),
         (192, 3),
         (65, 1),
+        // Block-aligned one-token completion: the dangling page is not
+        // reserved, so the lifetime is two pages, not three.
+        (128, 1),
     ] {
         for with_drafts in [false, true] {
             let lifetime = lifetime_blocks(prompt_len, max_tokens, PAGE);

@@ -32,7 +32,17 @@ use pegainfer_frontend::engine::KvPrefix;
 /// it, so admission reserves `prompt + max_tokens` for them. Both sides are
 /// pinned against kvbm's real schedule/apply sequences (whole and chunked
 /// prefill, plain decode, speculative verify) in `tests/lifetime_rule.rs`.
+/// An empty prompt still reserves one block.
+///
+/// # Panics
+///
+/// `block_size` must be nonzero (a pool's block size is a power of two in
+/// `2..=1024`).
 pub fn lifetime_blocks(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
+    assert!(
+        block_size > 0,
+        "lifetime_blocks: block_size must be nonzero"
+    );
     let tokens = if max_tokens <= 1 {
         prompt_len
     } else {
@@ -50,9 +60,6 @@ pub enum Denied {
     /// Even an empty pool cannot hold the request's lifetime. Permanent for
     /// this request shape: reject it at admission.
     ExceedsPool { need: usize, capacity: usize },
-    /// The request exceeds a per-request cap the caller declared. Permanent:
-    /// reject it at admission.
-    ExceedsRequest { need: usize, limit: usize },
 }
 
 impl std::fmt::Display for Denied {
@@ -61,9 +68,6 @@ impl std::fmt::Display for Denied {
             Self::Busy => write!(f, "blocks busy; retry after work drains"),
             Self::ExceedsPool { need, capacity } => {
                 write!(f, "needs {need} blocks, the pool holds at most {capacity}")
-            }
-            Self::ExceedsRequest { need, limit } => {
-                write!(f, "needs {need} blocks, the request cap is {limit}")
             }
         }
     }

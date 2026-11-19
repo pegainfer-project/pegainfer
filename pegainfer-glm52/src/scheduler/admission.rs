@@ -248,6 +248,30 @@ pub(super) fn admit_from_queue(
             ),
             Resolved::Failed { .. } => unreachable!("handled above"),
         };
+        // A lifetime the pool could never hold is permanent. The budget
+        // gate below would otherwise defer it forever, so reject the front
+        // here instead of parking the queue behind it.
+        let capacity = pool.max_request_blocks();
+        if need_blocks > capacity {
+            let Some(entry) = pending.pop_front() else {
+                unreachable!("front was checked non-empty");
+            };
+            let req = match entry {
+                Resolved::Plain { req, .. } | Resolved::Native { req, .. } => req,
+                Resolved::Failed { .. } => unreachable!("Failed handled above"),
+            };
+            reject(
+                &req,
+                format!(
+                    "GLM5.2 KV admission: {}",
+                    Denied::ExceedsPool {
+                        need: need_blocks,
+                        capacity,
+                    }
+                ),
+            );
+            continue;
+        }
         let active_resident: usize = slots
             .iter()
             .flatten()
