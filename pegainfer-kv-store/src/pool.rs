@@ -25,6 +25,52 @@ use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
 use pegainfer_frontend::engine::KvPrefix;
 
+/// Blocks a request may draw over its whole lifetime.
+///
+/// One-token completions finish after prefill, so `schedule_decode` never
+/// provisions the dangling generation block; multi-token requests can draw
+/// it, so admission reserves `prompt + max_tokens` for them. Both sides are
+/// pinned against kvbm's real schedule/apply sequences (whole and chunked
+/// prefill, plain decode, speculative verify) in `tests/lifetime_rule.rs`.
+pub fn lifetime_blocks(prompt_len: usize, max_tokens: usize, block_size: usize) -> usize {
+    let tokens = if max_tokens <= 1 {
+        prompt_len
+    } else {
+        prompt_len.saturating_add(max_tokens)
+    };
+    tokens.div_ceil(block_size).max(1)
+}
+
+/// Why a pool operation was refused, and what the caller should do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Denied {
+    /// The blocks the request needs are held by other work. Transient: let
+    /// that work drain (release/revert/evict) and retry.
+    Busy,
+    /// Even an empty pool cannot hold the request's lifetime. Permanent for
+    /// this request shape: reject it at admission.
+    ExceedsPool { need: usize, capacity: usize },
+    /// The request exceeds a per-request cap the caller declared. Permanent:
+    /// reject it at admission.
+    ExceedsRequest { need: usize, limit: usize },
+}
+
+impl std::fmt::Display for Denied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Busy => write!(f, "blocks busy; retry after work drains"),
+            Self::ExceedsPool { need, capacity } => {
+                write!(f, "needs {need} blocks, the pool holds at most {capacity}")
+            }
+            Self::ExceedsRequest { need, limit } => {
+                write!(f, "needs {need} blocks, the request cap is {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Denied {}
+
 /// Logical KV block pool: a `BlockManager` plus the reserved padding block.
 ///
 /// Owns no GPU memory — the physical layout (full-attention `KvBuffer`,
@@ -115,6 +161,17 @@ impl BlockPool {
         self.padding_block_id as i32
     }
 
+    /// This pool's [`lifetime_blocks`] rule.
+    pub fn lifetime_blocks(&self, prompt_len: usize, max_tokens: usize) -> usize {
+        lifetime_blocks(prompt_len, max_tokens, self.block_size)
+    }
+
+    /// Largest lifetime a single request may declare: every block except the
+    /// CUDA-graph padding block.
+    pub fn max_request_blocks(&self) -> usize {
+        self.block_manager.total_blocks().saturating_sub(1)
+    }
+
     /// Evict every cached-but-unused block from the GPU prefix cache (drain the
     /// inactive pool). In-use blocks are untouched. A cold-cache flush — and,
     /// for the offload path, the way to force a prefix out of HBM so a
@@ -151,7 +208,7 @@ impl BlockPool {
     ) -> RequestKv {
         let salt_hash = compute_salt_hash(cache_salt, lora_name)
             .expect("compute_salt_hash is infallible for string cache/lora identities");
-        let lifetime_blocks = (prompt_tokens.len() + max_output_tokens).div_ceil(self.block_size);
+        let lifetime_blocks = self.lifetime_blocks(prompt_tokens.len(), max_output_tokens);
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
@@ -503,24 +560,31 @@ impl RequestKv {
     /// [`BlockPool::reserve_loaded_blocks`] reach until release/drop, so a
     /// mid-flight page-crossing draw can never fail.
     ///
-    /// Returns false without admitting when the pool cannot cover every
-    /// admitted remainder plus this one — i.e. a concurrent reserve won the
-    /// race for these pages between the caller's budget check and this call;
-    /// the caller defers and retries. `credited_blocks` are prefix-held pages
-    /// that fold into this request's resident set on match: already out of
-    /// `available_blocks`, soon to shrink the remainder, so counting them
-    /// avoids a double charge. Idempotent once admitted.
-    pub fn try_admit(&mut self, pool: &BlockPool, credited_blocks: usize) -> bool {
+    /// Returns [`Denied::ExceedsPool`] when even an empty pool cannot hold
+    /// this request's lifetime (permanent — reject it), and [`Denied::Busy`]
+    /// when the pool cannot cover every admitted remainder plus this one
+    /// right now — i.e. a concurrent reserve won the race for these pages
+    /// between the caller's budget check and this call; the caller defers and
+    /// retries. `credited_blocks` are prefix-held pages that fold into this
+    /// request's resident set on match: already out of `available_blocks`,
+    /// soon to shrink the remainder, so counting them avoids a double
+    /// charge. Idempotent once admitted.
+    pub fn try_admit(&mut self, pool: &BlockPool, credited_blocks: usize) -> Result<(), Denied> {
         if self.inner.is_admitted() {
-            return true;
+            return Ok(());
+        }
+        let need = self.inner.lifetime_blocks();
+        let capacity = pool.max_request_blocks();
+        if need > capacity {
+            return Err(Denied::ExceedsPool { need, capacity });
         }
         let _gate = pool.reserve_gate.lock().expect("reserve gate poisoned");
         let remaining = self.inner.remaining().max(0) as usize;
         if pool.available_blocks() + credited_blocks < pool.entitled_blocks() + remaining {
-            return false;
+            return Err(Denied::Busy);
         }
         self.inner.admit();
-        true
+        Ok(())
     }
 
     // ── Prefix cache ───────────────────────────────────────────────────
@@ -670,9 +734,10 @@ impl RequestKv {
         self.inner.seq().generated_tokens()
     }
 
-    /// Full input-plus-output page capacity fixed when this request was
-    /// created. Admission uses this value for already-active requests so any
-    /// internal tokens added by a protocol remain accounted for.
+    /// Lifetime page capacity fixed when this request was created by the
+    /// pool's [`BlockPool::lifetime_blocks`] rule. Admission uses this value
+    /// for already-active requests so any internal tokens added by a
+    /// protocol remain accounted for.
     pub fn lifetime_blocks(&self) -> usize {
         self.inner.lifetime_blocks()
     }
@@ -882,6 +947,38 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_blocks_follows_the_single_token_rule() {
+        // `tests/lifetime_rule.rs` measures kvbm's real peak draw: a
+        // one-token completion never provisions the dangling block, a
+        // multi-token one always does.
+        assert_eq!(lifetime_blocks(16, 1, 16), 1);
+        assert_eq!(lifetime_blocks(17, 1, 16), 2);
+        assert_eq!(lifetime_blocks(16, 2, 16), 2);
+        assert_eq!(lifetime_blocks(64, 1, 64), 1);
+        assert_eq!(lifetime_blocks(64, 65, 64), 3);
+
+        let pool = BlockPool::new(16, 8);
+        assert_eq!(pool.lifetime_blocks(16, 1), 1);
+        assert_eq!(pool.lifetime_blocks(16, 2), 2);
+        assert_eq!(pool.max_request_blocks(), 7);
+    }
+
+    #[test]
+    fn try_admit_reports_exceeds_pool_for_an_impossible_request() {
+        // 4 blocks minus padding = a 3-block per-request ceiling.
+        let pool = BlockPool::new(16, 4);
+        // 16-token prompt + 64 outputs: lifetime = ceil(80/16) = 5.
+        let mut kv = pool.new_request(vec![1; 16], 64, None);
+        assert_eq!(
+            kv.try_admit(&pool, 0),
+            Err(Denied::ExceedsPool {
+                need: 5,
+                capacity: 3,
+            })
+        );
+    }
+
+    #[test]
     fn external_prefill_anchor_promotion_keeps_lifetime_capacity() {
         let pool = BlockPool::new(16, 8);
         // 16 restored tokens + 1 anchor tail + 16 output positions. The
@@ -1023,7 +1120,7 @@ mod tests {
         // 32-token prompt + 33 outputs: lifetime = ceil(65/16) = 5.
         let mut kv = pool.new_request((0..32).map(|i| 100 + i).collect(), 33, None);
         assert_eq!(pool.entitled_blocks(), 0, "construction entitles nothing");
-        assert!(kv.try_admit(&pool, 0));
+        assert!(kv.try_admit(&pool, 0).is_ok());
         audit(&pool, &kv, "admit");
 
         kv.schedule_prefill(32, &pool).unwrap();
@@ -1053,7 +1150,7 @@ mod tests {
     fn entitlement_refunds_on_drop_without_release() {
         let pool = BlockPool::new(16, 64);
         let mut kv = pool.new_request(vec![1; 16], 16, None);
-        assert!(kv.try_admit(&pool, 0));
+        assert!(kv.try_admit(&pool, 0).is_ok());
         kv.schedule_prefill(16, &pool).unwrap();
         assert!(pool.entitled_blocks() > 0);
         drop(kv);
@@ -1085,7 +1182,7 @@ mod tests {
 
         // 16-token prompt + 65 outputs: lifetime = ceil(81/16) = 6.
         let mut kv = pool.new_request(vec![1; 16], 65, None);
-        assert!(kv.try_admit(&pool, 0));
+        assert!(kv.try_admit(&pool, 0).is_ok());
         assert_eq!(pool.entitled_blocks(), 6);
 
         assert!(
@@ -1125,14 +1222,18 @@ mod tests {
         // Reserve first: admission must defer instead of over-committing.
         let held = pool.reserve_loaded_blocks(2).expect("empty floor");
         let mut kv = pool.new_request(vec![1; 16], 65, None);
-        assert!(
-            !kv.try_admit(&pool, 0),
+        assert_eq!(
+            kv.try_admit(&pool, 0),
+            Err(Denied::Busy),
             "5 available cannot cover a remainder of 6"
         );
         assert_eq!(pool.entitled_blocks(), 0, "a lost race entitles nothing");
         drop(held);
-        assert!(kv.try_admit(&pool, 0), "the freed pages admit the retry");
-        assert!(kv.try_admit(&pool, 0), "idempotent once admitted");
+        assert!(
+            kv.try_admit(&pool, 0).is_ok(),
+            "the freed pages admit the retry"
+        );
+        assert!(kv.try_admit(&pool, 0).is_ok(), "idempotent once admitted");
 
         // Admit first: the reserve must decline into the new floor.
         assert!(pool.reserve_loaded_blocks(2).is_none());
@@ -1147,9 +1248,9 @@ mod tests {
         let pool = BlockPool::new(16, 8);
         let held = pool.reserve_loaded_blocks(2).expect("empty floor");
         let mut kv = pool.new_request(vec![1; 16], 65, None);
-        assert!(!kv.try_admit(&pool, 0));
+        assert_eq!(kv.try_admit(&pool, 0), Err(Denied::Busy));
         assert!(
-            kv.try_admit(&pool, 1),
+            kv.try_admit(&pool, 1).is_ok(),
             "5 available + 1 credited page covers the remainder of 6"
         );
         drop(held);
@@ -1203,7 +1304,7 @@ mod tests {
             let max_output = 32 + ((rng >> 13) as usize % 4) * 16; // lifetime 3..=6
             let prompt: Vec<u32> = (0..16).map(|i| round.wrapping_mul(31) + i).collect();
             let mut kv = pool.new_request(prompt, max_output, None);
-            if !kv.try_admit(&pool, 0) {
+            if kv.try_admit(&pool, 0).is_err() {
                 continue;
             }
             admitted_rounds += 1;

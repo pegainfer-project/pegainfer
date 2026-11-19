@@ -18,12 +18,12 @@ use pegainfer_kv_store::KvStoreBuilder;
 use pegainfer_kv_store::NeverCancelled;
 use pegainfer_kv_store::ResolvePolicy;
 use pegainfer_kv_store::SaveCursor;
+use pegainfer_kv_store::lifetime_blocks;
 use pegainfer_sample::SamplingParams;
 
 use super::ActiveRequest;
 use super::PAGE;
 use super::RankSlots;
-use super::admission::lifetime_blocks;
 use super::admit_from_queue;
 use super::graph::graph_dump_bucket;
 use super::offload::NativeMtpHandoff;
@@ -220,7 +220,10 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
 
     let mut slots: RankSlots = std::array::from_fn(|_| None);
     let mut pending = VecDeque::new();
-    let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 1);
+    // max_tokens 2 keeps this a genuine four-block lifetime: a one-token
+    // completion is now three blocks (the dangling page is not reserved),
+    // which would fit the three temporarily free pages.
+    let mut req = request(vec![2; 3 * PAGE], SamplingParams::default(), 2);
     let (token_tx, _token_rx) = TokenSink::standalone();
     req.token_tx = token_tx;
     pending.push_back(plain(req));
@@ -936,7 +939,7 @@ fn full_lifetime_reservation_covers_kvbm_peak_draw() {
         (65, 1),
     ] {
         for with_drafts in [false, true] {
-            let lifetime = lifetime_blocks(prompt_len, max_tokens);
+            let lifetime = lifetime_blocks(prompt_len, max_tokens, PAGE);
             let pool = Arc::new(BlockPool::new(PAGE, lifetime + 1));
             drive_request(&pool, prompt_len, max_tokens, with_drafts).unwrap_or_else(|e| {
                 panic!("({prompt_len},{max_tokens},drafts={with_drafts}): {e}")
