@@ -1,6 +1,5 @@
 //! Gate: SplitKv decode batch-invariance. Co-batching A with a longer B moves A's chunk count;
 //! Tuned drifts, Pin/PerToken stay bit-identical.
-#![cfg(feature = "cuda")]
 
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;

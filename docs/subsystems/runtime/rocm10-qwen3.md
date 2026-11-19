@@ -1,8 +1,8 @@
 # Initial ROCm 10.1 support for Qwen3
 
-**TL;DR**: Qwen3-0.6B/4B BF16 runs on R9700 (`gfx1201`) through native Rust + HIP/rocBLAS, using single-GPU eager execution, greedy decoding, chunked prefill, and mixed batches. Both models pass independent HF golden and HTTP lifecycle gates. `scripts/amd/check_ci.sh` cross-compiles gfx1100/gfx1201 and runs CPU contract tests against the public ROCm 10.1 SDK; nothing ROCm runs in the repository's CI, so run it by hand, and the GPU gates are manual. RDNA 3 execution and a stable release with the CUDA backend's full feature set remain outstanding.
+**TL;DR**: Qwen3-0.6B/4B BF16 runs on R9700 (`gfx1201`) through `pegainfer-rocm` (native Rust + HIP/rocBLAS), using single-GPU eager execution, greedy decoding, chunked prefill, and mixed batches. Both models pass independent HF golden and HTTP lifecycle gates. `scripts/amd/check_ci.sh` cross-compiles gfx1100/gfx1201 and runs CPU contract tests against the public ROCm 10.1 SDK; nothing ROCm runs in the repository's CI, so run it by hand, and the GPU gates are manual. RDNA 3 execution and a stable release with the CUDA backend's full feature set remain outstanding.
 
-Last touched: 2026-11-17
+Last touched: 2026-11-19
 
 ## Supported profile
 
@@ -33,7 +33,7 @@ export ROCM_PATH="$(.venv-rocm/bin/rocm-sdk path --root)"
 export LD_LIBRARY_PATH="$ROCM_PATH/lib:$ROCM_PATH/lib64:${LD_LIBRARY_PATH:-}"
 export PEGAINFER_ROCM_ARCH=gfx1201
 cargo build --locked --release \
-  -p pegainfer-server --no-default-features --features rocm,qwen3
+  -p pegainfer-server --no-default-features --features rocm
 ```
 
 The installer uses AMD's public [ROCm Python package distribution](https://rocm.docs.amd.com/en/docs-10.1.0/install/rocm.html), pins ROCm 10.1.0, and runs `rocm-sdk init` to expand the development tree. The optional second argument installs device-specific runtime libraries (`device-gfx1201` here), needed to run on that target; compilation and the CPU checks need only `libraries,devel`. Installation itself does not require a GPU or install a kernel driver. Existing system installations can set `ROCM_PATH` directly.
@@ -51,7 +51,7 @@ hf download Qwen/Qwen3-0.6B --revision c1899de289a04d12100db370d81485cdf75e47ca 
 hf download Qwen/Qwen3-4B --revision 1cfa9a7208912126459214e8b04321603b3df60c \
   --local-dir "$PEGAINFER_MODEL_ROOT/Qwen3-4B"
 cargo run --locked --release \
-  -p pegainfer-server --no-default-features --features rocm,qwen3 -- \
+  -p pegainfer-server --no-default-features --features rocm -- \
   --model-path "$PEGAINFER_MODEL_ROOT/Qwen3-4B" --served-model-name qwen3-rocm \
   --port 18302 --rocm-slots 4 --rocm-max-context 4096 --rocm-chunk-size 128
 ```
@@ -60,15 +60,15 @@ The service uses the shared frontend's listener configuration. Select the intend
 
 ## Runtime contracts
 
-`pegainfer-device` owns HIP devices, streams, buffers, and rocBLAS handles. `Arc` keeps the runtime alive until its buffers are released; a mutex serializes submissions. Submissions rebind the device on the calling thread. Host copies synchronize before returning, and buffer destruction synchronizes before freeing memory. A partially failed model forward poisons the model, preventing reuse of partially updated KV.
+The `device` module of `pegainfer-rocm` owns HIP devices, streams, buffers, and rocBLAS handles. `Arc` keeps the runtime alive until its buffers are released; a mutex serializes submissions. Submissions rebind the device on the calling thread. Host copies synchronize before returning, and buffer destruction synchronizes before freeing memory. A partially failed model forward poisons the model, preventing reuse of partially updated KV.
 
-`pegainfer-kernels/csrc/hip/qwen3.cpp` implements embedding, RMSNorm, residual addition, SiLU, RoPE, KV append, causal GQA attention, and argmax; GEMM calls rocBLAS. The Rust ABI wrappers validate shapes, capacities, scalars, and device/stream ownership. Device-side token IDs, slots, and positions must be in range. Violations trap and surface at launch or stream synchronization; callers must discard the failed runtime. Trap tests use separate processes because the device context may become unusable.
+`pegainfer-rocm/csrc/qwen3.cpp` implements embedding, RMSNorm, residual addition, SiLU, RoPE, KV append, causal GQA attention, and argmax; GEMM calls rocBLAS. The Rust ABI wrappers validate shapes, capacities, scalars, and device/stream ownership. Device-side token IDs, slots, and positions must be in range. Violations trap and surface at launch or stream synchronization; callers must discard the failed runtime. Trap tests use separate processes because the device context may become unusable.
 
 The Qwen3 scheduler reuses the production `RequestLedger` and step contract. Each request owns a contiguous KV slot; reclaimed slots restart at position 0. Fixed-slot KV storage is `slots × context × layers × kv_heads × head_dim × 2(K,V) × 2(BF16)` bytes. Qwen3-4B with slots=4/context=4096 reserves approximately **2.25 GiB** for KV, plus weights, scratch, library workspace, and headroom. The KV metric reports the fraction of reserved capacity assigned to active slots. Cancellation reclaims slots while retaining the underlying allocation for reuse.
 
 The attention kernel establishes a correctness baseline with FP32 scores, softmax, and reductions over request-local KV, followed by BF16 output. It is not an optimized paged/flash attention implementation; long prefills are expensive. Wave width follows the compilation target.
 
-CUDA remains the default backend. Its implementation is included at the original Qwen3 crate root to preserve symbol paths. ROCm builds branch before CUDA discovery/submodule initialization and exclude CUDA-only sampling, KV/offload, and CUPTI dependencies. Backend features are mutually exclusive, so each is checked in its own build.
+CUDA remains the default backend. The ROCm line lives in its own crate, `pegainfer-rocm`, and joins the server through `ModelLine` behind the server's `rocm` feature; the CUDA crates carry no backend features, so a ROCm build with default features off never compiles them. The line keeps its own copy of the Qwen3 config fields it reads, and its golden gate includes the CUDA gate's fixture reader and bounds by path, so both backends are held to one definition.
 
 ## Verification
 
@@ -83,17 +83,17 @@ This builds the server and all relevant test targets, runs CPU tests, and explic
 The GPU gates are manual, using an already selected GPU, the server built above, and the model snapshots:
 
 ```bash
-cargo test --locked --release -p pegainfer-device --features rocm --lib -- --ignored --test-threads=1
-cargo test --locked --release -p pegainfer-kernels --no-default-features --features rocm \
-  --test rocm_contract -- --ignored --test-threads=1
+cargo test --locked --release -p pegainfer-rocm --features rocm --lib -- --ignored --test-threads=1
+cargo test --locked --release -p pegainfer-rocm --features rocm \
+  --test contract -- --ignored --test-threads=1
 PEGAINFER_TEST_MODEL_PATH="$PEGAINFER_MODEL_ROOT/Qwen3-4B" cargo test --locked --release \
-  -p pegainfer-qwen3 --no-default-features --features rocm --test rocm_golden -- --ignored --nocapture --test-threads=1
+  -p pegainfer-rocm --features rocm --test golden -- --ignored --nocapture --test-threads=1
 python3 scripts/amd/check_cli.py
 python3 scripts/amd/check_http.py --model-path "$PEGAINFER_MODEL_ROOT/Qwen3-4B" --context 4096 \
   --output target/rocm-http-4b
 ```
 
-Repeat the golden and HTTP lines for Qwen3-0.6B (`--context 512`). Together they check device ownership/copies, Rust wrapper failure paths, isolated device traps, both models' HF golden gates, and real HTTP/CLI behavior. GPU tests are marked ignored so the CPU checks compile them without executing them. Clippy currently reports warnings, including CUDA-oriented shared config unused in ROCm builds.
+Repeat the golden and HTTP lines for Qwen3-0.6B (`--context 512`). Together they check device ownership/copies, Rust wrapper failure paths, isolated device traps, both models' HF golden gates, and real HTTP/CLI behavior. GPU tests are marked ignored so the CPU checks compile them without executing them. Clippy reports nine pedantic warnings in the ROCm code: single-character bindings, the `rocm_` field prefix, and two indexed loops in the golden test.
 
 ### Numerical evidence
 

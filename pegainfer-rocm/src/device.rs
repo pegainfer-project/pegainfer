@@ -1,4 +1,3 @@
-#![cfg(feature = "rocm")]
 //! Single-stream HIP device resources with explicit ownership.
 //! Host copies complete before returning. Buffers retain the runtime and wait
 //! for its stream before free, including cancellation and failed execution.

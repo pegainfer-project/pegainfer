@@ -1,6 +1,7 @@
 //! Independent committed HF-golden gate for the production ROCm executor.
-#![cfg(feature = "rocm")]
-#[path = "common/hf_golden.rs"]
+// The fixture reader and bounds are the CUDA gate's own, so both backends are
+// held to one definition.
+#[path = "../../pegainfer-qwen3/tests/common/hf_golden.rs"]
 mod hf_golden;
 
 use std::path::PathBuf;
@@ -13,9 +14,9 @@ use hf_golden::HEAD_K;
 use hf_golden::MARGIN_TOL;
 use hf_golden::MEAN_TOL;
 use hf_golden::P99_TOL;
-use pegainfer_qwen3::rocm::Model;
-use pegainfer_qwen3::rocm::ModelOptions;
-use pegainfer_qwen3::rocm::TokenInput;
+use pegainfer_rocm::qwen3::Model;
+use pegainfer_rocm::qwen3::ModelOptions;
+use pegainfer_rocm::qwen3::TokenInput;
 
 #[derive(Default)]
 struct Stats {

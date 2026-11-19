@@ -32,7 +32,6 @@
 //! (drafter); the legacy gates skip when weights are absent. The ignored native
 //! gate requires explicit target and `PEGAINFER_DFLASH2_TEST_MODEL_PATH` paths
 //! and fails if its checkpoint is missing or not a native DFlash2 drafter.
-#![cfg(feature = "cuda")]
 
 use std::collections::HashMap;
 use std::collections::HashSet;

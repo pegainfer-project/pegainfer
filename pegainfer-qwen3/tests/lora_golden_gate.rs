@@ -14,7 +14,6 @@
 //!
 //! Needs a CUDA GPU and Qwen3-4B weights (`PEGAINFER_TEST_MODEL_PATH`); skips cleanly
 //! otherwise.
-#![cfg(feature = "cuda")]
 
 use std::collections::BTreeMap;
 use std::path::Path;

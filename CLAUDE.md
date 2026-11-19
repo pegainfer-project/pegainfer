@@ -118,6 +118,8 @@ HTTP Request → vLLM frontend → EngineHandle → per-model scheduler/executor
 
 **Scripts**: `scripts/` holds what a person runs by hand, with one directory per kind once there are several (`bench/`, `accuracy/`, `profiling/`, `eval/`). Code that only a build or CI job runs lives next to its caller: build-time generators under `pegainfer-kernels/tools/` and `pegainfer-{gemma4,k3}/kernels/`, workflow steps under `.github/scripts/`.
 
+**Backends**: `pegainfer-core` and `pegainfer-kernels` are the CUDA runtime and carry no backend features. Another device backend lives in its own crate, implements `ModelLine` from `pegainfer-frontend`, and joins the server as one optional dependency and one registry entry, as `pegainfer-rocm` does. Helpers every backend needs (logging, tracing, EOS ids, decodable vocab) live in `pegainfer-frontend`.
+
 ## EP Free-Running Discipline
 
 Canonical doc: `docs/models/glm52/free-running-dp.md` (K3's gang lane follows it). Invariants — violating any of these is a deadlock design:

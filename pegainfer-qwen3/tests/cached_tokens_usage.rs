@@ -8,7 +8,6 @@
 //!
 //! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when the model is
 //! absent (point `PEGAINFER_TEST_MODEL_PATH` at the weights to run it).
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 

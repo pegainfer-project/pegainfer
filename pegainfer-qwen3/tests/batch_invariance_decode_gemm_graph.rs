@@ -7,7 +7,6 @@
 //!
 //!   PEGAINFER_TEST_MODEL_PATH=<Qwen3-4B-base> cargo test --release \
 //!     -p pegainfer-qwen3 --test batch_invariance_decode_gemm_graph -- --nocapture
-#![cfg(feature = "cuda")]
 
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;

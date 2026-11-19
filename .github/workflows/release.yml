@@ -81,7 +81,7 @@ jobs:
           rustc - --crate-name cuda_link_probe -l cuda \
             -o "$probe_dir/cuda-link-probe" <<< 'fn main() {}'
           cargo build --release --locked -p pegainfer-server \
-            --no-default-features --features cuda,qwen3
+            --no-default-features --features qwen3
 
       - name: Upload server binary
         uses: actions/upload-artifact@v4

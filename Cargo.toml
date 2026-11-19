@@ -1,7 +1,7 @@
 [workspace]
 default-members = ["pegainfer-server"]
 members = [
-  "pegainfer-device",
+  "pegainfer-rocm",
   "pegainfer-frontend",
   "pegainfer-sim",
   "pegainfer-server",
@@ -121,22 +121,22 @@ nvtx = "1.3.0"
 oneshot = "0.1.11"
 pegainfer-bench = { path = "pegainfer-bench" }
 pegainfer-build = { path = "pegainfer-build" }
-pegainfer-device = { path = "pegainfer-device" }
-pegainfer-core = { path = "pegainfer-core", default-features = false }
+pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
 pegainfer-deepseek-v2-lite = { path = "pegainfer-deepseek-v2-lite" }
 pegainfer-frontend = { path = "pegainfer-frontend" }
 pegainfer-gemma4 = { path = "pegainfer-gemma4" }
 pegainfer-glm52 = { path = "pegainfer-glm52" }
 pegainfer-k3 = { path = "pegainfer-k3" }
-pegainfer-kernels = { path = "pegainfer-kernels", default-features = false }
+pegainfer-kernels = { path = "pegainfer-kernels" }
 pegainfer-kimi-k2 = { path = "pegainfer-kimi-k2" }
 pegainfer-kv-cache = { path = "pegainfer-kv-cache" }
 pegainfer-kv-offload = { path = "pegainfer-kv-offload" }
 pegainfer-kv-store = { path = "pegainfer-kv-store" }
-pegainfer-qwen3 = { path = "pegainfer-qwen3", default-features = false }
+pegainfer-qwen3 = { path = "pegainfer-qwen3" }
 pegainfer-qwen35 = { path = "pegainfer-qwen35" }
 pegainfer-qwen4 = { path = "pegainfer-qwen4" }
+pegainfer-rocm = { path = "pegainfer-rocm" }
 pegainfer-sample = { path = "pegainfer-sample" }
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = "0.31.0"

@@ -2,9 +2,9 @@
 //! GPU tests are manual; CI builds these without creating a HIP device.
 use anyhow::Result;
 use half::bf16;
-use pegainfer_device::Device;
-use pegainfer_kernels::rocm::AttentionShape;
-use pegainfer_kernels::rocm::{self as ops};
+use pegainfer_rocm::device::Device;
+use pegainfer_rocm::ops;
+use pegainfer_rocm::ops::AttentionShape;
 
 #[test]
 #[ignore = "requires an explicitly selected ROCm GPU"]

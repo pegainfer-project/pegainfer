@@ -4,7 +4,6 @@
 //! different reductions. With the GEMM and split-chunk axes pinned and the request's prefill
 //! isolated, the path choice is the only thing that can move its decode output across the boundary.
 //! The isolation is asserted, not assumed.
-#![cfg(feature = "cuda")]
 
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kernels::ops::NumericPolicy;

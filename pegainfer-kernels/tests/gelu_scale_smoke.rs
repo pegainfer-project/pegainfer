@@ -12,7 +12,6 @@
 //! (a SiLU swap, a dropped cubic term), not the variant or the op-sequence
 //! rounding. The variant question rides on the Gemma 4 layer oracle against
 //! the HF fixture.
-#![cfg(feature = "cuda")]
 
 mod common;
 

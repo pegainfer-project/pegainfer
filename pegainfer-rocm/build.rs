@@ -3,5 +3,6 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=csrc/runtime.h");
+    pegainfer_build::rocm::compile("pegainfer_hip_kernels", &["csrc/qwen3.cpp"], &["csrc"]);
     pegainfer_build::rocm::compile("pegainfer_hip_device", &["csrc/runtime.cpp"], &["csrc"]);
 }

@@ -297,7 +297,7 @@ jobs:
               pegainfer-kimi-k2) echo kimi-k2 ;;
               pegainfer-deepseek-v2-lite) echo deepseek-v2-lite ;;
               pegainfer-qwen4) echo qwen4 ;;
-              pegainfer-sim) ;;
+              pegainfer-sim | pegainfer-rocm) ;;
               *) echo all ;;
             esac
           }

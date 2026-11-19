@@ -6,12 +6,12 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::ensure;
 use half::bf16;
-use pegainfer_device::Buffer;
-use pegainfer_device::Device;
-use pegainfer_kernels::rocm::AttentionShape;
-use pegainfer_kernels::rocm::{self as ops};
 
-use crate::config::Config;
+use super::config::Config;
+use crate::device::Buffer;
+use crate::device::Device;
+use crate::ops;
+use crate::ops::AttentionShape;
 
 type Weight = Arc<Buffer<bf16>>;
 struct Layer {
@@ -93,7 +93,7 @@ impl Model {
         let path_str = path.to_str().context("non-UTF8 model path")?;
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
-        crate::config::probe_config_json(&raw)?;
+        super::config::probe_config_json(&raw)?;
         ensure!(
             raw.get("quantization_config")
                 .is_none_or(serde_json::Value::is_null),
@@ -162,7 +162,6 @@ impl Model {
         );
         c.decodable_vocab =
             pegainfer_frontend::decodable_vocab::decodable_vocab_width(path_str)?.min(c.vocab_size);
-        c.logits_rows = c.decodable_vocab;
         ensure!(c.decodable_vocab > 0, "empty decodable vocabulary");
         let (h, i, q, k) = (
             c.hidden_size,
