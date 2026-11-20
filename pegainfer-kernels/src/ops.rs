@@ -130,6 +130,7 @@ pub use elementwise::scaled_add_rows_token_range_into;
 pub use elementwise::silu_mul_batch;
 pub use elementwise::silu_mul_batch_into;
 pub use elementwise::silu_mul_fused_batch_into;
+pub use elementwise::silu_mul_fused_interleaved_batch_into;
 pub use elementwise::softcap_bf16_in_place;
 pub use elementwise::split_qkv_into;
 pub use elementwise::suppress_logits_bf16_in_place;
@@ -274,6 +275,10 @@ pub use qwen4::qsa_indexer_select_into;
 pub use qwen4::qsa_sparse_attention_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_combine_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_gate_up_interleave_into;
+#[cfg(feature = "qwen4")]
+pub use qwen4::qwen4_moe_grouped_gate_up_silu_into;
 #[cfg(feature = "qwen4")]
 pub use qwen4::qwen4_moe_grouped_gemm_into;
 #[cfg(feature = "qwen4")]

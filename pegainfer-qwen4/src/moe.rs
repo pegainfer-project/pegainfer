@@ -12,12 +12,13 @@ use pegainfer_kernels::ops::gather_hidden_tokens_into;
 use pegainfer_kernels::ops::gemm_into_checked;
 use pegainfer_kernels::ops::gemm_rows_span_into_checked;
 use pegainfer_kernels::ops::qwen4_moe_combine_into;
+use pegainfer_kernels::ops::qwen4_moe_grouped_gate_up_silu_into;
 use pegainfer_kernels::ops::qwen4_moe_grouped_gemm_into;
 use pegainfer_kernels::ops::qwen4_moe_route_into;
 use pegainfer_kernels::ops::qwen4_moe_route_meta_into;
 use pegainfer_kernels::ops::qwen4_moe_shared_branch_into;
 use pegainfer_kernels::ops::qwen4_moe_weighted_combine_into;
-use pegainfer_kernels::ops::silu_mul_fused_batch_into;
+use pegainfer_kernels::ops::silu_mul_fused_interleaved_batch_into;
 use pegainfer_kernels::tensor::DeviceContext;
 use pegainfer_kernels::tensor::HiddenStates;
 
@@ -82,25 +83,30 @@ pub fn moe_prefill(
     let mut x_sorted = HiddenStates::zeros(ctx, g.hidden, pairs)?;
     gather_hidden_tokens_into(ctx, hidden, &gather_rows, pairs, &mut x_sorted)?;
     let gate_up_width = 2 * g.moe_intermediate;
-    let mut gate_up = HiddenStates::zeros(ctx, gate_up_width, pairs)?;
     let mut down_out = HiddenStates::zeros(ctx, g.hidden, pairs)?;
     // The expert GEMMs: one grouped launch per leg above `GROUPED_MIN_TOKENS`,
     // where it beats the per-expert cuBLAS loop and lets `indptr` stay on the
     // device; below it the loop is level or ahead.
+    //
+    // The grouped gate_up leg folds the SiLU-mul into its epilogue, so it needs
+    // no `[pairs, 2 * I]` bf16 buffer between the two legs: that buffer was 52 MB
+    // written and 52 MB read back at 2048 tokens. Its weight slab is interleaved
+    // to `[g0, u0, g1, u1, ...]` at load (`weights::interleave_gate_up`), which
+    // is why the per-expert fallback below reads its gate and up from adjacent
+    // columns and takes the interleaved SiLU.
     if tokens >= GROUPED_MIN_TOKENS {
+        let mut activated = HiddenStates::zeros(ctx, g.moe_intermediate, pairs)?;
         let mut grouped = Qwen4GroupedGemmScratch::new(ctx, &geometry)?;
-        qwen4_moe_grouped_gemm_into(
+        qwen4_moe_grouped_gate_up_silu_into(
             ctx,
             &geometry,
             &x_sorted,
             &w.gate_up,
-            gate_up_width,
+            g.moe_intermediate,
             &indptr,
             &mut grouped,
-            &mut gate_up,
+            &mut activated,
         )?;
-        let mut activated = HiddenStates::zeros(ctx, g.moe_intermediate, pairs)?;
-        silu_mul_fused_batch_into(ctx, &gate_up, &mut activated)?;
         qwen4_moe_grouped_gemm_into(
             ctx,
             &geometry,
@@ -112,6 +118,7 @@ pub fn moe_prefill(
             &mut down_out,
         )?;
     } else {
+        let mut gate_up = HiddenStates::zeros(ctx, gate_up_width, pairs)?;
         let indptr_host: Vec<i32> = ctx.stream.clone_dtoh(&indptr)?;
         ctx.sync()?;
         for expert in 0..g.experts {
@@ -132,7 +139,7 @@ pub fn moe_prefill(
             )?;
         }
         let mut activated = HiddenStates::zeros(ctx, g.moe_intermediate, pairs)?;
-        silu_mul_fused_batch_into(ctx, &gate_up, &mut activated)?;
+        silu_mul_fused_interleaved_batch_into(ctx, &gate_up, &mut activated)?;
         for expert in 0..g.experts {
             let (first, end) = (
                 indptr_host[expert] as usize,

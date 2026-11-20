@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::Context as _;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
@@ -200,7 +201,10 @@ pub struct MoeBlock {
     pub shared_up_proj: DeviceMatrix,
     pub shared_down_proj: DeviceMatrix,
     pub shared_gate: DeviceMatrix,
-    /// `[experts * 2 * moe_intermediate, hidden]`, expert `e` at rows `e * 2 * moe_intermediate..`.
+    /// `[experts * 2 * moe_intermediate, hidden]`, expert `e` at rows
+    /// `e * 2 * moe_intermediate..`, its gate and up rows interleaved
+    /// `[g0, u0, g1, u1, ...]` (the checkpoint's split halves reordered at load;
+    /// see `interleave_gate_up`).
     pub gate_up: DeviceMatrix,
     /// `[experts * hidden, moe_intermediate]`, expert `e` at rows `e * hidden..`.
     pub down: DeviceMatrix,
@@ -522,16 +526,57 @@ fn record_moe(loader: &mut StagedWeightLoader, prefix: &str, g: &Geometry) -> Re
     })
 }
 
-fn take_moe(loader: &mut StagedWeightLoader, slots: &MoeSlots) -> MoeBlock {
-    MoeBlock {
+fn take_moe(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    loader: &mut StagedWeightLoader,
+    slots: &MoeSlots,
+) -> Result<MoeBlock> {
+    Ok(MoeBlock {
         router: loader.take(slots.router),
         shared_gate_proj: loader.take(slots.shared_gate_proj),
         shared_up_proj: loader.take(slots.shared_up_proj),
         shared_down_proj: loader.take(slots.shared_down_proj),
         shared_gate: loader.take(slots.shared_gate),
-        gate_up: loader.take(slots.gate_up),
+        gate_up: interleave_gate_up(ctx, g, loader.take(slots.gate_up))?,
         down: loader.take(slots.down),
-    }
+    })
+}
+
+/// Interleaves each expert's gate and up halves to `[g0, u0, g1, u1, ...]`, so
+/// one 128-column N tile of the routed gate_up GEMM holds both halves of every
+/// pair and its epilogue can fold the SiLU into the store
+/// (`qwen4_moe_grouped_gate_up_silu_into`).
+///
+/// The permute runs on the device into one transient slab that the caller's
+/// binding drops as soon as this returns, so the peak extra is one layer's
+/// `gate_up` (3.4 GB at this line's geometry). The shared loader's
+/// contiguous-only `expert_stack` upload stays as it is; the alternative, an
+/// in-place cycle walk over the same block, would trade that slab for a serial,
+/// dependency-chained copy of every expert whose failure mode is silently
+/// permuted weights.
+fn interleave_gate_up(
+    ctx: &DeviceContext,
+    g: &Geometry,
+    gate_up: DeviceMatrix,
+) -> Result<DeviceMatrix> {
+    let mut interleaved = DeviceMatrix {
+        data: ctx
+            .stream
+            .alloc_zeros(gate_up.rows * gate_up.cols)
+            .map_err(|err| anyhow!("gate_up interleave: {err}"))?,
+        rows: gate_up.rows,
+        cols: gate_up.cols,
+    };
+    pegainfer_kernels::ops::qwen4_moe_gate_up_interleave_into(
+        ctx,
+        &gate_up,
+        g.experts,
+        g.moe_intermediate,
+        &mut interleaved,
+    )?;
+    drop(gate_up);
+    Ok(interleaved)
 }
 
 /// Load one decoder layer. Only the shards holding that layer are mapped, so a
@@ -625,7 +670,7 @@ pub(crate) fn load_layer(
         attn_hc: take_hc(&mut loader, &attn_hc),
         mixer,
         mlp_hc: take_hc(&mut loader, &mlp_hc),
-        moe: take_moe(&mut loader, &moe),
+        moe: take_moe(ctx, &g, &mut loader, &moe)?,
     };
     ctx.sync()?;
     Ok(layer)

@@ -744,6 +744,51 @@ pub fn silu_mul_fused_batch_into(
     Ok(())
 }
 
+/// Fused SiLU-mul over a gate+up pair interleaved into adjacent columns:
+/// `out[j, i] = bf16(bf16(silu(bf16(gate_up[j, 2i]))) * bf16(gate_up[j, 2i+1])))`.
+///
+/// The layout the routed experts' gate_up GEMM produces once its weight slab is
+/// interleaved to `[g0, u0, g1, u1, ...]`. Identical arithmetic to
+/// [`silu_mul_fused_batch_into`], including the intermediate bf16 roundings.
+pub fn silu_mul_fused_interleaved_batch_into(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    let intermediate_size = out.hidden_dim;
+    let bs = gate_up.seq_len;
+    assert_eq!(
+        gate_up.hidden_dim,
+        2 * intermediate_size,
+        "gate_up dim {} != 2 * out dim {}",
+        gate_up.hidden_dim,
+        intermediate_size
+    );
+    assert_eq!(out.seq_len, bs);
+
+    let (gu_ptr, _g0) = gate_up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _g1) = out.data.device_ptr_mut(&ctx.stream);
+
+    let result = unsafe {
+        ffi::silu_mul_fused_interleaved_cuda(
+            gu_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            intermediate_size as i32,
+            bs as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if result != 0 {
+        return Err(anyhow!(
+            "silu_mul_fused_interleaved CUDA launch failed: cuda_status={}, intermediate={}, batch={}",
+            result,
+            intermediate_size,
+            bs
+        ));
+    }
+    Ok(())
+}
+
 /// Split contiguous `[Q; K; V]` projection output into compact Q/K/V tensors.
 ///
 /// This is a BF16 bitwise copy. The checked shape boundary matters because a

@@ -283,4 +283,35 @@ unsafe extern "C" {
         threadblocks: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    /// The gate_up leg with the SiLU-mul folded into the epilogue:
+    /// `out[first_e..] = silu_mul(x[first_e..] @ w[e]^T)` for the *interleaved*
+    /// bank `w` (`[g0, u0, g1, u1, ...]`, see
+    /// [`qwen4_moe_gate_up_interleave_cuda`]). `n` is the output width — the
+    /// GEMM computes `2 * n` columns internally and stores one per pair.
+    pub fn qwen4_moe_gate_up_silu_cuda(
+        x: *const Half,
+        w: *const Half,
+        out: *mut Half,
+        indptr: *const i32,
+        args: *mut core::ffi::c_void,
+        args_bytes: usize,
+        experts: i32,
+        n: i32,
+        k: i32,
+        threadblocks: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Interleaves the gate and up halves of every expert's `[2 * half, width]`
+    /// `gate_up` slab: `dst[2j] = src[j]`, `dst[2j + 1] = src[half + j]`. The
+    /// two buffers must not overlap and `width` must be a multiple of 8.
+    pub fn qwen4_moe_gate_up_interleave_cuda(
+        src: *const Half,
+        dst: *mut Half,
+        experts: i32,
+        half: i32,
+        width: i32,
+        stream: CUstream,
+    ) -> CUresult;
 }
