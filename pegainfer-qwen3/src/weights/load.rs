@@ -74,7 +74,8 @@ impl Qwen3Model {
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
         let mut config = Config::from_file(model_path)?;
-        let effective_vocab = pegainfer_core::decodable_vocab::decodable_vocab_width(model_path)?;
+        let effective_vocab =
+            pegainfer_frontend::decodable_vocab::decodable_vocab_width(model_path)?;
         anyhow::ensure!(
             effective_vocab <= config.vocab_size,
             "tokenizer defines ids up to {} but checkpoint vocab_size is {}",
@@ -82,7 +83,7 @@ impl Qwen3Model {
             config.vocab_size
         );
         config.decodable_vocab = effective_vocab;
-        config.logits_rows = pegainfer_core::decodable_vocab::aligned_logits_rows(
+        config.logits_rows = pegainfer_frontend::decodable_vocab::aligned_logits_rows(
             effective_vocab,
             config.vocab_size,
         );

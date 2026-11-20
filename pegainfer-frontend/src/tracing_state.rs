@@ -2,7 +2,7 @@
 //!
 //! The frontend and the model schedulers both need to know whether request
 //! tracing is on *before* doing any span work, so the check must live in this
-//! low-level contract crate that both depend on. `pegainfer-core::tracing` owns
+//! low-level contract crate that both depend on. [`crate::tracing`] owns
 //! the reporter and flips this flag once (and only once) a reporter is actually
 //! installed. When off, callers skip span creation entirely — fastrace is
 //! compiled with `enable`, so an unguarded `Span::root` would otherwise build

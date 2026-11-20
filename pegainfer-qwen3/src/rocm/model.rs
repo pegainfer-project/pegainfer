@@ -161,7 +161,7 @@ impl Model {
             "context exceeds the backend/checkpoint limit"
         );
         c.decodable_vocab =
-            pegainfer_core::decodable_vocab::decodable_vocab_width(path_str)?.min(c.vocab_size);
+            pegainfer_frontend::decodable_vocab::decodable_vocab_width(path_str)?.min(c.vocab_size);
         c.logits_rows = c.decodable_vocab;
         ensure!(c.decodable_vocab > 0, "empty decodable vocabulary");
         let (h, i, q, k) = (

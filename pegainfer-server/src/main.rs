@@ -25,8 +25,8 @@ use std::time::Instant;
 use anyhow::Context;
 use clap::FromArgMatches;
 use log::info;
-use pegainfer_core::logging;
 use pegainfer_frontend::engine::LaunchedEngine;
+use pegainfer_frontend::logging;
 use pegainfer_frontend::model_line::DetectError;
 use pegainfer_frontend::model_line::LaunchContext;
 use pegainfer_frontend::model_line::ModelLine;
@@ -163,7 +163,7 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
-    pegainfer_core::tracing::init();
+    pegainfer_frontend::tracing::init();
 
     let registry = ModelLineRegistry::new(model_lines());
     let cmd = registry.build_command(
@@ -312,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
     // Export the final batch of request spans before the runtime tears down.
     // Flush before propagating an error too — a failed server is exactly where
     // the last buffered spans matter. No-op when tracing was never enabled.
-    pegainfer_core::tracing::flush();
+    pegainfer_frontend::tracing::flush();
     serve_result?;
 
     Ok(())

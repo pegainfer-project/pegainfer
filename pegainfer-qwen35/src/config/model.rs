@@ -123,7 +123,8 @@ impl Config35 {
         let content = fs::read_to_string(&config_path)?;
         let raw: RawConfig = serde_json::from_str(&content)?;
         let mut config = Self::try_from(raw)?;
-        config.eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, config.vocab_size)?;
+        config.eos_token_ids =
+            pegainfer_frontend::eos::eos_token_ids(model_path, config.vocab_size)?;
         Ok(config)
     }
 
@@ -174,8 +175,10 @@ impl Config35 {
             });
         }
         self.decodable_vocab = effective_vocab;
-        self.selection_vocab =
-            pegainfer_core::decodable_vocab::aligned_logits_rows(effective_vocab, self.vocab_size);
+        self.selection_vocab = pegainfer_frontend::decodable_vocab::aligned_logits_rows(
+            effective_vocab,
+            self.vocab_size,
+        );
         Ok(())
     }
 }

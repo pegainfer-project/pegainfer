@@ -911,7 +911,7 @@ fn start_engine(
         )),
     );
 
-    let eos_token_ids = pegainfer_core::eos::eos_token_ids(model_path, GLM52_VOCAB)?;
+    let eos_token_ids = pegainfer_frontend::eos::eos_token_ids(model_path, GLM52_VOCAB)?;
     // Exactly-known VRAM that lands AFTER the workers' free-VRAM measurement
     // (post-FinishKv): the DeepEP/DeepGEMM buffers created in SetupComm, and
     // — when DSpark is on — the draft weights reserve plus its cap-scaled
