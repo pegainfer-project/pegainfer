@@ -18,12 +18,18 @@ use tokio_util::sync::CancellationToken;
 use vllm_chat::LoadModelBackendsOptions;
 use vllm_chat::load_model_backends;
 use vllm_engine_core_client::TransportMode;
+use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputBackend;
+use vllm_server::AccessLogConfig;
 use vllm_server::ApiServerOptions;
 use vllm_server::ChatTemplateContentFormatOption;
 use vllm_server::Config;
 use vllm_server::CoordinatorMode;
 use vllm_server::CorsConfig;
+use vllm_server::CustomHistogramBuckets;
 use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
+use vllm_server::DEFAULT_LOG_STATS_INTERVAL;
+use vllm_server::DefaultMmLoras;
+use vllm_server::FingerprintMode;
 use vllm_server::GenerationConfigMode;
 use vllm_server::HttpListenerMode;
 pub use vllm_server::ParserSelection;
@@ -289,7 +295,10 @@ where
     // failure it cancels the server so the error surfaces instead of hanging
     // in the registration wait.
     let server_shutdown = shutdown.child_token();
-    let bridge_shutdown = shutdown.child_token();
+    // The bridge outlives the server: the server drains its requests on
+    // shutdown and fails if the engine disconnects first, so the bridge stops
+    // only once the server returns.
+    let bridge_shutdown = CancellationToken::new();
     let engine_task = tokio::spawn({
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
@@ -451,24 +460,38 @@ where
         coordinator_mode: CoordinatorMode::None,
         model: model_id,
         revision: None,
+        tokenizer: None,
+        hf_config: None,
+        skip_tokenizer_init: false,
+        hf_token: None,
         hf_overrides: HfOverrides::default(),
         generation_config: GenerationConfigMode::Auto,
+        override_generation_config: serde_json::Map::new(),
         served_model_name,
         listener_mode: HttpListenerMode::BindTcp { host, port },
         tool_call_parser,
         reasoning_parser: ParserSelection::default(),
         tool_strict_level: None,
+        structured_outputs_backend: StructuredOutputBackend::default(),
         renderer: RendererSelection::default(),
         chat_template: None,
         default_chat_template_kwargs: None,
+        reasoning_effort_map: HashMap::new(),
+        // As in Python vLLM, a request that brings its own template is refused.
+        trust_request_chat_template: false,
+        exclude_tools_when_tool_choice_none: false,
         limit_mm_per_prompt: HashMap::new(),
+        mm_processor_kwargs: HashMap::new(),
         // Startup adapters go through the engine-side LoRA channel
         // (`load_startup_lora_modules`), never the upstream static loader.
         lora_modules: Vec::new(),
+        default_mm_loras: DefaultMmLoras::default(),
         chat_template_content_format: ChatTemplateContentFormatOption::default(),
         max_logprobs: None,
         language_model_only: true,
         cors: CorsConfig::default(),
+        access_log: AccessLogConfig::default(),
+        root_path: None,
         api_keys: Vec::new(),
         api_server_options: ApiServerOptions {
             enable_log_requests: true,
@@ -477,11 +500,18 @@ where
             enable_scale_out: false,
             enable_per_request_metrics: false,
             sse_keep_alive_interval: None,
+            ..ApiServerOptions::default()
         },
+        // The bridge reports no engine config hash to build one from.
+        fingerprint_mode: FingerprintMode::None,
         // Upstream ties the scheduler-stats and request-event metric recorders
         // to this flag, and the bridge's stats are what `/metrics` exports; the
         // periodic stats log line comes with it.
         disable_log_stats: false,
+        custom_histogram_buckets: CustomHistogramBuckets::default(),
+        log_stats_interval: Some(DEFAULT_LOG_STATS_INTERVAL),
+        disable_request_id_randomization: false,
+        keep_alive_on_engine_death: false,
         grpc_listener_mode: None,
         manages_engine: false,
         shutdown_timeout: Duration::from_secs(10),
@@ -509,9 +539,16 @@ where
     }
     let result = match engine_task.await {
         Ok(Ok(())) => result,
-        // Engine failed: the server saw a cancel and returned Ok — the engine
-        // error is the one worth reporting.
-        Ok(Err(engine_error)) => result.and(Err(engine_error)),
+        // Engine failed: the server either saw the cancel or failed on the
+        // engine's disconnect, so the engine error is the one worth reporting.
+        // A server that failed on its own leaves the bridge waiting for the
+        // cancel; its error is logged in case both failed.
+        Ok(Err(engine_error)) => {
+            if let Err(server_error) = &result {
+                warn!("the HTTP server failed too: {server_error:#}");
+            }
+            Err(engine_error)
+        }
         Err(join_error) => result.and(Err(anyhow::anyhow!(
             "engine startup task panicked: {join_error}"
         ))),

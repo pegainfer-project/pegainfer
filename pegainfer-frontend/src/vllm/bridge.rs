@@ -41,6 +41,7 @@ use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use vllm_engine_core_client::protocol::utility::UtilityOutput;
 use vllm_engine_core_client::protocol::utility::UtilityResultEnvelope;
@@ -185,19 +186,12 @@ impl LocalEngineBridge {
         streams: &mut HashMap<RequestTag, RequestStreamState>,
     ) -> Result<()> {
         let frames = message.into_vec();
-        if frames.len() != 2 {
-            bail!(
-                "expected 2 local engine request frames, got {}",
-                frames.len()
-            );
+        if is_add_request(&frames)? {
+            let request = EngineCoreRequest::from_frames(&frames[1..])?;
+            return self.start_request(request, event_tx, output_tx, streams);
         }
 
         match frames[0].as_ref() {
-            ty if ty == EngineCoreRequestType::Add.to_frame().as_ref() => {
-                let request: EngineCoreRequest =
-                    vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
-                self.start_request(request, event_tx, output_tx, streams)
-            }
             ty if ty == EngineCoreRequestType::Abort.to_frame().as_ref() => {
                 let request_ids: Vec<String> =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
@@ -249,8 +243,9 @@ impl LocalEngineBridge {
             sampling_params,
             ..
         } = request;
-        let Some(prompt_tokens) = prompt_token_ids else {
-            warn!("request {request_id} dropped: missing prompt_token_ids");
+        let Some(prompt_tokens) = prompt_token_ids.as_ref().and_then(WireNdArray::to_u32_vec)
+        else {
+            warn!("request {request_id} dropped: missing or non-integer prompt_token_ids");
             send_terminal_output(
                 self.engine_index,
                 output_tx,
@@ -623,14 +618,19 @@ fn spec_decode_delta(last: &SpecDecodeCounters, cur: &SpecDecodeCounters) -> Spe
         .map(|(cur_pos, last_pos)| cur_pos.saturating_sub(*last_pos))
         .take(cur.num_spec_tokens as usize)
         .collect();
+    let num_draft_tokens = cur.num_draft_tokens.saturating_sub(last.num_draft_tokens);
     SpecDecodingStats {
         num_spec_tokens: cur.num_spec_tokens,
         num_drafts: cur.num_drafts.saturating_sub(last.num_drafts),
-        num_draft_tokens: cur.num_draft_tokens.saturating_sub(last.num_draft_tokens),
+        num_draft_tokens,
         num_accepted_tokens: cur
             .num_accepted_tokens
             .saturating_sub(last.num_accepted_tokens),
         num_accepted_tokens_per_pos,
+        // Every drafted token runs in the verify forward. Drafted and verified
+        // counts per position are not tracked.
+        num_verified_tokens: num_draft_tokens,
+        ..SpecDecodingStats::default()
     }
 }
 
@@ -834,6 +834,15 @@ async fn connect_link(
         weight_transfer_backend: None,
         enable_sleep_mode: false,
         supports_draft_weight_updates: false,
+        vllm_config: None,
+        prefix_hash_config: None,
+        cache_config_info: None,
+        config_hash: None,
+        enable_expert_parallel: false,
+        // A line that cannot score prompts rejects the request itself.
+        supports_prompt_logprobs: true,
+        allow_missing_mm_embeddings: false,
+        max_mm_embeds_per_request: None,
     };
     info!(
         "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
@@ -981,6 +990,22 @@ fn send_utility_response(
     )
 }
 
+/// Whether `frames` is an add request, once its frame count checks out. An add
+/// request carries arrays of 256 bytes or more (a prompt of 64 tokens or more)
+/// in aux frames after its payload; every other request is one payload frame.
+fn is_add_request<B: AsRef<[u8]>>(frames: &[B]) -> Result<bool> {
+    let is_add = frames
+        .first()
+        .is_some_and(|ty| ty.as_ref() == EngineCoreRequestType::Add.to_frame().as_ref());
+    if frames.len() < 2 || (!is_add && frames.len() != 2) {
+        bail!(
+            "expected 2 local engine request frames, got {}",
+            frames.len()
+        );
+    }
+    Ok(is_add)
+}
+
 fn send_outputs(
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     outputs: EngineCoreOutputs,
@@ -1019,6 +1044,7 @@ fn engine_output(
         spec_decode_metrics: None,
         prompt_token_id_logprobs: None,
         error: None,
+        watermarking: None,
     }
 }
 

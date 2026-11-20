@@ -34,8 +34,11 @@ fn try_load_tokenizer(model_path: &str) -> Result<DynTokenizer> {
         })?
         .block_on(ResolvedModelFiles::new(model_path, None))?;
     match &files.tokenizer {
-        TokenizerSource::HuggingFace(path) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
-        TokenizerSource::Tiktoken(path) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),
-        TokenizerSource::Tekken(path) => Ok(Arc::new(TekkenTokenizer::new(path)?)),
+        Some(TokenizerSource::HuggingFace(path)) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
+        Some(TokenizerSource::Tiktoken(path)) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),
+        Some(TokenizerSource::Tekken(path)) => Ok(Arc::new(TekkenTokenizer::new(path)?)),
+        None => Err(Error::Tokenizer(format!(
+            "{model_path} has no tokenizer files"
+        ))),
     }
 }

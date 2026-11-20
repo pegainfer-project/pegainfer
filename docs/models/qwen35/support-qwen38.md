@@ -22,7 +22,7 @@
 > calls round-trip streaming and non-streaming), and the TP2 short/long
 > logits rows are recorded below. Tracked in #1067.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 ## What the checkpoint actually is
 
@@ -140,25 +140,20 @@ verbatim unless the template itself refuses it.
 
 Measured against the checkpoint's own template (`pegainfer-sim` pointed at the
 27B directory, CPU only). `none`, `low`, `medium` and `xhigh` pass through
-untouched, and a request with no top-level field is not modified at all. Two
-caller-supplied template controls are deliberately **not** rewritten. An
-explicit `chat_template_kwargs.reasoning_effort` is the caller addressing the
-template directly. A per-request `chat_template` override renders with a
-template the startup probe never measured, so the probed verdict has no
-authority over it — rewriting `high` → `xhigh` for an override that accepts
-`high` and rejects `xhigh` turns a working request into a render failure. In
-both cases a value outside the addressed template's vocabulary still fails the
-render there: the layer rewrites the API field, not the template contract.
+untouched, and a request with no top-level field is not modified at all. An
+explicit `chat_template_kwargs.reasoning_effort` is deliberately **not**
+rewritten: it is the caller addressing the template directly, so a value
+outside the template's vocabulary still fails the render there. The layer
+rewrites the API field, not the template contract. A request that brings its
+own `chat_template` is refused with a 400, since the server does not trust
+request templates.
 
 Render parity against the checkpoint's HF reference is a one-shot record:
 seven cases byte-identical at revision `1d4bf0f2`. No checked-in suite
 compares against the vendored renderer; after a `vllm-chat` rev bump,
 re-verify by diffing renders against HF `apply_chat_template` by hand. The
 HTTP path is covered by the sim e2e
-`reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary` and
-`a_per_request_chat_template_override_keeps_its_own_effort_vocabulary` (an
-override whose vocabulary is the inverse of the default's, with the override's
-rejection of the rewritten value as the control), and by the
+`reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary` and by the
 `reasoning_effort.rs` unit tests (probe arming, the bodies that must come
 back verbatim, body-read error categories).
 
@@ -316,9 +311,8 @@ One environment trap, not guarded in code:
    replays CUDA Graphs like 4B/9B (see `docs/models/qwen35/tp-design.md`).
 4. **`reasoning_effort` the layer does not own is still raw** — the
    normalization layer rewrites the API field against the default template
-   only; a caller addressing the template directly, through
-   `chat_template_kwargs` or a per-request `chat_template` override, gets that
-   template's own rejection (and, at the pinned `vllm-chat` rev, a 500 rather
+   only; a caller addressing the template directly through
+   `chat_template_kwargs` gets that template's own rejection (and, at the pinned `vllm-chat` rev, a 500 rather
    than a 400, because `raise_exception` is not registered there). Registering
    it and carrying an intentional template rejection as a typed request error
    is a `vllm-chat` change — a fork or an upstream PR plus a rev bump — not

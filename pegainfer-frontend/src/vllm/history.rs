@@ -381,6 +381,7 @@ fn probe_request(
         data_parallel_rank: None,
         session_id: None,
         lora_request: None,
+        return_prompt_text: false,
     }
 }
 

@@ -34,6 +34,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
 use zeromq::ZmqMessage;
 use zeromq::prelude::SocketRecv;
@@ -42,6 +43,7 @@ use super::BridgeLink;
 use super::StatsTracker;
 use super::connect_link;
 use super::engine_output;
+use super::is_add_request;
 use super::now_secs_f64;
 use super::send_outputs;
 use super::send_terminal_output;
@@ -276,19 +278,12 @@ impl SteppedEngineBridge {
         >,
     ) -> Result<()> {
         let frames = message.into_vec();
-        if frames.len() != 2 {
-            bail!(
-                "expected 2 local engine request frames, got {}",
-                frames.len()
-            );
+        if is_add_request(&frames)? {
+            let request = EngineCoreRequest::from_frames(&frames[1..])?;
+            return self.start_request(request, streams, names, output_tx);
         }
 
         match frames[0].as_ref() {
-            ty if ty == EngineCoreRequestType::Add.to_frame().as_ref() => {
-                let request: EngineCoreRequest =
-                    vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
-                self.start_request(request, streams, names, output_tx)
-            }
             ty if ty == EngineCoreRequestType::Abort.to_frame().as_ref() => {
                 let request_ids: Vec<String> =
                     vllm_engine_core_client::protocol::decode_msgpack(&frames[1])?;
@@ -334,8 +329,9 @@ impl SteppedEngineBridge {
             sampling_params,
             ..
         } = request;
-        let Some(prompt_tokens) = prompt_token_ids else {
-            warn!("request {request_id} dropped: missing prompt_token_ids");
+        let Some(prompt_tokens) = prompt_token_ids.as_ref().and_then(WireNdArray::to_u32_vec)
+        else {
+            warn!("request {request_id} dropped: missing or non-integer prompt_token_ids");
             return send_terminal_output(
                 self.engine_index,
                 output_tx,
@@ -799,7 +795,7 @@ mod tests {
         params.prompt_logprobs = prompt;
         EngineCoreRequest {
             request_id: "logprobs".into(),
-            prompt_token_ids: Some(vec![9, 8]),
+            prompt_token_ids: Some(vec![9, 8].into()),
             sampling_params: Some(params),
             ..Default::default()
         }
