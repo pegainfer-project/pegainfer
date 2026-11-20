@@ -22,7 +22,7 @@
 > calls round-trip streaming and non-streaming), and the TP2 short/long
 > logits rows are recorded below. Tracked in #1067.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 ## What the checkpoint actually is
 
@@ -153,10 +153,7 @@ seven cases byte-identical at revision `1d4bf0f2`. No checked-in suite
 compares against the vendored renderer; after a `vllm-chat` rev bump,
 re-verify by diffing renders against HF `apply_chat_template` by hand. The
 HTTP path is covered by the sim e2e
-`reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary` and
-`a_per_request_chat_template_override_keeps_its_own_effort_vocabulary` (an
-override whose vocabulary is the inverse of the default's, with the override's
-rejection of the rewritten value as the control), and by the
+`reasoning_effort_extremes_are_mapped_onto_the_templates_vocabulary` and by the
 `reasoning_effort.rs` unit tests (probe arming, the bodies that must come
 back verbatim, body-read error categories).
 
