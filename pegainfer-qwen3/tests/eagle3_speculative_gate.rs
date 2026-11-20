@@ -14,7 +14,6 @@
 //! `PEGAINFER_EAGLE3_TEST_MODEL_PATH` (drafter); the tests skip when either is
 //! absent. The two engines run one after the other so only one target is
 //! resident at a time.
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use std::path::PathBuf;

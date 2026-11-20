@@ -4,9 +4,10 @@ use std::ffi::c_void;
 use anyhow::Result;
 use anyhow::ensure;
 use half::bf16;
-use pegainfer_device::Buffer;
-use pegainfer_device::Device;
-use pegainfer_device::DeviceRepr;
+
+use crate::device::Buffer;
+use crate::device::Device;
+use crate::device::DeviceRepr;
 unsafe extern "C" {
     fn pgi_embedding(
         d: *mut c_void,

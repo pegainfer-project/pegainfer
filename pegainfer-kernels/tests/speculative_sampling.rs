@@ -1,5 +1,4 @@
 //! Sparse proposal verification, including the target sampler's filter order.
-#![cfg(feature = "cuda")]
 
 use anyhow::Result;
 use half::bf16;

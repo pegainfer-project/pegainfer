@@ -30,10 +30,10 @@ struct RocmArgs {
 }
 impl ModelLine for RocmQwen3Line {
     fn name(&self) -> &'static str {
-        "Qwen3"
+        "Qwen3 ROCm"
     }
     fn probe(&self, value: &serde_json::Value) -> Result<(), String> {
-        crate::config::probe_config_json(value).map_err(|e| e.to_string())
+        super::config::probe_config_json(value).map_err(|e| e.to_string())
     }
     fn augment_cli(&self, cmd: clap::Command) -> clap::Command {
         <RocmArgs as clap::Args>::augment_args(cmd)

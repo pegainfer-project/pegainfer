@@ -1,6 +1,5 @@
 //! DFlash2's context window is fixed at the anchor for the entire draft block.
 //! Every query sees that context and all draft slots, including future slots.
-#![cfg(feature = "cuda")]
 
 mod common;
 

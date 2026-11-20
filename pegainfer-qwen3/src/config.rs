@@ -166,7 +166,7 @@ struct RopeParameters {
 }
 
 fn default_selector_top_k() -> usize {
-    pegainfer_kernels::DFLASH2_CANDIDATE_K
+    pegainfer_kernels::ops::DFLASH2_CANDIDATE_K
 }
 
 fn default_markov_head_type() -> String {
@@ -316,7 +316,6 @@ impl Config {
             config.num_attention_heads,
             config.num_key_value_heads,
         );
-        #[cfg(feature = "cuda")]
         if !config.decode_group_is_compiled() {
             log::warn!(
                 "Qwen3 GQA group {}/{} has no compiled decode kernel; decode runs eager \
@@ -331,7 +330,6 @@ impl Config {
     }
 
     /// GQA ratio is TP-invariant, so the global head counts match the per-rank ones.
-    #[cfg(feature = "cuda")]
     pub(crate) fn decode_group_is_compiled(&self) -> bool {
         pegainfer_core::ops::SUPPORTED_GQA_GROUP_SIZES
             .contains(&(self.num_attention_heads / self.num_key_value_heads))
@@ -1313,7 +1311,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda")]
     fn dspine_checkpoints_are_refused_before_the_target_loads() {
         let directory = tempfile::tempdir().expect("temp dir");
         fs::write(directory.path().join("config.json"), DSPINE_8B_CONFIG).expect("write config");

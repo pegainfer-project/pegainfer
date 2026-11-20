@@ -3647,15 +3647,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pegainfer-device"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "half",
- "pegainfer-build",
-]
-
-[[package]]
 name = "pegainfer-frontend"
 version = "0.1.0"
 dependencies = [
@@ -3766,12 +3757,10 @@ dependencies = [
  "libc",
  "log",
  "pegainfer-build",
- "pegainfer-device",
  "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "tempfile",
  "tvm-ffi",
 ]
 
@@ -3857,11 +3846,9 @@ dependencies = [
  "half",
  "hex",
  "log",
- "memmap2",
  "pegainfer-bench",
  "pegainfer-core",
  "pegainfer-cupti",
- "pegainfer-device",
  "pegainfer-frontend",
  "pegainfer-kernels",
  "pegainfer-kv-cache",
@@ -3927,6 +3914,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-rocm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "log",
+ "memmap2",
+ "pegainfer-build",
+ "pegainfer-frontend",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pegainfer-sample"
 version = "0.1.0"
 dependencies = [
@@ -3945,7 +3950,6 @@ dependencies = [
  "anyhow",
  "clap",
  "log",
- "pegainfer-core",
  "pegainfer-deepseek-v2-lite",
  "pegainfer-frontend",
  "pegainfer-gemma4",
@@ -3955,6 +3959,7 @@ dependencies = [
  "pegainfer-qwen3",
  "pegainfer-qwen35",
  "pegainfer-qwen4",
+ "pegainfer-rocm",
  "serde_json",
  "tikv-jemallocator",
  "tokio",

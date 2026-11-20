@@ -6,7 +6,6 @@
 //! Manual gate: CI compiles this but never runs it. Run on a GPU box with
 //! PEGAINFER_REQUIRE_GPU=1, which turns a missing device into a failure rather
 //! than a skip.
-#![cfg(feature = "cuda")]
 
 mod common;
 

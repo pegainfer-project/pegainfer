@@ -6,7 +6,7 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
-cudarc = { workspace = true, optional = true }
+cudarc = { workspace = true }
 half = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
@@ -19,14 +19,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [features]
-default = ["cuda"]
-cuda = ["dep:cudarc", "pegainfer-kernels/cuda"]
-rocm = ["pegainfer-kernels/rocm"]
+default = []
 kernel-call-trace = []
 
 [lints]
 workspace = true
-
-[[test]]
-name = "weight_loader_gpu"
-required-features = ["cuda"]

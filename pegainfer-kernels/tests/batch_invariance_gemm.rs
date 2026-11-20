@@ -7,7 +7,6 @@
 //!
 //!   PEGAINFER_BI_REPS=8 cargo test --release -p pegainfer-kernels \
 //!     --test batch_invariance_gemm -- --nocapture --test-threads=1
-#![cfg(feature = "cuda")]
 
 use half::bf16;
 use pegainfer_kernels::ops::GEMM_LT_MAX_N;

@@ -3,23 +3,6 @@
 //! its model crate; this file only wires detection, CLI validation, and the
 //! serve path selection together.
 
-#[cfg(all(
-    feature = "rocm",
-    any(
-        feature = "cuda",
-        feature = "qwen35",
-        feature = "qwen4",
-        feature = "gemma4",
-        feature = "glm52",
-        feature = "k3",
-        feature = "kimi-k2",
-        feature = "deepseek-v2-lite"
-    )
-))]
-compile_error!(
-    "the ROCm first release supports only qwen3; disable default features and select rocm,qwen3"
-);
-
 use std::time::Instant;
 
 use anyhow::Context;
@@ -56,6 +39,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_qwen35::model_line::MODEL_LINE,
         #[cfg(feature = "qwen4")]
         &pegainfer_qwen4::model_line::MODEL_LINE,
+        #[cfg(feature = "rocm")]
+        &pegainfer_rocm::qwen3::model_line::MODEL_LINE,
     ]
 }
 

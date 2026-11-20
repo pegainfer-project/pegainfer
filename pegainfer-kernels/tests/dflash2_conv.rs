@@ -1,5 +1,4 @@
 //! Native conv arithmetic and request-boundary isolation against a BF16 oracle.
-#![cfg(feature = "cuda")]
 
 use anyhow::Result;
 use half::bf16;

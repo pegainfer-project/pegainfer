@@ -1,7 +1,6 @@
 //! Drives decode at GQA group 7 (56/8) — unsupported even if group 5 is added
 //! for Qwen3-14B — and asserts the FlashInfer throw surfaces as the -1
 //! sentinel plus a message. Before the guard this aborted the whole process.
-#![cfg(feature = "cuda")]
 
 use std::ffi::CStr;
 use std::ffi::c_void;

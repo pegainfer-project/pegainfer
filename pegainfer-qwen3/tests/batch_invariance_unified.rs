@@ -1,6 +1,5 @@
 //! Single-GPU gate: a decode row's output must be bit-identical across co-batched prefill lengths
 //! (GEMM-N) and across the pure-decode and unified paths, under Pin and PerToken.
-#![cfg(feature = "cuda")]
 use std::sync::Mutex;
 
 use pegainfer_frontend::sampler::SamplingParams;

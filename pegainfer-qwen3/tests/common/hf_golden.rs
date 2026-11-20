@@ -1,6 +1,6 @@
 //! The committed Qwen3 HF golden fixtures and the bounds every backend's gate
-//! holds them to. Shared by `hf_golden_gate` (CUDA) and `rocm_golden` (ROCm),
-//! each of which uses a subset.
+//! holds them to. Shared by `hf_golden_gate` (CUDA) and the `golden` test of
+//! `pegainfer-rocm`, which includes this file by path; each uses a subset.
 #![allow(dead_code)]
 
 use safetensors::Dtype;

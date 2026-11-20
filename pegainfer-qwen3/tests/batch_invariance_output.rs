@@ -5,7 +5,6 @@
 //! assignment is gated in the scheduler's unit tests, which read the assignment itself.
 //!
 //! Needs one CUDA GPU, `PEGAINFER_TEST_MODEL_PATH`, and `--test-threads=1`.
-#![cfg(feature = "cuda")]
 
 use std::collections::HashMap;
 use std::collections::HashSet;

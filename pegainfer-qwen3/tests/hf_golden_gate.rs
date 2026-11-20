@@ -51,7 +51,6 @@
 //! Requires a CUDA GPU and Qwen3 weights of a keyed size; skips cleanly when the
 //! model is absent (point `PEGAINFER_TEST_MODEL_PATH` at the weights to run it).
 //! The TP pass skips on single-GPU hosts.
-#![cfg(feature = "cuda")]
 #[path = "common/hf_golden.rs"]
 mod hf_golden;
 

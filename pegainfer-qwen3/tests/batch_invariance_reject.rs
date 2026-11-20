@@ -1,6 +1,5 @@
 //! Builder-boundary tests for unsupported `--batch-invariant` combinations. They call the public
 //! `start_engine_*` entry points, so they also cover guard wiring.
-#![cfg(feature = "cuda")]
 
 use std::path::Path;
 use std::sync::Mutex;

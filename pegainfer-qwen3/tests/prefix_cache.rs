@@ -21,7 +21,6 @@
 //!
 //! Requires a CUDA GPU and Qwen3-4B weights; skips cleanly when absent
 //! (point `PEGAINFER_TEST_MODEL_PATH` at the weights to run it).
-#![cfg(feature = "cuda")]
 
 use std::collections::HashMap;
 use std::path::Path;

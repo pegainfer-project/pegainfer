@@ -6,15 +6,13 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
-cudarc = { workspace = true, optional = true }
-pegainfer-device = { workspace = true, optional = true, features = ["rocm"] }
+cudarc = { workspace = true }
 half = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
 tvm-ffi = { version = "0.1.0-alpha.0", optional = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 # RLIMIT_FSIZE, to produce a real short write in the algo-store test.
 libc = { workspace = true }
 # Golden-fixture gates under this crate: the Qwen3.8-Flash-Next QSA indexer
@@ -31,9 +29,7 @@ cc = { workspace = true }
 pegainfer-build = { workspace = true }
 
 [features]
-default = ["cuda"]
-cuda = ["dep:cudarc"]
-rocm = ["dep:pegainfer-device"]
+default = []
 tvm-ffi-triton-cubin = ["dep:tvm-ffi", "qwen35"]
 # Qwen3.5 Triton AOT kernels (GDR chunkwise prefill) — the only feature that
 # needs Python + Triton at build time.
@@ -68,11 +64,7 @@ required-features = ["gemma4"]
 
 [[test]]
 name = "grouped_rmsnorm_equivalence"
-required-features = ["cuda", "qwen4"]
-
-[[test]]
-name = "rocm_contract"
-required-features = ["rocm"]
+required-features = ["qwen4"]
 
 [lints]
 workspace = true
