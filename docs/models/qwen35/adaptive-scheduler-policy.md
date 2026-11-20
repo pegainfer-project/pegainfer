@@ -6,9 +6,11 @@
 > instead of silently downgrading to `off`. With `--decode-overlap stream`,
 > `auto` keeps prefill running through the finishing window (the overlapped
 > chunk no longer stalls decode), trading a redundant QPS16 TPOT win for 31%
-> TTFT and 14% throughput at an unchanged tail.
+> TTFT and 14% throughput at an unchanged tail. The default per-step budget is
+> 4096 rows; once 16 decoders are live the step is capped to 1024 rows so a
+> packed prefill step stops landing on the whole batch's inter-token gap.
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-11
 
 ## Preparation
 
@@ -37,8 +39,9 @@
 - Added `Qwen35SchedulerPolicy::{Auto, Off}` in `pegainfer-qwen35`, defaulting existing Qwen3.5 launch paths to `Off`.
 - Added `choose_prefill_budget(...)` in `scheduler/plan.rs` so the adaptive decision is unit-testable outside the GPU loop.
 - Policy rules:
-  - `Off` preserves the fixed base prefill budget.
-  - No active decode or no in-flight prefill keeps the fixed budget.
+  - `Off` disables the decode-priority finishing tick; the busy-decode cap below applies to every policy.
+  - No active decode or no in-flight prefill keeps the configured budget.
+  - At 16 or more live decoders the step is capped to 1024 prompt rows (`BUSY_PREFILL_BUDGET`); below it the default 4096-row budget carries four standard prompts in one step. The A100 diagnostic on 2026-11-14 showed the cap at 32 still let four 4096-row steps run against 16–31 live decoders, each stalling 222–256 ms and pushing QPS16 ITL p99 to 232.7 ms; at 16 the packed step stops before the batch is wide enough for that stall to reach the tail.
   - Active requests with at most 4 tokens remaining get one decode-priority tick before the FIFO-front prefill continues.
   - With `--decode-overlap stream` the finishing-window deferral is disabled: the overlapped chunk already runs off the decode step, so deferring only delays prefill. Measured on A100-40GB, single run (1024/128 QPS16): TTFT `1828 → 1264 ms`, output throughput `873 → 992 tok/s`, ITL p99 unchanged (`41.7 ms`), TPOT back to vLLM parity (`23.8 vs 23.6 ms`); see #727.
   - `Auto` never returns more than the configured base budget; `--max-prefill-tokens` stays a hard per-step cap.

@@ -33,8 +33,9 @@ struct Qwen35Cli {
     #[arg(long)]
     max_batch: Option<usize>,
 
-    /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; `auto` is
-    /// opt-in and currently single-GPU only.
+    /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; the prefill
+    /// step is capped to 1024 tokens once 16 decodes are live, and `auto` adds
+    /// a decode-priority finishing tick. `auto` is currently single-GPU only.
     #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
     qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
 
