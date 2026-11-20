@@ -541,9 +541,11 @@ where
         Ok(Ok(())) => result,
         // Engine failed: the server either saw the cancel or failed on the
         // engine's disconnect, so the engine error is the one worth reporting.
+        // A server that failed on its own leaves the bridge waiting for the
+        // cancel; its error is logged in case both failed.
         Ok(Err(engine_error)) => {
             if let Err(server_error) = &result {
-                warn!("HTTP server stopped after the engine failed: {server_error:#}");
+                warn!("the HTTP server failed too: {server_error:#}");
             }
             Err(engine_error)
         }
