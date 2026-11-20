@@ -135,13 +135,28 @@ Under TP the configured budget applies to each rank. Every rank must allocate th
 
 ## Cache ownership and pinning
 
-`Qwen35PrefixCache` owns the full-attention KV manager and the joint-entry directory. Physical snapshot stores are separate so TP can use one metadata decision with identical slot numbers on every rank:
+`Qwen35PrefixCache` owns the full-attention KV manager and the joint-entry
+store. The store owns the directory on every backend, and the physical GPU
+slots on the single-GPU backend:
+
+- **Single GPU:** `RecurrentSnapshotStore::new_gpu` owns the directory and the
+  `RecurrentStateStore`; save and restore copy through those slots.
+- **TP:** the controller uses `RecurrentSnapshotStore::new_directory` (metadata
+  only), while each worker keeps its own `RecurrentStateStore`. The controller's
+  slot decision is broadcast, so every rank uses the same slot number.
+- **Host tier (step 2):** the store will also own the pinned host slab; this
+  first step keeps `host_slots = 0`.
 
 ```rust
 struct Qwen35PrefixCache {
     kv: KvCacheManager,
-    snapshots: SnapshotCache,
+    snapshots: RecurrentSnapshotStore,
     stats: PrefixCacheStats,
+}
+
+struct RecurrentSnapshotStore {
+    cache: SnapshotCache,                // directory, every backend
+    slots: Option<RecurrentStateStore>,  // Some on single-GPU, None on TP controller
 }
 
 struct SnapshotCache {

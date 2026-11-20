@@ -199,7 +199,7 @@ impl SnapshotReservation {
         self.recurrent_slot
     }
 
-    pub(crate) fn was_replacement(self) -> bool {
+    fn was_replacement(self) -> bool {
         self.replaced
     }
 }
@@ -221,10 +221,6 @@ impl RecurrentStateStore {
             slots.push(RecurrentState::new(ctx, config, geometry)?);
         }
         Ok(Self { slots })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
     }
 
     pub(crate) fn save(
@@ -279,7 +275,6 @@ impl RecurrentSnapshotStore {
         slot_count: usize,
     ) -> Result<Self> {
         let slots = RecurrentStateStore::new(ctx, config, geometry, slot_count)?;
-        debug_assert_eq!(slots.len(), slot_count);
         Ok(Self {
             cache: SnapshotCache::new(slot_count),
             slots: Some(slots),
@@ -323,7 +318,7 @@ impl RecurrentSnapshotStore {
         let slots = self
             .slots
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("snapshot store has no GPU slots"))?;
+            .expect("snapshot store has no GPU slots; directory-only stores cannot save");
         slots.save(ctx, reservation.recurrent_slot(), src)
     }
 
@@ -336,7 +331,7 @@ impl RecurrentSnapshotStore {
         let slots = self
             .slots
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("snapshot store has no GPU slots"))?;
+            .expect("snapshot store has no GPU slots; directory-only stores cannot restore");
         slots.restore(ctx, guard.recurrent_slot(), dst)
     }
 }
@@ -613,6 +608,11 @@ impl Qwen35PrefixCache {
     /// Copy the request's recurrent/conv state into the store and publish the
     /// reservation. Single-GPU callers use this instead of a separate
     /// `RecurrentStateStore`.
+    ///
+    /// TP keeps the worker-local save plus the controller-side
+    /// `publish_snapshot` because the copy crosses the worker/controller
+    /// boundary. Step 2 should route both shapes through this store rather
+    /// than growing a third copy of the transaction.
     pub(crate) fn save_and_publish_snapshot(
         &mut self,
         ctx: &DeviceContext,
@@ -699,8 +699,12 @@ fn eligible_boundaries(resident_tokens: usize, stride: usize) -> impl Iterator<I
 
 #[cfg(test)]
 mod tests {
+    use super::Config35;
+    use super::DeviceContext;
+    use super::LocalGeometry;
     use super::PrefixBoundaryKey;
     use super::RecurrentSnapshotStore;
+    use super::RecurrentState;
     use super::eligible_boundaries;
 
     fn key(tag: u8) -> PrefixBoundaryKey {
@@ -794,5 +798,65 @@ mod tests {
         assert!(state.reserve(key(2)).is_none());
         drop(guard);
         assert!(state.reserve(key(2)).is_some());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and a Qwen3.5 model directory (PEGAINFER_TEST_MODEL_PATH)"]
+    fn gpu_snapshot_store_round_trips_recurrent_state() {
+        let Some(model_path) = crate::test_fixture::model_path_or_skip(
+            "gpu_snapshot_store_round_trips_recurrent_state",
+        ) else {
+            return;
+        };
+        let ctx = DeviceContext::new_with_device(0).expect("create CUDA context");
+        let config = Config35::from_file(&model_path).expect("load Qwen3.5 config");
+        let geometry =
+            LocalGeometry::try_new(&config, Default::default()).expect("derive local geometry");
+
+        let mut store =
+            RecurrentSnapshotStore::new_gpu(&ctx, &config, geometry, 1).expect("create store");
+        let mut src = RecurrentState::new(&ctx, &config, geometry).expect("allocate source");
+        src.seq_len = 256;
+
+        let state_len = geometry.local_linear_num_value_heads()
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_len = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+        let host_state: Vec<f32> = (0..state_len).map(|i| i as f32 * 0.25 + 1.0).collect();
+        let host_conv: Vec<half::bf16> = (0..conv_len)
+            .map(|i| half::bf16::from_f32(i as f32 * 0.5 - 3.0))
+            .collect();
+        ctx.stream
+            .memcpy_htod(&host_state, &mut src.layers[0].state)
+            .expect("fill recurrent state");
+        ctx.stream
+            .memcpy_htod(&host_conv, &mut src.layers[0].conv_state.data)
+            .expect("fill conv state");
+
+        let key = PrefixBoundaryKey {
+            sequence_hash: [7; 16],
+            boundary_tokens: 256,
+        };
+        let reservation = store.reserve(key).expect("empty store must reserve");
+        store.save(&ctx, reservation, &src).expect("save snapshot");
+        store.publish(reservation);
+        assert!(store.contains(key));
+
+        let guard = store.lookup(key).expect("published key must be found");
+        let mut restored = RecurrentState::new(&ctx, &config, geometry).expect("allocate restore");
+        store
+            .restore_into(&ctx, &guard, &mut restored)
+            .expect("restore snapshot");
+        assert_eq!(restored.seq_len, src.seq_len);
+        let restored_state = ctx
+            .stream
+            .clone_dtoh(&restored.layers[0].state)
+            .expect("read restored recurrent state");
+        let restored_conv = ctx
+            .stream
+            .clone_dtoh(&restored.layers[0].conv_state.data)
+            .expect("read restored conv state");
+        assert_eq!(restored_state, host_state);
+        assert_eq!(restored_conv, host_conv);
     }
 }
