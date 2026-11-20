@@ -7,7 +7,6 @@ use crate::tp_executor::TpBeginRequestError;
 pub(super) struct SingleGpuBackend {
     pub(super) model: Qwen35Model,
     pub(super) kv_cache: Qwen35PrefixCache,
-    recurrent_store: RecurrentStateStore,
     graph_state: BatchDecodeGraphState,
     prefill_stream: Option<Arc<CudaStream>>,
 }
@@ -181,15 +180,11 @@ impl SingleGpuBackend {
                 rec.seq_len
             );
             if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
-                if let Err(error) = self.recurrent_store.save(
+                self.kv_cache.save_and_publish_snapshot(
                     self.model.device_ctx(),
-                    reservation.recurrent_slot(),
+                    reservation,
                     rec,
-                ) {
-                    self.kv_cache.abort_snapshot(reservation);
-                    return Err(error);
-                }
-                self.kv_cache.publish_snapshot(reservation);
+                )?;
             }
         }
         Ok(())
@@ -234,14 +229,13 @@ impl SingleGpuBackend {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
         let manager =
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
-        let kv_cache = Qwen35PrefixCache::new(manager, model.prefix_snapshot_slots())?;
-        let recurrent_store = RecurrentStateStore::new(
+        let snapshots = RecurrentSnapshotStore::new_gpu(
             model.device_ctx(),
             model.config(),
             model.geometry,
             model.prefix_snapshot_slots(),
         )?;
-        debug_assert_eq!(recurrent_store.len(), kv_cache.snapshot_slots());
+        let kv_cache = Qwen35PrefixCache::new_with_store(manager, snapshots)?;
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
         let graph_state = model.create_batch_decode_graph_state_with_capacity(
             graph_capacity,
@@ -260,7 +254,6 @@ impl SingleGpuBackend {
         Ok(Self {
             model,
             kv_cache,
-            recurrent_store,
             graph_state,
             prefill_stream,
         })
@@ -321,11 +314,10 @@ impl SingleGpuBackend {
             )
             .map_err(AdmissionError::Recoverable)?;
         let cached_tokens = if let Some(restore) = restore {
-            if let Err(error) = self.recurrent_store.restore(
-                self.model.device_ctx(),
-                restore.recurrent_slot(),
-                &mut rec,
-            ) {
+            if let Err(error) =
+                self.kv_cache
+                    .restore_snapshot(self.model.device_ctx(), &restore, &mut rec)
+            {
                 let _ = self.kv_cache.release_request(&mut kv);
                 return Err(AdmissionError::Recoverable(error));
             }

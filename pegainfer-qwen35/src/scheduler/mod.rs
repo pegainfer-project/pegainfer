@@ -84,7 +84,7 @@ use crate::executor::PrefillResult;
 use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::prefix_cache::Qwen35PrefixCache;
-use crate::prefix_cache::RecurrentStateStore;
+use crate::prefix_cache::RecurrentSnapshotStore;
 use crate::recurrent_state::RecurrentState;
 use crate::tp_executor::DropExpectation;
 use crate::tp_executor::Qwen35TpExecutor;

@@ -199,7 +199,7 @@ impl SnapshotReservation {
         self.recurrent_slot
     }
 
-    fn was_replacement(self) -> bool {
+    pub(crate) fn was_replacement(self) -> bool {
         self.replaced
     }
 }
@@ -254,13 +254,100 @@ impl RecurrentStateStore {
     }
 }
 
+/// Owns the recurrent/conv snapshot directory and, on a single-GPU backend,
+/// the physical GPU slots. The TP controller builds a directory-only store;
+/// each TP worker keeps its own `RecurrentStateStore`.
+pub(crate) struct RecurrentSnapshotStore {
+    cache: SnapshotCache,
+    slots: Option<RecurrentStateStore>,
+}
+
+impl RecurrentSnapshotStore {
+    /// Directory only: no physical slots (TP controller, zero-budget builds).
+    pub(crate) fn new_directory(slot_count: usize) -> Self {
+        Self {
+            cache: SnapshotCache::new(slot_count),
+            slots: None,
+        }
+    }
+
+    /// Directory plus GPU-resident physical slots (single-GPU backend).
+    pub(crate) fn new_gpu(
+        ctx: &DeviceContext,
+        config: &Config35,
+        geometry: LocalGeometry,
+        slot_count: usize,
+    ) -> Result<Self> {
+        let slots = RecurrentStateStore::new(ctx, config, geometry, slot_count)?;
+        debug_assert_eq!(slots.len(), slot_count);
+        Ok(Self {
+            cache: SnapshotCache::new(slot_count),
+            slots: Some(slots),
+        })
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.cache.capacity()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub(crate) fn contains(&self, key: PrefixBoundaryKey) -> bool {
+        self.cache.contains(key)
+    }
+
+    pub(crate) fn lookup(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotGuard> {
+        self.cache.lookup(key)
+    }
+
+    pub(crate) fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
+        self.cache.reserve(key)
+    }
+
+    pub(crate) fn publish(&mut self, reservation: SnapshotReservation) {
+        self.cache.publish(reservation);
+    }
+
+    pub(crate) fn abort(&mut self, reservation: SnapshotReservation) {
+        self.cache.abort(reservation);
+    }
+
+    pub(crate) fn save(
+        &mut self,
+        ctx: &DeviceContext,
+        reservation: SnapshotReservation,
+        src: &RecurrentState,
+    ) -> Result<()> {
+        let slots = self
+            .slots
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("snapshot store has no GPU slots"))?;
+        slots.save(ctx, reservation.recurrent_slot(), src)
+    }
+
+    pub(crate) fn restore_into(
+        &self,
+        ctx: &DeviceContext,
+        guard: &SnapshotGuard,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        let slots = self
+            .slots
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot store has no GPU slots"))?;
+        slots.restore(ctx, guard.recurrent_slot(), dst)
+    }
+}
+
 /// The only Qwen3.5 scheduler interface allowed to reconcile paged KV with
 /// recurrent/conv state.
 pub(crate) struct Qwen35PrefixCache {
     /// Logical block pool paired with the full-attention GPU KV buffer.
     kv: KvCacheManager,
     /// Prefix key, slot, pin, and LRU state for reusable entries.
-    snapshots: SnapshotCache,
+    snapshots: RecurrentSnapshotStore,
     /// Scheduler-thread-owned cumulative metrics.
     stats: PrefixCacheStats,
 }
@@ -268,6 +355,14 @@ pub(crate) struct Qwen35PrefixCache {
 impl Qwen35PrefixCache {
     /// Build the joint coordinator for `snapshot_slots` per-rank allocations.
     pub(crate) fn new(kv: KvCacheManager, snapshot_slots: usize) -> Result<Self> {
+        Self::new_with_store(kv, RecurrentSnapshotStore::new_directory(snapshot_slots))
+    }
+
+    /// Build the joint coordinator around a caller-provided snapshot store.
+    pub(crate) fn new_with_store(
+        kv: KvCacheManager,
+        snapshots: RecurrentSnapshotStore,
+    ) -> Result<Self> {
         anyhow::ensure!(
             SNAPSHOT_STRIDE_TOKENS.is_multiple_of(kv.pool().block_size()),
             "Qwen3.5 snapshot stride {SNAPSHOT_STRIDE_TOKENS} must be a multiple of KV block size {}",
@@ -275,7 +370,7 @@ impl Qwen35PrefixCache {
         );
         Ok(Self {
             kv,
-            snapshots: SnapshotCache::new(snapshot_slots),
+            snapshots,
             stats: PrefixCacheStats::default(),
         })
     }
@@ -515,6 +610,33 @@ impl Qwen35PrefixCache {
         self.snapshots.publish(reservation);
     }
 
+    /// Copy the request's recurrent/conv state into the store and publish the
+    /// reservation. Single-GPU callers use this instead of a separate
+    /// `RecurrentStateStore`.
+    pub(crate) fn save_and_publish_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        reservation: SnapshotReservation,
+        src: &RecurrentState,
+    ) -> Result<()> {
+        if let Err(error) = self.snapshots.save(ctx, reservation, src) {
+            self.snapshots.abort(reservation);
+            return Err(error);
+        }
+        self.publish_snapshot(reservation);
+        Ok(())
+    }
+
+    /// Copy a pinned snapshot into a request's recurrent/conv state.
+    pub(crate) fn restore_snapshot(
+        &self,
+        ctx: &DeviceContext,
+        guard: &SnapshotGuard,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        self.snapshots.restore_into(ctx, guard, dst)
+    }
+
     /// Abort a prefix reservation after any rank-local copy failure.
     pub(crate) fn abort_snapshot(&mut self, reservation: SnapshotReservation) {
         self.snapshots.abort(reservation);
@@ -578,7 +700,7 @@ fn eligible_boundaries(resident_tokens: usize, stride: usize) -> impl Iterator<I
 #[cfg(test)]
 mod tests {
     use super::PrefixBoundaryKey;
-    use super::SnapshotCache;
+    use super::RecurrentSnapshotStore;
     use super::eligible_boundaries;
 
     fn key(tag: u8) -> PrefixBoundaryKey {
@@ -603,7 +725,7 @@ mod tests {
 
     #[test]
     fn state_publishes_only_after_explicit_commit() {
-        let mut state = SnapshotCache::new(1);
+        let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
@@ -614,7 +736,7 @@ mod tests {
 
     #[test]
     fn aborted_write_does_not_expose_partial_snapshot() {
-        let mut state = SnapshotCache::new(1);
+        let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
@@ -625,7 +747,7 @@ mod tests {
 
     #[test]
     fn duplicate_reservation_refreshes_lru() {
-        let mut state = SnapshotCache::new(2);
+        let mut state = RecurrentSnapshotStore::new_directory(2);
         for tag in [1, 2] {
             let reservation = state
                 .reserve(key(tag))
@@ -644,7 +766,7 @@ mod tests {
 
     #[test]
     fn lru_evicts_untouched_snapshot_but_preserves_touched_snapshot() {
-        let mut state = SnapshotCache::new(2);
+        let mut state = RecurrentSnapshotStore::new_directory(2);
         for tag in [1, 2] {
             let reservation = state
                 .reserve(key(tag))
@@ -663,7 +785,7 @@ mod tests {
 
     #[test]
     fn all_pinned_snapshots_make_insertion_a_soft_miss() {
-        let mut state = SnapshotCache::new(1);
+        let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
             .expect("empty state must reserve a write");
