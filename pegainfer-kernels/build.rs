@@ -2210,6 +2210,17 @@ fn main() {
         );
         return;
     }
+
+    // No `cuda` feature: nothing here can be compiled. This is the shape a
+    // non-CUDA/non-ROCm backend builds in (`--no-default-features`), where the
+    // crate still has to exist as a dependency of `pegainfer-core`, but none of
+    // the CUDA artifacts (submodules, `nvidia-smi` SM detection, `nvcc`) are
+    // needed. Bail out before any of them is touched.
+    if std::env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        println!("cargo:warning=no GPU backend feature enabled; skipping kernel compilation");
+        return;
+    }
+
     ensure_git_submodules_initialized(&workspace_root());
 
     let toolkit = pegainfer_build::CudaToolkit::discover();
