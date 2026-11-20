@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -57,8 +59,9 @@ const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metr
 /// Long enough that a request is admitted (counting its lookup) well before it
 /// can emit a token, so abandoning it leaves a delta with no output to ride.
 const ABORT_TTFT_MS: f64 = 400.0;
-/// Short enough that the client gives up inside that prefill window.
-const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(60);
+/// Long enough that the request is admitted while the whole suite runs at once,
+/// and short enough that the client gives up inside that prefill window.
+const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(250);
 /// The pretend lookup the prefix-metrics server reports on every admitted
 /// ordinary request: 8 prompt tokens queried, 5 found in local KV and 2 of the
 /// remainder restored from the connector.
@@ -2172,10 +2175,25 @@ async fn wait_for_health(client: &Client, base_url: &str) -> Result<()> {
     }
 }
 
+/// Ports already given to a test in this process. A reserved port is free again
+/// until its server binds it, so the OS can offer it to another test in the
+/// meantime, and the test whose server loses the bind ends up talking to the
+/// other test's server.
+static HANDED_OUT_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
 fn reserve_loopback_port() -> Result<u16> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to reserve loopback port for sim e2e test")?;
-    Ok(listener.local_addr()?.port())
+    let mut handed_out = HANDED_OUT_PORTS
+        .lock()
+        .map_err(|_| anyhow!("the sim e2e port ledger is poisoned"))?;
+    for _ in 0..64 {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .context("failed to reserve loopback port for sim e2e test")?;
+        let port = listener.local_addr()?.port();
+        if handed_out.insert(port) {
+            return Ok(port);
+        }
+    }
+    bail!("the OS kept offering loopback ports already given to other sim e2e tests")
 }
 
 const TINY_TOKENIZER_JSON: &str = r#"{
