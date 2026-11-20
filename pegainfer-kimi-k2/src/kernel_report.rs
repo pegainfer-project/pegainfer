@@ -37,6 +37,7 @@ use pegainfer_kernels::ops::KimiMarlinInt4Weight;
 use pegainfer_kernels::ops::KimiMarlinRouteWorkspace;
 use pegainfer_kernels::ops::KimiMarlinWna16Workspace;
 use pegainfer_kernels::ops::KimiMlaPagedKvLayout;
+use pegainfer_kernels::ops::KimiMlaSplitKv;
 use pegainfer_kernels::ops::KimiRouterBatch;
 use pegainfer_kernels::ops::KimiRouterConfig;
 use pegainfer_kernels::ops::KimiRouterOutput;
@@ -686,11 +687,23 @@ fn measure_mla_decode(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let page_indices_d = ctx.stream.clone_htod(&page_indices)?;
     let page_indptr_d = ctx.stream.clone_htod(&page_indptr)?;
     let last_page_len_d = ctx.stream.clone_htod(&vec![last_page; batch])?;
-    let request_indices_d = ctx
+    let row_slots_d = ctx
         .stream
         .clone_htod(&(0..batch as i32).collect::<Vec<_>>())?;
-    let kv_tile_indices_d = ctx.stream.clone_htod(&vec![0_i32; batch])?;
-    let kv_chunk_size_d = ctx.stream.clone_htod(&vec![kv_len as i32; batch])?;
+    let row_tiles_d = ctx.stream.clone_htod(&vec![0_i32; batch])?;
+    let tile_tokens_d = ctx.stream.clone_htod(&vec![kv_len as i32])?;
+    // One tile per request, so the timed span is one attention launch plus the
+    // merge the split path always runs.
+    let slot_indptr_d = ctx
+        .stream
+        .clone_htod(&(0..=batch as i32).collect::<Vec<_>>())?;
+    let row_valid_d = ctx.stream.clone_htod(&vec![1_u8; batch])?;
+    let mut partial_ckv = ctx
+        .stream
+        .alloc_zeros::<bf16>(batch * KIMI_K2_MLA_LOCAL_HEADS_TP8 * KIMI_K2_MLA_KV_LORA_RANK)?;
+    let mut partial_lse = ctx
+        .stream
+        .alloc_zeros::<f32>(batch * KIMI_K2_MLA_LOCAL_HEADS_TP8)?;
     let sm_scale = 1.0f32 / ((KIMI_K2_MLA_KV_LORA_RANK + KIMI_K2_MLA_ROPE_DIM) as f32).sqrt();
     measure_loop(&ctx, iters, || {
         kimi_flashinfer_batch_decode_mla_rt(
@@ -704,9 +717,16 @@ fn measure_mla_decode(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
             &page_indices_d,
             &page_indptr_d,
             &last_page_len_d,
-            &request_indices_d,
-            &kv_tile_indices_d,
-            &kv_chunk_size_d,
+            KimiMlaSplitKv {
+                row_slots: &row_slots_d,
+                row_tiles: &row_tiles_d,
+                row_valid: &row_valid_d,
+                slot_indptr: &slot_indptr_d,
+                tile_tokens: &tile_tokens_d,
+                partial_ckv: &mut partial_ckv,
+                partial_lse: &mut partial_lse,
+                rows: batch,
+            },
             sm_scale,
             KIMI_K2_MLA_LOCAL_HEADS_TP8,
         )
