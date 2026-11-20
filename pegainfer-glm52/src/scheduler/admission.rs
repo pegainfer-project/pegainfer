@@ -16,10 +16,12 @@ use pegainfer_frontend::engine::GenerateRequest;
 use pegainfer_frontend::engine::TokenEvent;
 use pegainfer_frontend::engine::unix_now_s;
 use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::Denied;
 use pegainfer_kv_store::KvPrefix;
 use pegainfer_kv_store::KvStore;
 use pegainfer_kv_store::RequestKv;
 use pegainfer_kv_store::SaveCursor;
+use pegainfer_kv_store::lifetime_blocks;
 
 use super::ActiveRequest;
 use super::BoundaryCopy;
@@ -102,15 +104,6 @@ pub(super) fn validate_request(
     Ok(())
 }
 
-/// Pool pages a request draws over its whole lifetime, reserved at
-/// admission. One more token than the last KV-written position: kvbm appends
-/// the final generated token to the sequence and provisions its page even
-/// though its KV is never written (the dangling-token contract — the same
-/// off-by-one Kimi's admission had to learn empirically).
-pub(super) fn lifetime_blocks(prompt_tokens: usize, max_tokens: usize) -> usize {
-    (prompt_tokens + max_tokens).div_ceil(PAGE)
-}
-
 fn admission_lifetime_blocks(
     req: &GenerateRequest,
     handoff: Option<&offload::NativeMtpHandoff>,
@@ -122,7 +115,7 @@ fn admission_lifetime_blocks(
         }
         None => (req.prompt_tokens.len(), req.max_tokens),
     };
-    lifetime_blocks(input_tokens, max_output_tokens)
+    lifetime_blocks(input_tokens, max_output_tokens, PAGE)
 }
 
 pub(super) fn reject(req: &GenerateRequest, message: String) {
@@ -255,6 +248,30 @@ pub(super) fn admit_from_queue(
             ),
             Resolved::Failed { .. } => unreachable!("handled above"),
         };
+        // A lifetime the pool could never hold is permanent. The budget
+        // gate below would otherwise defer it forever, so reject the front
+        // here instead of parking the queue behind it.
+        let capacity = pool.max_request_blocks();
+        if need_blocks > capacity {
+            let Some(entry) = pending.pop_front() else {
+                unreachable!("front was checked non-empty");
+            };
+            let req = match entry {
+                Resolved::Plain { req, .. } | Resolved::Native { req, .. } => req,
+                Resolved::Failed { .. } => unreachable!("Failed handled above"),
+            };
+            reject(
+                &req,
+                format!(
+                    "GLM5.2 KV admission: {}",
+                    Denied::ExceedsPool {
+                        need: need_blocks,
+                        capacity,
+                    }
+                ),
+            );
+            continue;
+        }
         let active_resident: usize = slots
             .iter()
             .flatten()
@@ -351,9 +368,18 @@ pub(super) fn admit_from_queue(
                 // physical re-check. A concurrent resolve either sees the
                 // new floor or won these pages first — then the front
                 // defers, holds re-queue intact, and retries next tick.
-                if !kv.try_admit(pool, front_held) {
-                    pending.push_front(Resolved::Plain { req, prefix });
-                    break;
+                // A permanent denial (the pool could never hold this
+                // lifetime) is rejected instead of deferred forever.
+                match kv.try_admit(pool, front_held) {
+                    Ok(()) => {}
+                    Err(Denied::Busy) => {
+                        pending.push_front(Resolved::Plain { req, prefix });
+                        break;
+                    }
+                    Err(denied) => {
+                        reject(&req, format!("GLM5.2 KV admission: {denied}"));
+                        continue;
+                    }
                 }
                 let cached_tokens = if prefix_cache_enabled {
                     match kv.match_and_add_prefix(pool) {
@@ -474,13 +500,21 @@ fn admit_native(
     );
     // Credit FULL pages only: an unaligned chain's padded boundary page is
     // the pinned copy source, never part of the resident set.
-    if !kv.try_admit(pool, handoff.committed_len / PAGE) {
-        req.prompt_tokens.pop();
-        return Ok(Some(Resolved::Native {
-            req,
-            prefix,
-            handoff,
-        }));
+    match kv.try_admit(pool, handoff.committed_len / PAGE) {
+        Ok(()) => {}
+        Err(Denied::Busy) => {
+            req.prompt_tokens.pop();
+            return Ok(Some(Resolved::Native {
+                req,
+                prefix,
+                handoff,
+            }));
+        }
+        Err(denied) => {
+            req.prompt_tokens.pop();
+            reject(&req, format!("GLM5.2 KV admission: {denied}"));
+            return Ok(None);
+        }
     }
     let _ = req.token_tx.send(TokenEvent::Scheduled {
         queued_at_unix_s,
@@ -663,14 +697,14 @@ mod tests {
     }
 
     #[test]
-    fn lifetime_blocks_counts_the_dangling_token() {
-        // 64 prompt + 1 max_tokens: the generated token is appended to the
-        // sequence (dangling) and provisions page 2 even though its KV is
-        // never written.
-        assert_eq!(lifetime_blocks(64, 1), 2);
-        assert_eq!(lifetime_blocks(63, 1), 1);
-        assert_eq!(lifetime_blocks(64, 64), 2);
-        assert_eq!(lifetime_blocks(64, 65), 3);
+    fn lifetime_blocks_match_the_kvbm_peak_draw() {
+        // `pegainfer-kv-store/tests/lifetime_rule.rs` measures kvbm's real
+        // peak: a one-token completion finishes after prefill and never
+        // provisions the dangling block; multi-token requests do.
+        assert_eq!(lifetime_blocks(64, 1, PAGE), 1);
+        assert_eq!(lifetime_blocks(63, 1, PAGE), 1);
+        assert_eq!(lifetime_blocks(64, 64, PAGE), 2);
+        assert_eq!(lifetime_blocks(64, 65, PAGE), 3);
     }
 
     #[test]

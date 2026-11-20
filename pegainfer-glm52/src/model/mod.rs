@@ -138,9 +138,11 @@ pub(crate) const GLM52_MODEL_LEN_ALIGN: usize = GLM52_FLASHMLA_SPARSE_PAGE_SIZE;
 /// every slot's full-lifetime draw plus the reserved padding page
 /// (`BlockPool` block 0 — padding rows and CUDA-graph pre-capture write
 /// there). A request's lifetime draw is `ceil((prompt + max_tokens)/page)`
-/// with `prompt + max_tokens <= cap + 1` (`validate_request`) — one page
-/// more than its KV ever writes, because kvbm appends the final generated
-/// token and eagerly provisions its page (the dangling-token contract). The
+/// for multi-token completions and `ceil(prompt/page)` for one-token ones
+/// (they finish after prefill; kvbm never provisions the dangling page).
+/// `validate_request` keeps `prompt + max_tokens <= cap + 1`, and sizing for
+/// that worst case also covers every multi-token request, which can draw one
+/// page past its last written position (the dangling-token contract). The
 /// engine's `BlockPool` and the rank arenas
 /// ([`Glm52RankModel::finish_kv`]) MUST agree on this count: pool block ids
 /// index the arenas directly.

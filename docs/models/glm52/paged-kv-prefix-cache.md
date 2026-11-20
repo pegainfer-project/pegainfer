@@ -2,7 +2,7 @@
 
 **TL;DR**: The static per-slot KV partitions (slot `b` owns tokens `[b*cap, (b+1)*cap)`, identity block table) are replaced by a per-rank `pegainfer-kv-cache::BlockPool` of 64-token pages with content-hashed blocks — the Kimi #239 pattern, zero kernel changes. Admission reserves a request's full-lifetime page count (honor-or-reject), prefix caching is on by default (suffix-only prefill, `cached_tokens` reported), and the coordinator ships each step's page rows + write slots to the ranks as `Glm52StepKv`. DSpark and prefix caching are mutually exclusive (draft anchor-position assert). **jz-38 validated 2026-07-06: warm prefix TTFT 14.1 s → 0.84 s (16.9×) on a 1200-token varied prompt with byte-identical output; step-bench sweep dead even with the D5 main anchors (b1 25.4 / b8 43.2 ms, c64 1483 tok/s); oracle gates green; 9-way near-tie divergence adjudicated under the D2 cross-bucket contract.**
 
-Last touched: 2026-08
+Last touched: 2026-11
 
 ## Why the kernels needed nothing
 
@@ -44,10 +44,10 @@ cap no request can fit). The only estimate left is `GLM52_GRAPH_RESERVE_GIB`
 (default 3) for lazy graph instantiation + runtime workspaces. One page is
 the reserved **padding page**: padding rows and graph pre-capture write
 there, nobody reads it meaningfully (Kimi's benign-garbage argument). The
-`cap+1` (not `cap`) in the floors keeps max-shape requests
+`cap+1` (not `cap`) in the floors keeps max-shape multi-token requests
 (`prompt + max_tokens = cap + 1`) admissible including the dangling-token
 page — a toxic-review finding; the naive `ceil(cap/64)` variant silently
-degraded max-shape concurrency.
+degraded max-shape concurrency. A one-token completion draws one page less.
 
 Measured on GB300 (EP4, 16K cap): the fill lands ~1.35-1.44M pool tokens per
 rank (2.6x the old 32-slot nominal), and admission's lifetime reservation
@@ -75,9 +75,12 @@ contents-change-pointers-don't contract as before.
 
 ### Admission: full-lifetime reservation
 
-`lifetime_blocks = ceil((prompt + max_tokens)/64)` — one token more than the
-last written position, because kvbm appends the final generated token and
-provisions its page (the dangling-token off-by-one Kimi probed empirically).
+`lifetime_blocks` is the pool's shared rule (`pegainfer_kv_store::lifetime_blocks`):
+`ceil((prompt + max_tokens)/64)` for multi-token completions and
+`ceil(prompt/64)` for one-token ones — those finish after prefill, so kvbm
+never provisions the dangling final-token page. A multi-token request can
+draw one page past its last written position (the dangling-token off-by-one
+Kimi probed empirically).
 `admission_target` picks the least-loaded rank among those with a free slot
 AND `Σ active lifetimes + new ≤ pool usable`; no rank fits → the request
 stays queued (never mid-decode starvation, never a livelock — an empty rank
