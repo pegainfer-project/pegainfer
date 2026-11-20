@@ -59,8 +59,9 @@ const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metr
 /// Long enough that a request is admitted (counting its lookup) well before it
 /// can emit a token, so abandoning it leaves a delta with no output to ride.
 const ABORT_TTFT_MS: f64 = 400.0;
-/// Short enough that the client gives up inside that prefill window.
-const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(60);
+/// Long enough that the request is admitted while the whole suite runs at once,
+/// and short enough that the client gives up inside that prefill window.
+const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(250);
 /// The pretend lookup the prefix-metrics server reports on every admitted
 /// ordinary request: 8 prompt tokens queried, 5 found in local KV and 2 of the
 /// remainder restored from the connector.
