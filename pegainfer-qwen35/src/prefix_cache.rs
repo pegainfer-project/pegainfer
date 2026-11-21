@@ -181,6 +181,33 @@ impl SnapshotCache {
         }
     }
 
+    /// Drop unpinned entries whose KV is already gone. Their snapshots cannot
+    /// hit, so they are not worth spilling.
+    fn drop_dead_unpinned(
+        &mut self,
+        tier: SnapshotTier,
+        is_live: &dyn Fn(PrefixBoundaryKey) -> bool,
+    ) {
+        let dead: Vec<(PrefixBoundaryKey, usize)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tier == tier && Arc::strong_count(entry) == 1)
+            .filter(|(key, _)| !is_live(**key))
+            .map(|(key, entry)| (*key, entry.slot))
+            .collect();
+        for (key, slot) in dead {
+            let removed = self
+                .entries
+                .remove(&key)
+                .expect("dead snapshot must still be present");
+            debug_assert_eq!(removed.slot, slot);
+            match tier {
+                SnapshotTier::Gpu => self.free_gpu_slots.push(slot),
+                SnapshotTier::Host => self.free_host_slots.push(slot),
+            }
+        }
+    }
+
     fn take_unpinned_victim(&mut self, tier: SnapshotTier) -> Option<(PrefixBoundaryKey, usize)> {
         let (&victim_key, slot) = self
             .entries
@@ -199,11 +226,16 @@ impl SnapshotCache {
 
     /// Decide which slot the next snapshot uses. With a host slab, a reused GPU
     /// slot returns a spill plan the caller must perform before `commit_plan`.
-    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservePlan> {
+    fn reserve(
+        &mut self,
+        key: PrefixBoundaryKey,
+        is_live: &dyn Fn(PrefixBoundaryKey) -> bool,
+    ) -> Option<SnapshotReservePlan> {
         if self.contains(key) {
             self.touch(key);
             return None;
         }
+        self.drop_dead_unpinned(SnapshotTier::Gpu, is_live);
         if let Some(slot) = self.free_gpu_slots.pop() {
             return Some(SnapshotReservePlan {
                 reservation: SnapshotReservation {
@@ -216,6 +248,7 @@ impl SnapshotCache {
         }
         let (victim_key, victim_slot) = self.take_unpinned_victim(SnapshotTier::Gpu)?;
         if self.host_slot_count > 0 {
+            self.drop_dead_unpinned(SnapshotTier::Host, is_live);
             let host_slot = if let Some(slot) = self.free_host_slots.pop() {
                 slot
             } else if let Some((_, slot)) = self.take_unpinned_victim(SnapshotTier::Host) {
@@ -831,7 +864,10 @@ impl Qwen35PrefixCache {
         let Some(key) = self.snapshot_key(request, boundary)? else {
             return Ok(None);
         };
-        Ok(self.snapshots.reserve(key))
+        let kv = &self.kv;
+        Ok(self
+            .snapshots
+            .reserve(key, &|key| kv.pool().has_resident_hash(key.sequence_hash)))
     }
 
     pub(crate) fn commit_reserve_snapshot(&mut self, plan: SnapshotReservePlan) {
@@ -924,6 +960,10 @@ mod tests {
     use super::eligible_boundaries;
     use crate::config::TensorParallelConfig;
 
+    fn live(_: PrefixBoundaryKey) -> bool {
+        true
+    }
+
     fn key(tag: u8) -> PrefixBoundaryKey {
         PrefixBoundaryKey {
             sequence_hash: [tag; 16],
@@ -947,7 +987,9 @@ mod tests {
     #[test]
     fn state_publishes_only_after_explicit_commit() {
         let mut state = SnapshotCache::new(1, 0);
-        let plan = state.reserve(key(1)).expect("empty state must reserve");
+        let plan = state
+            .reserve(key(1), &live)
+            .expect("empty state must reserve");
         assert!(state.lookup(key(1)).is_none());
         state.commit_plan(plan);
         state.publish(plan.reservation());
@@ -957,22 +999,24 @@ mod tests {
     #[test]
     fn aborted_write_does_not_expose_partial_snapshot() {
         let mut state = SnapshotCache::new(1, 0);
-        let plan = state.reserve(key(1)).expect("empty state must reserve");
+        let plan = state
+            .reserve(key(1), &live)
+            .expect("empty state must reserve");
         state.abort_plan(plan);
         assert!(state.lookup(key(1)).is_none());
-        assert!(state.reserve(key(2)).is_some());
+        assert!(state.reserve(key(2), &live).is_some());
     }
 
     #[test]
     fn duplicate_reservation_refreshes_lru() {
         let mut state = SnapshotCache::new(2, 0);
         for tag in [1, 2] {
-            let plan = state.reserve(key(tag)).expect("free slot");
+            let plan = state.reserve(key(tag), &live).expect("free slot");
             state.commit_plan(plan);
             state.publish(plan.reservation());
         }
-        assert!(state.reserve(key(1)).is_none());
-        let plan = state.reserve(key(3)).expect("unpinned LRU victim");
+        assert!(state.reserve(key(1), &live).is_none());
+        let plan = state.reserve(key(3), &live).expect("unpinned LRU victim");
         state.commit_plan(plan);
         state.publish(plan.reservation());
         assert!(state.lookup(key(1)).is_some());
@@ -984,12 +1028,12 @@ mod tests {
     fn lru_evicts_untouched_snapshot_but_preserves_touched_snapshot() {
         let mut state = SnapshotCache::new(2, 0);
         for tag in [1, 2] {
-            let plan = state.reserve(key(tag)).expect("free slot");
+            let plan = state.reserve(key(tag), &live).expect("free slot");
             state.commit_plan(plan);
             state.publish(plan.reservation());
         }
         drop(state.lookup(key(1)).expect("key 1 should be present"));
-        let plan = state.reserve(key(3)).expect("unpinned LRU victim");
+        let plan = state.reserve(key(3), &live).expect("unpinned LRU victim");
         state.commit_plan(plan);
         state.publish(plan.reservation());
         assert!(state.lookup(key(1)).is_some());
@@ -1000,22 +1044,24 @@ mod tests {
     #[test]
     fn all_pinned_snapshots_make_insertion_a_soft_miss() {
         let mut state = SnapshotCache::new(1, 0);
-        let plan = state.reserve(key(1)).expect("empty state must reserve");
+        let plan = state
+            .reserve(key(1), &live)
+            .expect("empty state must reserve");
         state.commit_plan(plan);
         state.publish(plan.reservation());
         let guard = state.lookup(key(1)).expect("key 1 should be present");
-        assert!(state.reserve(key(2)).is_none());
+        assert!(state.reserve(key(2), &live).is_none());
         drop(guard);
-        assert!(state.reserve(key(2)).is_some());
+        assert!(state.reserve(key(2), &live).is_some());
     }
 
     #[test]
     fn host_plan_commit_moves_victim_to_host() {
         let mut state = SnapshotCache::new(1, 1);
-        let plan = state.reserve(key(1)).expect("free GPU slot");
+        let plan = state.reserve(key(1), &live).expect("free GPU slot");
         state.commit_plan(plan);
         state.publish(plan.reservation());
-        let plan = state.reserve(key(2)).expect("spill plan");
+        let plan = state.reserve(key(2), &live).expect("spill plan");
         let spill = plan.spill().expect("host spill");
         assert_eq!(spill.gpu_slot, 0);
         assert_eq!(spill.host_slot, 0);
@@ -1032,12 +1078,36 @@ mod tests {
     }
 
     #[test]
-    fn host_plan_abort_restores_victim() {
+    fn dead_victim_is_dropped_before_spill() {
         let mut state = SnapshotCache::new(1, 1);
-        let plan = state.reserve(key(1)).expect("free GPU slot");
+        let plan = state.reserve(key(1), &live).expect("free GPU slot");
         state.commit_plan(plan);
         state.publish(plan.reservation());
-        let plan = state.reserve(key(2)).expect("spill plan");
+
+        let dead = key(1);
+        let plan = state
+            .reserve(key(2), &|candidate| candidate != dead)
+            .expect("dead victim frees the slot");
+        assert!(plan.spill().is_none());
+        assert!(state.lookup(dead).is_none());
+        assert!(
+            state
+                .entries
+                .values()
+                .all(|entry| entry.tier != SnapshotTier::Host)
+        );
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
+        assert!(state.lookup(key(2)).is_some());
+    }
+
+    #[test]
+    fn host_plan_abort_restores_victim() {
+        let mut state = SnapshotCache::new(1, 1);
+        let plan = state.reserve(key(1), &live).expect("free GPU slot");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
+        let plan = state.reserve(key(2), &live).expect("spill plan");
         state.abort_plan(plan);
         assert_eq!(
             state.lookup(key(1)).expect("victim").tier(),

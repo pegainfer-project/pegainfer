@@ -8,6 +8,7 @@ use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
+use serde::Deserialize;
 
 use crate::view::KvView;
 
@@ -84,6 +85,17 @@ impl BlockPool {
     /// subsequent request must restore it from the CPU tier.
     pub fn evict_inactive(&self) {
         self.block_manager.evict_inactive();
+    }
+
+    /// Whether one packed lineage hash is still resident in the GPU prefix
+    /// cache. Inactive entries count; nothing is promoted or pinned.
+    pub fn has_resident_hash(&self, hash: [u8; 16]) -> bool {
+        let de =
+            serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(hash.into_iter());
+        let Ok(hash) = SequenceHash::deserialize(de) else {
+            return false;
+        };
+        self.block_manager.has_resident_block(hash)
     }
 
     /// Return active prompt-prefix hashes without promoting inactive entries or
@@ -733,8 +745,13 @@ mod tests {
         request.schedule_prefill(32, &pool).expect("schedule");
         request.apply_prefill_chunk(&pool).expect("apply");
 
-        assert_eq!(pool.active_prefix_hashes(prompt.clone(), None).len(), 2);
+        let hashes = pool.active_prefix_hashes(prompt.clone(), None);
+        assert_eq!(hashes.len(), 2);
+        assert!(pool.has_resident_hash(hashes[0]));
         request.release().expect("release");
+        assert!(pool.has_resident_hash(hashes[0]));
+        pool.evict_inactive();
+        assert!(!pool.has_resident_hash(hashes[0]));
         assert!(pool.active_prefix_hashes(prompt, None).is_empty());
     }
 
