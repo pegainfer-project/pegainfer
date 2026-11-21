@@ -17,7 +17,7 @@ scheduler/worker.
 | `temperature` = 0 | **honored** (greedy argmax) | honored (greedy) | frontend normalizes to `{0.0, top_k=-1, top_p=1.0}` |
 | `temperature` < 0 | treated as 0 → greedy | same | frontend (`convert_sampling` lowers `<= 0` to greedy; vLLM would 400 — divergence, documented) |
 | `top_p` ∈ (0,1] | **honored** | rejected if non-greedy | engine |
-| `top_p` = 0 / out of range | **rejected** (HTTP 500, see below) | rejected | engine (`lifecycle.rs validate_sampling_params`) |
+| `top_p` = 0 / out of range | **rejected** (HTTP 400, see below) | rejected | engine (`lifecycle.rs validate_sampling_params`) |
 | `top_k` ≥ 1 | **honored** (`top_k=1` routes greedy) | rejected if non-greedy | engine |
 | `top_k` = 0 | all tokens (disabled) | — | frontend maps 0 → -1; protocol type is `u32`, negatives don't parse |
 | `seed` | **accepted, ignored** — engine seed is fixed at 42, per-request seed is dropped at `convert_sampling` | same | frontend |
@@ -25,14 +25,7 @@ scheduler/worker.
 | `max_tokens`, `echo`, `stop` (EOS) | honored | honored | engine / frontend |
 | `min_p`, `frequency_penalty`, `presence_penalty`, `repetition_penalty`, `logit_bias`, `min_tokens`, `prompt_logprobs`, custom `stop_token_ids` | **accepted, ignored** — dropped at `convert_sampling`, never reach the engine | same | frontend (all models, not kimi-specific) |
 
-Rejection UX pitfall: an engine-side rejection surfaces as a generic HTTP 500
-(`"Internal server error"`). The real message ("top_p must be in (0, 1]…",
-"Kimi TP8 path does not support sampling yet…") goes through
-`TokenEvent::Rejected` → engine-core `Error` finish, and the upstream
-vllm-server OpenAI layer swallows the text. Check the server log
-(`vllm_engine_core_client::client::stream "request failed"`) when a client
-reports a 500. Fixing the mapping is a vllm-rust-workspace change, not a
-pegainfer one.
+An engine-side rejection answers HTTP 400 with the engine's message ("top_p must be in (0, 1]…", "Kimi TP8 path does not support sampling yet…"): the bridge sends `TokenEvent::Rejected` as an engine-core `Error` finish carrying a `validation_error`, which the vLLM server turns into a 400. A 500 means an engine fault (`TokenEvent::Error`); its message is only in the server log.
 
 ## Design (TP1/DP8)
 

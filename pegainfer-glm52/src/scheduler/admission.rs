@@ -126,6 +126,29 @@ fn admission_lifetime_blocks(
 }
 
 pub(super) fn reject(req: &GenerateRequest, message: String) {
+    let prompt_tokens = announce(req);
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message,
+        prompt_tokens,
+        completion_tokens: 0,
+    });
+}
+
+/// End a request this engine failed before admitting it, such as a P/D
+/// restore whose KV did not arrive in time. The request itself was valid, so
+/// it ends as an engine error rather than a rejection.
+pub(super) fn fail(req: &GenerateRequest, message: String) {
+    let prompt_tokens = announce(req);
+    let _ = req.token_tx.send(TokenEvent::Error {
+        message,
+        prompt_tokens,
+        completion_tokens: 0,
+    });
+}
+
+/// Report the request as scheduled before its terminal event, returning its
+/// prompt length.
+fn announce(req: &GenerateRequest) -> usize {
     let prompt_tokens = req.prompt_tokens.len();
     let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
     let _ = req.token_tx.send(TokenEvent::Scheduled {
@@ -134,11 +157,7 @@ pub(super) fn reject(req: &GenerateRequest, message: String) {
         prompt_tokens,
         cached_tokens: 0,
     });
-    let _ = req.token_tx.send(TokenEvent::Rejected {
-        message,
-        prompt_tokens,
-        completion_tokens: 0,
-    });
+    prompt_tokens
 }
 
 pub(super) fn admit_from_queue(
@@ -231,7 +250,7 @@ pub(super) fn admit_from_queue(
             let Some(Resolved::Failed { req, message }) = pending.pop_front() else {
                 unreachable!("front matched Failed");
             };
-            reject(&req, message);
+            fail(&req, message);
             continue;
         }
 
