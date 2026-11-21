@@ -284,7 +284,7 @@ impl SnapshotCache {
                 reservation: SnapshotReservation {
                     key,
                     recurrent_slot: victim_slot,
-                    replaced: false,
+                    replaced: evicted_host,
                 },
                 spill: Some(SnapshotSpill {
                     victim_key,
@@ -1115,6 +1115,19 @@ mod tests {
             state.lookup(key(2)).expect("new entry").tier(),
             SnapshotTier::Gpu
         );
+    }
+
+    #[test]
+    fn host_victim_is_counted_as_an_eviction() {
+        let mut state = SnapshotCache::new(1, 1);
+        for tag in [1, 2] {
+            let plan = state.reserve(key(tag), &live).expect("reserve");
+            state.commit_plan(plan);
+            state.publish(plan.reservation());
+        }
+        let plan = state.reserve(key(3), &live).expect("host spill");
+        assert!(plan.evicted_host());
+        assert!(plan.reservation().was_replacement());
     }
 
     #[test]
