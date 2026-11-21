@@ -23,7 +23,7 @@ static ACL_INIT_STATUS: AtomicI32 = AtomicI32::new(i32::MIN);
 
 fn init_acl() -> Result<()> {
     ACL_INIT.call_once(|| {
-        let status = unsafe { sys::aclInit(std::ptr::null()) };
+        let status = { sys::aclInit(std::ptr::null()) };
         ACL_INIT_STATUS.store(status, Ordering::SeqCst);
     });
     check(ACL_INIT_STATUS.load(Ordering::SeqCst))
@@ -102,12 +102,12 @@ impl Device {
     pub fn new(ordinal: usize) -> Result<Self> {
         init_acl()?;
         let device_id = i32::try_from(ordinal)?;
-        check(unsafe { sys::aclrtSetDevice(device_id) })?;
+        check(sys::aclrtSetDevice(device_id))?;
         let mut context = std::ptr::null_mut();
-        check(unsafe { sys::aclrtCreateContext(&raw mut context, device_id) })?;
-        check(unsafe { sys::aclrtSetCurrentContext(context) })?;
+        check(sys::aclrtCreateContext(&raw mut context, device_id))?;
+        check(sys::aclrtSetCurrentContext(context))?;
         let mut stream = std::ptr::null_mut();
-        check(unsafe { sys::aclrtCreateStream(&raw mut stream) })?;
+        check(sys::aclrtCreateStream(&raw mut stream))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 device_id,
@@ -131,13 +131,13 @@ impl Device {
             .lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Ascend device lock poisoned"))?;
-        check(unsafe { sys::aclrtSetCurrentContext(self.inner.context) })?;
+        check(sys::aclrtSetCurrentContext(self.inner.context))?;
         call(self.inner.stream)
     }
 
     pub(crate) fn synchronize(&self) -> Result<()> {
         let stream = self.inner.stream;
-        self.run(|_| check(unsafe { sys::aclrtSynchronizeStream(stream) }))
+        self.run(|_| check(sys::aclrtSynchronizeStream(stream)))
     }
 
     pub fn info(&self) -> Result<DeviceInfo> {
@@ -162,7 +162,11 @@ impl Device {
         ensure!(bytes > 0, "zero-length device allocation");
         let mut raw = std::ptr::null_mut();
         self.run(|_| {
-            check(unsafe { sys::aclrtMalloc(&raw mut raw, bytes, sys::ACL_MEM_MALLOC_HUGE_FIRST) })
+            check(sys::aclrtMalloc(
+                &raw mut raw,
+                bytes,
+                sys::ACL_MEM_MALLOC_HUGE_FIRST,
+            ))
         })?;
         Ok(Buffer {
             raw: raw.cast(),
@@ -185,10 +189,10 @@ impl Device {
             "mis-sized device data"
         );
         let buffer = self.zeros::<T>(bytes.len() / std::mem::size_of::<T>())?;
-        unsafe {
+        {
             let raw = buffer.raw;
             self.run(|_| {
-                check(unsafe {
+                check({
                     sys::aclrtMemcpy(
                         raw.cast(),
                         bytes.len(),
@@ -239,7 +243,11 @@ impl Device {
             return Ok(ptr as *mut std::ffi::c_void);
         }
         let mut raw = std::ptr::null_mut();
-        check(unsafe { sys::aclrtMalloc(&raw mut raw, bytes, sys::ACL_MEM_MALLOC_HUGE_FIRST) })?;
+        check(sys::aclrtMalloc(
+            &raw mut raw,
+            bytes,
+            sys::ACL_MEM_MALLOC_HUGE_FIRST,
+        ))?;
         map.insert(bytes, raw as usize);
         Ok(raw)
     }
@@ -271,7 +279,7 @@ impl Device {
         if let Some(&ptr) = cache.get(&value) {
             return Ok(ptr);
         }
-        let ptr = unsafe { sys::aclCreateIntArray(&raw const value, 1) } as usize;
+        let ptr = { sys::aclCreateIntArray(&raw const value, 1) } as usize;
         ensure!(ptr != 0, "aclCreateIntArray returned null");
         cache.insert(value, ptr);
         Ok(ptr)
@@ -322,7 +330,7 @@ impl<T: DeviceRepr> Buffer<T> {
         let raw = self.raw;
         let bytes = std::mem::size_of_val(data);
         self.device.run(|_| {
-            check(unsafe {
+            check({
                 sys::aclrtMemcpy(
                     raw.cast(),
                     bytes,
@@ -339,7 +347,7 @@ impl<T: DeviceRepr> Buffer<T> {
         let raw = self.raw;
         let bytes = std::mem::size_of_val(data.as_slice());
         self.device.run(|_| {
-            check(unsafe {
+            check({
                 sys::aclrtMemcpy(
                     data.as_mut_ptr().cast(),
                     bytes,
@@ -361,7 +369,7 @@ impl<T: DeviceRepr> Drop for Buffer<T> {
             .lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        unsafe {
+        {
             let _ = sys::aclrtSetCurrentContext(device.context);
             let status = sys::aclrtFree(raw);
             if status != sys::ACL_SUCCESS {
