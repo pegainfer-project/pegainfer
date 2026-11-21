@@ -1,6 +1,6 @@
 # Qwen3.5-4B prefix cache
 
-> **TL;DR:** Qwen3.5-4B uses a GPU-only, content-hashed joint prefix cache: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. Snapshots are taken only at budget-sized prefill step ends rounded down to 256 tokens plus one stop at the last boundary of `history_tokens` (or the prompt), so the cache no longer splits cold prefill every 256 tokens. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests passed for #836; the tests #1077 changed have run on TP1 (Qwen3.5-2B and 4B) only so far. A 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
+> **TL;DR:** Qwen3.5-4B uses a GPU-first, content-hashed joint prefix cache with an optional pinned-host tier: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. Snapshots are taken only at budget-sized prefill step ends rounded down to 256 tokens plus one stop at the last boundary of `history_tokens` (or the prompt), so the cache no longer splits cold prefill every 256 tokens. KV stays in kvbm's reclaimable inactive pool, while `SnapshotCache` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests passed for #836; the tests #1077 changed have run on TP1 (Qwen3.5-2B and 4B) only so far. A 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
 > **Last touched:** 2026-11
 
@@ -28,15 +28,15 @@
 
 The first version is deliberately narrow:
 
-- GPU-only recurrent snapshot allocator with a fixed load-time byte budget.
+- A fixed GPU recurrent-snapshot budget plus an optional pinned-host tier (`--qwen35-snapshot-host-mib`, default zero).
 - One complete snapshot contains all linear layers' f32 GDR state, bf16 conv state, and the token position.
 - Snapshots lie on a 256-token grid but are taken only at prefill step ends (see Snapshot interval). Non-aligned request ends apply normally but do not create snapshots.
-- A reusable boundary must have both registered full-attention KV and a GPU-resident recurrent snapshot for the same token prefix.
+- A reusable boundary must have both registered full-attention KV and a recurrent snapshot (GPU or host) for the same token prefix.
 - `Qwen35PrefixCache` is the only interface used by the scheduler for joint prefix creation and restore.
 - Restored state is copied into the request's own `RecurrentState`; active requests never modify or directly share a cache slot.
 - Echo requests are rejected before cache lookup because cached positions would not produce their required logits.
 
-CPU offload, a second LRU tier, snapshot compression, request-end snapshots, and cross-process transfer are deferred. They must keep the same rule that KV and recurrent state are restored together.
+Snapshot compression, request-end snapshots, and cross-process transfer are deferred. Any later tier must keep the same rule that KV and recurrent state are restored together.
 
 ## Implemented state flow
 
@@ -133,6 +133,8 @@ Snapshot bytes are reserved before KV capacity is finalized, so snapshot allocat
 
 Under TP the configured budget applies to each rank. Every rank must allocate the same number of physical slots.
 
+`--qwen35-snapshot-host-mib` adds a pinned-host slab of whole snapshots per rank. It defaults to zero and requires a non-zero GPU prefix-cache budget. A GPU slot reused for a new boundary spills its victim to host before the new copy; a free or LRU host slot is chosen first, and a request restores from host only when the directory says that tier holds the boundary. D2H runs on a copy stream and records an event; the next save into that GPU slot, and every H2D restore, waits on that event. Spills, host evictions and host occupancy are logged with the existing prefix-cache summary. `host_hits` is reported through the existing prefix-cache counter as `source="host"`; there is no separate host metric family.
+
 ## Cache ownership and pinning
 
 `Qwen35PrefixCache` owns the full-attention KV manager and the joint-entry directory. Physical snapshot stores are separate so TP can use one metadata decision with identical slot numbers on every rank:
@@ -146,13 +148,16 @@ struct Qwen35PrefixCache {
 
 struct SnapshotCache {
     entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
-    free_slots: Vec<usize>,
-    slot_count: usize,
+    free_gpu_slots: Vec<usize>,
+    free_host_slots: Vec<usize>,
+    gpu_slot_count: usize,
+    host_slot_count: usize,
     clock: u64,
 }
 
 struct SnapshotEntry {
-    recurrent_slot: usize,
+    slot: usize,
+    tier: SnapshotTier,
     last_used: AtomicU64,
 }
 
@@ -191,8 +196,8 @@ A snapshot is created after a whole-model window, not inside per-layer GDR scrat
 4. On failure, revert the KV schedule and publish nothing.
 5. On success, apply KV with `apply_prefill_chunk` or final `apply_prefill`.
 6. Verify that KV position and `rec.seq_len` equal the candidate boundary.
-7. At an eligible boundary, call `reserve_snapshot`; if it returns a reservation, copy the complete `RecurrentState` into that slot.
-8. Publish the `SnapshotEntry` after all rank-local copies succeed; abort the reservation on failure.
+7. At an eligible boundary, call `plan_reserve_snapshot`; if it returns a plan with a spill, copy the victim `RecurrentState` to its host slot, then commit the plan.
+8. Copy the complete `RecurrentState` into the reserved GPU slot, then publish the `SnapshotEntry` after all rank-local copies succeed; abort the reservation on failure.
 
 The GDR `chunk_state` scratch is per linear-layer call and cannot represent a whole-model snapshot. Only request-local `RecurrentState` after all layers finish contains the complete recurrent/conv state required for publication.
 

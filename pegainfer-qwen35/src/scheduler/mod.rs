@@ -290,7 +290,7 @@ pub(crate) fn start_tp_with_capacity(
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
     prefix_snapshot_bytes: usize,
-    host_slot_count: usize,
+    host_snapshot_bytes: usize,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -303,7 +303,7 @@ pub(crate) fn start_tp_with_capacity(
         max_prefill_tokens,
         enable_cuda_graph,
         prefix_snapshot_bytes,
-        host_slot_count,
+        host_snapshot_bytes,
     )?;
     let servable = servable_len(
         backend.max_position_embeddings(),
@@ -713,7 +713,7 @@ impl Scheduler for Qwen35Scheduler {
                 as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
-            prefix_cache: None,
+            prefix_cache: self.backend.prefix_cache_counters(),
         }
     }
 }

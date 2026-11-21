@@ -51,6 +51,23 @@ fn start_engine_with_graph(
     EngineHarness::new(handle)
 }
 
+fn start_engine_with_host(
+    model_path: &str,
+    prefix_cache_mib: usize,
+    host_mib: usize,
+) -> EngineHarness {
+    let options = Qwen35LaunchOptions::new(0, 1, true, 2, 1024, prefix_cache_mib)
+        .with_snapshot_host_mib(host_mib);
+    let handle = pegainfer_qwen35::launch_with_options_policy_and_overlap(
+        Path::new(model_path),
+        options,
+        Qwen35SchedulerPolicy::Off,
+        pegainfer_qwen35::Qwen35DecodeOverlap::Off,
+    )
+    .unwrap_or_else(|err| panic!("failed to start Qwen3.5 host-snapshot engine: {err}"));
+    EngineHarness::new(handle)
+}
+
 struct Generation {
     cached_tokens: usize,
     tokens: Vec<u32>,
@@ -473,4 +490,24 @@ fn tp2_prefix_restore_during_mixed_step() {
 #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
 fn tp2_graph_prefix_restore_during_mixed_step() {
     restore_during_live_decode(2, true, pegainfer_qwen35::Qwen35DecodeOverlap::Off);
+}
+
+#[test]
+#[ignore = "requires one CUDA device and Qwen3.5 weights"]
+fn single_gpu_host_snapshot_spill_and_hit() {
+    let Some(model_path) = model_path_or_skip() else {
+        return;
+    };
+    // 64 MiB is one 4B GPU snapshot; 64 MiB of host is one host slot. A second
+    // distinct prefix spills the first, and the third request restores it.
+    let mut handle = start_engine_with_host(&model_path, 64, 64);
+    let prompt_a = vec![151_646; 320];
+    let prompt_b = vec![9707; 320];
+
+    let first = generate(&mut handle, prompt_a.clone(), 1, 0);
+    assert_eq!(first.cached_tokens, 0);
+    let second = generate(&mut handle, prompt_b, 1, 0);
+    assert_eq!(second.cached_tokens, 0);
+    let restored = generate(&mut handle, prompt_a, 1, 0);
+    assert_eq!(restored.cached_tokens, PREFIX_BOUNDARY);
 }

@@ -799,8 +799,9 @@ fn tp2_host_snapshot_spill_and_hit() {
     // 64 MiB is two GPU snapshots for Qwen3.5-4B TP2. Three distinct
     // prefixes force one GPU snapshot into the host slab; re-requesting the
     // first prefix then has to restore from host.
-    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 64 << 20, 1)
-        .expect("start TP2 host-snapshot scheduler");
+    let mut engine =
+        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 64 << 20, 64 << 20)
+            .expect("start TP2 host-snapshot scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();
 

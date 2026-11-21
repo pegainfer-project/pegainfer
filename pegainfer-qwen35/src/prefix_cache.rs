@@ -56,8 +56,14 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) inserts: u64,
     /// Published snapshots replaced by LRU insertion.
     pub(crate) evictions: u64,
+    /// Prompt tokens that reached an enabled prefix-cache lookup.
+    pub(crate) queries: u64,
     /// Of `joint_hit_tokens`, tokens restored from the pinned host tier.
     pub(crate) host_hits: u64,
+    /// GPU -> host copies completed for a reused snapshot slot.
+    pub(crate) spills: u64,
+    /// Published host snapshots replaced by a new spill.
+    pub(crate) host_evictions: u64,
 }
 
 /// Which backing tier holds one published snapshot.
@@ -116,6 +122,7 @@ pub(crate) struct SnapshotSpill {
 pub(crate) struct SnapshotReservePlan {
     reservation: SnapshotReservation,
     spill: Option<SnapshotSpill>,
+    evicted_host: bool,
 }
 
 impl SnapshotReservePlan {
@@ -125,6 +132,10 @@ impl SnapshotReservePlan {
 
     pub(crate) fn spill(&self) -> Option<SnapshotSpill> {
         self.spill.clone()
+    }
+
+    pub(crate) fn evicted_host(&self) -> bool {
+        self.evicted_host
     }
 }
 
@@ -158,6 +169,17 @@ impl SnapshotCache {
 
     fn capacity(&self) -> usize {
         self.gpu_slot_count
+    }
+
+    fn host_capacity(&self) -> usize {
+        self.host_slot_count
+    }
+
+    fn host_len(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.tier == SnapshotTier::Host)
+            .count()
     }
 
     fn tick(&mut self) -> u64 {
@@ -247,16 +269,17 @@ impl SnapshotCache {
                     replaced: false,
                 },
                 spill: None,
+                evicted_host: false,
             });
         }
         let (victim_key, victim_slot, victim_hashes) =
             self.take_unpinned_victim(SnapshotTier::Gpu)?;
         if self.host_slot_count > 0 {
             self.drop_dead_unpinned(SnapshotTier::Host, is_live);
-            let host_slot = if let Some(slot) = self.free_host_slots.pop() {
-                slot
+            let (host_slot, evicted_host) = if let Some(slot) = self.free_host_slots.pop() {
+                (slot, false)
             } else if let Some((_, slot, _)) = self.take_unpinned_victim(SnapshotTier::Host) {
-                slot
+                (slot, true)
             } else {
                 self.insert(victim_key, victim_slot, SnapshotTier::Gpu, victim_hashes);
                 return None;
@@ -266,7 +289,7 @@ impl SnapshotCache {
                     key,
                     recurrent_slot: victim_slot,
                     prefix_hashes,
-                    replaced: false,
+                    replaced: evicted_host,
                 },
                 spill: Some(SnapshotSpill {
                     victim_key,
@@ -274,6 +297,7 @@ impl SnapshotCache {
                     host_slot,
                     prefix_hashes: victim_hashes,
                 }),
+                evicted_host,
             });
         }
         Some(SnapshotReservePlan {
@@ -284,6 +308,7 @@ impl SnapshotCache {
                 replaced: true,
             },
             spill: None,
+            evicted_host: false,
         })
     }
 
@@ -678,6 +703,14 @@ impl Qwen35PrefixCache {
         self.snapshots.len()
     }
 
+    pub(crate) fn snapshot_host_slots(&self) -> usize {
+        self.snapshots.host_capacity()
+    }
+
+    pub(crate) fn snapshot_host_occupancy(&self) -> usize {
+        self.snapshots.host_len()
+    }
+
     /// Return a point-in-time copy of cumulative cache metrics.
     pub(crate) fn stats(&self) -> PrefixCacheStats {
         self.stats
@@ -736,6 +769,7 @@ impl Qwen35PrefixCache {
         if !self.enabled() || !allow_match {
             return Ok((request, None));
         }
+        self.stats.queries += prompt_tokens.len() as u64;
 
         let probe = self
             .kv
@@ -909,6 +943,12 @@ impl Qwen35PrefixCache {
     }
 
     pub(crate) fn commit_reserve_snapshot(&mut self, plan: &SnapshotReservePlan) {
+        if plan.spill().is_some() {
+            self.stats.spills += 1;
+        }
+        if plan.evicted_host() {
+            self.stats.host_evictions += 1;
+        }
         self.snapshots.commit_plan(plan);
     }
 

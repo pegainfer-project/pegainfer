@@ -1,5 +1,7 @@
 //! Qwen3.5 scheduler backend abstraction (single-GPU + TP).
 
+use pegainfer_frontend::engine::PrefixCacheCounters;
+
 use super::*;
 use crate::logprobs::LogprobSnapshot;
 use crate::tp_executor::TpBeginRequestError;
@@ -226,16 +228,34 @@ impl SingleGpuBackend {
         let cache = &self.kv_cache;
         let stats = cache.stats();
         info!(
-            "prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: joint_hits={}, hit_tokens={}, host_hits={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, spills={}, evictions={}, host_evictions={}, occupancy={}/{} host={}/{}",
             stats.joint_hits,
             stats.joint_hit_tokens,
+            stats.host_hits,
             stats.kv_only_fallbacks,
             stats.snapshot_misses,
             stats.inserts,
+            stats.spills,
             stats.evictions,
+            stats.host_evictions,
             cache.snapshot_occupancy(),
             cache.snapshot_slots(),
+            cache.snapshot_host_occupancy(),
+            cache.snapshot_host_slots(),
         );
+    }
+
+    pub(super) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        if !self.kv_cache.enabled() {
+            return None;
+        }
+        let stats = self.kv_cache.stats();
+        Some(PrefixCacheCounters {
+            queries: stats.queries,
+            hits: stats.joint_hit_tokens,
+            host_hits: stats.host_hits,
+            ..PrefixCacheCounters::default()
+        })
     }
 
     pub(super) fn new(
@@ -672,7 +692,7 @@ impl TpSchedulerBackend {
         max_prefill_tokens: usize,
         enable_cuda_graph: bool,
         prefix_snapshot_bytes: usize,
-        host_slot_count: usize,
+        host_snapshot_bytes: usize,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits_and_prefix(
             model_path,
@@ -681,7 +701,7 @@ impl TpSchedulerBackend {
             max_batch,
             max_prefill_tokens,
             prefix_snapshot_bytes,
-            host_slot_count,
+            host_snapshot_bytes,
         )?;
         Ok(Self {
             executor,
@@ -816,6 +836,13 @@ impl TpSchedulerBackend {
 }
 
 impl SchedulerBackend {
+    pub(super) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        match self {
+            Self::Single(backend) => backend.prefix_cache_counters(),
+            Self::Tp(backend) => backend.executor.prefix_cache_counters(),
+        }
+    }
+
     pub(super) fn log_prefix_cache_stats(&self) {
         match self {
             Self::Single(backend) if backend.kv_cache.enabled() => backend.log_prefix_cache_stats(),

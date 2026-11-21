@@ -20,6 +20,7 @@ use std::thread::{self};
 use std::time::Instant;
 
 use anyhow::Result;
+use pegainfer_frontend::engine::PrefixCacheCounters;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kv_cache::KvCacheManager;
 use pegainfer_kv_cache::KvView;
@@ -611,19 +612,37 @@ impl Qwen35TpExecutor {
         self.kv_cache.enabled()
     }
 
+    pub(crate) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        if !self.prefix_cache_enabled() {
+            return None;
+        }
+        let stats = self.kv_cache.stats();
+        Some(PrefixCacheCounters {
+            queries: stats.queries,
+            hits: stats.joint_hit_tokens,
+            host_hits: stats.host_hits,
+            ..PrefixCacheCounters::default()
+        })
+    }
+
     pub(crate) fn log_prefix_cache_stats(&self) {
         let stats = self.kv_cache.stats();
         log::info!(
-            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, host_hits={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, spills={}, evictions={}, host_evictions={}, occupancy={}/{} host={}/{}",
             self.world_size,
             stats.joint_hits,
             stats.joint_hit_tokens,
+            stats.host_hits,
             stats.kv_only_fallbacks,
             stats.snapshot_misses,
             stats.inserts,
+            stats.spills,
             stats.evictions,
+            stats.host_evictions,
             self.kv_cache.snapshot_occupancy(),
             self.kv_cache.snapshot_slots(),
+            self.kv_cache.snapshot_host_occupancy(),
+            self.kv_cache.snapshot_host_slots(),
         );
     }
 
@@ -732,7 +751,7 @@ impl Qwen35TpExecutor {
         max_batch: usize,
         max_prefill_tokens: usize,
         prefix_snapshot_bytes: usize,
-        host_slot_count: usize,
+        host_snapshot_bytes: usize,
     ) -> Result<Self> {
         validate_cuda_ordinals(device_ordinals)?;
         anyhow::ensure!(
@@ -791,6 +810,15 @@ impl Qwen35TpExecutor {
             min_capacity_pages = min_capacity_pages.min(model.kv_buffer().num_blocks());
         }
         let snapshot_slots = first.prefix_snapshot_slots();
+        let snapshot_bytes_per_slot =
+            crate::recurrent_state::bytes_per_request(first.config(), geometry);
+        let host_slot_count = host_snapshot_bytes / snapshot_bytes_per_slot;
+        anyhow::ensure!(
+            host_snapshot_bytes == 0 || host_slot_count > 0,
+            "Qwen3.5 host snapshot budget is {} MiB, but one recurrent/conv snapshot requires {:.3} MiB",
+            host_snapshot_bytes / (1024 * 1024),
+            snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
+        );
         anyhow::ensure!(
             models
                 .iter()
