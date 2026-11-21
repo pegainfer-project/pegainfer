@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use cudarc::driver::PinnedHostSlice;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvCacheManager;
@@ -52,12 +53,22 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) inserts: u64,
     /// Published snapshots replaced by LRU insertion.
     pub(crate) evictions: u64,
+    /// Of `joint_hit_tokens`, tokens restored from the pinned host tier.
+    pub(crate) host_hits: u64,
+}
+
+/// Which backing tier holds one published snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotTier {
+    Gpu,
+    Host,
 }
 
 /// One recurrent snapshot indexed by a reusable prefix boundary.
 struct SnapshotEntry {
-    /// Identically numbered physical recurrent snapshot on every rank.
-    recurrent_slot: usize,
+    /// Physical slot in the GPU store or the pinned host slab.
+    slot: usize,
+    tier: SnapshotTier,
     /// Logical timestamp used to select an unpinned LRU victim.
     last_used: AtomicU64,
 }
@@ -75,50 +86,77 @@ impl SnapshotGuard {
         self.boundary
     }
 
+    /// Slot number in the GPU store or the host slab.
     pub(crate) fn recurrent_slot(&self) -> usize {
-        self.entry.recurrent_slot
+        self.entry.slot
+    }
+
+    pub(crate) fn tier(&self) -> SnapshotTier {
+        self.entry.tier
     }
 }
 
-/// Mutable prefix-cache state shared by every execution rank.
+/// A pending GPU -> host copy. The caller performs it before
+/// [`SnapshotCache::commit_plan`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotSpill {
+    pub(crate) victim_key: PrefixBoundaryKey,
+    pub(crate) gpu_slot: usize,
+    pub(crate) host_slot: usize,
+}
+
+/// A reservation decision plus the optional spill the caller must perform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotReservePlan {
+    reservation: SnapshotReservation,
+    spill: Option<SnapshotSpill>,
+}
+
+impl SnapshotReservePlan {
+    pub(crate) fn reservation(self) -> SnapshotReservation {
+        self.reservation
+    }
+
+    pub(crate) fn spill(self) -> Option<SnapshotSpill> {
+        self.spill
+    }
+}
+
+/// Mutable prefix-cache directory shared by every execution rank.
 struct SnapshotCache {
-    /// Published boundary key to its recurrent snapshot entry.
     entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
-    /// Unpublished slots available without eviction.
-    free_slots: Vec<usize>,
-    /// Total number of preallocated physical snapshot slots.
-    slot_count: usize,
-    /// Monotonic logical time for LRU ordering.
+    free_gpu_slots: Vec<usize>,
+    free_host_slots: Vec<usize>,
+    gpu_slot_count: usize,
+    host_slot_count: usize,
     clock: u64,
 }
 
 impl SnapshotCache {
-    fn new(slot_count: usize) -> Self {
+    fn new(gpu_slot_count: usize, host_slot_count: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(slot_count),
-            free_slots: (0..slot_count).rev().collect(),
-            slot_count,
+            entries: HashMap::with_capacity(gpu_slot_count + host_slot_count),
+            free_gpu_slots: (0..gpu_slot_count).rev().collect(),
+            free_host_slots: (0..host_slot_count).rev().collect(),
+            gpu_slot_count,
+            host_slot_count,
             clock: 0,
         }
     }
 
-    /// Number of currently published joint entries.
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Number of preallocated recurrent-state slots.
     fn capacity(&self) -> usize {
-        self.slot_count
+        self.gpu_slot_count
     }
 
-    /// Advance the non-zero logical clock used by the LRU policy.
     fn tick(&mut self) -> u64 {
         self.clock = self.clock.wrapping_add(1).max(1);
         self.clock
     }
 
-    /// Look up `key`, refresh its LRU timestamp, and pin its entry.
     fn lookup(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotGuard> {
         let last_used = self.tick();
         let entry = self.entries.get(&key)?;
@@ -133,55 +171,120 @@ impl SnapshotCache {
         self.entries.contains_key(&key)
     }
 
-    /// Reserve a free or unpinned LRU slot without publishing the new entry.
-    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
+    fn touch(&mut self, key: PrefixBoundaryKey) {
         let last_used = self.tick();
         if let Some(entry) = self.entries.get(&key) {
             entry.last_used.store(last_used, Ordering::Relaxed);
+        }
+    }
+
+    fn take_unpinned_victim(&mut self, tier: SnapshotTier) -> Option<(PrefixBoundaryKey, usize)> {
+        let (&victim_key, slot) = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tier == tier && Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+            .map(|(key, entry)| (key, entry.slot))?;
+        let victim = self
+            .entries
+            .remove(&victim_key)
+            .expect("LRU victim must still be present");
+        debug_assert_eq!(victim.slot, slot);
+        debug_assert_eq!(victim.tier, tier);
+        Some((victim_key, slot))
+    }
+
+    /// Decide which slot the next snapshot uses. With a host slab, a reused GPU
+    /// slot returns a spill plan the caller must perform before `commit_plan`.
+    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservePlan> {
+        if self.contains(key) {
+            self.touch(key);
             return None;
         }
-
-        let (slot, evicted) = if let Some(slot) = self.free_slots.pop() {
-            (slot, false)
-        } else {
-            let (&victim_key, slot) = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| Arc::strong_count(entry) == 1)
-                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
-                .map(|(key, entry)| (key, entry.recurrent_slot))?;
-            let evicted = self
-                .entries
-                .remove(&victim_key)
-                .expect("LRU victim must still be present");
-            debug_assert_eq!(evicted.recurrent_slot, slot);
-            (slot, true)
-        };
-
-        Some(SnapshotReservation {
-            recurrent_slot: slot,
-            key,
-            replaced: evicted,
+        if let Some(slot) = self.free_gpu_slots.pop() {
+            return Some(SnapshotReservePlan {
+                reservation: SnapshotReservation {
+                    key,
+                    recurrent_slot: slot,
+                    replaced: false,
+                },
+                spill: None,
+            });
+        }
+        let (victim_key, victim_slot) = self.take_unpinned_victim(SnapshotTier::Gpu)?;
+        if self.host_slot_count > 0 {
+            let host_slot = if let Some(slot) = self.free_host_slots.pop() {
+                slot
+            } else if let Some((_, slot)) = self.take_unpinned_victim(SnapshotTier::Host) {
+                slot
+            } else {
+                self.insert(victim_key, victim_slot, SnapshotTier::Gpu);
+                return None;
+            };
+            return Some(SnapshotReservePlan {
+                reservation: SnapshotReservation {
+                    key,
+                    recurrent_slot: victim_slot,
+                    replaced: false,
+                },
+                spill: Some(SnapshotSpill {
+                    victim_key,
+                    gpu_slot: victim_slot,
+                    host_slot,
+                }),
+            });
+        }
+        Some(SnapshotReservePlan {
+            reservation: SnapshotReservation {
+                key,
+                recurrent_slot: victim_slot,
+                replaced: true,
+            },
+            spill: None,
         })
     }
 
-    /// Publish after every rank has enqueued its recurrent-state copy.
-    fn publish(&mut self, reservation: SnapshotReservation) {
+    fn insert(&mut self, key: PrefixBoundaryKey, slot: usize, tier: SnapshotTier) {
         let last_used = self.tick();
         let previous = self.entries.insert(
-            reservation.key,
+            key,
             Arc::new(SnapshotEntry {
-                recurrent_slot: reservation.recurrent_slot,
+                slot,
+                tier,
                 last_used: AtomicU64::new(last_used),
             }),
         );
         debug_assert!(previous.is_none());
     }
 
-    /// Return an unpublished slot after a physical copy failure.
+    /// Commit a plan after the caller performed its spill.
+    fn commit_plan(&mut self, plan: SnapshotReservePlan) {
+        if let Some(spill) = plan.spill {
+            self.insert(spill.victim_key, spill.host_slot, SnapshotTier::Host);
+        }
+    }
+
+    /// Abort a plan: restore a spilled victim or release the free slot.
+    fn abort_plan(&mut self, plan: SnapshotReservePlan) {
+        if let Some(spill) = plan.spill {
+            self.free_host_slots.push(spill.host_slot);
+            self.insert(spill.victim_key, spill.gpu_slot, SnapshotTier::Gpu);
+        } else {
+            self.free_gpu_slots.push(plan.reservation.recurrent_slot);
+        }
+    }
+
+    fn publish(&mut self, reservation: SnapshotReservation) {
+        self.insert(
+            reservation.key,
+            reservation.recurrent_slot,
+            SnapshotTier::Gpu,
+        );
+    }
+
     fn abort(&mut self, reservation: SnapshotReservation) {
         debug_assert!(!self.entries.contains_key(&reservation.key));
-        self.free_slots.push(reservation.recurrent_slot);
+        self.free_gpu_slots.push(reservation.recurrent_slot);
     }
 }
 
@@ -190,7 +293,6 @@ impl SnapshotCache {
 pub(crate) struct SnapshotReservation {
     recurrent_slot: usize,
     key: PrefixBoundaryKey,
-    /// Whether this insertion replaced an unpinned snapshot entry.
     replaced: bool,
 }
 
@@ -204,27 +306,155 @@ impl SnapshotReservation {
     }
 }
 
-/// Rank-local physical recurrent/conv snapshot allocations.
-pub(crate) struct RecurrentStateStore {
-    slots: Vec<RecurrentState>,
+/// Pinned-host backing for recurrent/conv snapshots.
+pub(crate) struct HostSnapshotSlab {
+    state: PinnedHostSlice<f32>,
+    conv: PinnedHostSlice<half::bf16>,
+    slots: usize,
+    layers: usize,
+    state_per_layer: usize,
+    conv_per_layer: usize,
+    state_per_slot: usize,
+    conv_per_slot: usize,
 }
 
-impl RecurrentStateStore {
+impl HostSnapshotSlab {
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
-        slot_count: usize,
+        slots: usize,
     ) -> Result<Self> {
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
+        anyhow::ensure!(slots > 0, "host snapshot slab needs at least one slot");
+        let layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let state_per_layer = geometry.local_linear_num_value_heads()
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_per_layer = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+        let state_per_slot = layers * state_per_layer;
+        let conv_per_slot = layers * conv_per_layer;
+        let state = unsafe { ctx.ctx.alloc_pinned::<f32>(slots * state_per_slot) }
+            .map_err(|e| anyhow::anyhow!("allocate pinned recurrent slab: {e}"))?;
+        let conv = unsafe { ctx.ctx.alloc_pinned::<half::bf16>(slots * conv_per_slot) }
+            .map_err(|e| anyhow::anyhow!("allocate pinned conv slab: {e}"))?;
+        Ok(Self {
+            state,
+            conv,
+            slots,
+            layers,
+            state_per_layer,
+            conv_per_layer,
+            state_per_slot,
+            conv_per_slot,
+        })
+    }
+
+    pub(crate) fn spill_from(
+        &mut self,
+        ctx: &DeviceContext,
+        src: &RecurrentState,
+        slot: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
+        anyhow::ensure!(
+            src.layers.len() == self.layers,
+            "host snapshot layer mismatch: src={}, expected={}",
+            src.layers.len(),
+            self.layers
+        );
+        let state = self.state.as_mut_slice()?;
+        let conv = self.conv.as_mut_slice()?;
+        let state_base = slot * self.state_per_slot;
+        let conv_base = slot * self.conv_per_slot;
+        for layer in 0..self.layers {
+            let state_at = state_base + layer * self.state_per_layer;
+            ctx.stream.memcpy_dtoh(
+                &src.layers[layer].state,
+                &mut state[state_at..state_at + self.state_per_layer],
+            )?;
+            let conv_at = conv_base + layer * self.conv_per_layer;
+            ctx.stream.memcpy_dtoh(
+                &src.layers[layer].conv_state.data,
+                &mut conv[conv_at..conv_at + self.conv_per_layer],
+            )?;
+        }
+        ctx.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub(crate) fn restore_into(
+        &self,
+        ctx: &DeviceContext,
+        slot: usize,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
+        anyhow::ensure!(
+            dst.layers.len() == self.layers,
+            "host snapshot layer mismatch: dst={}, expected={}",
+            dst.layers.len(),
+            self.layers
+        );
+        let state = self.state.as_slice()?;
+        let conv = self.conv.as_slice()?;
+        let state_base = slot * self.state_per_slot;
+        let conv_base = slot * self.conv_per_slot;
+        for layer in 0..self.layers {
+            let state_at = state_base + layer * self.state_per_layer;
+            ctx.stream.memcpy_htod(
+                &state[state_at..state_at + self.state_per_layer],
+                &mut dst.layers[layer].state,
+            )?;
+            let conv_at = conv_base + layer * self.conv_per_layer;
+            ctx.stream.memcpy_htod(
+                &conv[conv_at..conv_at + self.conv_per_layer],
+                &mut dst.layers[layer].conv_state.data,
+            )?;
+        }
+        ctx.stream.synchronize()?;
+        Ok(())
+    }
+}
+
+/// Rank-local physical recurrent/conv snapshot allocations.
+pub(crate) struct RecurrentStateStore {
+    slots: Vec<RecurrentState>,
+    host: Option<HostSnapshotSlab>,
+}
+
+impl RecurrentStateStore {
+    pub(crate) fn new_with_host(
+        ctx: &DeviceContext,
+        config: &Config35,
+        geometry: LocalGeometry,
+        gpu_slot_count: usize,
+        host_slot_count: usize,
+    ) -> Result<Self> {
+        let mut slots = Vec::with_capacity(gpu_slot_count);
+        for _ in 0..gpu_slot_count {
             slots.push(RecurrentState::new(ctx, config, geometry)?);
         }
-        Ok(Self { slots })
+        let host = if host_slot_count == 0 {
+            None
+        } else {
+            Some(HostSnapshotSlab::new(
+                ctx,
+                config,
+                geometry,
+                host_slot_count,
+            )?)
+        };
+        Ok(Self { slots, host })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    pub(crate) fn state(&self, slot: usize) -> Result<&RecurrentState> {
+        self.slots
+            .get(slot)
+            .ok_or_else(|| anyhow::anyhow!("snapshot slot {slot} out of range"))
     }
 
     pub(crate) fn save(
@@ -246,11 +476,36 @@ impl RecurrentStateStore {
         slot: usize,
         dst: &mut RecurrentState,
     ) -> Result<()> {
+        let src = self.state(slot)?;
+        dst.copy_from(ctx, src)
+    }
+
+    pub(crate) fn spill_to_host(
+        &mut self,
+        ctx: &DeviceContext,
+        gpu_slot: usize,
+        host_slot: usize,
+    ) -> Result<()> {
         let src = self
             .slots
-            .get(slot)
-            .ok_or_else(|| anyhow::anyhow!("snapshot slot {slot} out of range"))?;
-        dst.copy_from(ctx, src)
+            .get(gpu_slot)
+            .ok_or_else(|| anyhow::anyhow!("snapshot slot {gpu_slot} out of range"))?;
+        self.host
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("snapshot store has no host slab"))?
+            .spill_from(ctx, src, host_slot)
+    }
+
+    pub(crate) fn restore_from_host(
+        &self,
+        ctx: &DeviceContext,
+        host_slot: usize,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        self.host
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("snapshot store has no host slab"))?
+            .restore_into(ctx, host_slot, dst)
     }
 }
 
@@ -268,6 +523,15 @@ pub(crate) struct Qwen35PrefixCache {
 impl Qwen35PrefixCache {
     /// Build the joint coordinator for `snapshot_slots` per-rank allocations.
     pub(crate) fn new(kv: KvCacheManager, snapshot_slots: usize) -> Result<Self> {
+        Self::new_with_host(kv, snapshot_slots, 0)
+    }
+
+    /// Build the joint coordinator with a pinned-host snapshot budget.
+    pub(crate) fn new_with_host(
+        kv: KvCacheManager,
+        snapshot_slots: usize,
+        host_slots: usize,
+    ) -> Result<Self> {
         anyhow::ensure!(
             SNAPSHOT_STRIDE_TOKENS.is_multiple_of(kv.pool().block_size()),
             "Qwen3.5 snapshot stride {SNAPSHOT_STRIDE_TOKENS} must be a multiple of KV block size {}",
@@ -275,7 +539,7 @@ impl Qwen35PrefixCache {
         );
         Ok(Self {
             kv,
-            snapshots: SnapshotCache::new(snapshot_slots),
+            snapshots: SnapshotCache::new(snapshot_slots, host_slots),
             stats: PrefixCacheStats::default(),
         })
     }
@@ -434,8 +698,12 @@ impl Qwen35PrefixCache {
             request.kv_position(),
             boundary,
         );
+        let tier = guard.tier();
         self.stats.joint_hits += 1;
         self.stats.joint_hit_tokens += boundary as u64;
+        if tier == SnapshotTier::Host {
+            self.stats.host_hits += boundary as u64;
+        }
         // End the cache pin after restore enqueue and position validation.
         drop(guard);
         Ok(boundary)
@@ -484,11 +752,11 @@ impl Qwen35PrefixCache {
     /// slot on every rank, then publishes or aborts the reservation. Duplicate
     /// boundaries, disabled caching, ineligible boundaries, and fully pinned
     /// capacity return `None`.
-    pub(crate) fn reserve_snapshot(
-        &mut self,
+    fn snapshot_key(
+        &self,
         request: &RequestKv,
         boundary: usize,
-    ) -> Result<Option<SnapshotReservation>> {
+    ) -> Result<Option<PrefixBoundaryKey>> {
         if !self.enabled() {
             return Ok(None);
         }
@@ -498,15 +766,33 @@ impl Qwen35PrefixCache {
         let sequence_hash = request
             .registered_boundary_hash(boundary)
             .ok_or_else(|| anyhow::anyhow!("no registered KV hash at boundary {boundary}"))?;
-        let key = PrefixBoundaryKey {
+        Ok(Some(PrefixBoundaryKey {
             sequence_hash,
             boundary_tokens: boundary,
+        }))
+    }
+
+    /// Decide the next snapshot's slot/tier and its optional spill plan.
+    pub(crate) fn plan_reserve_snapshot(
+        &mut self,
+        request: &RequestKv,
+        boundary: usize,
+    ) -> Result<Option<SnapshotReservePlan>> {
+        let Some(key) = self.snapshot_key(request, boundary)? else {
+            return Ok(None);
         };
         Ok(self.snapshots.reserve(key))
     }
 
-    /// Publish after rank-local snapshot copies succeed. `reserve_snapshot`
-    /// already validated registered KV at the boundary.
+    pub(crate) fn commit_reserve_snapshot(&mut self, plan: SnapshotReservePlan) {
+        self.snapshots.commit_plan(plan);
+    }
+
+    pub(crate) fn abort_reserve_snapshot(&mut self, plan: SnapshotReservePlan) {
+        self.snapshots.abort_plan(plan);
+    }
+
+    /// Publish after rank-local snapshot copies succeed.
     pub(crate) fn publish_snapshot(&mut self, reservation: SnapshotReservation) {
         self.stats.inserts += 1;
         if reservation.was_replacement() {
@@ -577,9 +863,16 @@ fn eligible_boundaries(resident_tokens: usize, stride: usize) -> impl Iterator<I
 
 #[cfg(test)]
 mod tests {
+    use super::Config35;
+    use super::DeviceContext;
+    use super::LocalGeometry;
     use super::PrefixBoundaryKey;
+    use super::RecurrentState;
+    use super::RecurrentStateStore;
     use super::SnapshotCache;
+    use super::SnapshotTier;
     use super::eligible_boundaries;
+    use crate::config::TensorParallelConfig;
 
     fn key(tag: u8) -> PrefixBoundaryKey {
         PrefixBoundaryKey {
@@ -603,40 +896,35 @@ mod tests {
 
     #[test]
     fn state_publishes_only_after_explicit_commit() {
-        let mut state = SnapshotCache::new(1);
-        let reservation = state
-            .reserve(key(1))
-            .expect("empty state must reserve a write");
+        let mut state = SnapshotCache::new(1, 0);
+        let plan = state.reserve(key(1)).expect("empty state must reserve");
         assert!(state.lookup(key(1)).is_none());
-        state.publish(reservation);
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
         assert!(state.lookup(key(1)).is_some());
     }
 
     #[test]
     fn aborted_write_does_not_expose_partial_snapshot() {
-        let mut state = SnapshotCache::new(1);
-        let reservation = state
-            .reserve(key(1))
-            .expect("empty state must reserve a write");
-        state.abort(reservation);
+        let mut state = SnapshotCache::new(1, 0);
+        let plan = state.reserve(key(1)).expect("empty state must reserve");
+        state.abort_plan(plan);
         assert!(state.lookup(key(1)).is_none());
         assert!(state.reserve(key(2)).is_some());
     }
 
     #[test]
     fn duplicate_reservation_refreshes_lru() {
-        let mut state = SnapshotCache::new(2);
+        let mut state = SnapshotCache::new(2, 0);
         for tag in [1, 2] {
-            let reservation = state
-                .reserve(key(tag))
-                .expect("state should have a free slot");
-            state.publish(reservation);
+            let plan = state.reserve(key(tag)).expect("free slot");
+            state.commit_plan(plan);
+            state.publish(plan.reservation());
         }
         assert!(state.reserve(key(1)).is_none());
-        let reservation = state
-            .reserve(key(3))
-            .expect("an unpinned LRU victim should be available");
-        state.publish(reservation);
+        let plan = state.reserve(key(3)).expect("unpinned LRU victim");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
         assert!(state.lookup(key(1)).is_some());
         assert!(state.lookup(key(2)).is_none());
         assert!(state.lookup(key(3)).is_some());
@@ -644,18 +932,16 @@ mod tests {
 
     #[test]
     fn lru_evicts_untouched_snapshot_but_preserves_touched_snapshot() {
-        let mut state = SnapshotCache::new(2);
+        let mut state = SnapshotCache::new(2, 0);
         for tag in [1, 2] {
-            let reservation = state
-                .reserve(key(tag))
-                .expect("state should have a free slot");
-            state.publish(reservation);
+            let plan = state.reserve(key(tag)).expect("free slot");
+            state.commit_plan(plan);
+            state.publish(plan.reservation());
         }
         drop(state.lookup(key(1)).expect("key 1 should be present"));
-        let reservation = state
-            .reserve(key(3))
-            .expect("an unpinned LRU victim should be available");
-        state.publish(reservation);
+        let plan = state.reserve(key(3)).expect("unpinned LRU victim");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
         assert!(state.lookup(key(1)).is_some());
         assert!(state.lookup(key(2)).is_none());
         assert!(state.lookup(key(3)).is_some());
@@ -663,14 +949,118 @@ mod tests {
 
     #[test]
     fn all_pinned_snapshots_make_insertion_a_soft_miss() {
-        let mut state = SnapshotCache::new(1);
-        let reservation = state
-            .reserve(key(1))
-            .expect("empty state must reserve a write");
-        state.publish(reservation);
+        let mut state = SnapshotCache::new(1, 0);
+        let plan = state.reserve(key(1)).expect("empty state must reserve");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
         let guard = state.lookup(key(1)).expect("key 1 should be present");
         assert!(state.reserve(key(2)).is_none());
         drop(guard);
         assert!(state.reserve(key(2)).is_some());
+    }
+
+    #[test]
+    fn host_plan_commit_moves_victim_to_host() {
+        let mut state = SnapshotCache::new(1, 1);
+        let plan = state.reserve(key(1)).expect("free GPU slot");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
+        let plan = state.reserve(key(2)).expect("spill plan");
+        let spill = plan.spill().expect("host spill");
+        assert_eq!(spill.gpu_slot, 0);
+        assert_eq!(spill.host_slot, 0);
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
+        assert_eq!(
+            state.lookup(key(1)).expect("victim").tier(),
+            SnapshotTier::Host
+        );
+        assert_eq!(
+            state.lookup(key(2)).expect("new entry").tier(),
+            SnapshotTier::Gpu
+        );
+    }
+
+    #[test]
+    fn host_plan_abort_restores_victim() {
+        let mut state = SnapshotCache::new(1, 1);
+        let plan = state.reserve(key(1)).expect("free GPU slot");
+        state.commit_plan(plan);
+        state.publish(plan.reservation());
+        let plan = state.reserve(key(2)).expect("spill plan");
+        state.abort_plan(plan);
+        assert_eq!(
+            state.lookup(key(1)).expect("victim").tier(),
+            SnapshotTier::Gpu
+        );
+        assert!(state.lookup(key(2)).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and a Qwen3.5 model directory (PEGAINFER_TEST_MODEL_PATH)"]
+    fn host_slab_round_trips_every_layer() {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("host_slab_round_trips_every_layer")
+        else {
+            return;
+        };
+        let ctx = DeviceContext::new_with_device(0).expect("create CUDA context");
+        let config = Config35::from_file(&model_path).expect("load Qwen3.5 config");
+        let geometry =
+            LocalGeometry::try_new(&config, TensorParallelConfig::default()).expect("geometry");
+        let layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let state_len = geometry.local_linear_num_value_heads()
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_len = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+
+        let mut store =
+            RecurrentStateStore::new_with_host(&ctx, &config, geometry, 1, 1).expect("store");
+        for layer in 0..layers {
+            let host_state: Vec<f32> = (0..state_len)
+                .map(|i| (layer * 1000 + i) as f32 * 0.125 - 7.0)
+                .collect();
+            let host_conv: Vec<half::bf16> = (0..conv_len)
+                .map(|i| half::bf16::from_f32((layer * 100 + i) as f32 * 0.25 - 3.0))
+                .collect();
+            ctx.stream
+                .memcpy_htod(&host_state, &mut store.slots[0].layers[layer].state)
+                .expect("fill recurrent");
+            ctx.stream
+                .memcpy_htod(
+                    &host_conv,
+                    &mut store.slots[0].layers[layer].conv_state.data,
+                )
+                .expect("fill conv");
+        }
+
+        store.spill_to_host(&ctx, 0, 0).expect("spill");
+        let mut restored = RecurrentState::new(&ctx, &config, geometry).expect("restore state");
+        store
+            .restore_from_host(&ctx, 0, &mut restored)
+            .expect("restore from host");
+
+        for layer in 0..layers {
+            let expected_state: Vec<f32> = (0..state_len)
+                .map(|i| (layer * 1000 + i) as f32 * 0.125 - 7.0)
+                .collect();
+            let expected_conv: Vec<half::bf16> = (0..conv_len)
+                .map(|i| half::bf16::from_f32((layer * 100 + i) as f32 * 0.25 - 3.0))
+                .collect();
+            assert_eq!(
+                ctx.stream
+                    .clone_dtoh(&restored.layers[layer].state)
+                    .expect("read recurrent"),
+                expected_state,
+                "recurrent layer {layer}"
+            );
+            assert_eq!(
+                ctx.stream
+                    .clone_dtoh(&restored.layers[layer].conv_state.data)
+                    .expect("read conv"),
+                expected_conv,
+                "conv layer {layer}"
+            );
+        }
     }
 }
