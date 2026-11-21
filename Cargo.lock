@@ -3779,6 +3779,7 @@ dependencies = [
  "half",
  "kvbm-logical",
  "pegainfer-kernels",
+ "serde",
 ]
 
 [[package]]
