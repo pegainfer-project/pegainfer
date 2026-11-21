@@ -44,7 +44,6 @@ use crate::executor::RequestId;
 use crate::logprobs::snapshot_requested_logprobs;
 use crate::prefill::PREFILL_CHUNK_LEN;
 use crate::prefill_buffers::prefill_scratch_bytes;
-use crate::prefix_cache::HostSnapshotSlab;
 use crate::prefix_cache::Qwen35PrefixCache;
 use crate::prefix_cache::RecurrentStateStore;
 use crate::prefix_cache::SnapshotGuard;

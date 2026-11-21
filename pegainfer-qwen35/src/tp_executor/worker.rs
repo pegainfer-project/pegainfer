@@ -201,7 +201,6 @@ impl Drop for TpWorker {
 
 pub(super) struct TpWorkerState {
     snapshots: RecurrentStateStore,
-    host_snapshots: Option<HostSnapshotSlab>,
     rank: usize,
     _world_size: usize,
     pub(super) max_batch: usize,
@@ -227,7 +226,6 @@ pub(super) struct TpWorkerState {
 
 struct TpWorkerPrepared {
     snapshots: RecurrentStateStore,
-    host_snapshots: Option<HostSnapshotSlab>,
     rank: usize,
     world_size: usize,
     max_batch: usize,
@@ -280,16 +278,6 @@ impl TpWorkerPrepared {
             model.prefix_snapshot_slots(),
             host_slot_count,
         )?;
-        let host_snapshots = if host_slot_count == 0 {
-            None
-        } else {
-            Some(HostSnapshotSlab::new(
-                model.device_ctx(),
-                model.config(),
-                model.geometry,
-                host_slot_count,
-            )?)
-        };
         let (free_bytes, total_bytes) = model
             .device_ctx()
             .ctx
@@ -366,7 +354,6 @@ impl TpWorkerPrepared {
         Ok((
             Self {
                 snapshots,
-                host_snapshots,
                 rank,
                 world_size,
                 max_batch,
@@ -389,7 +376,6 @@ impl TpWorkerPrepared {
     ) -> Result<TpWorkerState> {
         let Self {
             snapshots,
-            host_snapshots,
             rank,
             world_size,
             max_batch,
@@ -431,7 +417,6 @@ impl TpWorkerPrepared {
         };
         Ok(TpWorkerState {
             snapshots,
-            host_snapshots,
             rank,
             _world_size: world_size,
             max_batch: effective_max_batch,
@@ -499,11 +484,11 @@ impl TpWorkerState {
                         .restore(self.model.device_ctx(), slot, &mut recurrent)?;
                 }
                 SnapshotTier::Host => {
-                    let host = self
-                        .host_snapshots
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("TP worker has no host snapshot slab"))?;
-                    host.restore_into(self.model.device_ctx(), slot, &mut recurrent)?;
+                    self.snapshots.restore_from_host(
+                        self.model.device_ctx(),
+                        slot,
+                        &mut recurrent,
+                    )?;
                     recurrent.seq_len = boundary;
                 }
             }
@@ -541,12 +526,8 @@ impl TpWorkerState {
     }
 
     fn spill_snapshot(&mut self, gpu_slot: usize, host_slot: usize) -> Result<TpWorkerReply> {
-        let src = self.snapshots.state(gpu_slot)?;
-        let host = self
-            .host_snapshots
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("TP worker has no host snapshot slab"))?;
-        host.spill_from(self.model.device_ctx(), src, host_slot)?;
+        self.snapshots
+            .spill_to_host(self.model.device_ctx(), gpu_slot, host_slot)?;
         Ok(TpWorkerReply::Ack)
     }
 

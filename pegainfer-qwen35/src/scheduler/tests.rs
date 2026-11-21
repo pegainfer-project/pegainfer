@@ -786,8 +786,9 @@ fn tp2_host_snapshot_spill_and_hit() {
     else {
         return;
     };
-    // 64 MiB is two GPU snapshots; one host slot spills one GPU slot on a
-    // second distinct prefix. The third request restores the first from host.
+    // 64 MiB is two GPU snapshots for Qwen3.5-4B TP2. Three distinct
+    // prefixes force one GPU snapshot into the host slab; re-requesting the
+    // first prefix then has to restore from host.
     let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 64 << 20, 1)
         .expect("start TP2 host-snapshot scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
@@ -795,6 +796,7 @@ fn tp2_host_snapshot_spill_and_hit() {
 
     let prompt_a = vec![151_646; 320];
     let prompt_b = vec![9707; 320];
+    let prompt_c = vec![12_345; 320];
     assert_eq!(
         finish_one(
             &mut handle,
@@ -805,6 +807,10 @@ fn tp2_host_snapshot_spill_and_hit() {
     );
     assert_eq!(
         finish_one(&mut handle, &mut steps, test_request("host-b", prompt_b, 1)),
+        0
+    );
+    assert_eq!(
+        finish_one(&mut handle, &mut steps, test_request("host-c", prompt_c, 1)),
         0
     );
     assert_eq!(
