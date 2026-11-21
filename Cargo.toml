@@ -1,6 +1,7 @@
 [workspace]
 default-members = ["pegainfer-server"]
 members = [
+  "pegainfer-ascend",
   "pegainfer-rocm",
   "pegainfer-frontend",
   "pegainfer-sim",
@@ -120,6 +121,7 @@ mockall = "0.13.1"
 nvtx = "1.3.0"
 oneshot = "0.1.11"
 pegainfer-bench = { path = "pegainfer-bench" }
+pegainfer-ascend = { path = "pegainfer-ascend" }
 pegainfer-build = { path = "pegainfer-build" }
 pegainfer-core = { path = "pegainfer-core" }
 pegainfer-cupti = { path = "pegainfer-cupti" }
