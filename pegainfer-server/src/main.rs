@@ -41,6 +41,8 @@ fn model_lines() -> Vec<&'static dyn ModelLine> {
         &pegainfer_qwen4::model_line::MODEL_LINE,
         #[cfg(feature = "rocm")]
         &pegainfer_rocm::qwen3::model_line::MODEL_LINE,
+        #[cfg(feature = "ascend")]
+        &pegainfer_ascend::qwen3::model_line::MODEL_LINE,
     ]
 }
 

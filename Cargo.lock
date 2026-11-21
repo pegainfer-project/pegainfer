@@ -3556,6 +3556,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pegainfer-ascend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "half",
+ "log",
+ "memmap2",
+ "pegainfer-frontend",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pegainfer-bench"
 version = "0.1.0"
 dependencies = [
@@ -3930,6 +3947,7 @@ dependencies = [
  "anyhow",
  "clap",
  "log",
+ "pegainfer-ascend",
  "pegainfer-deepseek-v2-lite",
  "pegainfer-frontend",
  "pegainfer-gemma4",
