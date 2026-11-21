@@ -1172,6 +1172,21 @@ mod tests {
     }
 
     #[test]
+    fn host_victim_is_counted_as_an_eviction() {
+        let mut state = SnapshotCache::new(1, 1);
+        for tag in [1, 2] {
+            let plan = state
+                .reserve(key(tag), hashes(tag), &live)
+                .expect("reserve");
+            state.commit_plan(&plan);
+            state.publish(plan.reservation());
+        }
+        let plan = state.reserve(key(3), hashes(3), &live).expect("host spill");
+        assert!(plan.evicted_host());
+        assert!(plan.reservation().was_replacement());
+    }
+
+    #[test]
     fn dead_victim_is_dropped_before_spill() {
         let mut state = SnapshotCache::new(1, 1);
         let plan = state
