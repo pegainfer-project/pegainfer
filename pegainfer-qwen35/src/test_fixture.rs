@@ -167,6 +167,7 @@ impl GdnAcceptance {
             max_prefill_tokens,
             policy,
             overlap,
+            0,
         )
     }
 }

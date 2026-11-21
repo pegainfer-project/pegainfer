@@ -324,6 +324,7 @@ fn start_engine_with_backend(
             max_prefill_tokens,
             enable_cuda_graph,
             prefix_snapshot_bytes,
+            0,
         );
     }
 
@@ -362,6 +363,7 @@ fn start_engine_with_backend(
         max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
+        0,
     )
 }
 

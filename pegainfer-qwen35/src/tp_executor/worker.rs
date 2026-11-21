@@ -102,6 +102,7 @@ impl TpWorker {
         max_prefill_tokens: usize,
         graph_enabled: bool,
         padding_block_id: i32,
+        host_slot_count: usize,
         nccl_id: cudarc::nccl::safe::Id,
         startup_gate: Arc<TpStartupGate>,
         effective_max_batch: Arc<AtomicUsize>,
@@ -128,6 +129,7 @@ impl TpWorker {
                         max_prefill_tokens,
                         graph_enabled,
                         padding_block_id,
+                        host_slot_count,
                     );
                     let prepared = match prepared {
                         Ok((prepared, rank_max_batch)) => {
@@ -266,13 +268,15 @@ impl TpWorkerPrepared {
         max_prefill_tokens: usize,
         graph_enabled: bool,
         padding_block_id: i32,
+        host_slot_count: usize,
     ) -> Result<(Self, usize)> {
         let cublas_guard = bind_worker_thread(&model)?;
-        let snapshots = RecurrentStateStore::new(
+        let snapshots = RecurrentStateStore::new_with_host(
             model.device_ctx(),
             model.config(),
             model.geometry,
             model.prefix_snapshot_slots(),
+            host_slot_count,
         )?;
         let (free_bytes, total_bytes) = model
             .device_ctx()
@@ -455,7 +459,7 @@ impl TpWorkerState {
     fn restore_request(
         &mut self,
         request_id: RequestId,
-        snapshot_slot: Option<usize>,
+        snapshot: Option<(SnapshotTier, usize)>,
         boundary: usize,
     ) -> Result<TpWorkerReply> {
         anyhow::ensure!(
@@ -473,9 +477,21 @@ impl TpWorkerState {
             self.model.config(),
             self.model.geometry,
         )?;
-        if let Some(slot) = snapshot_slot {
-            self.snapshots
-                .restore(self.model.device_ctx(), slot, &mut recurrent)?;
+        if let Some((tier, slot)) = snapshot {
+            match tier {
+                SnapshotTier::Gpu => {
+                    self.snapshots
+                        .restore(self.model.device_ctx(), slot, &mut recurrent)?;
+                }
+                SnapshotTier::Host => {
+                    self.snapshots.restore_from_host(
+                        self.model.device_ctx(),
+                        slot,
+                        &mut recurrent,
+                    )?;
+                    recurrent.seq_len = boundary;
+                }
+            }
         }
         anyhow::ensure!(
             recurrent.seq_len == boundary,
@@ -509,13 +525,19 @@ impl TpWorkerState {
         Ok(TpWorkerReply::Position(recurrent.seq_len))
     }
 
+    fn spill_snapshot(&mut self, gpu_slot: usize, host_slot: usize) -> Result<TpWorkerReply> {
+        self.snapshots
+            .spill_to_host(self.model.device_ctx(), gpu_slot, host_slot)?;
+        Ok(TpWorkerReply::Ack)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn run(&mut self, rx: mpsc::Receiver<TpWorkerCommand>) {
         while let Ok(command) = rx.recv() {
             let fatal = match command {
                 TpWorkerCommand::RestoreRequest {
                     request_id,
-                    snapshot_slot,
+                    snapshot,
                     boundary,
                     start,
                     resp,
@@ -523,8 +545,21 @@ impl TpWorkerState {
                     if start.wait() == TpCommandDecision::Cancel {
                         false
                     } else {
-                        let result = self.restore_request(request_id, snapshot_slot, boundary);
+                        let result = self.restore_request(request_id, snapshot, boundary);
                         self.respond(resp, "restore request", result)
+                    }
+                }
+                TpWorkerCommand::SpillSnapshot {
+                    gpu_slot,
+                    host_slot,
+                    start,
+                    resp,
+                } => {
+                    if start.wait() == TpCommandDecision::Cancel {
+                        false
+                    } else {
+                        let result = self.spill_snapshot(gpu_slot, host_slot);
+                        self.respond(resp, "spill snapshot", result)
                     }
                 }
                 TpWorkerCommand::SaveSnapshot {
