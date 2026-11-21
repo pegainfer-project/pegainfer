@@ -45,8 +45,9 @@ use super::connect_link;
 use super::engine_output;
 use super::is_add_request;
 use super::now_secs_f64;
+use super::rejection;
 use super::send_outputs;
-use super::send_terminal_output;
+use super::send_refusal;
 use super::send_utility_response;
 use super::stop_sentinel_id;
 use crate::engine::FinishReason;
@@ -332,39 +333,20 @@ impl SteppedEngineBridge {
         let Some(prompt_tokens) = prompt_token_ids.as_ref().and_then(WireNdArray::to_u32_vec)
         else {
             warn!("request {request_id} dropped: missing or non-integer prompt_token_ids");
-            return send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            );
+            return send_refusal(self.engine_index, output_tx, request_id, None);
         };
         let Some(sampling_params) = sampling_params else {
             warn!("request {request_id} dropped: missing sampling_params");
-            return send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            );
+            return send_refusal(self.engine_index, output_tx, request_id, None);
         };
 
         if let Some(unsupported) = crate::vllm::wire::unsupported_request_params(&sampling_params) {
             warn!("request {request_id} rejected: {unsupported}");
-            return send_terminal_output(
+            return send_refusal(
                 self.engine_index,
                 output_tx,
                 request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
+                Some(rejection(unsupported)),
             );
         }
 
@@ -373,14 +355,11 @@ impl SteppedEngineBridge {
             Err(error) => {
                 let message = error.to_string();
                 warn!("request {request_id} rejected: {message}");
-                return send_terminal_output(
+                return send_refusal(
                     self.engine_index,
                     output_tx,
                     request_id,
-                    EngineCoreFinishReason::Error,
-                    Some(StopReason::Text(message)),
-                    None,
-                    None,
+                    Some(rejection(message)),
                 );
             }
         };
@@ -590,6 +569,7 @@ fn reduce_update(
 
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
+    let mut error = None;
     let mut terminated = false;
     match update.terminal {
         None => {}
@@ -613,12 +593,12 @@ fn reduce_update(
             terminated = true;
         }
         Some(Terminal::Rejected { reason, .. }) => {
-            // The vLLM wire only carries a string; typed classification stops
-            // here and the rendered message is what reaches the client.
+            // Every reject reason is something the request asked for, so the
+            // rendered reason goes out as a validation error.
             let message = reason.to_string();
             warn!("request {} rejected: {message}", state.request_id);
             finish_reason = Some(EngineCoreFinishReason::Error);
-            stop_reason = Some(StopReason::Text(message));
+            error = Some(rejection(message));
             terminated = true;
         }
         Some(Terminal::Failed { message, .. }) => {
@@ -645,6 +625,7 @@ fn reduce_update(
     );
     output.new_prompt_logprobs_tensors = prompt_logprobs;
     output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
+    output.error = error.map(Box::new);
     (Some(output), terminated)
 }
 
@@ -678,6 +659,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
+    use vllm_engine_core_client::protocol::output::RequestError;
     use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
     use super::*;
@@ -723,10 +705,12 @@ mod tests {
         assert!(terminated);
         assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
         assert_eq!(
-            output.stop_reason,
-            Some(StopReason::Text(
-                "this engine does not support kv_transfer".into()
-            ))
+            output.error.as_deref(),
+            Some(&RequestError {
+                code: "validation_error".into(),
+                message: "this engine does not support kv_transfer".into(),
+                retryable: false,
+            })
         );
         assert!(
             output.prefill_stats.is_none(),

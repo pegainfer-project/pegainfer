@@ -31,6 +31,7 @@ use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
 use vllm_engine_core_client::protocol::output::EngineCoreOutput;
 use vllm_engine_core_client::protocol::output::EngineCoreOutputs;
 use vllm_engine_core_client::protocol::output::RequestBatchOutputs;
+use vllm_engine_core_client::protocol::output::RequestError;
 use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::output::UtilityCallOutput;
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
@@ -246,59 +247,33 @@ impl LocalEngineBridge {
         let Some(prompt_tokens) = prompt_token_ids.as_ref().and_then(WireNdArray::to_u32_vec)
         else {
             warn!("request {request_id} dropped: missing or non-integer prompt_token_ids");
-            send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            )?;
-            return Ok(());
+            return send_refusal(self.engine_index, output_tx, request_id, None);
         };
         let Some(sampling_params) = sampling_params else {
             warn!("request {request_id} dropped: missing sampling_params");
-            send_terminal_output(
-                self.engine_index,
-                output_tx,
-                request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            )?;
-            return Ok(());
+            return send_refusal(self.engine_index, output_tx, request_id, None);
         };
 
         if let Some(unsupported) = crate::vllm::wire::unsupported_request_params(&sampling_params) {
             warn!("request {request_id} rejected: {unsupported}");
-            send_terminal_output(
+            return send_refusal(
                 self.engine_index,
                 output_tx,
                 request_id,
-                EngineCoreFinishReason::Error,
-                None,
-                None,
-                None,
-            )?;
-            return Ok(());
+                Some(rejection(unsupported)),
+            );
         }
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
                 let message = error.to_string();
                 warn!("request {request_id} rejected: {message}");
-                send_terminal_output(
+                return send_refusal(
                     self.engine_index,
                     output_tx,
                     request_id,
-                    EngineCoreFinishReason::Error,
-                    Some(StopReason::Text(message)),
-                    None,
-                    None,
-                )?;
-                return Ok(());
+                    Some(rejection(message)),
+                );
             }
         };
         let kv_transfer_params = sampling_params
@@ -483,6 +458,7 @@ fn reduce_request(
     let mut has_logprobs = false;
     let mut finish_reason: Option<EngineCoreFinishReason> = None;
     let mut stop_reason: Option<StopReason> = None;
+    let mut error = None;
     let mut terminated = false;
 
     for event in events {
@@ -558,11 +534,9 @@ fn reduce_request(
                 terminated = true;
             }
             TokenEvent::Rejected { message, .. } => {
-                // Rejected means the request could not be admitted, not that it
-                // completed cleanly.
                 warn!("request {request_id} rejected: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
-                stop_reason = Some(StopReason::Text(message));
+                error = Some(rejection(message));
                 terminated = true;
             }
         }
@@ -583,6 +557,7 @@ fn reduce_request(
         state.first_token_prefill_stats.take(),
     );
     output.kv_transfer_params = state.kv_transfer_params.take().map(Box::new);
+    output.error = error.map(Box::new);
     (Some(output), terminated)
 }
 
@@ -931,28 +906,40 @@ async fn output_loop(
     Ok(())
 }
 
-fn send_terminal_output(
+/// The error for a request refused because of what it asks for: upstream
+/// answers a validation error with a 400 carrying `message`. Engine faults
+/// carry no error and stay a 500.
+fn rejection(message: String) -> RequestError {
+    RequestError {
+        code: RequestError::VALIDATION_ERROR.to_string(),
+        message,
+        retryable: false,
+    }
+}
+
+/// Finish a request the bridge refuses before it reaches the engine, with
+/// `error` for the client or, without one, a bare engine error.
+fn send_refusal(
     engine_index: u32,
     output_tx: &mpsc::UnboundedSender<EngineCoreOutputs>,
     request_id: String,
-    finish_reason: EngineCoreFinishReason,
-    stop_reason: Option<StopReason>,
-    events: Option<Vec<EngineCoreEvent>>,
-    prefill_stats: Option<PrefillStats>,
+    error: Option<RequestError>,
 ) -> Result<()> {
+    let mut output = engine_output(
+        request_id.clone(),
+        Vec::new(),
+        None,
+        Some(EngineCoreFinishReason::Error),
+        None,
+        None,
+        None,
+    );
+    output.error = error.map(Box::new);
     send_outputs(
         output_tx,
         RequestBatchOutputs {
             engine_index,
-            outputs: vec![engine_output(
-                request_id.clone(),
-                Vec::new(),
-                None,
-                Some(finish_reason),
-                stop_reason,
-                events,
-                prefill_stats,
-            )],
+            outputs: vec![output],
             finished_requests: Some(BTreeSet::from([request_id])),
             timestamp: now_secs_f64(),
             ..Default::default()

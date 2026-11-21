@@ -48,6 +48,7 @@ const SLOW_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-slow-metrics";
 const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
 const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
 const PROFILE_GATE_MODEL_NAME: &str = "pegainfer-sim-online-gate";
+const REFUSAL_MODEL_NAME: &str = "pegainfer-sim-e2e-refusal";
 const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// The pretend drafter the spec-metrics server runs: `K` and how many of those
 /// draft tokens each verify step accepts.
@@ -1603,13 +1604,59 @@ async fn invalid_lora_xarg_rejects_only_its_request() -> Result<()> {
         .send()
         .await?;
     let status = response.status();
-    let response_body = response.text().await?;
-    if status.is_success() {
-        bail!("invalid pegainfer_lora_adapter unexpectedly succeeded: {response_body}");
-    }
+    let response_body: Value = response.json().await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{response_body}");
+    assert_eq!(
+        response_body["error"]["message"],
+        "pegainfer_lora_adapter must be a string"
+    );
 
     assert_non_streaming_completion_has_output(&client, &server.base_url, &server.model_name)
         .await?;
+    server.shutdown().await
+}
+
+/// A request the engine refuses at admission answers 400 with the reason, and
+/// the server goes on serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_refusal_answers_400_with_its_reason() -> Result<()> {
+    let (_fixture_dir, profile) = profile_fixture("online-step-gate.json")?;
+    let config = SimulatedEngineConfig::default().with_engine_profile(profile)?;
+    let server = SimServer::spawn_with_config(
+        model_dir_with_minimal_metadata()?,
+        1,
+        REFUSAL_MODEL_NAME,
+        config,
+    )
+    .await?;
+    let client = test_client()?;
+    let completion = |max_tokens: usize| {
+        client
+            .post(format!("{}/v1/completions", server.base_url))
+            .json(&json!({
+                "model": REFUSAL_MODEL_NAME,
+                "prompt": [1, 2],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": true
+            }))
+            .send()
+    };
+
+    // The profile holds 16 tokens per request and the server allows 128, so
+    // only the engine sees that 22 is too long.
+    let refused = completion(20).await?;
+    let status = refused.status();
+    let body: Value = refused.json().await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "request exceeds this model's maximum context length of 16 tokens: \
+         requested 22 (prompt=2 + max_tokens=20)"
+    );
+
+    let served: Value = completion(2).await?.error_for_status()?.json().await?;
+    assert_eq!(served["choices"][0]["finish_reason"], "length");
     server.shutdown().await
 }
 

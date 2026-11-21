@@ -520,8 +520,8 @@ fn abort_reason_tracks_first_output_boundary() {
 }
 
 /// A rejected request (could not be admitted, e.g. too large for the KV cache)
-/// surfaces to the client as an error with the rejection message, and its stream
-/// is retired.
+/// goes out as a validation error carrying the rejection message, and its
+/// stream is retired.
 #[test]
 fn rejected_request_is_reported_as_error() {
     let mut d = Demux::new();
@@ -548,10 +548,12 @@ fn rejected_request_is_reported_as_error() {
     assert_eq!(output.request_id, "req-1");
     assert_eq!(output.finish_reason, Some(EngineCoreFinishReason::Error));
     assert_eq!(
-        output.stop_reason,
-        Some(StopReason::Text(
-            "request is too large for KV cache".to_string()
-        ))
+        output.error.as_deref(),
+        Some(&RequestError {
+            code: "validation_error".to_string(),
+            message: "request is too large for KV cache".to_string(),
+            retryable: false,
+        })
     );
     assert!(d.next_output().is_none());
     assert!(
