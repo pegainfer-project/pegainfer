@@ -6,7 +6,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use cudarc::driver::CudaEvent;
+use cudarc::driver::CudaStream;
 use cudarc::driver::PinnedHostSlice;
+use cudarc::driver::sys::CUevent_flags;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvCacheManager;
@@ -310,6 +313,9 @@ impl SnapshotReservation {
 pub(crate) struct HostSnapshotSlab {
     state: PinnedHostSlice<f32>,
     conv: PinnedHostSlice<half::bf16>,
+    copy_stream: Arc<CudaStream>,
+    source_ready: CudaEvent,
+    spill_events: Vec<CudaEvent>,
     slots: usize,
     layers: usize,
     state_per_layer: usize,
@@ -337,9 +343,27 @@ impl HostSnapshotSlab {
             .map_err(|e| anyhow::anyhow!("allocate pinned recurrent slab: {e}"))?;
         let conv = unsafe { ctx.ctx.alloc_pinned::<half::bf16>(slots * conv_per_slot) }
             .map_err(|e| anyhow::anyhow!("allocate pinned conv slab: {e}"))?;
+        let copy_stream = ctx
+            .ctx
+            .new_stream()
+            .map_err(|e| anyhow::anyhow!("create host snapshot copy stream: {e}"))?;
+        let source_ready = ctx
+            .ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))
+            .map_err(|e| anyhow::anyhow!("create host snapshot source event: {e}"))?;
+        let spill_events = (0..slots)
+            .map(|_| {
+                ctx.ctx
+                    .new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                    .map_err(|e| anyhow::anyhow!("create host snapshot spill event: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             state,
             conv,
+            copy_stream,
+            source_ready,
+            spill_events,
             slots,
             layers,
             state_per_layer,
@@ -366,19 +390,21 @@ impl HostSnapshotSlab {
         let conv = self.conv.as_mut_slice()?;
         let state_base = slot * self.state_per_slot;
         let conv_base = slot * self.conv_per_slot;
+        self.source_ready.record(&ctx.stream)?;
+        self.copy_stream.wait(&self.source_ready)?;
         for layer in 0..self.layers {
             let state_at = state_base + layer * self.state_per_layer;
-            ctx.stream.memcpy_dtoh(
+            self.copy_stream.memcpy_dtoh(
                 &src.layers[layer].state,
                 &mut state[state_at..state_at + self.state_per_layer],
             )?;
             let conv_at = conv_base + layer * self.conv_per_layer;
-            ctx.stream.memcpy_dtoh(
+            self.copy_stream.memcpy_dtoh(
                 &src.layers[layer].conv_state.data,
                 &mut conv[conv_at..conv_at + self.conv_per_layer],
             )?;
         }
-        ctx.stream.synchronize()?;
+        self.spill_events[slot].record(&self.copy_stream)?;
         Ok(())
     }
 
@@ -397,6 +423,7 @@ impl HostSnapshotSlab {
         );
         let state = self.state.as_slice()?;
         let conv = self.conv.as_slice()?;
+        ctx.stream.wait(&self.spill_events[slot])?;
         let state_base = slot * self.state_per_slot;
         let conv_base = slot * self.conv_per_slot;
         for layer in 0..self.layers {
@@ -411,7 +438,12 @@ impl HostSnapshotSlab {
                 &mut dst.layers[layer].conv_state.data,
             )?;
         }
-        ctx.stream.synchronize()?;
+        Ok(())
+    }
+
+    fn wait_spill(&self, ctx: &DeviceContext, slot: usize) -> Result<()> {
+        anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
+        ctx.stream.wait(&self.spill_events[slot])?;
         Ok(())
     }
 }
@@ -420,6 +452,7 @@ impl HostSnapshotSlab {
 pub(crate) struct RecurrentStateStore {
     slots: Vec<RecurrentState>,
     host: Option<HostSnapshotSlab>,
+    pending_spill: Vec<Option<usize>>,
 }
 
 impl RecurrentStateStore {
@@ -444,7 +477,11 @@ impl RecurrentStateStore {
                 host_slot_count,
             )?)
         };
-        Ok(Self { slots, host })
+        Ok(Self {
+            pending_spill: vec![None; gpu_slot_count],
+            slots,
+            host,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -463,6 +500,17 @@ impl RecurrentStateStore {
         slot: usize,
         src: &RecurrentState,
     ) -> Result<()> {
+        let host_slot = self
+            .pending_spill
+            .get_mut(slot)
+            .ok_or_else(|| anyhow::anyhow!("snapshot slot {slot} out of range"))?
+            .take();
+        if let Some(host_slot) = host_slot {
+            self.host
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("snapshot store has no host slab"))?
+                .wait_spill(ctx, host_slot)?;
+        }
         let dst = self
             .slots
             .get_mut(slot)
@@ -493,7 +541,9 @@ impl RecurrentStateStore {
         self.host
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("snapshot store has no host slab"))?
-            .spill_from(ctx, src, host_slot)
+            .spill_from(ctx, src, host_slot)?;
+        self.pending_spill[gpu_slot] = Some(host_slot);
+        Ok(())
     }
 
     pub(crate) fn restore_from_host(
