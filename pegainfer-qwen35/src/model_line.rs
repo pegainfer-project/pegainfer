@@ -27,6 +27,10 @@ struct Qwen35Cli {
     /// Per-rank GPU budget in MiB for joint prefix snapshots; zero disables reuse.
     #[arg(long, default_value_t = 0)]
     qwen35_prefix_cache_mib: usize,
+    /// Per-rank pinned-host budget in MiB for spilled prefix snapshots; zero
+    /// disables the host tier and requires no extra GPU memory.
+    #[arg(long, default_value_t = 0)]
+    qwen35_snapshot_host_mib: usize,
     /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
     /// the next graph bucket but admits only this many scheduler slots; defaults
     /// to 64.
@@ -75,6 +79,7 @@ pub(crate) fn launch_options(ctx: &LaunchContext<'_>) -> Qwen35LaunchOptions {
         cuda_graph: ctx.shared.cuda_graph,
         gdn_backend: cli.qwen35_gdn_backend,
         prefix_cache_mib: cli.qwen35_prefix_cache_mib,
+        snapshot_host_mib: cli.qwen35_snapshot_host_mib,
         max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
         max_prefill_tokens: ctx
             .shared
@@ -133,6 +138,16 @@ impl ModelLine for Qwen35Line {
         if cli.qwen35_prefix_cache_mib > 0 && ctx.shared.no_prefix_cache {
             return Err(CliError::rule(
                 "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
+            ));
+        }
+        if cli.qwen35_snapshot_host_mib > 0 && cli.qwen35_prefix_cache_mib == 0 {
+            return Err(CliError::rule(
+                "--qwen35-snapshot-host-mib requires --qwen35-prefix-cache-mib > 0",
+            ));
+        }
+        if cli.qwen35_snapshot_host_mib > 0 && ctx.shared.no_prefix_cache {
+            return Err(CliError::rule(
+                "--qwen35-snapshot-host-mib and --no-prefix-cache are contradictory",
             ));
         }
         crate::check_launch(
@@ -199,6 +214,38 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("contradictory"), "{error}");
+    }
+
+    #[test]
+    fn host_snapshot_budget_requires_gpu_prefix_cache() {
+        let error = validate_argv(&["pegainfer", "--qwen35-snapshot-host-mib", "64"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires --qwen35-prefix-cache-mib"),
+            "{error}"
+        );
+
+        let error = validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--qwen35-snapshot-host-mib",
+            "64",
+            "--no-prefix-cache",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("contradictory"), "{error}");
+
+        validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--qwen35-snapshot-host-mib",
+            "64",
+        ])
+        .expect("host budget should be accepted with a GPU prefix cache");
     }
 
     #[test]
