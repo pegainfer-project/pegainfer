@@ -88,7 +88,7 @@ impl Tensors {
         let n = self.arrays.len();
         let dims = self.arrays[n - 2].as_ptr();
         let st = self.arrays[n - 1].as_ptr();
-        let t = unsafe {
+        let t = {
             sys::aclCreateTensor(
                 dims,
                 shape.len(),
@@ -122,7 +122,7 @@ impl Tensors {
 impl Drop for Tensors {
     fn drop(&mut self) {
         for &t in &self.handles {
-            unsafe {
+            {
                 sys::aclDestroyTensor(t);
             }
         }
@@ -134,7 +134,7 @@ impl Drop for Tensors {
 fn mk_tensor_owned(shape: &[i64], dtype: u32, ptr: *mut c_void) -> *mut sys::aclTensor {
     let dims: &'static [i64] = Box::leak(shape.to_vec().into_boxed_slice());
     let st: &'static [i64] = Box::leak(strides(shape).into_boxed_slice());
-    unsafe {
+    {
         sys::aclCreateTensor(
             dims.as_ptr(),
             shape.len(),
@@ -152,26 +152,8 @@ fn mk_tensor_owned(shape: &[i64], dtype: u32, ptr: *mut c_void) -> *mut sys::acl
 struct Scalar(*mut sys::aclScalar);
 impl Drop for Scalar {
     fn drop(&mut self) {
-        unsafe {
+        {
             sys::aclDestroyScalar(self.0);
-        }
-    }
-}
-
-struct IntArray(*mut sys::aclIntArray);
-impl Drop for IntArray {
-    fn drop(&mut self) {
-        unsafe {
-            sys::aclDestroyIntArray(self.0);
-        }
-    }
-}
-
-struct TensorList(*mut sys::aclTensorList);
-impl Drop for TensorList {
-    fn drop(&mut self) {
-        unsafe {
-            sys::aclDestroyTensorList(self.0);
         }
     }
 }
@@ -183,7 +165,7 @@ impl Workspace {
             return Ok(Self(std::ptr::null_mut()));
         }
         let mut raw = std::ptr::null_mut();
-        crate::device::check(unsafe {
+        crate::device::check({
             sys::aclrtMalloc(
                 &raw mut raw,
                 usize::try_from(bytes)?,
@@ -196,7 +178,7 @@ impl Workspace {
 impl Drop for Workspace {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe {
+            {
                 sys::aclrtFree(self.0);
             }
         }
@@ -215,7 +197,7 @@ fn run_locked(
     let status = prepare(&mut ws, &mut executor);
     if status != 0 {
         if !executor.is_null() {
-            unsafe {
+            {
                 sys::aclDestroyAclOpExecutor(executor);
             }
         }
@@ -224,11 +206,11 @@ fn run_locked(
     let workspace = Workspace::new(ws)?;
     let status = launch(workspace.0, ws, executor, stream);
     let synced = if status == 0 {
-        unsafe { sys::aclrtSynchronizeStream(stream) }
+        sys::aclrtSynchronizeStream(stream)
     } else {
         0
     };
-    unsafe {
+    {
         sys::aclDestroyAclOpExecutor(executor);
     }
     crate::device::check(status)?;
@@ -247,7 +229,7 @@ fn run_cached(
     let workspace = Workspace::new(ws)?;
     let status = launch(workspace.0, ws, executor as *mut sys::aclOpExecutor, stream);
     let synced = if status == 0 {
-        unsafe { sys::aclrtSynchronizeStream(stream) }
+        sys::aclrtSynchronizeStream(stream)
     } else {
         0
     };
@@ -270,7 +252,7 @@ fn run_keep_locked(
     let workspace = Workspace::new(ws)?;
     let status = launch(workspace.0, ws, executor, stream);
     let synced = if status == 0 {
-        unsafe { sys::aclrtSynchronizeStream(stream) }
+        sys::aclrtSynchronizeStream(stream)
     } else {
         0
     };
@@ -342,7 +324,7 @@ pub fn gemm(
         ],
     );
     d.run(|stream| {
-        let (executor, ws) = d.cached_gemm(cache_key, || unsafe {
+        let (executor, ws) = d.cached_gemm(cache_key, || {
             let tx = mk_tensor_owned(
                 &[rows as i64, k as i64],
                 sys::ACL_BF16,
@@ -375,9 +357,9 @@ pub fn gemm(
         })?;
         let workspace = Workspace::new(ws)?;
         let ex = executor as *mut sys::aclOpExecutor;
-        let status = unsafe { sys::aclnnMatmul(workspace.0, ws, ex, stream) };
+        let status = { sys::aclnnMatmul(workspace.0, ws, ex, stream) };
         let synced = if status == 0 {
-            unsafe { sys::aclrtSynchronizeStream(stream) }
+            sys::aclrtSynchronizeStream(stream)
         } else {
             0
         };
@@ -442,7 +424,7 @@ pub fn add(
     check(d, out, n)?;
     ensure!(n > 0, "empty add");
     let mut one = 1.0f32;
-    let alpha = Scalar(unsafe { sys::aclCreateScalar((&raw mut one).cast(), sys::ACL_FLOAT) });
+    let alpha = Scalar(sys::aclCreateScalar((&raw mut one).cast(), sys::ACL_FLOAT));
     ensure!(!alpha.0.is_null(), "aclCreateScalar returned null");
     let cache_key = key(
         "add",
@@ -491,7 +473,7 @@ fn mul_locked(
     n: usize,
 ) -> Result<()> {
     let cache_key = key("mul", &[n as i64], &[a as usize, b as usize, out as usize]);
-    let (executor, ws) = d.cached_gemm(cache_key, || unsafe {
+    let (executor, ws) = d.cached_gemm(cache_key, || {
         let ta = mk_tensor_owned(&[n as i64], sys::ACL_BF16, a);
         let tb = mk_tensor_owned(&[n as i64], sys::ACL_BF16, b);
         let to = mk_tensor_owned(&[n as i64], sys::ACL_BF16, out);
@@ -510,7 +492,7 @@ fn mul_locked(
     let ex = executor as *mut sys::aclOpExecutor;
     let status = sys::aclnnMul(workspace.0, ws, ex, stream);
     let synced = if status == 0 {
-        unsafe { sys::aclrtSynchronizeStream(stream) }
+        sys::aclrtSynchronizeStream(stream)
     } else {
         0
     };
@@ -835,7 +817,7 @@ pub fn attention(
             ],
             &[q_ptr, out_ptr, keys_ptr, values_ptr],
         );
-        let descs = d.cached_descs(cache_key, || unsafe {
+        let descs = d.cached_descs(cache_key, || {
             let tq = mk_tensor_owned(
                 &[1, s.heads as i64, 1, s.dim as i64],
                 sys::ACL_BF16,
@@ -879,7 +861,7 @@ pub fn attention(
             let layout = c"BNSD";
             run_keep_locked(
                 stream,
-                |ws, ex| unsafe {
+                |ws, ex| {
                     sys::aclnnIncreFlashAttentionV4GetWorkspaceSize(
                         tq,
                         klist,
@@ -907,7 +889,7 @@ pub fn attention(
                         ex,
                     )
                 },
-                |p, n, ex, st| unsafe { sys::aclnnIncreFlashAttentionV4(p, n, ex, st) },
+                |p, n, ex, st| sys::aclnnIncreFlashAttentionV4(p, n, ex, st),
             )
         })?;
     }
