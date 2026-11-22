@@ -1233,12 +1233,17 @@ impl Glm52Engine {
                             pages: active.kv.current_page_indices(),
                         });
                     }
-                }
-                let wants_drafts = active
-                    .state
-                    .wants_full_draft(crate::mtp::glm52_mtp_draft_len());
-                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
-                    rank_proposals.push((slot_id, anchor, anchor_pos));
+                    // DSpark emitted its own proposal (or materialize-only
+                    // entry) inside the branch above; a second push here would
+                    // duplicate the slot and trip the worker's slot-order
+                    // guard (and propose a Plain request's empty context).
+                    let wants_drafts = active
+                        .state
+                        .wants_full_draft(crate::mtp::glm52_mtp_draft_len());
+                    if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
+                    {
+                        rank_proposals.push((slot_id, anchor, anchor_pos));
+                    }
                 }
             }
         }
@@ -1339,6 +1344,18 @@ impl Glm52Engine {
                     pages[position / PAGE],
                     position,
                 ));
+            }
+            // The frontier page keeps rows past `cover` from an older epoch
+            // (another sequence, other content): the pool no longer holds one
+            // content for the whole page, so its tag must not survive and let
+            // a later hit gather that mix. The tag pass re-establishes it once
+            // the cursor crosses the page.
+            if !cover.is_multiple_of(PAGE)
+                && let Some(&page) = pages.get(cover / PAGE)
+                && page >= 0
+                && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
+            {
+                *tag = None;
             }
             scatters.push(DsparkScatter {
                 slot: slot_id,

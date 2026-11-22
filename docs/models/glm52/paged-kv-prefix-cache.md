@@ -150,7 +150,10 @@ does the same in a **bounded side pool**:
   target has provisioned (a dangling-bonus row waits one round) and at the last
   page the draft pool itself owns, so a pool smaller than the target pool never
   writes out of bounds. A page is **tagged** only after all 64 of its rows are
-  in the pool. A prefill-only turn (`max_tokens=1`) runs a materialize-only
+  in the pool, and a page whose tail rows past `cover` still belong to an
+  older epoch has its tag dropped (the pool no longer holds one content for
+  the whole page; the tag pass re-establishes it once the cursor crosses the
+  page). A prefill-only turn (`max_tokens=1`) runs a materialize-only
   round so its prompt pages still become matchable.
 - **Restore:** at admission, every matched page must be in the pool and carry
   the same sequence hash; then the next draft round gathers the prefix into the
@@ -160,8 +163,9 @@ does the same in a **bounded side pool**:
 - **Scope:** rank-local, zero collectives (the drafter is replicated per rank
   already; under mirrored TP every worker holds an identical pool and the
   existing span-identity assert covers it). `--no-prefix-cache` skips the pool
-  entirely; host offload stays rejected with DSpark (offloaded pages are
-  untagged by construction).
+  entirely — it is neither allocated nor charged against the context budget;
+  host offload stays rejected with DSpark (offloaded pages are untagged by
+  construction).
 
 Status: implementation complete; the GB300 EP4/EP8 gates (cold vs warm accept
 parity, losslessness, untagged fallback, exact 64-token boundary, prefill-only
