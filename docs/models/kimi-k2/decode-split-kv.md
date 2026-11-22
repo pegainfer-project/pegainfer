@@ -1,8 +1,8 @@
 # Kimi-K2.5 Decode MLA 的 KV 分片并行
 
-> **TL;DR:** decode 阶段的 MLA attention 现在把每个请求的 KV 读切成多片、铺到多个 CTA 上（flashinfer 的 partition-KV + merge 路径）。8×H20 实测 8k 入 / 1k 出：单请求 123.2 s → 20.8 s（8.31 → 49.2 tok/s，5.9×），12 并发 74.7 → 148.0 tok/s（2.0×），decode 每步 118.0 ms → 17.6 ms，TTFT 不变（prefill 未改）。每层 MLA decode kernel 1.60 ms → 53.8 µs，attention 在步长里的占比 83% → 15%。
+> **TL;DR:** decode 阶段的 MLA attention 现在把每个请求的 KV 读切成多片、铺到多个 CTA 上（flashinfer 的 partition-KV + merge 路径）。8×H20 实测 8k 入 / 1k 出：单请求 123.2 s → 20.8 s（8.31 → 49.2 tok/s，5.9×），12 并发 74.7 → 148.0 tok/s（2.0×），decode 每步 118.0 ms → 17.6 ms，TTFT 不变（prefill 未改）。每层 MLA decode kernel 1.60 ms → 53.8 µs，attention 在步长里的占比 83% → 14%。
 
-**Last touched:** 2026-10
+**Last touched:** 2026-11
 
 ## 为什么做
 
@@ -21,11 +21,12 @@ flashinfer 的 MLA decode 自带 partition-KV：`BatchDecodeWithPagedKVCacheDisp
 
 改动把这条既有路径接起来，不再自己写 kernel：
 
-- **一行 = 一个 (请求, KV 分片)**。`request_indices` 是该行的 slot，`kv_tile_indices` 是该行负责的分片号，`kv_chunk_size` 是统一分片长度（kernel 只读第 0 个元素），`row_valid` 关掉这一步用不到的行，`slot_indptr` 给出每个请求的行区间供合并使用。
+- **一行 = 一个 (请求, KV 分片)**。`request_indices` 是该行的 slot，`kv_tile_indices` 是该行负责的分片号，`kv_chunk_size` 是统一分片长度（kernel 只读第 0 个元素），`row_valid` 关掉这一步用不到的行，`slot_indptr` 给出每个 slot 的行区间供合并使用。
 - **行容量固定** = `batch_size × tiles`，`tiles = max(64 / batch_size, 1)`。启动几何因此与 KV 长度无关，CUDA graph 可复用；短 KV 只是让尾部行失效，不缩 grid。
 - **分片长度** = `max(ceil(最长 KV / tiles), 256)`。256 的下限保证短上下文不会被切得过碎（切碎只增加 merge 的读放大）。
-- **每步只重算 plan**：`plan_decode_kv_tiles` 生成 `row_valid` 与 `slot_indptr` 并上传，代价是几百字节的 H2D，数值路径不变。
-- **行按请求成群排列**：请求 `r` 占 `[r*tiles, (r+1)*tiles)`。合并 kernel 的输出行数取自 `paged_kv.batch_size`（即 bucket 的 batch），与 `slot_indptr` 的 `batch_size + 1` 条目一一对应，所以行序必须与 decode 行序一致，一个请求的分片必须连续。
+- **每步重算 plan**：`plan_decode_kv_tiles` 生成 `row_slots`、`row_tiles`、`row_valid`、`slot_indptr` 与 `tile_tokens` 并上传，代价是几百字节的 H2D，数值路径不变。
+- **分片行按 slot 紧排**：活跃 slot 的分片依次铺在行区间头部，每个 slot 的行连续；同一 slot 的行都写进 `slot_indptr[slot]` 到 `slot_indptr[slot + 1]` 之间。`VariableLengthMergeStates` 会把窗口内的每一行都当成该 slot 的分片参与合并，所以窗口里不能夹空闲行或别的请求的行——否则会在合并时读进被掩码的 partial、丢掉真正的分片。KV 长度不齐的并发请求因此按 slot 顺序紧排，尾部剩余的行全部掩码。空闲 slot 的窗口为空，合并直接写出零行。
+- **合并的输出行数取自 `paged_kv.batch_size`**（即 bucket 的 batch），与 `slot_indptr` 的 `batch_size + 1` 条目一一对应，合并结果写回该 slot 的行。
 
 缓冲按 arena 分配：`partial_ckv` = 行数 × 本地头数(8) × 512，`partial_lse` = 行数 × 8。64 行时分别是 512 KiB 与 2 KiB，相对每卡 86 GiB 的权重可以忽略。
 
@@ -71,7 +72,7 @@ TTFT p50 五档分别是 2403/7427/11860/16331/11702 ms（原树）与 2639/6958
 ## 正确性口径
 
 - token 级相等在这条路径上不可用：**原树自己跨进程也不一致**。同一个原树二进制（md5 64731e45）、同一个 prompt、temperature 0：1024 入 / 16 出两次启动给出两段不同文本；8192 入 / 16 出同样两次不同；256 入 / 64 出在两棵树上分别得到 `9a8f5481` 与 `1374b6f5`，而分片版自身在另一次进程里又是 `80f7d803`。这份不确定性来自 TP8 的 all-reduce 求和顺序与 expert split-K 归约，改动前就存在。
-- 因此本次的锚点是：① 256 token 上下文只占 1 个 tile，走的是与改动前相同的单行形状、同一个 kernel；② `plan_decode_kv_tiles` 的纯函数单测（分片切分、短 KV 单分片、空闲行掩码、参数校验）；③ 只改 KV 切分，其余 kernel 与缓冲区语义不变，合并走 flashinfer 自己的 `VariableLengthMergeStates`（与其余 MLA 前向共用同一份实现），只改变浮点求和顺序。
+- 因此本次的锚点是：① 256 token 上下文只占 1 个 tile，走的是与改动前相同的单行形状、同一个 kernel；② `plan_decode_kv_tiles` 的纯函数单测（分片切分、短 KV 单分片、长短混合时按 slot 紧排、空闲行掩码与空窗口、参数校验）；③ 只改 KV 切分，其余 kernel 与缓冲区语义不变，合并走 flashinfer 自己的 `VariableLengthMergeStates`（与其余 MLA 前向共用同一份实现），只改变浮点求和顺序。
 - `logprobs` 在 TP8 路径返回 HTTP 500，无法用 logit 差做 gate。精度回归要跑同机 DP8 路径的 `vllm_golden_gate`（K2.6 权重 + 已提交 fixture）：在 96 GB 的 H20 上，原树与分片版都在装载阶段以同一个 `vstack alloc failed: CUDA_ERROR_OUT_OF_MEMORY` 失败（每 rank 权重 89.2 GiB），需要 141 GB 机型（文档记录的绿灯是 8×H200）。
 
 ## 代价与边界
