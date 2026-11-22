@@ -506,7 +506,7 @@ pub(crate) fn plan_decode_kv_tiles(
     );
     ensure!(
         slots.len() <= batch_size,
-        "Kimi decode tile plan rows {} exceed batch size {batch_size}",
+        "Kimi decode tile plan active slots {} exceed batch size {batch_size}",
         slots.len()
     );
     let mut live = vec![false; batch_size];

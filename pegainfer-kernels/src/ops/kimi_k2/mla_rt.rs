@@ -108,10 +108,11 @@ pub fn kimi_mla_v_up_rt(
     Ok(())
 }
 
-/// Split-KV plan for one MLA decode step: row `row * tiles + tile` is tile
-/// `tile` of the request on decode row `row`, `slot_indptr` groups each
-/// request's rows for the merge, and `partial_ckv`/`partial_lse` hold one
-/// partial attention result per row.
+/// Split-KV plan for one MLA decode step: `row_slots` names the request each row
+/// serves and `row_tiles` its KV tile, `row_valid` masks the rows this step leaves
+/// empty, `slot_indptr` gives each request the contiguous row run its partials
+/// occupy for the merge, and `partial_ckv`/`partial_lse` hold one partial
+/// attention result per row.
 pub struct KimiMlaSplitKv<'a> {
     pub row_slots: &'a CudaSlice<i32>,
     pub row_tiles: &'a CudaSlice<i32>,
@@ -198,7 +199,7 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
             kti_ptr as *const i32,
             kcs_ptr as *const i32,
             sip_ptr as *const i32,
-            rv_ptr as *const bool,
+            rv_ptr as *const u8,
             pc_ptr as *mut ffi::Half,
             pl_ptr as *mut f32,
             local_heads as i32,

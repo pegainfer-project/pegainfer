@@ -21,7 +21,7 @@ flashinfer 的 MLA decode 自带 partition-KV：`BatchDecodeWithPagedKVCacheDisp
 
 改动把这条既有路径接起来，不再自己写 kernel：
 
-- **一行 = 一个 (请求, KV 分片)**。`request_indices` 是该行的 slot，`kv_tile_indices` 是该行负责的分片号，`kv_chunk_size` 是统一分片长度（kernel 只读第 0 个元素），`row_valid` 关掉这一步用不到的行，`slot_indptr` 给出每个 slot 的行区间供合并使用。
+- **一行 = 一个 (请求, KV 分片)**。arena 的 `row_slots` 是该行的 slot（FlashInfer 的 `request_indices`），`row_tiles` 是该行负责的分片号（`kv_tile_indices`），`tile_tokens` 是统一分片长度（`kv_chunk_size`，kernel 只读第 0 个元素），`row_valid` 关掉这一步用不到的行，`slot_indptr` 给出每个 slot 的行区间供合并使用。
 - **行容量固定** = `batch_size × tiles`，`tiles = max(64 / batch_size, 1)`。启动几何因此与 KV 长度无关，CUDA graph 可复用；短 KV 只是让尾部行失效，不缩 grid。
 - **分片长度** = `max(ceil(最长 KV / tiles), 256)`。256 的下限保证短上下文不会被切得过碎（切碎只增加 merge 的读放大）。
 - **每步重算 plan**：`plan_decode_kv_tiles` 生成 `row_slots`、`row_tiles`、`row_valid`、`slot_indptr` 与 `tile_tokens` 并上传，代价是几百字节的 H2D，数值路径不变。

@@ -644,7 +644,7 @@ struct KimiWorkerDecodeArena {
     row_tiles_d: CudaSlice<i32>,
     /// FlashInfer's `kv_chunk_size`: tile span, one value per step.
     tile_tokens_d: CudaSlice<i32>,
-    /// FlashInfer's `o_indptr`: per decode row, its first row.
+    /// FlashInfer's `o_indptr`: first tile row of each decode slot.
     slot_indptr_d: CudaSlice<i32>,
     /// FlashInfer's `block_valid_mask`: row carries KV this step.
     row_valid_d: CudaSlice<u8>,
@@ -871,6 +871,7 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 mod tests {
     use super::KimiKvStepPages;
     use super::cache::build_slot_page_table;
+    use super::cache::decode_kv_tiles;
     use super::cache::plan_decode_kv_tiles;
     use super::decode_batch_bucket;
 
@@ -936,6 +937,15 @@ mod tests {
         let kv_pages = KimiKvStepPages::single(vec![1], 0);
         assert!(build_slot_page_table(2, 16, &kv_pages, &[2], &[1]).is_err());
         assert!(build_slot_page_table(2, 16, &kv_pages, &[0, 1], &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn decode_kv_tiles_keeps_every_bucket_at_64_rows() {
+        // The tile count only trades rows for tiles; the row capacity a bucket
+        // launches stays 64, so CUDA graph shapes do not depend on the batch.
+        for (batch, tiles) in [(1, 64), (2, 32), (4, 16), (8, 8), (16, 4), (32, 2), (64, 1)] {
+            assert_eq!(decode_kv_tiles(batch), tiles, "bucket {batch}");
+        }
     }
 
     #[test]

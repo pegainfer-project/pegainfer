@@ -834,7 +834,7 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
                                           IdType* kv_tile_indices,
                                           IdType* kv_chunk_size_ptr,
                                           IdType* slot_indptr,
-                                          bool* row_valid,
+                                          const uint8_t* row_valid,
                                           void* partial_ckv,
                                           float* partial_lse,
                                           int num_qo_heads,
@@ -875,7 +875,9 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
   params.kv_tile_indices = kv_tile_indices;
   params.o_indptr = slot_indptr;
   params.kv_chunk_size_ptr = kv_chunk_size_ptr;
-  params.block_valid_mask = row_valid;
+  // FlashInfer reads the mask through a non-const `bool*` field; the bytes stay
+  // read-only here.
+  params.block_valid_mask = const_cast<bool*>(reinterpret_cast<const bool*>(row_valid));
 
   // A non-null `tmp_v` selects the launcher's split-KV path: per-tile decode
   // over the `rows` grid, then a merge of each request's rows into `output`.

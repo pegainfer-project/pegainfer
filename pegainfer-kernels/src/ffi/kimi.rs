@@ -35,7 +35,7 @@ unsafe extern "C" {
         kv_tile_indices: *const i32,
         kv_chunk_size_ptr: *const i32,
         slot_indptr: *const i32,
-        row_valid: *const bool,
+        row_valid: *const u8,
         partial_ckv: *mut Half,
         partial_lse: *mut f32,
         num_qo_heads: i32,
