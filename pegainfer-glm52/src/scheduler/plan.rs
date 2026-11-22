@@ -255,6 +255,7 @@ pub(super) fn plan_prefill_spans(
 mod tests {
     use super::*;
     use crate::scheduler::ActiveRequest;
+    use crate::scheduler::DraftMode;
     use crate::scheduler::slot::Glm52StepOutcome;
     use crate::scheduler::testkit::EOS;
     use crate::scheduler::testkit::commit;
@@ -315,6 +316,7 @@ mod tests {
         slots[0] = Some(ActiveRequest {
             req,
             state,
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 1,
             kv,
             save_cursor: pegainfer_kv_store::SaveCursor::new(),
@@ -388,6 +390,7 @@ mod tests {
         rank_slots[0] = Some(ActiveRequest {
             req: request(vec![10], sampled(0.8), 8),
             state: decode_state,
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
             save_cursor: pegainfer_kv_store::SaveCursor::new(),
@@ -402,6 +405,7 @@ mod tests {
         rank_slots[1] = Some(ActiveRequest {
             req: request(vec![10, 11, 12, 13, 14], sampled(0.8), 8),
             state: boundary_state,
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 5,
             kv: test_kv(vec![10, 11, 12, 13, 14], 8),
             save_cursor: pegainfer_kv_store::SaveCursor::new(),
@@ -416,6 +420,7 @@ mod tests {
         rank_slots[2] = Some(ActiveRequest {
             req: request(vec![10], pegainfer_sample::SamplingParams::default(), 8),
             state: greedy_state,
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
             save_cursor: pegainfer_kv_store::SaveCursor::new(),
@@ -425,6 +430,7 @@ mod tests {
         rank_slots[3] = Some(ActiveRequest {
             req: request(vec![30; 10], sampled(0.8), 8),
             state: state(vec![30; 10], 8, false),
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 10,
             kv: test_kv(vec![30; 10], 8),
             save_cursor: pegainfer_kv_store::SaveCursor::new(),
@@ -465,6 +471,7 @@ mod tests {
                 8,
             ),
             state,
+            draft: DraftMode::Eligible,
             client_prompt_tokens: 1,
             kv: test_kv(vec![10], 8),
             save_cursor: pegainfer_kv_store::SaveCursor::new(),

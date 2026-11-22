@@ -70,7 +70,7 @@ Issue #551 records one request that entered the frontend but never reached a ter
 
 ### 3. Feature composition
 
-DSpark is mutually exclusive with prefix caching, host offload, and P/D. A prefix hit skips the target forwards that normally produce DSpark's historical auxiliary state. Issue #590 must first measure a position-correct boundary cold start before the project considers transferring the additional draft K/V payload.
+DSpark keeps prefix caching off unless the paged draft-K/V pool is funded (issue #590): the projected draft K/V lives in a budgeted side pool addressed by the target page ids, so a hit gathers the drafter state instead of cold-starting it (see `paged-kv-prefix-cache.md` § DSpark × prefix cache). With no pool budget the historical exclusion stands (logged). Host offload and P/D remain mutually exclusive with DSpark.
 
 In the multi-process cross-node shape, KV offload registers each node's local arenas on its own pegaflow host under the shared deterministic namespace.
 

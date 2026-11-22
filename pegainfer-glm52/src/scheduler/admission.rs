@@ -171,6 +171,7 @@ pub(super) fn admit_from_queue(
     drafter_enabled: bool,
     native_mtp_prefill: bool,
     pending_resets: &mut Vec<usize>,
+    mut draft: Option<&mut super::DraftAdmission<'_>>,
 ) -> anyhow::Result<()> {
     // Zero-capacity natives finish at intake, before the slot and budget
     // gates — a saturated rank must never delay a reply that needs no
@@ -390,6 +391,42 @@ pub(super) fn admit_from_queue(
                 } else {
                     0
                 };
+                // DSpark (#590): a hit is only draftable when every matched
+                // page's draft rows are in the paged pool. Missing rows keep
+                // the target KV hit but degrade this request to plain decode.
+                let (draft_mode, restore) = if let Some(book) = draft.as_mut() {
+                    if let Some(pages) = restorable_prefix(&kv, book.tags, cached_tokens) {
+                        if cached_tokens > 0 {
+                            let locs = (0..cached_tokens)
+                                .map(|position| {
+                                    crate::dspark_pool::pool_slot(
+                                        pages[position / super::PAGE],
+                                        position,
+                                    )
+                                })
+                                .collect();
+                            (
+                                super::DraftMode::Eligible,
+                                Some(crate::runner::DsparkRestore {
+                                    slot,
+                                    tokens: cached_tokens,
+                                    locs,
+                                }),
+                            )
+                        } else {
+                            (super::DraftMode::Eligible, None)
+                        }
+                    } else {
+                        log::debug!(
+                            "GLM5.2 rank {rank}: draft rows missing for {cached_tokens} \
+                             cached tokens; plain decode"
+                        );
+                        (super::DraftMode::Plain, None)
+                    }
+                } else {
+                    (super::DraftMode::Eligible, None)
+                };
+                let restored_tokens = if restore.is_some() { cached_tokens } else { 0 };
                 // The resolve's anti-eviction hold has served its purpose:
                 // the match above re-pinned whatever it restored.
                 drop(prefix);
@@ -418,11 +455,19 @@ pub(super) fn admit_from_queue(
                 slots[slot] = Some(ActiveRequest {
                     req,
                     state,
+                    draft: draft_mode,
                     client_prompt_tokens,
                     kv,
                     save_cursor: SaveCursor::new(),
                     boundary_copy: None,
                 });
+                if let Some(book) = draft.as_mut() {
+                    book.restores[slot] = restore;
+                    book.committed[slot] = restored_tokens;
+                    book.materialized[slot] = restored_tokens;
+                    book.pending[slot] = 0;
+                    book.tagged[slot] = restored_tokens / super::PAGE;
+                }
                 committed += need_blocks;
             }
             Resolved::Native {
@@ -563,6 +608,7 @@ fn admit_native(
     slots[slot] = Some(ActiveRequest {
         req,
         state,
+        draft: super::DraftMode::Eligible,
         client_prompt_tokens,
         kv,
         save_cursor: SaveCursor::new(),
@@ -570,6 +616,34 @@ fn admit_native(
     });
     *committed += need_blocks;
     Ok(None)
+}
+
+/// Pages of a matched prefix whose draft K/V rows are all in the paged pool.
+/// `None` means at least one page is untagged or out of the pool: the request
+/// keeps its target KV hit but must not draft.
+fn restorable_prefix(
+    kv: &RequestKv,
+    tags: &[Option<[u8; 16]>],
+    cached_tokens: usize,
+) -> Option<Vec<i32>> {
+    if cached_tokens == 0 {
+        return Some(Vec::new());
+    }
+    let blocks = cached_tokens / super::PAGE;
+    let assigned = kv.assigned_block_hashes();
+    let pages = kv.current_page_indices();
+    if assigned.len() < blocks || pages.len() < blocks {
+        return None;
+    }
+    for &(page, hash) in assigned.iter().take(blocks) {
+        if page < 0 || page as usize >= tags.len() {
+            return None;
+        }
+        if tags[page as usize] != Some(hash) {
+            return None;
+        }
+    }
+    Some(pages[..blocks].to_vec())
 }
 
 /// Rebuild the restored chain under the request's own KV. Full pages match
@@ -742,6 +816,48 @@ mod tests {
         assert!(
             validate_request(&overflows, 4096, true, false).is_ok(),
             "plain TP4 prefill does not execute the native-MTP proposal loop"
+        );
+    }
+
+    /// A hit is draftable only when every matched page is tagged with the
+    /// same sequence hash; any untagged page or mismatch falls back to plain
+    /// decode while the target KV hit stands.
+    #[test]
+    fn restorable_prefix_requires_every_matched_page_to_be_tagged() {
+        let pool = BlockPool::new(PAGE, 16);
+        let prompt: Vec<u32> = (0..192).collect(); // three full pages
+        let mut kv = pool.new_request(prompt, 4, None);
+        kv.schedule_prefill(192, &pool).expect("schedule");
+        kv.apply_prefill(42, &pool).expect("apply");
+        let hashes = kv.assigned_block_hashes();
+        assert_eq!(hashes.len(), 3);
+
+        let mut tags = vec![None; 16];
+        assert!(
+            restorable_prefix(&kv, &tags, 2 * PAGE).is_none(),
+            "untagged pages must not restore"
+        );
+        for (page, hash) in &hashes[..2] {
+            tags[*page as usize] = Some(*hash);
+        }
+        assert_eq!(
+            restorable_prefix(&kv, &tags, 2 * PAGE),
+            Some(kv.current_page_indices()[..2].to_vec())
+        );
+        let mut wrong = tags.clone();
+        wrong[hashes[1].0 as usize] = Some([0u8; 16]);
+        assert!(
+            restorable_prefix(&kv, &wrong, 2 * PAGE).is_none(),
+            "a hash mismatch must not restore"
+        );
+        assert!(
+            restorable_prefix(&kv, &[], 2 * PAGE).is_none(),
+            "a page outside the pool must not restore"
+        );
+        assert_eq!(
+            restorable_prefix(&kv, &tags, 0),
+            Some(Vec::new()),
+            "a miss has nothing to restore"
         );
     }
 }
