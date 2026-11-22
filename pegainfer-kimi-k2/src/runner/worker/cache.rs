@@ -114,7 +114,7 @@ impl KimiWorkerDecodeArena {
         let layout = KimiMlaPagedKvLayout::separate_contiguous(pool_pages, page_size, batch_size);
         // `batch_size * (rows / batch_size)` rows, the same count in every
         // bucket.
-        let kv_tiles = (KIMI_DECODE_KV_TILE_ROWS / batch_size).max(1);
+        let kv_tiles = decode_kv_tiles(batch_size);
         let kv_rows = batch_size * kv_tiles;
         // Placeholder table (page 0 everywhere): configure_* always rebuilds
         // it before any forward touches the pool.
@@ -342,6 +342,8 @@ impl KimiWorkerDecodeArena {
         ctx.stream
             .memcpy_htod(&plan.row_slots, &mut self.row_slots_d)?;
         ctx.stream
+            .memcpy_htod(&plan.row_tiles, &mut self.row_tiles_d)?;
+        ctx.stream
             .memcpy_htod(&plan.slot_indptr, &mut self.slot_indptr_d)?;
         ctx.stream
             .memcpy_htod(&plan.row_valid, &mut self.row_valid_d)?;
@@ -469,23 +471,32 @@ pub(super) fn build_slot_page_table(
     Ok((page_indices, page_indptr, last_page_len))
 }
 
-/// One step's split-KV layout: row `row * tiles + tile` is tile `tile` of
-/// decode row `row`, `slot_indptr` keeps a request's rows contiguous for the
-/// merge, and rows it does not fill stay masked so the grid stays bucket-sized.
-pub(super) struct KimiDecodeTilePlan {
-    pub(super) tile_tokens: i32,
-    pub(super) slot_indptr: Vec<i32>,
-    pub(super) row_slots: Vec<i32>,
-    pub(super) row_tiles: Vec<i32>,
-    pub(super) row_valid: Vec<u8>,
+/// Split-KV geometry of one decode bucket: every bucket keeps at most
+/// `KIMI_DECODE_KV_TILE_ROWS` CTA rows, so a narrow bucket cuts each request's
+/// KV into more tiles.
+pub(crate) fn decode_kv_tiles(batch_size: usize) -> usize {
+    (KIMI_DECODE_KV_TILE_ROWS / batch_size).max(1)
 }
 
-pub(super) fn plan_decode_kv_tiles(
+/// One step's split-KV layout: each live request's tiles occupy a contiguous
+/// run of rows, packed in slot order with masked rows only after the last live
+/// tile. `slot_indptr` (indexed by slot) therefore windows exactly one
+/// request's tiles for the merge, and the grid stays bucket-sized.
+pub(crate) struct KimiDecodeTilePlan {
+    pub(crate) tile_tokens: i32,
+    pub(crate) slot_indptr: Vec<i32>,
+    pub(crate) row_slots: Vec<i32>,
+    pub(crate) row_tiles: Vec<i32>,
+    pub(crate) row_valid: Vec<u8>,
+}
+
+pub(crate) fn plan_decode_kv_tiles(
     batch_size: usize,
     tiles: usize,
     slots: &[usize],
     kv_tokens: &[usize],
 ) -> Result<KimiDecodeTilePlan> {
+    ensure!(batch_size > 0, "Kimi decode tile plan needs a decode slot");
     ensure!(tiles > 0, "Kimi decode tile plan needs at least one tile");
     ensure!(
         slots.len() == kv_tokens.len(),
@@ -498,35 +509,48 @@ pub(super) fn plan_decode_kv_tiles(
         "Kimi decode tile plan rows {} exceed batch size {batch_size}",
         slots.len()
     );
-    let longest = kv_tokens.iter().copied().max().unwrap_or(0);
-    let tile_tokens = longest.div_ceil(tiles).max(KIMI_DECODE_MIN_KV_TILE_TOKENS);
-    let rows = batch_size * tiles;
-    // Tile index depends on the row index alone, so the arena uploads it once.
-    let row_tiles = (0..rows)
-        .map(|row| (row % tiles) as i32)
-        .collect::<Vec<_>>();
-    let mut row_slots = vec![0i32; rows];
-    let mut row_valid = vec![0u8; rows];
-    let mut slot_indptr = Vec::with_capacity(batch_size + 1);
-    slot_indptr.push(0i32);
-    let mut used_rows = 0i32;
-    for (row, (&slot, &kv)) in slots.iter().zip(kv_tokens.iter()).enumerate() {
+    let mut live = vec![false; batch_size];
+    let mut kv_by_slot = vec![0usize; batch_size];
+    for (&slot, &kv) in slots.iter().zip(kv_tokens.iter()) {
         ensure!(
             slot < batch_size,
             "Kimi decode tile plan slot {slot} exceeds batch size {batch_size}"
         );
-        let base = row * tiles;
-        let used = kv.div_ceil(tile_tokens).min(tiles);
-        for tile in 0..tiles {
-            row_slots[base + tile] = slot as i32;
-            row_valid[base + tile] = u8::from(tile < used);
-        }
-        used_rows += used as i32;
-        slot_indptr.push(used_rows);
+        ensure!(
+            !live[slot],
+            "Kimi decode tile plan slot {slot} appears more than once"
+        );
+        ensure!(
+            kv > 0,
+            "Kimi decode tile plan slot {slot} carries no KV tokens"
+        );
+        live[slot] = true;
+        kv_by_slot[slot] = kv;
     }
-    // Idle rows still launch (the grid is bucket-sized) but own no tile.
-    for _ in slots.len()..batch_size {
-        slot_indptr.push(used_rows);
+    let longest = kv_tokens.iter().copied().max().unwrap_or(0);
+    let tile_tokens = longest.div_ceil(tiles).max(KIMI_DECODE_MIN_KV_TILE_TOKENS);
+    let rows = batch_size * tiles;
+    let mut row_slots = vec![0i32; rows];
+    let mut row_tiles = vec![0i32; rows];
+    let mut row_valid = vec![0u8; rows];
+    let mut slot_indptr = Vec::with_capacity(batch_size + 1);
+    slot_indptr.push(0i32);
+    let mut used_rows = 0usize;
+    // `VariableLengthMergeStates` walks `slot_indptr[slot]..slot_indptr[slot + 1]`
+    // and merges every row in that window as one of the slot's partials, so a
+    // live request's tiles are packed with no idle row or other request's tile
+    // between them. A slot that is not live gets an empty window.
+    for slot in 0..batch_size {
+        if live[slot] {
+            let used = kv_by_slot[slot].div_ceil(tile_tokens).min(tiles);
+            for tile in 0..used {
+                row_slots[used_rows + tile] = slot as i32;
+                row_tiles[used_rows + tile] = tile as i32;
+                row_valid[used_rows + tile] = 1;
+            }
+            used_rows += used;
+        }
+        slot_indptr.push(used_rows as i32);
     }
     Ok(KimiDecodeTilePlan {
         tile_tokens: tile_tokens as i32,

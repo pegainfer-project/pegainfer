@@ -628,8 +628,9 @@ struct KimiWorkerDecodeArena {
     page_table_capacity: usize,
     append_capacity: usize,
     layout: KimiMlaPagedKvLayout,
-    /// Split-KV geometry of this bucket: row `row * kv_tiles + tile` reads tile
-    /// `tile` of decode row `row`, so `kv_rows == batch_size * kv_tiles`.
+    /// Split-KV geometry of this bucket: the live requests' tiles are packed
+    /// into rows `0..slot_indptr[batch_size]` in slot order, and the remaining
+    /// rows stay masked, so `kv_rows == batch_size * kv_tiles`.
     kv_tiles: usize,
     kv_rows: usize,
     page_indices_d: CudaSlice<i32>,
@@ -829,6 +830,10 @@ pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
 pub(super) use runtime::reduce_scatter_f32_hidden_into;
 mod forward;
 mod state;
+// The split-KV plan is the single owner of decode tile geometry: the arena and
+// the kernel report both build their launch layout through it.
+pub(crate) use cache::decode_kv_tiles;
+pub(crate) use cache::plan_decode_kv_tiles;
 
 impl KimiRankWeightLoadReport {
     fn from_loaded_weights(
@@ -934,15 +939,29 @@ mod tests {
     }
 
     #[test]
-    fn decode_tile_plan_splits_the_longest_request_and_masks_the_short_one() {
-        // The longest request sets the chunk (3000 / 4 = 750); the 10-token
-        // request fills one of its four tiles.
+    fn decode_tile_plan_packs_the_short_request_after_the_long_one() {
+        // The longest request sets the chunk (3000 / 4 = 750). Slot 0's four
+        // tiles take rows 0..4 and slot 1's single 10-token tile follows at row
+        // 4, so each slot's merge window holds exactly its own tiles with no
+        // masked row in between.
         let plan = plan_decode_kv_tiles(2, 4, &[1, 0], &[10, 3000]).unwrap();
         assert_eq!(plan.tile_tokens, 750);
-        assert_eq!(plan.slot_indptr, vec![0, 1, 5]);
-        assert_eq!(plan.row_tiles, vec![0, 1, 2, 3, 0, 1, 2, 3]);
-        assert_eq!(plan.row_slots, vec![1, 1, 1, 1, 0, 0, 0, 0]);
-        assert_eq!(plan.row_valid, vec![1, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(plan.slot_indptr, vec![0, 4, 5]);
+        assert_eq!(plan.row_tiles, vec![0, 1, 2, 3, 0, 0, 0, 0]);
+        assert_eq!(plan.row_slots, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(plan.row_valid, vec![1, 1, 1, 1, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decode_tile_plan_packs_live_tiles_in_slot_order() {
+        // Slot 1 is shorter than slot 0, so its tiles must not be placed at a
+        // slot-derived row offset with a hole in between.
+        let plan = plan_decode_kv_tiles(2, 2, &[1, 0], &[300, 900]).unwrap();
+        assert_eq!(plan.tile_tokens, 450);
+        assert_eq!(plan.slot_indptr, vec![0, 2, 3]);
+        assert_eq!(plan.row_tiles, vec![0, 1, 0, 0]);
+        assert_eq!(plan.row_slots, vec![0, 0, 1, 0]);
+        assert_eq!(plan.row_valid, vec![1, 1, 1, 0]);
     }
 
     #[test]
@@ -957,11 +976,12 @@ mod tests {
     #[test]
     fn decode_tile_plan_pads_idle_rows_without_kv() {
         // One active request in a four-slot bucket: the rest of the rows launch
-        // with no KV.
+        // with no KV, and the idle slots get empty merge windows.
         let plan = plan_decode_kv_tiles(4, 2, &[3], &[900]).unwrap();
         assert_eq!(plan.tile_tokens, 450);
-        assert_eq!(plan.slot_indptr, vec![0, 2, 2, 2, 2]);
+        assert_eq!(plan.slot_indptr, vec![0, 0, 0, 0, 2]);
         assert_eq!(plan.row_valid, vec![1, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(plan.row_tiles[0..2], [0, 1]);
         assert_eq!(plan.row_slots[0], 3);
         assert_eq!(plan.row_slots[1], 3);
         assert!(plan.row_slots[2..].iter().all(|slot| *slot == 0));
@@ -969,9 +989,12 @@ mod tests {
 
     #[test]
     fn decode_tile_plan_rejects_row_and_slot_mismatches() {
+        assert!(plan_decode_kv_tiles(0, 4, &[], &[]).is_err());
         assert!(plan_decode_kv_tiles(2, 4, &[0, 1], &[1]).is_err());
         assert!(plan_decode_kv_tiles(2, 4, &[0, 1, 2], &[1, 1, 1]).is_err());
         assert!(plan_decode_kv_tiles(2, 4, &[2], &[1]).is_err());
         assert!(plan_decode_kv_tiles(2, 0, &[0], &[1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[0, 0], &[1, 1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[0], &[0]).is_err());
     }
 }
