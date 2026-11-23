@@ -20,6 +20,7 @@ use pegainfer_core::rope::precompute_rope;
 use pegainfer_kernels::ops::GatedNormActivation;
 use pegainfer_kernels::ops::GdrChunkwiseScratch35;
 use pegainfer_kernels::ops::HcMixScratch;
+use pegainfer_kernels::ops::Hd256Prefill;
 use pegainfer_kernels::ops::PrefillPagedPlan;
 use pegainfer_kernels::ops::add_batch_into;
 use pegainfer_kernels::ops::attention_decode_via_prefill_hd256_into;
@@ -700,10 +701,8 @@ fn attention_project(
 /// score and mask buffers of a long prompt.
 const SPARSE_CHUNK: usize = 256;
 
-/// QSA for the rows of `slot` at positions `first..end`: the indexer scores and
-/// selects their tokens, and the attention over those tokens replaces rows
-/// `row..` of `gated`, which the dense entry filled. The slot's indexer rows
-/// and K/V must already hold every token before `end`.
+/// Run QSA for positions `first..end` in `slot`, writing to `gated` starting
+/// at `row`. The slot's indexer and K/V caches must hold every token before `end`.
 #[allow(clippy::too_many_arguments)]
 fn attention_sparse(
     ctx: &DeviceContext,
@@ -817,9 +816,8 @@ pub fn qsa_select(
     })
 }
 
-/// Gated full attention over one prompt appended in `slot` at its length,
-/// through the hd256 prefill entry, with the rows past the dense range
-/// replaced by QSA's. Returns the stages and the `o_proj` output.
+/// Append the whole chunk to the slot's K/V cache. Dense attention fills
+/// the output while all causal keys fit the QSA budget, and QSA fills the tail.
 fn attention_prefill(
     ctx: &DeviceContext,
     g: &Geometry,
@@ -832,6 +830,7 @@ fn attention_prefill(
     let rows = mixed.seq_len;
     let start = kv.lens[slot];
     let kv_len = start + rows;
+    let dense_rows = g.dense_attention_rows().saturating_sub(start).min(rows);
     check_reach(g, kv, rope, kv_len)?;
     let projections = attention_project(ctx, g, w, mixed)?;
     copy_hidden_token_range_into(
@@ -843,17 +842,6 @@ fn attention_prefill(
         rows,
     )?;
     let pages = kv.pages(slot, kv_len)?;
-    let plan = PrefillPagedPlan::new_with_cta_tile_q(
-        ctx,
-        &pages,
-        kv_len - KV_PAGE * (pages.len() - 1),
-        start,
-        rows,
-        g.heads,
-        g.kv_heads,
-        g.head_dim,
-        0,
-    )?;
     let mut q_prepped = HiddenStates::zeros(ctx, g.attn_width(), rows)?;
     let mut gated = HiddenStates::zeros(ctx, g.attn_width(), rows)?;
     attention_prefill_hd256_into(
@@ -868,7 +856,10 @@ fn attention_prefill(
         &kv.pool,
         &kv.layout,
         0,
-        &plan,
+        Hd256Prefill::DensePrefix {
+            pages: &pages,
+            rows: dense_rows,
+        },
         start,
         g.rotary_dim,
         g.rms_eps,
@@ -876,8 +867,7 @@ fn attention_prefill(
         &mut gated,
     )?;
     kv.lens[slot] = kv_len;
-    let sparse = start.max(g.dense_attention_rows());
-    if sparse < kv_len {
+    if dense_rows < rows {
         attention_sparse(
             ctx,
             g,
@@ -885,8 +875,8 @@ fn attention_prefill(
             rope,
             kv,
             slot,
-            sparse - start,
-            (sparse, kv_len),
+            dense_rows,
+            (start + dense_rows, kv_len),
             &projections.q,
             &q_prepped,
             &mut gated,
