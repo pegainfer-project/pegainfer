@@ -90,12 +90,24 @@ impl BlockPool {
     /// Whether one packed lineage hash is still resident in the GPU prefix
     /// cache. Inactive entries count; nothing is promoted or pinned.
     pub fn has_resident_hash(&self, hash: [u8; 16]) -> bool {
-        let de =
-            serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(hash.into_iter());
-        let Ok(hash) = SequenceHash::deserialize(de) else {
+        let Some(hash) = sequence_hash_from_bytes(hash) else {
             return false;
         };
         self.block_manager.has_resident_block(hash)
+    }
+
+    /// Whether a whole packed prefix is still representable by the resident
+    /// KV pages, in order. Active and inactive pages both count; nothing is
+    /// promoted or pinned.
+    pub fn has_resident_prefix(&self, hashes: &[[u8; 16]]) -> bool {
+        let mut seq_hashes = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let Some(hash) = sequence_hash_from_bytes(*hash) else {
+                return false;
+            };
+            seq_hashes.push(hash);
+        }
+        self.block_manager.resident_prefix_len(&seq_hashes) == seq_hashes.len()
     }
 
     /// Return active prompt-prefix hashes without promoting inactive entries or
@@ -657,6 +669,12 @@ impl RequestKv {
     }
 }
 
+/// Unpack the 16-byte content key back into kvbm's lineage hash.
+fn sequence_hash_from_bytes(hash: [u8; 16]) -> Option<SequenceHash> {
+    let de = serde::de::value::SeqDeserializer::<_, serde::de::value::Error>::new(hash.into_iter());
+    SequenceHash::deserialize(de).ok()
+}
+
 /// Pack a kvbm [`SequenceHash`] (lineage hash) into the 16-byte content key the
 /// offload tier addresses blocks by. Big-endian for a stable on-wire ordering.
 fn sequence_hash_bytes(hash: &SequenceHash) -> [u8; 16] {
@@ -748,10 +766,27 @@ mod tests {
         let hashes = pool.active_prefix_hashes(prompt.clone(), None);
         assert_eq!(hashes.len(), 2);
         assert!(pool.has_resident_hash(hashes[0]));
+        let prefix: Vec<[u8; 16]> = request
+            .assigned_block_hashes()
+            .into_iter()
+            .take(2)
+            .map(|(_, hash)| hash)
+            .collect();
+        assert!(pool.has_resident_prefix(&prefix));
+        let boundary = *prefix.last().expect("non-empty prefix");
+        let mut broken = prefix.clone();
+        broken[1] = [0xAB; 16];
+        assert!(pool.has_resident_hash(boundary));
+        assert!(
+            !pool.has_resident_prefix(&broken),
+            "a resident boundary page must not hide a missing earlier page"
+        );
         request.release().expect("release");
         assert!(pool.has_resident_hash(hashes[0]));
+        assert!(pool.has_resident_prefix(&prefix));
         pool.evict_inactive();
         assert!(!pool.has_resident_hash(hashes[0]));
+        assert!(!pool.has_resident_prefix(&prefix));
         assert!(pool.active_prefix_hashes(prompt, None).is_empty());
     }
 

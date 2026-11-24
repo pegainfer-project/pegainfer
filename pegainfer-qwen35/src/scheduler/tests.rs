@@ -690,13 +690,19 @@ fn prompt_logprobs_filter_rejects_unsupported_requests() {
     }) if feature == "prompt_logprobs"));
 }
 
+struct HostRun {
+    cached_tokens: usize,
+    tokens: Vec<u32>,
+}
+
 fn finish_one(
     handle: &mut pegainfer_frontend::engine::SchedulerHandle,
     steps: &mut StepReceiver,
     request: pegainfer_frontend::engine::Request,
-) -> usize {
+) -> HostRun {
     let control = handle.submit(request);
     let mut cached_tokens = 0;
+    let mut tokens = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match steps.try_recv() {
@@ -705,11 +711,15 @@ fn finish_one(
                     if update.id != control.id() {
                         continue;
                     }
+                    tokens.extend(update.tokens);
                     if let Some(hit) = update.cached_tokens {
                         cached_tokens = hit;
                     }
                     if let Some(Terminal::Finished { .. }) = update.terminal {
-                        return cached_tokens;
+                        return HostRun {
+                            cached_tokens,
+                            tokens,
+                        };
                     }
                 }
             }
@@ -797,29 +807,25 @@ fn tp2_host_snapshot_spill_and_hit() {
     let prompt_a = vec![151_646; 320];
     let prompt_b = vec![9707; 320];
     let prompt_c = vec![12_345; 320];
-    assert_eq!(
-        finish_one(
-            &mut handle,
-            &mut steps,
-            test_request("host-a", prompt_a.clone(), 1)
-        ),
-        0
+    let run_a = finish_one(
+        &mut handle,
+        &mut steps,
+        test_request("host-a", prompt_a.clone(), 8),
     );
-    assert_eq!(
-        finish_one(&mut handle, &mut steps, test_request("host-b", prompt_b, 1)),
-        0
+    assert_eq!(run_a.cached_tokens, 0);
+    let run_b = finish_one(&mut handle, &mut steps, test_request("host-b", prompt_b, 8));
+    assert_eq!(run_b.cached_tokens, 0);
+    let run_c = finish_one(&mut handle, &mut steps, test_request("host-c", prompt_c, 8));
+    assert_eq!(run_c.cached_tokens, 0);
+    let run_a2 = finish_one(
+        &mut handle,
+        &mut steps,
+        test_request("host-a-again", prompt_a, 8),
     );
+    assert_eq!(run_a2.cached_tokens, 256);
     assert_eq!(
-        finish_one(&mut handle, &mut steps, test_request("host-c", prompt_c, 1)),
-        0
-    );
-    assert_eq!(
-        finish_one(
-            &mut handle,
-            &mut steps,
-            test_request("host-a-again", prompt_a, 1)
-        ),
-        256
+        run_a2.tokens, run_a.tokens,
+        "TP host restore must reproduce the cold output"
     );
 
     drop(handle);

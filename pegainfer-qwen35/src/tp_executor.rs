@@ -482,18 +482,18 @@ impl Qwen35TpExecutor {
                     if let Err(error) =
                         self.broadcast_spill_snapshot(spill.gpu_slot, spill.host_slot)
                     {
-                        self.kv_cache.abort_reserve_snapshot(plan);
+                        self.kv_cache.abort_reserve_snapshot(&plan);
                         return Err(error);
                     }
                 }
-                self.kv_cache.commit_reserve_snapshot(plan);
                 let reservation = plan.reservation();
+                self.kv_cache.commit_reserve_snapshot(&plan);
                 match self.broadcast_save_snapshot(chunk.request_id, reservation.recurrent_slot()) {
                     Ok(positions) if positions.iter().all(|&p| p == boundary) => {
                         self.kv_cache.publish_snapshot(reservation);
                     }
                     result => {
-                        self.kv_cache.abort_snapshot(reservation);
+                        self.kv_cache.abort_snapshot(&reservation);
                         let positions = result?;
                         anyhow::bail!(
                             "TP snapshot boundary mismatch: {positions:?}, expected {boundary}"

@@ -187,18 +187,18 @@ impl SingleGpuBackend {
                         spill.gpu_slot,
                         spill.host_slot,
                     ) {
-                        self.kv_cache.abort_reserve_snapshot(plan);
+                        self.kv_cache.abort_reserve_snapshot(&plan);
                         return Err(error);
                     }
                 }
-                self.kv_cache.commit_reserve_snapshot(plan);
                 let reservation = plan.reservation();
+                self.kv_cache.commit_reserve_snapshot(&plan);
                 if let Err(error) = self.recurrent_store.save(
                     self.model.device_ctx(),
                     reservation.recurrent_slot(),
                     rec,
                 ) {
-                    self.kv_cache.abort_snapshot(reservation);
+                    self.kv_cache.abort_snapshot(&reservation);
                     return Err(error);
                 }
                 self.kv_cache.publish_snapshot(reservation);

@@ -168,6 +168,12 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
         self.store.active_prefix_len(&[seq_hash]) == 1 || self.store.has_inactive(seq_hash)
     }
 
+    /// Contiguous prefix length resident in the active or inactive pool.
+    /// Nothing is promoted or pinned.
+    pub fn resident_prefix_len(&self, seq_hash: &[SequenceHash]) -> usize {
+        self.store.resident_prefix_len(seq_hash)
+    }
+
     /// Scatter-gather scan: finds all blocks matching any hash, without
     /// stopping on misses.
     pub fn scan_matches(
