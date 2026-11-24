@@ -504,10 +504,14 @@ fn single_gpu_host_snapshot_spill_and_hit() {
     let prompt_a = vec![151_646; 320];
     let prompt_b = vec![9707; 320];
 
-    let first = generate(&mut handle, prompt_a.clone(), 1, 0);
+    let first = generate(&mut handle, prompt_a.clone(), 8, 0);
     assert_eq!(first.cached_tokens, 0);
-    let second = generate(&mut handle, prompt_b, 1, 0);
+    let second = generate(&mut handle, prompt_b, 8, 0);
     assert_eq!(second.cached_tokens, 0);
-    let restored = generate(&mut handle, prompt_a, 1, 0);
+    let restored = generate(&mut handle, prompt_a, 8, 0);
     assert_eq!(restored.cached_tokens, PREFIX_BOUNDARY);
+    assert_eq!(
+        restored.tokens, first.tokens,
+        "single-GPU host restore must reproduce the cold output"
+    );
 }
