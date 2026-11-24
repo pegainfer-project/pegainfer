@@ -387,6 +387,25 @@ impl<T: BlockMetadata + Sync> BlockStore<T> {
         self.inner.lock().inactive.has(seq_hash)
     }
 
+    /// Length of the contiguous prefix whose hashes are resident in either
+    /// the active or inactive pool, without promoting or pinning any block.
+    pub(crate) fn resident_prefix_len(&self, hashes: &[SequenceHash]) -> usize {
+        let inner = self.inner.lock();
+        hashes
+            .iter()
+            .take_while(|hash| {
+                if let Some(&block_id) = inner.active_by_hash.get(*hash) {
+                    match &inner.slots[block_id].state {
+                        SlotState::Primary { inner, .. } => inner.strong_count() > 0,
+                        _ => false,
+                    }
+                } else {
+                    inner.inactive.has(**hash)
+                }
+            })
+            .count()
+    }
+
     pub(crate) fn slot_block_size(&self, block_id: BlockId) -> usize {
         self.inner.lock().slots[block_id].block_size
     }

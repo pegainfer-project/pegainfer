@@ -137,6 +137,7 @@ pub fn start_engine(
         max_prefill_tokens,
         Qwen35SchedulerPolicy::Off,
         0,
+        0,
     )
 }
 
@@ -153,6 +154,7 @@ pub struct Qwen35LaunchOptions {
     max_prefill_tokens: usize,
     gdn_backend: Qwen35GdnBackend,
     prefix_cache_mib: usize,
+    snapshot_host_mib: usize,
 }
 
 impl Qwen35LaunchOptions {
@@ -172,8 +174,17 @@ impl Qwen35LaunchOptions {
             max_batch,
             max_prefill_tokens,
             prefix_cache_mib,
+            snapshot_host_mib: 0,
             gdn_backend: Qwen35GdnBackend::Triton,
         }
+    }
+
+    /// Optional pinned-host snapshot budget in MiB. Requires a non-zero
+    /// `prefix_cache_mib`; zero disables the host tier.
+    #[must_use]
+    pub fn with_snapshot_host_mib(mut self, snapshot_host_mib: usize) -> Self {
+        self.snapshot_host_mib = snapshot_host_mib;
+        self
     }
 
     fn device_ordinals(&self) -> Result<Vec<usize>> {
@@ -209,6 +220,7 @@ pub fn launch_with_options_policy_and_overlap(
         decode_overlap,
         options.gdn_backend,
         options.prefix_cache_mib,
+        options.snapshot_host_mib,
     )
 }
 
@@ -219,6 +231,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
     max_prefill_tokens: usize,
     scheduler_policy: Qwen35SchedulerPolicy,
     prefix_cache_mib: usize,
+    snapshot_host_mib: usize,
 ) -> Result<Engine> {
     start_engine_with_capacity_policy_and_overlap(
         model_path,
@@ -228,6 +241,7 @@ pub(crate) fn start_engine_with_capacity_and_policy(
         scheduler_policy,
         Qwen35DecodeOverlap::Off,
         prefix_cache_mib,
+        snapshot_host_mib,
     )
 }
 
@@ -270,6 +284,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
     scheduler_policy: Qwen35SchedulerPolicy,
     decode_overlap: Qwen35DecodeOverlap,
     prefix_cache_mib: usize,
+    snapshot_host_mib: usize,
 ) -> Result<Engine> {
     start_engine_with_backend(
         model_path,
@@ -280,6 +295,7 @@ pub fn start_engine_with_capacity_policy_and_overlap(
         decode_overlap,
         Qwen35GdnBackend::Triton,
         prefix_cache_mib,
+        snapshot_host_mib,
     )
 }
 
@@ -292,6 +308,7 @@ fn start_engine_with_backend(
     decode_overlap: Qwen35DecodeOverlap,
     gdn_backend: Qwen35GdnBackend,
     prefix_cache_mib: usize,
+    snapshot_host_mib: usize,
 ) -> Result<Engine> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -308,6 +325,13 @@ fn start_engine_with_backend(
     let prefix_snapshot_bytes = prefix_cache_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow!("Qwen3.5 prefix-cache MiB budget overflows usize"))?;
+    let host_snapshot_bytes = snapshot_host_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow!("Qwen3.5 host-snapshot MiB budget overflows usize"))?;
+    anyhow::ensure!(
+        host_snapshot_bytes == 0 || prefix_snapshot_bytes > 0,
+        "Qwen3.5 host snapshot budget requires --qwen35-prefix-cache-mib > 0"
+    );
     if device_ordinals.len() > 1 {
         anyhow::ensure!(
             gdn_backend == Qwen35GdnBackend::Triton,
@@ -324,6 +348,7 @@ fn start_engine_with_backend(
             max_prefill_tokens,
             enable_cuda_graph,
             prefix_snapshot_bytes,
+            host_snapshot_bytes,
         );
     }
 
@@ -355,6 +380,15 @@ fn start_engine_with_backend(
         },
         max_batch,
     )?;
+    let snapshot_bytes_per_slot =
+        crate::recurrent_state::bytes_per_request(model.config(), model.geometry);
+    let host_slot_count = host_snapshot_bytes / snapshot_bytes_per_slot;
+    anyhow::ensure!(
+        host_snapshot_bytes == 0 || host_slot_count > 0,
+        "Qwen3.5 host snapshot budget is {} MiB, but one recurrent/conv snapshot requires {:.3} MiB",
+        host_snapshot_bytes / (1024 * 1024),
+        snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
+    );
     scheduler::start_with_capacity_and_policy(
         model,
         seed,
@@ -362,6 +396,7 @@ fn start_engine_with_backend(
         max_prefill_tokens,
         scheduler_policy,
         decode_overlap,
+        host_slot_count,
     )
 }
 
@@ -387,6 +422,7 @@ mod tests {
             max_prefill_tokens: 1,
             gdn_backend: super::Qwen35GdnBackend::Triton,
             prefix_cache_mib: 0,
+            snapshot_host_mib: 0,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();
@@ -413,6 +449,7 @@ mod tests {
             1,
             Qwen35SchedulerPolicy::Off,
             Qwen35DecodeOverlap::SharedSm,
+            0,
             0,
         )
         .err()
