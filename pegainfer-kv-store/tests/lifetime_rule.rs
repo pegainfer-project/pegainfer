@@ -6,11 +6,10 @@
 //! draw (`base - available_blocks()`), then compares it with the two
 //! competing rules:
 //!
-//! - `Special`: `ceil((prompt if max_tokens <= 1 else prompt + max_tokens) / bs)`
-//!   (qwen3 `scheduler.rs:328`, qwen35 `plan.rs:174`; the rule now shared
-//!   through `pegainfer_kv_store::lifetime_blocks`)
-//! - `Always`: `ceil((prompt + max_tokens) / bs)` (the old Kimi/GLM5.2
-//!   copies, and the pool before this change)
+//! - `production`: `pegainfer_kv_store::lifetime_blocks` — the rule under
+//!   test. The oracle calls it directly and must never re-implement it.
+//! - `old`: `ceil((prompt + max_tokens) / bs)` — the pre-change formula, kept
+//!   only as the comparison arm.
 //!
 //! Not modeled here: prefix matching (it only lowers the draw), external
 //! anchor promotion and pad-to-boundary (covered by pool unit tests), and a
@@ -20,9 +19,11 @@
 //! The one-token question is whether kvbm provisions a page for the dangling
 //! first generated token when the request finishes after prefill. The tests
 //! print the boundary table and assert which rule is a safe upper bound and
-//! which is tight; a `Special` violation means the union must be `Always`.
+//! which is tight; a production violation means the union must be the old
+//! rule.
 
 use pegainfer_kv_store::BlockPool;
+use pegainfer_kv_store::lifetime_blocks;
 
 const BS: usize = 16;
 
@@ -134,16 +135,10 @@ fn run(prompt: usize, max_tokens: usize, path: Path, total_blocks: usize) -> Res
     Ok(peak)
 }
 
-fn rule_special(prompt: usize, max_tokens: usize) -> usize {
-    let tokens = if max_tokens <= 1 {
-        prompt
-    } else {
-        prompt + max_tokens
-    };
-    tokens.div_ceil(BS).max(1)
-}
-
-fn rule_always(prompt: usize, max_tokens: usize) -> usize {
+/// The rule every scheduler used before the shared function: always
+/// `prompt + max_tokens`. Kept only as the comparison arm of the oracle —
+/// production must be measured through `lifetime_blocks`, never a copy.
+fn old_prompt_plus_max(prompt: usize, max_tokens: usize) -> usize {
     (prompt + max_tokens).div_ceil(BS)
 }
 
@@ -155,7 +150,7 @@ fn pool_for(peak: usize) -> usize {
 #[test]
 fn peak_table_at_the_boundaries() {
     println!("bs={BS}");
-    println!("prompt max | peak | special | always | winner");
+    println!("prompt max | peak | production | old | winner");
     for (prompt, max_tokens) in [
         (15, 1),
         (16, 1),
@@ -172,32 +167,34 @@ fn peak_table_at_the_boundaries() {
         (64, 65),
     ] {
         let peak = run(prompt, max_tokens, Path::PLAIN, 1024).expect("plain path");
-        let special = rule_special(prompt, max_tokens);
-        let always = rule_always(prompt, max_tokens);
-        let winner = if peak == special && peak == always {
+        let production = lifetime_blocks(prompt, max_tokens, BS);
+        let old = old_prompt_plus_max(prompt, max_tokens);
+        let winner = if peak == production && peak == old {
             "both"
-        } else if peak == special {
-            "special"
-        } else if peak == always {
-            "always"
+        } else if peak == production {
+            "production"
+        } else if peak == old {
+            "old"
         } else {
             "neither"
         };
-        println!("{prompt:>6} {max_tokens:>3} | {peak:>4} | {special:>7} | {always:>6} | {winner}");
+        println!(
+            "{prompt:>6} {max_tokens:>3} | {peak:>4} | {production:>10} | {old:>3} | {winner}"
+        );
     }
 }
 
 #[test]
-fn special_rule_is_never_under_the_plain_peak() {
+fn production_rule_is_never_under_the_plain_peak() {
     for prompt in 1..=48 {
         for max_tokens in 1..=48 {
             let peak = run(prompt, max_tokens, Path::PLAIN, 1024).expect("plain path");
-            let special = rule_special(prompt, max_tokens);
+            let production = lifetime_blocks(prompt, max_tokens, BS);
             assert!(
-                peak <= special,
-                "Special under-reserves: prompt={prompt} max={max_tokens} peak={peak} \
-                 special={special} always={}",
-                rule_always(prompt, max_tokens)
+                peak <= production,
+                "production under-reserves: prompt={prompt} max={max_tokens} peak={peak} \
+                 production={production} old={}",
+                old_prompt_plus_max(prompt, max_tokens)
             );
         }
     }
@@ -216,23 +213,30 @@ fn single_token_completion_never_provisions_the_dangling_page() {
             "prompt={prompt}: a one-token completion drew {peak} blocks"
         );
     }
-    // The boundary that makes the two rules disagree.
+    // The boundary that makes the two rules disagree: production is tight,
+    // the old rule over-reserves one block.
     assert_eq!(run(16, 1, Path::PLAIN, 1024).unwrap(), 1);
-    assert_eq!(rule_special(16, 1), 1);
-    assert_eq!(rule_always(16, 1), 2);
+    assert_eq!(lifetime_blocks(16, 1, BS), 1);
+    assert_eq!(old_prompt_plus_max(16, 1), 2);
 }
 
 #[test]
-fn multi_token_completion_reaches_the_always_rule() {
+fn multi_token_completion_matches_both_rules() {
     // For max_tokens > 1 the last decode step pre-allocates the block its
-    // dangling generated token will occupy, so the draw covers prompt + max.
+    // dangling generated token will occupy, so the draw covers prompt + max —
+    // production and the old rule coincide here.
     for prompt in 1..=48 {
         for max_tokens in 2..=48 {
             let peak = run(prompt, max_tokens, Path::PLAIN, 1024).expect("plain path");
             assert_eq!(
                 peak,
-                rule_always(prompt, max_tokens),
-                "prompt={prompt} max={max_tokens}"
+                lifetime_blocks(prompt, max_tokens, BS),
+                "production mismatch: prompt={prompt} max={max_tokens}"
+            );
+            assert_eq!(
+                peak,
+                old_prompt_plus_max(prompt, max_tokens),
+                "old-rule mismatch: prompt={prompt} max={max_tokens}"
             );
         }
     }
@@ -264,18 +268,18 @@ fn speculative_peak_stays_within_the_lifetime_rule() {
                     let path = Path::spec(draft, accept);
                     let peak = run(prompt, max_tokens, path, 1024).expect("speculative path");
                     assert!(
-                        peak <= rule_always(prompt, max_tokens),
+                        peak <= old_prompt_plus_max(prompt, max_tokens),
                         "draft={draft} accept={accept} prompt={prompt} max={max_tokens}: \
-                         peak={peak} always={}",
-                        rule_always(prompt, max_tokens)
+                         peak={peak} old={}",
+                        old_prompt_plus_max(prompt, max_tokens)
                     );
                     // Speculation runs only with max_tokens > 1 in every
-                    // scheduler; assert the unified rule still covers it.
+                    // scheduler; assert the production rule still covers it.
                     assert!(
-                        peak <= rule_special(prompt, max_tokens),
+                        peak <= lifetime_blocks(prompt, max_tokens, BS),
                         "draft={draft} accept={accept} prompt={prompt} max={max_tokens}: \
-                         peak={peak} special={}",
-                        rule_special(prompt, max_tokens)
+                         peak={peak} production={}",
+                        lifetime_blocks(prompt, max_tokens, BS)
                     );
                 }
             }
