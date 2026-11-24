@@ -182,6 +182,177 @@ pub(crate) enum DraftMode {
     Plain,
 }
 
+/// What one span asks the DSpark lane to do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DsparkSpanWork {
+    /// No draft work: plain mode, or a dying slot with nothing to persist.
+    None,
+    /// Feed the captures into the slot; a later round drains them.
+    Captures,
+    /// Run the draft forward to materialize the captures (the proposal is
+    /// discarded).
+    Materialize {
+        /// The request finishes this span: hold the slot (and its target
+        /// pages) until the draft round persists the captures.
+        defer_release: bool,
+    },
+    /// Propose a span for the next verify step.
+    Propose,
+}
+
+/// Decide the DSpark work for one span.
+///
+/// Two rules are load-bearing:
+/// - a finishing slot still materializes its captures when the pool is on,
+///   because a prefill-only turn is exactly the seed a later prefix hit
+///   restores from (and its target pages must outlive the scatter);
+/// - materialization is pointless without a pool, so a disabled pool never
+///   runs a discarded proposal.
+fn dspark_span_plan(
+    draft: DraftMode,
+    finished: bool,
+    pool_on: bool,
+    wants_drafts: bool,
+    anchor: Option<(u32, usize)>,
+    context_rows: usize,
+) -> DsparkSpanWork {
+    if draft != DraftMode::Eligible {
+        return DsparkSpanWork::None;
+    }
+    if !finished && wants_drafts && anchor.is_some() {
+        return DsparkSpanWork::Propose;
+    }
+    if anchor.is_some() && context_rows > 0 && pool_on {
+        return DsparkSpanWork::Materialize {
+            defer_release: finished,
+        };
+    }
+    if finished {
+        // A dying slot with no pool (or nothing to materialize) has no
+        // reason to keep its captures.
+        return DsparkSpanWork::None;
+    }
+    DsparkSpanWork::Captures
+}
+
+#[cfg(test)]
+mod dspark_span_plan_tests {
+    use super::DraftMode;
+    use super::DsparkSpanWork;
+    use super::dspark_span_plan;
+
+    const ANCHOR: Option<(u32, usize)> = Some((7, 0));
+
+    fn plan(
+        finished: bool,
+        pool_on: bool,
+        wants_drafts: bool,
+        anchor: Option<(u32, usize)>,
+        context_rows: usize,
+    ) -> DsparkSpanWork {
+        dspark_span_plan(
+            DraftMode::Eligible,
+            finished,
+            pool_on,
+            wants_drafts,
+            anchor,
+            context_rows,
+        )
+    }
+
+    #[test]
+    fn single_token_finish_materializes_before_release() {
+        // max_tokens=1 at the prefill boundary: the request finishes on the
+        // span that also produced the captures, so the slot must survive one
+        // materialize round and then release.
+        assert_eq!(
+            plan(true, true, false, ANCHOR, 64),
+            DsparkSpanWork::Materialize {
+                defer_release: true
+            }
+        );
+    }
+
+    #[test]
+    fn pool_off_finish_retires_without_a_discarded_proposal() {
+        assert_eq!(
+            plan(true, false, false, ANCHOR, 64),
+            DsparkSpanWork::None,
+            "a dying slot with no pool needs no captures"
+        );
+    }
+
+    #[test]
+    fn client_disconnect_materializes_without_proposing() {
+        // A disconnect can happen mid-decode with draft budget left: never
+        // propose into a slot that is about to disappear, but do persist the
+        // captures for a future prefix hit.
+        assert_eq!(
+            plan(true, true, true, ANCHOR, 3),
+            DsparkSpanWork::Materialize {
+                defer_release: true
+            }
+        );
+    }
+
+    #[test]
+    fn live_decode_proposes() {
+        assert_eq!(plan(false, true, true, ANCHOR, 1), DsparkSpanWork::Propose);
+    }
+
+    #[test]
+    fn live_tail_span_materializes() {
+        // A span that cannot draft (budget tail) still persists its captures
+        // so the page becomes taggable; the request stays live.
+        assert_eq!(
+            plan(false, true, false, ANCHOR, 1),
+            DsparkSpanWork::Materialize {
+                defer_release: false
+            }
+        );
+    }
+
+    #[test]
+    fn live_mid_prefill_keeps_captures_without_materializing() {
+        // Mid-prefill has no anchor yet; the captures accumulate until the
+        // boundary round.
+        assert_eq!(plan(false, true, false, None, 64), DsparkSpanWork::Captures);
+    }
+
+    #[test]
+    fn pool_off_live_tail_does_not_materialize() {
+        assert_eq!(
+            plan(false, false, false, ANCHOR, 1),
+            DsparkSpanWork::Captures,
+            "live captures still feed future proposals; no pool, no proposal"
+        );
+    }
+
+    #[test]
+    fn pool_off_live_decode_still_proposes() {
+        // Fix 2 must not disable speculative decoding: only the
+        // materialize-only work depends on the pool.
+        assert_eq!(plan(false, false, true, ANCHOR, 1), DsparkSpanWork::Propose);
+    }
+
+    #[test]
+    fn a_dying_slot_without_an_anchor_keeps_nothing() {
+        assert_eq!(plan(true, true, false, None, 64), DsparkSpanWork::None);
+    }
+
+    #[test]
+    fn plain_mode_does_no_draft_work() {
+        assert_eq!(
+            dspark_span_plan(DraftMode::Plain, true, true, true, ANCHOR, 64),
+            DsparkSpanWork::None
+        );
+        assert_eq!(
+            dspark_span_plan(DraftMode::Plain, false, true, true, ANCHOR, 64),
+            DsparkSpanWork::None
+        );
+    }
+}
+
 /// Admission's view of the paged draft state: the tag table it checks and the
 /// per-slot bookkeeping it resets for a new request.
 pub(super) struct DraftAdmission<'a> {
@@ -349,6 +520,10 @@ pub(crate) struct Glm52Engine {
     /// let admission hand them to another request while the replay still
     /// writes them.
     deferred_releases: Vec<usize>,
+    /// Slots whose finish waited for this step's draft round to persist
+    /// their DSpark captures. They stay active (target pages pinned) through
+    /// `run_draft_round`, then release.
+    materialize_releases: Vec<usize>,
     /// Rank-local step counter driving the non-greedy rows' philox seeds (a
     /// fresh well-mixed seed per (step, rank); ranks never compare seeds).
     sample_step: u64,
@@ -437,6 +612,7 @@ impl Glm52Engine {
             pending_resets: Vec::new(),
             leased_shape: None,
             deferred_releases: Vec::new(),
+            materialize_releases: Vec::new(),
             sample_step: 0,
             channel_open: true,
         }
@@ -653,8 +829,9 @@ impl Glm52Engine {
             } else {
                 Ok(())
             };
-            if let Err(err) = draft_result {
-                self.fatal(&err);
+            match draft_result {
+                Ok(()) => self.release_materialized(),
+                Err(err) => self.fatal(&err),
             }
         }
     }
@@ -1158,6 +1335,72 @@ impl Glm52Engine {
                     (freed, context_rows)
                 }
             };
+            let pool_on = self.prefix_cache && self.draft_pool_blocks > 0;
+            let mut work = DsparkSpanWork::None;
+            let mut release_now = false;
+            if self.drafter.is_dspark() {
+                let anchor = active.state.decode_anchor();
+                work = dspark_span_plan(
+                    active.draft,
+                    freed,
+                    pool_on,
+                    active.state.wants_drafts(),
+                    anchor,
+                    context_rows,
+                );
+                if matches!(
+                    work,
+                    DsparkSpanWork::Captures
+                        | DsparkSpanWork::Materialize { .. }
+                        | DsparkSpanWork::Propose
+                ) {
+                    rank_appends.extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
+                    if pool_on {
+                        // These rows join the slot's pending context; the
+                        // next round that runs a propose drains them and the
+                        // scatter step persists them.
+                        self.draft_pending[slot_id] += context_rows;
+                    }
+                }
+                if let Some((anchor, anchor_pos)) = anchor {
+                    match work {
+                        DsparkSpanWork::Propose => {
+                            rank_proposals.push((slot_id, anchor, anchor_pos));
+                        }
+                        DsparkSpanWork::Materialize { .. } => {
+                            // A span that cannot draft (or a finishing
+                            // request) still drains its captures so the page
+                            // becomes taggable. A finishing slot's release
+                            // waits for the round below (the scatter reads
+                            // its target pages).
+                            rank_materialize_only.push((slot_id, anchor, anchor_pos));
+                        }
+                        DsparkSpanWork::None | DsparkSpanWork::Captures => {}
+                    }
+                }
+            } else if self.drafter.enabled() && !freed {
+                for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
+                    let input_token = if offset + 1 < context_rows {
+                        step_inputs[target_row + 1].0
+                    } else {
+                        active.state.next_input_at(0).token
+                    };
+                    mtp_appends.push(Glm52MtpAppend {
+                        target_row,
+                        slot: slot_id,
+                        input_token,
+                        position: step_inputs[target_row].1,
+                        pages: active.kv.current_page_indices(),
+                    });
+                }
+                let wants_drafts = active
+                    .state
+                    .wants_full_draft(crate::mtp::glm52_mtp_draft_len());
+                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
+                    rank_proposals.push((slot_id, anchor, anchor_pos));
+                }
+            }
+
             if freed {
                 #[cfg(test)]
                 active
@@ -1182,69 +1425,21 @@ impl Glm52Engine {
                     // admission hand them to another request while the
                     // replay still writes them.
                     self.deferred_releases.push(slot_id);
+                } else if matches!(
+                    work,
+                    DsparkSpanWork::Materialize {
+                        defer_release: true
+                    }
+                ) {
+                    // The draft round below persists this finish's captures;
+                    // the target pages stay assigned (and pinned) until then.
+                    self.materialize_releases.push(slot_id);
                 } else {
-                    let finished = slot.take().expect("freed slot was active");
-                    self.store.retire(
-                        self.rank,
-                        finished.kv,
-                        finished.save_cursor,
-                        SaveClass::Cacheable,
-                    );
-                    if self.drafter.enabled() {
-                        self.pending_resets.push(slot_id);
-                    }
-                    *slot = None;
+                    release_now = true;
                 }
-            } else if self.drafter.enabled() {
-                if self.drafter.is_dspark() {
-                    if active.draft == DraftMode::Eligible {
-                        rank_appends
-                            .extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
-                        if self.prefix_cache && self.draft_pool_blocks > 0 {
-                            // These rows join the slot's pending context; the
-                            // next round that runs a propose drains them and
-                            // the scatter step persists them.
-                            self.draft_pending[slot_id] += context_rows;
-                        }
-                        let wants_drafts = active.state.wants_drafts();
-                        if let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
-                            if wants_drafts {
-                                rank_proposals.push((slot_id, anchor, anchor_pos));
-                            } else if context_rows > 0 {
-                                // Prefill-only turn (or a span that cannot
-                                // draft): still drain the captures so the
-                                // page becomes taggable.
-                                rank_materialize_only.push((slot_id, anchor, anchor_pos));
-                            }
-                        }
-                    }
-                } else {
-                    for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
-                        let input_token = if offset + 1 < context_rows {
-                            step_inputs[target_row + 1].0
-                        } else {
-                            active.state.next_input_at(0).token
-                        };
-                        mtp_appends.push(Glm52MtpAppend {
-                            target_row,
-                            slot: slot_id,
-                            input_token,
-                            position: step_inputs[target_row].1,
-                            pages: active.kv.current_page_indices(),
-                        });
-                    }
-                    // DSpark emitted its own proposal (or materialize-only
-                    // entry) inside the branch above; a second push here would
-                    // duplicate the slot and trip the worker's slot-order
-                    // guard (and propose a Plain request's empty context).
-                    let wants_drafts = active
-                        .state
-                        .wants_full_draft(crate::mtp::glm52_mtp_draft_len());
-                    if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
-                    {
-                        rank_proposals.push((slot_id, anchor, anchor_pos));
-                    }
-                }
+            }
+            if release_now {
+                self.release_slot(slot_id);
             }
         }
         Ok((
@@ -1271,6 +1466,32 @@ impl Glm52Engine {
                 active.save_cursor,
                 SaveClass::Cacheable,
             );
+        }
+    }
+
+    /// Physically release one slot whose client events already fired and
+    /// whose blocks were sealed at the finish.
+    fn release_slot(&mut self, slot_id: usize) {
+        let Some(finished) = self.slots[slot_id].take() else {
+            return;
+        };
+        self.store.retire(
+            self.rank,
+            finished.kv,
+            finished.save_cursor,
+            SaveClass::Cacheable,
+        );
+        if self.drafter.enabled() {
+            self.pending_resets.push(slot_id);
+        }
+    }
+
+    /// Release the slots whose finish waited for this step's draft round to
+    /// persist their DSpark captures. Runs AFTER `run_draft_round`: the
+    /// scatter and tag pass still need the slot's target pages.
+    fn release_materialized(&mut self) {
+        for slot_id in std::mem::take(&mut self.materialize_releases) {
+            self.release_slot(slot_id);
         }
     }
 
