@@ -37,4 +37,61 @@ impl SamplingParams {
     pub fn is_greedy(&self) -> bool {
         self.temperature < 1e-5 || self.top_k == 1
     }
+
+    /// Matches the wire greedy conversion and the sampler kernel's host validation,
+    /// so admission can reject bad parameters before batching.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        // Wire forces greedy when temperature <= 0, rewriting top_p/min_p to valid values.
+        if self.temperature <= 0.0 {
+            return Ok(());
+        }
+        if !self.temperature.is_finite() {
+            return Err("temperature must be finite and positive");
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err("top_p must be in (0, 1]");
+        }
+        if !self.min_p.is_finite() || self.min_p < 0.0 || self.min_p >= 1.0 {
+            return Err("min_p must be in [0, 1)");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SamplingParams;
+
+    #[test]
+    fn rejects_out_of_range_sampling_parameters() {
+        let bad_top_p = SamplingParams {
+            temperature: 0.8,
+            top_p: 0.0,
+            ..SamplingParams::default()
+        };
+        assert_eq!(bad_top_p.validate(), Err("top_p must be in (0, 1]"));
+
+        let bad_min_p = SamplingParams {
+            temperature: 0.8,
+            top_p: 1.0,
+            min_p: 1.0,
+            ..SamplingParams::default()
+        };
+        assert_eq!(bad_min_p.validate(), Err("min_p must be in [0, 1)"));
+    }
+
+    #[test]
+    fn zero_temperature_skips_sampling_validation() {
+        let greedy = SamplingParams::default();
+        assert!(greedy.validate().is_ok());
+
+        // top_k=1 only changes the kernel sampling path; it does not exempt top_p from host validation.
+        let top_k_one = SamplingParams {
+            temperature: 0.8,
+            top_k: 1,
+            top_p: 0.0,
+            ..SamplingParams::default()
+        };
+        assert_eq!(top_k_one.validate(), Err("top_p must be in (0, 1]"));
+    }
 }

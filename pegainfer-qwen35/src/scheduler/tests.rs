@@ -5,6 +5,7 @@ use pegainfer_frontend::engine::RequestUpdate;
 use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
+use pegainfer_frontend::engine::drive;
 
 use super::*;
 
@@ -706,7 +707,9 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     };
     let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
         .expect("start TP2 scheduler");
-    let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
+    let LiveScheduler {
+        mut handle, join, ..
+    } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();
     let decode = handle.submit(test_request("mixed-active", vec![151_646], 8));
     let prefill = handle.submit(test_request("mixed-prefill", vec![151_646, 9707], 2));

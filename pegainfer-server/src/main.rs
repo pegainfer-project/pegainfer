@@ -3,6 +3,10 @@
 //! its model crate; this file only wires detection, CLI validation, and the
 //! serve path selection together.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -145,6 +149,36 @@ fn feature_gate_hint(config: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// Process-level escape hatch: once SIGINT/SIGTERM starts the drain, the
+/// engine join may block forever behind a wedged scheduler. A plain OS thread
+/// enforces the 30s budget independent of the Tokio runtime, and exits only
+/// while the serve future is still alive.
+#[allow(clippy::exit)]
+fn spawn_shutdown_deadline(
+    shutdown: tokio_util::sync::CancellationToken,
+    serve_done: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        while !shutdown.is_cancelled() {
+            if serve_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if serve_done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !serve_done.load(Ordering::Acquire) {
+            eprintln!("shutdown deadline exceeded; forcing exit");
+            std::process::exit(1);
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
@@ -214,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to start {} engine", line.name()))
     });
 
+    let serve_done = Arc::new(AtomicBool::new(false));
     let serve_result = if let Some(lora_modules) = plan.lora_modules {
         // LoRA routes need the engine's control plane when the router is
         // built, so this path stays sequential.
@@ -234,11 +269,12 @@ async fn main() -> anyhow::Result<()> {
             lora_modules,
             port,
             max_model_len,
-            pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
+            pegainfer_frontend::vllm::shutdown_token_from_signals(),
         )
         .await
     } else {
         let shutdown = tokio_util::sync::CancellationToken::new();
+        spawn_shutdown_deadline(shutdown.clone(), serve_done.clone());
         let engine = {
             let shutdown = shutdown.clone();
             async move {
@@ -246,10 +282,10 @@ async fn main() -> anyhow::Result<()> {
                     .await
                     .context("engine loader thread panicked")??;
                 info!("Engine loaded: elapsed_ms={}", start.elapsed().as_millis());
-                // The blocking load can't be cancelled, so SIGINT keeps its
+                // The blocking load can't be cancelled, so signals keep their
                 // default kill behavior until the engine is up; only then
                 // switch to graceful shutdown.
-                pegainfer_frontend::vllm::cancel_token_on_ctrl_c(&shutdown);
+                pegainfer_frontend::vllm::cancel_token_on_signal(&shutdown);
                 anyhow::Ok(handle)
             }
         };
@@ -298,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
     // Flush before propagating an error too — a failed server is exactly where
     // the last buffered spans matter. No-op when tracing was never enabled.
     pegainfer_frontend::tracing::flush();
+    serve_done.store(true, Ordering::Release);
     serve_result?;
 
     Ok(())

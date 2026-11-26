@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
         shared.port,
         None,
         plan.scheduler_partition_count,
-        vllm::shutdown_token_from_ctrl_c(),
+        vllm::shutdown_token_from_signals(),
     )
     .await
 }

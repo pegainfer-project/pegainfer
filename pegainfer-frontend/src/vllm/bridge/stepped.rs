@@ -42,6 +42,7 @@ use zeromq::prelude::SocketRecv;
 use super::BridgeLink;
 use super::StatsTracker;
 use super::connect_link;
+use super::engine_admission_message;
 use super::engine_output;
 use super::is_add_request;
 use super::now_secs_f64;
@@ -60,6 +61,8 @@ use crate::engine::SchedulerHandle;
 use crate::engine::StepOutputs;
 use crate::engine::StopCause;
 use crate::engine::Terminal;
+use crate::vllm::admission::Admission;
+use crate::vllm::admission::AdmissionPermit;
 use crate::vllm::history::GENERATION_PROMPT_TOKENS;
 use crate::vllm::history::HISTORY_MARKS;
 use crate::vllm::wire::convert_finish_reason;
@@ -81,6 +84,7 @@ pub(crate) struct SteppedEngineBridge {
     pub(crate) max_model_len: u32,
     pub(crate) engine_index: u32,
     pub(crate) data_parallel_size: u32,
+    pub(crate) admission: Arc<Admission>,
 }
 
 impl SteppedEngineBridge {
@@ -350,6 +354,21 @@ impl SteppedEngineBridge {
             );
         }
 
+        // Reject a malformed sampler row before it reaches a batched kernel:
+        // the kernel fails the whole batch on one bad row, so the request that
+        // caused it must not enter the batch.
+        let params = convert_sampling(&sampling_params);
+        if let Err(reason) = params.validate() {
+            let message = format!("invalid sampling parameters: {reason}");
+            warn!("request {request_id} rejected: {message}");
+            return send_refusal(
+                self.engine_index,
+                output_tx,
+                request_id,
+                Some(rejection(message)),
+            );
+        }
+
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -409,12 +428,28 @@ impl SteppedEngineBridge {
         };
         let trace_parent = SpanContext::from_span(&trace_root);
 
+        // One HTTP completion may expand into many engine requests (`n`,
+        // `prompt[]`, scoring items); cap the work the scheduler receives.
+        let permit = match self.admission.try_acquire() {
+            Ok(permit) => permit,
+            Err(reject) => {
+                let message = engine_admission_message(reject);
+                warn!("request {request_id} rejected: {message}");
+                return send_refusal(
+                    self.engine_index,
+                    output_tx,
+                    request_id,
+                    Some(rejection(message.to_string())),
+                );
+            }
+        };
+
         let control = self.scheduler.submit(Request {
             prompt_tokens,
             // Keep the legacy SamplingParams lowering unchanged for stepped
             // producers that have not migrated to StopPolicy; the others
             // classify stops with the independent policy below.
-            params: convert_sampling(&sampling_params),
+            params,
             history_tokens,
             history_marks,
             stop_policy: convert_stop_policy(&sampling_params),
@@ -430,7 +465,7 @@ impl SteppedEngineBridge {
         names.insert(request_id.clone(), control.id());
         streams.insert(
             control.id(),
-            SteppedStream::new(request_id, control, trace_root, stop_sentinel_id),
+            SteppedStream::new(request_id, control, trace_root, stop_sentinel_id, permit),
         );
         Ok(())
     }
@@ -452,6 +487,8 @@ struct SteppedStream {
     /// P/D handoff metadata can arrive in an update with no token or
     /// terminal, so retain it until the next output carries it to the router.
     kv_transfer_params: Option<serde_json::Value>,
+    /// Engine-side admission permit; released when the stream is removed.
+    _permit: AdmissionPermit,
     /// Compatibility sentinel for stepped producers that predate typed
     /// [`StopCause`]. New producers must include their triggering token in the
     /// update and therefore bypass this fallback.
@@ -468,6 +505,7 @@ impl SteppedStream {
         control: RequestControl,
         trace_root: Span,
         stop_sentinel_id: Option<u32>,
+        permit: AdmissionPermit,
     ) -> Self {
         Self {
             request_id,
@@ -478,6 +516,7 @@ impl SteppedStream {
             prefill_stats_sent: false,
             kv_transfer_params: None,
             stop_sentinel_id,
+            _permit: permit,
             trace_root,
         }
     }
@@ -670,6 +709,12 @@ mod tests {
     use crate::engine::TokenLogprob;
     use crate::engine::scheduler_pair;
 
+    fn permit() -> AdmissionPermit {
+        Admission::new()
+            .try_acquire()
+            .expect("fresh admission has a permit")
+    }
+
     fn request() -> Request {
         Request {
             prompt_tokens: vec![1, 2],
@@ -691,7 +736,8 @@ mod tests {
     fn unsupported_rejection_is_rendered_for_vllm() {
         let (handle, _backend) = scheduler_pair();
         let control = handle.submit(request());
-        let mut stream = SteppedStream::new("unsupported".into(), control, Span::noop(), None);
+        let mut stream =
+            SteppedStream::new("unsupported".into(), control, Span::noop(), None, permit());
         let mut update = RequestUpdate::empty(stream.control.id());
         update.terminal = Some(Terminal::Rejected {
             reason: RejectReason::Unsupported {
@@ -727,6 +773,7 @@ mod tests {
             max_model_len: 128,
             engine_index: 0,
             data_parallel_size: 1,
+            admission: Admission::new(),
         }
     }
 
@@ -743,7 +790,7 @@ mod tests {
         });
         let mut streams = HashMap::from([(
             control.id(),
-            SteppedStream::new("scheduled".into(), control, Span::noop(), None),
+            SteppedStream::new("scheduled".into(), control, Span::noop(), None, permit()),
         )]);
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -870,7 +917,13 @@ mod tests {
     fn request_stop_maps_the_actual_token_and_preserves_its_logprob() {
         let id = RequestId::new(7);
         let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-7".to_string(), control, Span::noop(), None);
+        let mut state = SteppedStream::new(
+            "request-7".to_string(),
+            control,
+            Span::noop(),
+            None,
+            permit(),
+        );
 
         let mut update = RequestUpdate::empty(id);
         update.tokens = vec![11, 43];
@@ -911,7 +964,13 @@ mod tests {
     fn model_eos_has_no_wire_stop_reason() {
         let id = RequestId::new(8);
         let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
-        let mut state = SteppedStream::new("request-8".to_string(), control, Span::noop(), None);
+        let mut state = SteppedStream::new(
+            "request-8".to_string(),
+            control,
+            Span::noop(),
+            None,
+            permit(),
+        );
 
         let mut update = RequestUpdate::empty(id);
         update.tokens = vec![2];
@@ -936,8 +995,13 @@ mod tests {
     fn legacy_stop_without_typed_cause_keeps_the_wire_sentinel() {
         let id = RequestId::new(9);
         let control = RequestControl::new(id, Arc::new(AtomicBool::new(false)));
-        let mut state =
-            SteppedStream::new("request-9".to_string(), control, Span::noop(), Some(99));
+        let mut state = SteppedStream::new(
+            "request-9".to_string(),
+            control,
+            Span::noop(),
+            Some(99),
+            permit(),
+        );
 
         let mut update = RequestUpdate::empty(id);
         update.tokens = vec![11];

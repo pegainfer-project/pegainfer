@@ -24,6 +24,7 @@
 //! - [`sink`] — the per-request `TokenSink` over the shared tagged channel.
 //! - [`kv`] — KV-prefix resolution.
 //! - [`handle`] — `EngineHandle`: routing, load feed, shutdown.
+//! - [`health`] — `EngineHealth`: heartbeat, readiness, drain, failure.
 //!
 //! Everything is re-exported flat here, so `pegainfer_frontend::engine::X`
 //! paths are unchanged by the split.
@@ -32,6 +33,7 @@ mod control;
 mod driver;
 mod event;
 mod handle;
+mod health;
 mod kv;
 mod ledger;
 mod metrics;
@@ -46,6 +48,7 @@ pub use control::*;
 pub use driver::*;
 pub use event::*;
 pub use handle::*;
+pub use health::*;
 pub use kv::*;
 pub use ledger::*;
 pub use metrics::*;
