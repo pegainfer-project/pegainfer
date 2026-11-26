@@ -35,17 +35,11 @@ pub(super) enum RejectReason {
     KvBudget,
 }
 
-/// What one scheduler step runs.
-///
-/// The plan is data, not a mode: it says whether the active decode batch moves
-/// and which prompt rows are forwarded, in FIFO order from the front of the
-/// prefilling queue. A prompt longer than the remaining budget appears as a
-/// partial chunk and resumes on the next step.
+/// FIFO prompt slices and whether the active decode batch advances.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct StepPlan {
-    /// Run the active decode batch this step.
     pub(super) decode: bool,
-    /// Prompt rows forwarded this step, one entry per scheduled prompt.
+    /// Row counts for consecutive prompts at the front of the prefill queue.
     pub(super) prefill: Vec<usize>,
 }
 
@@ -53,20 +47,10 @@ impl StepPlan {
     pub(super) fn is_empty(&self) -> bool {
         !self.decode && self.prefill.is_empty()
     }
-
-    #[cfg(test)]
-    pub(super) fn prefill_rows(&self) -> usize {
-        self.prefill.iter().sum()
-    }
 }
 
-/// Build the step that consumes at most `budget` prompt rows.
-///
-/// Live decode requests take the step when `active_decodes` is non-zero, but
-/// they do not consume the prompt budget: their one row per request is the
-/// decode batch, not a prompt chunk. Prompts are taken from the front of
-/// `prefilling`; the first prompt that does not fit in the remaining budget is
-/// sliced and resumes on the next step, keeping FIFO order.
+/// Pack FIFO prompt slices into `budget`; decode rows do not consume it.
+/// A prompt crossing the budget resumes at the queue front on the next step.
 pub(super) fn plan_step(
     active_decodes: usize,
     budget: usize,
@@ -298,11 +282,6 @@ mod tests {
 
     #[test]
     fn default_budget_is_one_standard_prompt_chunk() {
-        assert_eq!(
-            crate::DEFAULT_MAX_PREFILL_TOKENS,
-            STANDARD_PROMPT_CHUNK,
-            "the default budget is one standard chunk"
-        );
         let plan = plan_step(
             1,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
@@ -310,11 +289,8 @@ mod tests {
         );
         assert!(plan.decode);
         assert_eq!(plan.prefill, vec![STANDARD_PROMPT_CHUNK]);
-        assert_eq!(plan.prefill_rows(), crate::DEFAULT_MAX_PREFILL_TOKENS);
     }
 
-    /// Four chunks in one step is an explicit operator choice, not the
-    /// default; these tests exercise the packing arithmetic at that budget.
     const PACK_BUDGET: usize = STANDARD_PROMPT_CHUNK * 4;
 
     #[test]
@@ -322,21 +298,18 @@ mod tests {
         let plan = plan_step(1, PACK_BUDGET, &prompts(&[300, 700, 900, 1500]));
         assert!(plan.decode);
         assert_eq!(plan.prefill, vec![300, 700, 900, 1500]);
-        assert_eq!(plan.prefill_rows(), 3400);
     }
 
     #[test]
     fn plan_slices_the_prompt_that_crosses_the_budget() {
         let plan = plan_step(1, PACK_BUDGET, &prompts(&[6000]));
         assert_eq!(plan.prefill, vec![PACK_BUDGET]);
-        assert_eq!(plan.prefill_rows(), PACK_BUDGET);
     }
 
     #[test]
     fn plan_slices_against_the_budget_left_by_earlier_prompts() {
         let plan = plan_step(1, PACK_BUDGET, &prompts(&[2000, 3000, 1]));
         assert_eq!(plan.prefill, vec![2000, 2096]);
-        assert_eq!(plan.prefill_rows(), PACK_BUDGET);
     }
 
     #[test]
@@ -364,7 +337,6 @@ mod tests {
     fn plan_never_widens_a_smaller_budget() {
         let plan = plan_step(1, 512, &prompts(&[STANDARD_PROMPT_CHUNK; 4]));
         assert_eq!(plan.prefill, vec![512]);
-        assert_eq!(plan.prefill_rows(), 512);
     }
 
     #[test]
@@ -399,7 +371,6 @@ mod tests {
     fn plan_is_empty_without_prompt_or_decode_work() {
         let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
         assert!(plan.is_empty());
-        assert_eq!(plan.prefill_rows(), 0);
     }
 
     #[test]

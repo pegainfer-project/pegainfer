@@ -490,8 +490,7 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
     }
 }
 
-/// Pull this step's prefill set off the FRONT of `prefilling`, in the row
-/// counts the plan assigned to each prompt.
+/// Drain the planned FIFO prefix, aligning chunks to snapshot boundaries.
 pub(super) fn take_prefill_chunks(
     prefilling: &mut Vec<PrefillingRequest35>,
     plan: &StepPlan,
@@ -515,15 +514,7 @@ pub(super) fn take_prefill_chunks(
     scheduled
 }
 
-/// Run one planned step.
-///
-/// The plan decides what runs; the backend decides how. A step with prompt
-/// rows and live decode requests takes the unified path, or the overlap lane
-/// when the backend offers it. A step with one side only uses that side's
-/// dedicated path, which is the shape both backends require of their
-/// executors. Execution may forward fewer rows than planned when the prefix
-/// cache aligns the tail chunk to a snapshot stride; the returned count is
-/// what telemetry reports.
+/// Run the plan and return the prompt rows forwarded after snapshot alignment.
 pub(super) fn run_step(
     backend: &mut SchedulerBackend,
     active: &mut Vec<ActiveRequest35>,

@@ -183,10 +183,7 @@ impl PrefillStepArtifacts {
     }
 }
 
-/// Default per-step prefill budget: one standard prompt chunk
-/// (`plan::STANDARD_PROMPT_CHUNK` rows). The serving cells that set Qwen3.5's
-/// tail target were tuned against this step size; `--max-prefill-tokens`
-/// overrides it.
+/// Default per-step prompt budget, overridden by `--max-prefill-tokens`.
 pub const DEFAULT_MAX_PREFILL_TOKENS: usize = plan::STANDARD_PROMPT_CHUNK;
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -485,8 +482,7 @@ impl Qwen35Scheduler {
                 );
                 ("overlap_wait", result)
             } else {
-                // The async prefill owns the stream; only decode rows move this
-                // step. It is still a planned step with an empty prompt side.
+                // Only decode advances while async prefill is in flight.
                 let plan = StepPlan {
                     decode: true,
                     prefill: Vec::new(),
@@ -598,9 +594,6 @@ impl Qwen35Scheduler {
             admission_pending = admission.deferred;
         }
 
-        // One budget decides the step: the active batch moves if anything is
-        // live, and the remaining rows go to the FIFO front of the prefill
-        // queue. A prompt that crosses the budget resumes next step.
         let prefill_queue: Vec<PrefillQueueState> = prefilling
             .iter()
             .map(|req| PrefillQueueState {
@@ -621,11 +614,8 @@ impl Qwen35Scheduler {
                 (true, false) => "unified",
                 (false, _) => "prefill",
             };
-            // ITL diagnostics (#470): forwarded prompt rows, scheduled prompt
-            // count, and the frozen decode width for this step. The stride
-            // alignment in `take_prefill_chunks` can shorten the tail chunk, so
-            // report the rows the executor actually forwards. Off unless
-            // PEGAINFER_ITL_DEBUG is set.
+            // Snapshot alignment may shorten planned chunks, so telemetry
+            // reports the rows the executor actually forwards.
             let itl_debug = itl_debug_enabled();
             let itl_prefill_reqs = plan.prefill.len();
             let itl_decode_n = active.len();
