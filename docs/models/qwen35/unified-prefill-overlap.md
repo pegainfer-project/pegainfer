@@ -7,9 +7,11 @@
 > per-stream cuBLAS route. The original HTTP table below predates that cap and
 > used the server's implicit Qwen3.5 max-batch default, so treat it as pre-cap
 > evidence until the HTTP cells are re-run with an explicit safe max batch.
-> The `auto` scheduler policy may now be combined with `stream` (the #715
-> startup rejection is retired): `auto` shapes the per-step prefill budget,
-> `stream` moves the chunk off the decode step. On A100-40GB (`70a600b7` +
+> The `auto` policy numbers below were measured while that policy existed and
+> are kept as historical evidence; the policy and its finishing tick were
+> removed when steps became one plan over a single budget
+> (`scheduler-step-plan.md`). At that time `auto` shaped the per-step prefill
+> budget, `stream` moved the chunk off the decode step. On A100-40GB (`70a600b7` +
 > this change, vLLM 0.27.0 baseline), the combination dominates every
 > single-lever config: 1024/256 c8 ITL p99 `65.5 → 34.2 ms`, c16 p99
 > `81.4 → 36.5 ms` (vLLM `83.3`), QPS16 TPOT `36.7 → 20.8 ms` (vLLM `23.6`)
@@ -27,7 +29,7 @@
 
 - **Read**:
   - `docs/index.md` - routes Qwen3.5 scheduler, accuracy, mixed-load, and profiling evidence.
-  - `docs/models/qwen35/adaptive-scheduler-policy.md` - `off` stays the default; `auto` is a separate opt-in policy and may now be combined with `stream`.
+  - `docs/models/qwen35/scheduler-step-plan.md` - how one step is planned; stream overlap is an execution mode of a mixed plan.
   - `docs/models/qwen35/mixed-load-itl-470.md` - valid mixed load needs spare admission capacity and an observed prefill/decode intersection.
   - `docs/models/qwen35/accuracy.md` - `hf_golden_gate` is the numerical oracle; generated-text hashes are sanity evidence.
   - `docs/playbooks/bench-vs-vllm.md` and `docs/playbooks/profiling-guide.md` - bind A/B numbers and profiler claims to a fixed environment and raw artifacts.
@@ -36,7 +38,7 @@
   - Qwen3 issue #699 shows that an in-flight prefill must participate in the scheduler idle wait or the scheduler can park forever after the last decoder retires.
   - Historical prototype `8ed45964` is design evidence only. It predates current crate names and duplicates merged scheduler/trace work with about 3,000 added lines.
 - **Plan**:
-  1. Add default-off `Qwen35DecodeOverlap::{Off, SharedSm}` startup plumbing and reject TP, Green Context, and `Auto + SharedSm` before model loading.
+  1. Add default-off `Qwen35DecodeOverlap::{Off, SharedSm}` startup plumbing and reject TP, Green Context, and the then-existing `Auto + SharedSm` combination before model loading.
   2. Keep at most one `InflightPrefill`; run its allocations, kernels, and stream-ordered drops on one owned prefill stream, then run active decode on the existing compute stream.
   3. Poll the completion event while decode is active; block on the event when it is the only remaining work; sample and promote exactly once after completion.
   4. Validate scheduler transitions, GPU correctness and lifecycle, HTTP A/B, mixed load, and Nsight on one RTX 5090.
@@ -151,7 +153,7 @@ flag.
   mean/p99/max was `0.0225/0.0718/0.0968`; short graph mean was
   `0.0253-0.0281`, max `0.1394-0.2403`.
 - Release server and `bench_serving` builds passed. Startup rejection probes
-  passed for TP, `Auto + SharedSm`, and Green Context.
+  passed for TP, the then-existing `Auto + SharedSm`, and Green Context.
 
 ### HTTP A/B (pre-cap evidence; needs explicit max-batch rerun)
 
@@ -183,7 +185,7 @@ cargo build --release -p pegainfer-server --features qwen35
 
 target/release/pegainfer \
   --model-path <model> --served-model-name qwen35-715 --port <port> \
-  --cuda-graph=true --qwen35-scheduler-policy off \
+  --cuda-graph=true \
   --max-batch 32 --max-prefill-tokens 1024 \
   --decode-overlap <off|stream>
 ```
@@ -305,8 +307,8 @@ load traffic. No new kernel-first optimization is justified by this trace.
   and `StreamOverrideGuard`. It does not add a second scheduler, duplicate model
   state, a new chunk policy, or a speculative abstraction.
 - **Decision:** keep `off` as the default. Stream helps concurrent admission and
-  QPS TPOT but slightly regresses c1 and increases loaded TTFT. `auto`, TP, and
-  Green Context remain separate policies with explicit startup errors.
+  QPS TPOT but slightly regresses c1 and increases loaded TTFT. TP and Green
+  Context remain unsupported combinations with explicit startup errors.
 - **Claim boundary:** evidence covers this source, model revision, and one RTX
   5090. It does not claim vLLM parity, SOTA, production readiness, TP overlap,
   prefix caching, or broad hardware results.

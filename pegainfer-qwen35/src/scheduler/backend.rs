@@ -783,6 +783,11 @@ impl TpSchedulerBackend {
 }
 
 impl SchedulerBackend {
+    /// The async prefill lane exists on the single-GPU backend only.
+    pub(super) fn overlap_enabled(&self) -> bool {
+        matches!(self, Self::Single(single) if single.overlap_enabled())
+    }
+
     pub(super) fn log_prefix_cache_stats(&self) {
         match self {
             Self::Single(backend) if backend.kv_cache.enabled() => backend.log_prefix_cache_stats(),

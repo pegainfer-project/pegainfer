@@ -1,11 +1,3 @@
-use crate::Qwen35SchedulerPolicy;
-
-pub(super) enum ExecutionPlan<T> {
-    Prefill { pending: Vec<T> },
-    Decode,
-    Unified { pending: Vec<T> },
-}
-
 pub(super) struct AdmissionOutcome<T> {
     pub(super) pending: Vec<T>,
     pub(super) deferred: Vec<T>,
@@ -20,23 +12,15 @@ pub(super) struct ActiveKvBudget {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ActiveDecodeState {
-    pub(super) generated_count: usize,
-    pub(super) max_tokens: usize,
-}
-
-impl ActiveDecodeState {
-    fn remaining_tokens(self) -> usize {
-        self.max_tokens.saturating_sub(self.generated_count)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PrefillQueueState {
     pub(super) remaining_tokens: usize,
 }
 
-const DECODE_FINISH_WINDOW_TOKENS: usize = 4;
+/// Prompt rows in one standard chunk.
+///
+/// The serving cells that set Qwen3.5's tail target were tuned against a
+/// 1024-row prefill step, so the default budget is this one chunk.
+pub(super) const STANDARD_PROMPT_CHUNK: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SlotCompaction {
@@ -51,45 +35,64 @@ pub(super) enum RejectReason {
     KvBudget,
 }
 
-pub(super) fn build_next_plan<T>(have_active: bool, pending: Vec<T>) -> Option<ExecutionPlan<T>> {
-    if !pending.is_empty() && have_active {
-        Some(ExecutionPlan::Unified { pending })
-    } else if !pending.is_empty() {
-        Some(ExecutionPlan::Prefill { pending })
-    } else if have_active {
-        Some(ExecutionPlan::Decode)
-    } else {
-        None
+/// What one scheduler step runs.
+///
+/// The plan is data, not a mode: it says whether the active decode batch moves
+/// and which prompt rows are forwarded, in FIFO order from the front of the
+/// prefilling queue. A prompt longer than the remaining budget appears as a
+/// partial chunk and resumes on the next step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct StepPlan {
+    /// Run the active decode batch this step.
+    pub(super) decode: bool,
+    /// Prompt rows forwarded this step, one entry per scheduled prompt.
+    pub(super) prefill: Vec<usize>,
+}
+
+impl StepPlan {
+    pub(super) fn is_empty(&self) -> bool {
+        !self.decode && self.prefill.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn prefill_rows(&self) -> usize {
+        self.prefill.iter().sum()
     }
 }
 
-pub(super) fn choose_prefill_budget(
-    policy: Qwen35SchedulerPolicy,
-    base_budget: usize,
-    active: &[ActiveDecodeState],
+/// Build the step that consumes at most `budget` prompt rows.
+///
+/// Live decode requests take the step when `active_decodes` is non-zero, but
+/// they do not consume the prompt budget: their one row per request is the
+/// decode batch, not a prompt chunk. Prompts are taken from the front of
+/// `prefilling`; the first prompt that does not fit in the remaining budget is
+/// sliced and resumes on the next step, keeping FIFO order.
+pub(super) fn plan_step(
+    active_decodes: usize,
+    budget: usize,
     prefilling: &[PrefillQueueState],
-    decode_overlap: bool,
-) -> usize {
+) -> StepPlan {
     assert!(
-        base_budget > 0,
-        "Qwen3.5 adaptive scheduler requires a positive base prefill budget"
+        budget > 0,
+        "Qwen3.5 scheduler requires a positive prefill budget"
     );
-    if policy == Qwen35SchedulerPolicy::Off || active.is_empty() || prefilling.is_empty() {
-        return base_budget;
+    let mut remaining = budget;
+    let mut prefill = Vec::new();
+    for state in prefilling {
+        let rows = state.remaining_tokens.min(remaining);
+        if rows == 0 {
+            break;
+        }
+        prefill.push(rows);
+        remaining -= rows;
+        if rows < state.remaining_tokens {
+            break;
+        }
     }
-
-    // With stream overlap the finishing request's last tokens keep ticking on
-    // the decode stream while the chunk runs aside, so the full prefill
-    // deferral would only delay prefill without buying decode latency.
-    if !decode_overlap
-        && active
-            .iter()
-            .any(|req| req.remaining_tokens() <= DECODE_FINISH_WINDOW_TOKENS)
-    {
-        return 0;
+    StepPlan {
+        decode: active_decodes > 0,
+        prefill,
     }
-
-    prefilling[0].remaining_tokens.min(base_budget)
 }
 
 pub(super) fn admit_pending_requests<T>(
@@ -227,25 +230,6 @@ pub(super) fn prefilling_future_pages(prefilling: &[PrefillKvBudget], page_size:
         .sum()
 }
 
-/// Decide how many prompt tokens each FIFO-front prefilling request prefills this step
-/// return FIFO order with token budget
-pub(super) fn plan_prefill_chunks(remaining: &[usize], budget: usize) -> Vec<usize> {
-    let mut chunks = Vec::new();
-    let mut left = budget;
-    for &rem in remaining {
-        if left == 0 || rem == 0 {
-            break;
-        }
-        let take = rem.min(left);
-        chunks.push(take);
-        left -= take;
-        if take < rem {
-            break;
-        }
-    }
-    chunks
-}
-
 pub(super) fn compaction_after_retire(
     active_len_before: usize,
     retired_idx: usize,
@@ -299,213 +283,129 @@ mod tests {
         reqs.iter().map(|(req, _)| req.id).collect()
     }
 
+    fn four_standard_prompts() -> [PrefillQueueState; 4] {
+        [PrefillQueueState {
+            remaining_tokens: STANDARD_PROMPT_CHUNK,
+        }; 4]
+    }
+
+    fn prompts(remaining: &[usize]) -> Vec<PrefillQueueState> {
+        remaining
+            .iter()
+            .map(|&remaining_tokens| PrefillQueueState { remaining_tokens })
+            .collect()
+    }
+
     #[test]
-    fn plan_selection_follows_active_and_pending_state() {
-        assert!(
-            build_next_plan::<Pending>(false, vec![]).is_none(),
-            "idle scheduler produces no execution plan"
+    fn default_budget_is_one_standard_prompt_chunk() {
+        assert_eq!(
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            STANDARD_PROMPT_CHUNK,
+            "the default budget is one standard chunk"
         );
-        assert!(
-            matches!(
-                build_next_plan::<Pending>(true, vec![]),
-                Some(ExecutionPlan::Decode)
-            ),
-            "active-only scheduler tick decodes the active batch"
+        let plan = plan_step(
+            1,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &four_standard_prompts(),
         );
-        assert!(
-            matches!(
-                build_next_plan(false, vec![pending(1, 8)]),
-                Some(ExecutionPlan::Prefill { pending }) if ids(&pending) == vec![1]
-            ),
-            "pending-only scheduler tick prefills new requests"
+        assert!(plan.decode);
+        assert_eq!(plan.prefill, vec![STANDARD_PROMPT_CHUNK]);
+        assert_eq!(plan.prefill_rows(), crate::DEFAULT_MAX_PREFILL_TOKENS);
+    }
+
+    /// Four chunks in one step is an explicit operator choice, not the
+    /// default; these tests exercise the packing arithmetic at that budget.
+    const PACK_BUDGET: usize = STANDARD_PROMPT_CHUNK * 4;
+
+    #[test]
+    fn plan_packs_whole_prompts_in_fifo_order() {
+        let plan = plan_step(1, PACK_BUDGET, &prompts(&[300, 700, 900, 1500]));
+        assert!(plan.decode);
+        assert_eq!(plan.prefill, vec![300, 700, 900, 1500]);
+        assert_eq!(plan.prefill_rows(), 3400);
+    }
+
+    #[test]
+    fn plan_slices_the_prompt_that_crosses_the_budget() {
+        let plan = plan_step(1, PACK_BUDGET, &prompts(&[6000]));
+        assert_eq!(plan.prefill, vec![PACK_BUDGET]);
+        assert_eq!(plan.prefill_rows(), PACK_BUDGET);
+    }
+
+    #[test]
+    fn plan_slices_against_the_budget_left_by_earlier_prompts() {
+        let plan = plan_step(1, PACK_BUDGET, &prompts(&[2000, 3000, 1]));
+        assert_eq!(plan.prefill, vec![2000, 2096]);
+        assert_eq!(plan.prefill_rows(), PACK_BUDGET);
+    }
+
+    #[test]
+    fn plan_resumes_the_sliced_tail_before_the_next_prompt() {
+        // The 6000-token prompt was sliced at 4096; its tail is now the front
+        // of the queue and must be finished before the next prompt moves.
+        let plan = plan_step(1, PACK_BUDGET, &prompts(&[1904, 1024]));
+        assert_eq!(plan.prefill, vec![1904, 1024]);
+    }
+
+    #[test]
+    fn plan_packs_everything_under_a_huge_budget() {
+        let plan = plan_step(
+            1,
+            usize::MAX,
+            &prompts(&[STANDARD_PROMPT_CHUNK, STANDARD_PROMPT_CHUNK, 7]),
         );
-        assert!(
-            matches!(
-                build_next_plan(true, vec![pending(1, 8)]),
-                Some(ExecutionPlan::Unified { pending }) if ids(&pending) == vec![1]
-            ),
-            "active + pending scheduler tick runs the unified path"
+        assert_eq!(
+            plan.prefill,
+            vec![STANDARD_PROMPT_CHUNK, STANDARD_PROMPT_CHUNK, 7]
         );
     }
 
     #[test]
-    fn adaptive_prefill_budget_preserves_off_policy() {
-        let active = [ActiveDecodeState {
-            generated_count: 16,
-            max_tokens: 256,
-        }];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 4096,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Off,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            1024,
-            "off keeps the fixed chunk budget"
-        );
+    fn plan_never_widens_a_smaller_budget() {
+        let plan = plan_step(1, 512, &prompts(&[STANDARD_PROMPT_CHUNK; 4]));
+        assert_eq!(plan.prefill, vec![512]);
+        assert_eq!(plan.prefill_rows(), 512);
     }
 
     #[test]
-    fn adaptive_prefill_budget_never_exceeds_configured_cap() {
-        let active = [ActiveDecodeState {
-            generated_count: 16,
-            max_tokens: 4096,
-        }];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 4096,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            1024,
-            "auto preserves --max-prefill-tokens as a hard per-step cap"
+    fn plan_breaks_on_a_finished_prompt() {
+        let plan = plan_step(
+            1,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &prompts(&[0, STANDARD_PROMPT_CHUNK]),
         );
+        assert!(plan.prefill.is_empty());
+        assert!(plan.decode);
+        assert!(!plan.is_empty());
     }
 
     #[test]
-    fn adaptive_prefill_budget_keeps_standard_long_output_cells_chunked() {
-        let active = [ActiveDecodeState {
-            generated_count: 16,
-            max_tokens: 256,
-        }];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 4096,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            1024,
-            "standard serving cells with long outputs keep the fixed chunk path"
-        );
+    fn plan_is_prefill_only_without_decode_work() {
+        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &prompts(&[700]));
+        assert!(!plan.decode);
+        assert_eq!(plan.prefill, vec![700]);
+        assert!(!plan.is_empty());
     }
 
     #[test]
-    fn adaptive_prefill_budget_trims_final_chunk_to_remaining_tokens() {
-        let active = [ActiveDecodeState {
-            generated_count: 16,
-            max_tokens: 4096,
-        }];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 512,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            512,
-            "auto may shrink the final chunk but never expands beyond the configured cap"
-        );
+    fn plan_is_decode_only_without_prompt_work() {
+        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        assert!(plan.decode);
+        assert!(plan.prefill.is_empty());
+        assert!(!plan.is_empty());
     }
 
     #[test]
-    fn adaptive_prefill_budget_prioritizes_decode_when_active_request_is_finishing() {
-        let active = [
-            ActiveDecodeState {
-                generated_count: 252,
-                max_tokens: 256,
-            },
-            ActiveDecodeState {
-                generated_count: 16,
-                max_tokens: 4096,
-            },
-        ];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 4096,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            0,
-            "a near-finished active request gets a decode-priority tick before a long prefill"
-        );
+    fn plan_is_empty_without_prompt_or_decode_work() {
+        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        assert!(plan.is_empty());
+        assert_eq!(plan.prefill_rows(), 0);
     }
 
     #[test]
-    fn adaptive_prefill_budget_keeps_prefill_running_under_stream_overlap() {
-        let active = [
-            ActiveDecodeState {
-                generated_count: 252,
-                max_tokens: 256,
-            },
-            ActiveDecodeState {
-                generated_count: 16,
-                max_tokens: 4096,
-            },
-        ];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 4096,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                true
-            ),
-            1024,
-            "with stream overlap the finishing window keeps prefill on the prefill stream instead of deferring it"
-        );
-        assert!(
-            matches!(
-                build_next_plan::<Pending>(true, vec![pending(1, 4096)]),
-                Some(ExecutionPlan::Unified { .. })
-            ),
-            "the kept budget keeps the tick a unified prefill+decode step instead of a decode-only tick"
-        );
-    }
-
-    #[test]
-    fn adaptive_prefill_budget_prioritizes_decode_before_final_prefill_chunk() {
-        let active = [ActiveDecodeState {
-            generated_count: 253,
-            max_tokens: 256,
-        }];
-        let prefilling = [PrefillQueueState {
-            remaining_tokens: 512,
-        }];
-
-        assert_eq!(
-            choose_prefill_budget(
-                Qwen35SchedulerPolicy::Auto,
-                1024,
-                &active,
-                &prefilling,
-                false
-            ),
-            0,
-            "decode-priority applies before even a final prefill chunk when an active request is finishing"
-        );
+    #[should_panic(expected = "positive prefill budget")]
+    fn plan_rejects_a_zero_budget() {
+        plan_step(1, 0, &[]);
     }
 
     #[test]
@@ -746,12 +646,10 @@ mod tests {
         assert!(outcome.pending.is_empty());
         assert_eq!(ids(&outcome.deferred), vec![1]);
         assert!(outcome.rejected.is_empty());
+        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
         assert!(
-            matches!(
-                build_next_plan(true, outcome.pending),
-                Some(ExecutionPlan::Decode)
-            ),
-            "active requests should keep decoding when pending requests are all deferred"
+            plan.decode && plan.prefill.is_empty(),
+            "active requests keep decoding when pending requests are all deferred"
         );
     }
 
@@ -998,50 +896,6 @@ mod tests {
             Some(3),
             "after compaction, the next request reuses the next dense slot"
         );
-    }
-
-    #[test]
-    fn prefill_chunks_slice_long_prompt_and_stop_packing() {
-        // One long prompt, budget smaller than its remaining work: take a
-        // partial chunk and stop so it stays at the front next step.
-        assert_eq!(plan_prefill_chunks(&[5000], 512), vec![512]);
-        assert_eq!(plan_prefill_chunks(&[5000, 8], 512), vec![512]);
-    }
-
-    #[test]
-    fn prefill_chunks_pack_short_prompts_up_to_budget() {
-        // Several short prompts pack into one step until the budget runs out.
-        assert_eq!(
-            plan_prefill_chunks(&[100, 100, 100], 512),
-            vec![100, 100, 100]
-        );
-        // Third prompt only partially fits: 200 + 200 = 400 used, 112 left, the
-        // 300-token prompt takes 112 and stops.
-        assert_eq!(
-            plan_prefill_chunks(&[200, 200, 300], 512),
-            vec![200, 200, 112]
-        );
-    }
-
-    #[test]
-    fn prefill_chunks_complete_then_continue_to_next() {
-        // A prompt that exactly fits the budget completes; packing continues.
-        assert_eq!(plan_prefill_chunks(&[512, 8], 1024), vec![512, 8]);
-    }
-
-    #[test]
-    fn prefill_chunks_huge_budget_prefills_everything_in_one_step() {
-        // The pre-#375 behaviour: a budget above total remaining work prefills
-        // every prompt in a single step.
-        assert_eq!(
-            plan_prefill_chunks(&[1000, 2000, 3000], usize::MAX),
-            vec![1000, 2000, 3000]
-        );
-    }
-
-    #[test]
-    fn prefill_chunks_empty_queue_schedules_nothing() {
-        assert!(plan_prefill_chunks(&[], 512).is_empty());
     }
 
     #[test]

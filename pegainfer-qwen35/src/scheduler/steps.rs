@@ -490,20 +490,19 @@ impl From<Vec<PrefillingRequest35>> for ScheduledChunk {
     }
 }
 
-/// Pull this step's prefill set off the FRONT of `prefilling`, capping the
-/// step's total forwarded prompt tokens at `prefill_budget`.
+/// Pull this step's prefill set off the FRONT of `prefilling`, in the row
+/// counts the plan assigned to each prompt.
 pub(super) fn take_prefill_chunks(
     prefilling: &mut Vec<PrefillingRequest35>,
-    prefill_budget: usize,
+    plan: &StepPlan,
     snapshot_stride: Option<usize>,
 ) -> Vec<PrefillingRequest35> {
-    let remaining: Vec<usize> = prefilling
-        .iter()
-        .map(|p| p.req.request.prompt_tokens.len() - p.cursor)
-        .collect();
-    let chunks = plan_prefill_chunks(&remaining, prefill_budget);
-    let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..chunks.len()).collect();
-    for (p, chunk) in scheduled.iter_mut().zip(&chunks) {
+    debug_assert!(
+        plan.prefill.len() <= prefilling.len(),
+        "step plan cannot schedule more prompts than are queued"
+    );
+    let mut scheduled: Vec<PrefillingRequest35> = prefilling.drain(0..plan.prefill.len()).collect();
+    for (p, chunk) in scheduled.iter_mut().zip(&plan.prefill) {
         let request = &p.req.request;
         p.step_chunk = prefill_step_chunk(
             p.cursor,
@@ -514,6 +513,48 @@ pub(super) fn take_prefill_chunks(
         );
     }
     scheduled
+}
+
+/// Run one planned step.
+///
+/// The plan decides what runs; the backend decides how. A step with prompt
+/// rows and live decode requests takes the unified path, or the overlap lane
+/// when the backend offers it. A step with one side only uses that side's
+/// dedicated path, which is the shape both backends require of their
+/// executors. Execution may forward fewer rows than planned when the prefix
+/// cache aligns the tail chunk to a snapshot stride; the returned count is
+/// what telemetry reports.
+pub(super) fn run_step(
+    backend: &mut SchedulerBackend,
+    active: &mut Vec<ActiveRequest35>,
+    prefilling: &mut Vec<PrefillingRequest35>,
+    plan: &StepPlan,
+    inflight_prefill: &mut Option<InflightPrefill>,
+    rng: &mut StdRng,
+    ledger: &mut RequestLedger,
+    snapshot_stride: Option<usize>,
+) -> Result<usize> {
+    let scheduled = take_prefill_chunks(prefilling, plan, snapshot_stride);
+    if scheduled.is_empty() {
+        debug_assert!(
+            plan.prefill.is_empty(),
+            "a planned prefill row must schedule a prompt"
+        );
+        if plan.decode {
+            decode_step(backend, active, rng, ledger)?;
+        }
+        return Ok(0);
+    }
+    let forwarded: usize = scheduled.iter().map(|p| p.step_chunk).sum();
+    let overlap = backend.overlap_enabled();
+    if !plan.decode {
+        prefill_batch(backend, active, scheduled, prefilling, rng, ledger)?;
+    } else if overlap {
+        launch_overlap_step(backend, active, scheduled, inflight_prefill, rng, ledger)?;
+    } else {
+        unified_step_sched(backend, active, scheduled, prefilling, rng, ledger)?;
+    }
+    Ok(forwarded)
 }
 
 /// Report a forward/sampling failure to every request in the failed chunk.

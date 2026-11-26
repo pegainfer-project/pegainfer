@@ -15,7 +15,6 @@ use pegainfer_frontend::vllm::ParserSelection;
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35GdnBackend;
 use crate::Qwen35LaunchOptions;
-use crate::Qwen35SchedulerPolicy;
 
 pub static MODEL_LINE: Qwen35Line = Qwen35Line;
 
@@ -33,34 +32,10 @@ struct Qwen35Cli {
     #[arg(long)]
     max_batch: Option<usize>,
 
-    /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; `auto` is
-    /// opt-in and currently single-GPU only.
-    #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
-    qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
-
     /// GDN prefill backend. The FlashInfer candidate requires a build-linked
     /// artifact and SM120/Hv32/TP1; Triton remains the default.
     #[arg(long, value_enum, default_value_t = Qwen35GdnBackend::Triton)]
     qwen35_gdn_backend: Qwen35GdnBackend,
-}
-
-/// CLI selector for the Qwen3.5 adaptive scheduler policy.
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
-enum CliQwen35SchedulerPolicy {
-    /// Fixed chunked-prefill behavior.
-    #[default]
-    Off,
-    /// Runtime-state adaptive policy.
-    Auto,
-}
-
-impl CliQwen35SchedulerPolicy {
-    fn resolve(self) -> Qwen35SchedulerPolicy {
-        match self {
-            Self::Off => Qwen35SchedulerPolicy::Off,
-            Self::Auto => Qwen35SchedulerPolicy::Auto,
-        }
-    }
 }
 
 fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
@@ -137,8 +112,10 @@ impl ModelLine for Qwen35Line {
         }
         crate::check_launch(
             cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+            ctx.shared
+                .max_prefill_tokens
+                .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
             ctx.shared.tp_size > 1,
-            cli.qwen35_scheduler_policy.resolve(),
             decode_overlap,
         )
         .map_err(|error| CliError::rule(error.to_string()))
@@ -157,11 +134,9 @@ impl ModelLine for Qwen35Line {
     }
 
     fn launch(&self, ctx: &LaunchContext<'_>) -> anyhow::Result<LaunchedEngine> {
-        let cli = cli(ctx);
-        crate::launch_with_options_policy_and_overlap(
+        crate::launch_with_options(
             ctx.model_path,
             launch_options(ctx),
-            cli.qwen35_scheduler_policy.resolve(),
             resolve_decode_overlap(ctx.shared.decode_overlap)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
         )
@@ -186,6 +161,46 @@ mod tests {
             matches: &matches,
         };
         MODEL_LINE.validate(&ctx, &provided)
+    }
+
+    fn resolved_launch_options(argv: &[&str]) -> Qwen35LaunchOptions {
+        let (shared, matches, _) =
+            parse_for_line(&MODEL_LINE, argv).expect("the shared flags parse");
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        launch_options(&ctx)
+    }
+
+    /// The launch default is one standard chunk on both paths; an explicit
+    /// `--max-prefill-tokens` still wins.
+    #[test]
+    fn default_budget_is_one_standard_chunk() {
+        assert_eq!(
+            resolved_launch_options(&["pegainfer"]).max_prefill_tokens,
+            crate::DEFAULT_MAX_PREFILL_TOKENS
+        );
+        assert_eq!(
+            resolved_launch_options(&["pegainfer", "--tp-size", "2", "--cuda-graph=false"])
+                .max_prefill_tokens,
+            crate::DEFAULT_MAX_PREFILL_TOKENS
+        );
+        assert_eq!(
+            resolved_launch_options(&[
+                "pegainfer",
+                "--tp-size",
+                "2",
+                "--cuda-graph=false",
+                "--max-prefill-tokens",
+                "4096",
+            ])
+            .max_prefill_tokens,
+            4096
+        );
     }
 
     #[test]
@@ -227,12 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_scheduler_policy_off() {
-        validate_argv(&["pegainfer", "--qwen35-scheduler-policy", "off"])
-            .expect("Qwen3.5 should accept explicit scheduler-policy off");
-    }
-
-    #[test]
     fn accepts_shared_stream_overlap() {
         let max_batch = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
         validate_argv(&[
@@ -262,34 +271,6 @@ mod tests {
         let error = validate_argv(&["pegainfer", "--decode-overlap", "green-ctx"])
             .expect_err("Qwen3.5 should reject green-context overlap");
         assert!(error.to_string().contains("off|stream"));
-    }
-
-    #[test]
-    fn accepts_auto_policy_with_overlap() {
-        validate_argv(&[
-            "pegainfer",
-            "--decode-overlap",
-            "stream",
-            "--max-batch",
-            "32",
-            "--qwen35-scheduler-policy",
-            "auto",
-        ])
-        .expect("Qwen3.5 should accept the auto policy together with stream overlap");
-    }
-
-    #[test]
-    fn rejects_tp_auto_scheduler_policy() {
-        let error = validate_argv(&[
-            "pegainfer",
-            "--tp-size",
-            "2",
-            "--cuda-graph=false",
-            "--qwen35-scheduler-policy",
-            "auto",
-        ])
-        .expect_err("Qwen3.5 TP should reject auto scheduler-policy");
-        assert!(error.to_string().contains("single-GPU only"));
     }
 
     #[test]

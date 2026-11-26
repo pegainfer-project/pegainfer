@@ -51,7 +51,7 @@ When prefill and decode coexist, the common planner produces one
 `RunUnifiedStep`. Every rank executes prefill before decode in the same
 collective order. The scheduler consumes decode results before promoting
 prefill results, allowing acknowledged retirement to free slots first.
-TP does not support the single-GPU stream-overlap or adaptive `auto` policies.
+TP does not support the single-GPU stream-overlap lane.
 
 ## Dispatch and result contracts
 
