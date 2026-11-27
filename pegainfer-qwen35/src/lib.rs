@@ -40,6 +40,8 @@ use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
+pub use scheduler::plan::StepCostModel;
+pub use scheduler::plan::StepPolicy;
 
 /// Maximum supported Qwen3.5 decode scheduler slots.
 const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
@@ -143,6 +145,7 @@ pub struct Qwen35LaunchOptions {
     max_prefill_tokens: usize,
     gdn_backend: Qwen35GdnBackend,
     prefix_cache_mib: usize,
+    step_policy: StepPolicy,
 }
 
 impl Qwen35LaunchOptions {
@@ -163,7 +166,14 @@ impl Qwen35LaunchOptions {
             max_prefill_tokens,
             prefix_cache_mib,
             gdn_backend: Qwen35GdnBackend::Triton,
+            step_policy: StepPolicy::Fixed,
         }
+    }
+
+    #[must_use]
+    pub fn with_step_policy(mut self, step_policy: StepPolicy) -> Self {
+        self.step_policy = step_policy;
+        self
     }
 
     fn device_ordinals(&self) -> Result<Vec<usize>> {
@@ -197,6 +207,7 @@ pub fn launch_with_options(
         decode_overlap,
         options.gdn_backend,
         options.prefix_cache_mib,
+        options.step_policy,
     )
 }
 
@@ -207,6 +218,7 @@ pub(crate) fn check_launch(
     max_prefill_tokens: usize,
     tensor_parallel: bool,
     decode_overlap: Qwen35DecodeOverlap,
+    step_policy: StepPolicy,
 ) -> Result<()> {
     anyhow::ensure!(
         (1..=MAX_DECODE_BATCH).contains(&max_batch),
@@ -216,6 +228,30 @@ pub(crate) fn check_launch(
         max_prefill_tokens > 0,
         "Qwen3.5 --max-prefill-tokens must be at least 1, got {max_prefill_tokens}"
     );
+    if let StepPolicy::StallBounded {
+        max_stall_us,
+        cost_model,
+    } = step_policy
+    {
+        anyhow::ensure!(
+            max_stall_us > 0,
+            "Qwen3.5 --qwen35-prefill-stall-ms must be at least 1, got 0"
+        );
+        anyhow::ensure!(
+            cost_model.us_per_prefill_row > 0,
+            "Qwen3.5 step cost model requires a positive prefill slope"
+        );
+        let min_stall_us = cost_model.min_reachable_stall_us();
+        anyhow::ensure!(
+            max_stall_us >= min_stall_us,
+            "Qwen3.5 --qwen35-prefill-stall-ms must be at least {} ms to cover one prefill row alongside one active decoder; a mixed prefill+decode step cannot stall less than {min_stall_us} us, got {max_stall_us} us",
+            min_stall_us.div_ceil(1_000)
+        );
+        anyhow::ensure!(
+            decode_overlap == Qwen35DecodeOverlap::Off,
+            "Qwen3.5 --qwen35-prefill-stall-ms cannot be combined with --decode-overlap=stream"
+        );
+    }
     if decode_overlap == Qwen35DecodeOverlap::SharedSm {
         anyhow::ensure!(
             max_batch <= MAX_SHARED_SM_DECODE_BATCH,
@@ -247,6 +283,7 @@ pub fn start_engine_with_capacity_and_overlap(
         decode_overlap,
         Qwen35GdnBackend::Triton,
         prefix_cache_mib,
+        StepPolicy::Fixed,
     )
 }
 
@@ -258,6 +295,7 @@ fn start_engine_with_backend(
     decode_overlap: Qwen35DecodeOverlap,
     gdn_backend: Qwen35GdnBackend,
     prefix_cache_mib: usize,
+    step_policy: StepPolicy,
 ) -> Result<Engine> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -270,6 +308,7 @@ fn start_engine_with_backend(
         max_prefill_tokens,
         device_ordinals.len() > 1,
         decode_overlap,
+        step_policy,
     )?;
     let prefix_snapshot_bytes = prefix_cache_mib
         .checked_mul(1024 * 1024)
@@ -290,6 +329,7 @@ fn start_engine_with_backend(
             max_prefill_tokens,
             enable_cuda_graph,
             prefix_snapshot_bytes,
+            step_policy,
         );
     }
 
@@ -327,6 +367,7 @@ fn start_engine_with_backend(
         max_batch,
         max_prefill_tokens,
         decode_overlap,
+        step_policy,
     )
 }
 
@@ -338,7 +379,11 @@ mod tests {
     use pegainfer_frontend::engine::EpBackend;
 
     use super::Qwen35DecodeOverlap;
+    use super::Qwen35GdnBackend;
     use super::Qwen35LaunchOptions;
+    use super::StepCostModel;
+    use super::StepPolicy;
+    use super::start_engine_with_backend;
     use super::start_engine_with_capacity_and_overlap;
 
     #[test]
@@ -349,12 +394,25 @@ mod tests {
             cuda_graph: false,
             max_batch: 1,
             max_prefill_tokens: 1,
-            gdn_backend: super::Qwen35GdnBackend::Triton,
+            gdn_backend: Qwen35GdnBackend::Triton,
             prefix_cache_mib: 0,
+            step_policy: StepPolicy::Fixed,
         };
 
         let err = options.device_ordinals().unwrap_err().to_string();
         assert!(err.contains("tp_size must be >= 1"));
+    }
+
+    #[test]
+    fn launch_options_default_step_policy_is_fixed() {
+        let options = Qwen35LaunchOptions::new(0, 1, true, 4, 1_024, 0);
+        assert_eq!(options.step_policy, StepPolicy::Fixed);
+
+        let tp_options = Qwen35LaunchOptions::new(0, 2, false, 4, 1_024, 0);
+        assert_eq!(tp_options.step_policy, StepPolicy::Fixed);
+
+        let options = options.with_step_policy(StepPolicy::stall_bounded_ms(60));
+        assert_eq!(options.step_policy, StepPolicy::stall_bounded_ms(60));
     }
 
     #[test]
@@ -401,5 +459,121 @@ mod tests {
         .to_string();
 
         assert!(err.contains("at least 1"));
+    }
+
+    #[test]
+    fn rejects_zero_stall_bound_before_loading_model() {
+        let err = start_engine_with_backend(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            1_024,
+            Qwen35DecodeOverlap::Off,
+            Qwen35GdnBackend::Triton,
+            0,
+            StepPolicy::StallBounded {
+                max_stall_us: 0,
+                cost_model: StepCostModel::H20_QWEN35_4B,
+            },
+        )
+        .err()
+        .expect("zero stall bound should reject the launch")
+        .to_string();
+
+        assert!(
+            err.contains("--qwen35-prefill-stall-ms must be at least 1, got 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unreachable_stall_bound_before_loading_model() {
+        let err = start_engine_with_backend(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            1_024,
+            Qwen35DecodeOverlap::Off,
+            Qwen35GdnBackend::Triton,
+            0,
+            StepPolicy::stall_bounded_ms(1),
+        )
+        .err()
+        .expect("an unreachable stall bound should reject the launch")
+        .to_string();
+
+        assert!(err.contains("at least 9 ms"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_cost_model_slope_before_loading_model() {
+        let err = start_engine_with_backend(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            1_024,
+            Qwen35DecodeOverlap::Off,
+            Qwen35GdnBackend::Triton,
+            0,
+            StepPolicy::StallBounded {
+                max_stall_us: 60_000,
+                cost_model: StepCostModel {
+                    base_us: 8_200,
+                    us_per_prefill_row: 0,
+                    us_per_decode_row: 106,
+                },
+            },
+        )
+        .err()
+        .expect("a zero prefill slope should reject the launch")
+        .to_string();
+
+        assert!(err.contains("positive prefill slope"), "{err}");
+    }
+
+    #[test]
+    fn rejects_stall_bound_with_stream_overlap_before_loading_model() {
+        let err = start_engine_with_backend(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            32,
+            1_024,
+            Qwen35DecodeOverlap::SharedSm,
+            Qwen35GdnBackend::Triton,
+            0,
+            StepPolicy::stall_bounded_ms(60),
+        )
+        .err()
+        .expect("stream overlap should reject a stall-bounded policy")
+        .to_string();
+
+        assert!(
+            err.contains("cannot be combined with --decode-overlap=stream"),
+            "{err}"
+        );
     }
 }

@@ -615,7 +615,13 @@ fn take_prefill_chunks_cuts_each_request_on_its_own_prompt() {
                 remaining_tokens: p.req.request.prompt_tokens.len().saturating_sub(p.cursor),
             })
             .collect();
-        let plan = plan_step(1, 1024, &queue);
+        let plan = plan_step(
+            1,
+            1024,
+            &queue,
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         take_prefill_chunks(&mut prefilling, &plan, stride)
             .iter()
             .map(|p| p.step_chunk)
@@ -704,8 +710,9 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
-        .expect("start TP2 scheduler");
+    let mut engine =
+        start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0, StepPolicy::Fixed)
+            .expect("start TP2 scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();
     let decode = handle.submit(test_request("mixed-active", vec![151_646], 8));

@@ -31,6 +31,8 @@ pub(super) fn log_itl_step(
     prefill_tokens: usize,
     prefill_reqs: usize,
     decode_n: usize,
+    prefill_queue_reqs: usize,
+    prefill_queue_tok: usize,
 ) {
     let Some(step_start) = step_start else {
         return;
@@ -40,13 +42,15 @@ pub(super) fn log_itl_step(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_micros());
     info!(
-        "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={}",
+        "ITL_STEP mono_us={} epoch_us={} plan={} prefill_tok={} prefill_reqs={} decode_n={} dur_us={} prefill_queue_reqs={} prefill_queue_tok={}",
         itl_debug_mono_us(),
         epoch_us,
         plan,
         prefill_tokens,
         prefill_reqs,
         decode_n,
-        dur_us
+        dur_us,
+        prefill_queue_reqs,
+        prefill_queue_tok
     );
 }

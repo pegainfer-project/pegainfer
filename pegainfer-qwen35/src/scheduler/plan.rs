@@ -16,6 +16,94 @@ pub(super) struct PrefillQueueState {
     pub(super) remaining_tokens: usize,
 }
 
+/// Linear per-step cost fit used to bound the prefill rows of one step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StepCostModel {
+    pub base_us: u64,
+    pub us_per_prefill_row: u64,
+    pub us_per_decode_row: u64,
+}
+
+impl StepCostModel {
+    /// H20 Qwen3.5-4B `PEGAINFER_ITL_DEBUG` fit: n=1497 unified steps,
+    /// R^2=0.9972.
+    pub const H20_QWEN35_4B: Self = Self {
+        base_us: 8_200,
+        us_per_prefill_row: 74,
+        us_per_decode_row: 106,
+    };
+
+    pub const fn predict_step_us(&self, prefill_rows: usize, active_decodes: usize) -> u64 {
+        self.base_us
+            .saturating_add(self.us_per_prefill_row.saturating_mul(prefill_rows as u64))
+            .saturating_add(self.us_per_decode_row.saturating_mul(active_decodes as u64))
+    }
+
+    /// Fastest mixed step the model can represent: one prefill row alongside one
+    /// active decoder.
+    pub const fn min_reachable_stall_us(&self) -> u64 {
+        self.predict_step_us(1, 1)
+    }
+
+    /// Prompt rows that keep the fitted step cost at or below `max_stall_us`.
+    ///
+    /// Launch validation rejects a target below [`Self::min_reachable_stall_us`],
+    /// so one row fits a one-decoder mix. The keepalive floor still matters for
+    /// a much wider active batch: the fixed decode cost can exceed the target,
+    /// and the single row keeps the prefill queue from starving.
+    pub fn max_prefill_rows_for_stall(&self, max_stall_us: u64, active_decodes: usize) -> usize {
+        assert!(
+            self.us_per_prefill_row > 0,
+            "step cost model requires positive prefill slope"
+        );
+        let fixed_us = self
+            .base_us
+            .saturating_add(self.us_per_decode_row.saturating_mul(active_decodes as u64));
+        let headroom_us = max_stall_us.saturating_sub(fixed_us);
+        usize::try_from((headroom_us / self.us_per_prefill_row).max(1)).unwrap_or(usize::MAX)
+    }
+}
+
+/// Queue pressure visible to the step planner.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct StepLoadSignals {
+    pub(super) pending_reqs: usize,
+    pub(super) queued_prefill_tokens: usize,
+}
+
+impl StepLoadSignals {
+    pub(super) fn from_queue(pending_reqs: usize, prefilling: &[PrefillQueueState]) -> Self {
+        Self {
+            pending_reqs,
+            queued_prefill_tokens: prefilling.iter().fold(0usize, |total, state| {
+                total.saturating_add(state.remaining_tokens)
+            }),
+        }
+    }
+}
+
+/// Which prefill row policy a scheduler instance applies.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StepPolicy {
+    /// Pack FIFO prompt slices into the configured fixed token budget.
+    #[default]
+    Fixed,
+    /// Bound prefill rows by a fitted per-step cost target.
+    StallBounded {
+        max_stall_us: u64,
+        cost_model: StepCostModel,
+    },
+}
+
+impl StepPolicy {
+    pub const fn stall_bounded_ms(max_stall_ms: u64) -> Self {
+        Self::StallBounded {
+            max_stall_us: max_stall_ms.saturating_mul(1_000),
+            cost_model: StepCostModel::H20_QWEN35_4B,
+        }
+    }
+}
+
 /// Prompt rows in one standard chunk.
 ///
 /// The serving cells that set Qwen3.5's tail target were tuned against a
@@ -49,17 +137,97 @@ impl StepPlan {
     }
 }
 
-/// Pack FIFO prompt slices into `budget`; decode rows do not consume it.
-/// A prompt crossing the budget resumes at the queue front on the next step.
-pub(super) fn plan_step(
+/// Pack FIFO prompt slices into `remaining_budget`; decode rows do not consume
+/// it. A prompt crossing the budget resumes at the queue front on the next step.
+pub(super) fn plan_prefill_rows(
     active_decodes: usize,
-    budget: usize,
     prefilling: &[PrefillQueueState],
-) -> StepPlan {
-    assert!(
-        budget > 0,
-        "Qwen3.5 scheduler requires a positive prefill budget"
-    );
+    remaining_budget: usize,
+    load: StepLoadSignals,
+    policy: StepPolicy,
+) -> Vec<usize> {
+    if remaining_budget == 0 || prefilling.is_empty() {
+        return Vec::new();
+    }
+    match policy {
+        StepPolicy::Fixed => pack_fifo(prefilling, remaining_budget),
+        StepPolicy::StallBounded {
+            max_stall_us,
+            cost_model,
+        } => {
+            let stall_cap = cost_model
+                .max_prefill_rows_for_stall(max_stall_us, active_decodes)
+                .min(remaining_budget);
+            if active_decodes == 0 {
+                // No active decoder shares this step, so a long prompt may use
+                // the whole budget instead of being sliced by the stall cap.
+                let first_rem = prefilling[0].remaining_tokens;
+                let first = first_rem.min(remaining_budget);
+                if first == 0 {
+                    return Vec::new();
+                }
+                if first < first_rem {
+                    return vec![first];
+                }
+                pack_whole_followers(first, &prefilling[1..], stall_cap)
+            } else {
+                let step_cap = stall_cap;
+                let first_rem = prefilling[0].remaining_tokens;
+                if first_rem == 0 {
+                    return Vec::new();
+                }
+                if first_rem <= step_cap {
+                    return pack_whole_followers(first_rem, &prefilling[1..], step_cap);
+                }
+                let has_backlog = prefilling.len() > 1
+                    || load.pending_reqs > 0
+                    || load.queued_prefill_tokens > first_rem;
+                let tail = first_rem % step_cap;
+                let next_fits_with_tail = tail > 0
+                    && prefilling.get(1).is_some_and(|next| {
+                        next.remaining_tokens > 0
+                            && tail.saturating_add(next.remaining_tokens) <= step_cap
+                    });
+                if has_backlog && next_fits_with_tail {
+                    // Finish the tail in the next step beside the whole follower,
+                    // so this step takes a full slice instead of a fragment.
+                    return vec![step_cap];
+                }
+                // Same number of steps as repeated capped slices, lower peak ITL.
+                let chunks = first_rem.div_ceil(step_cap);
+                vec![first_rem.div_ceil(chunks)]
+            }
+        }
+    }
+}
+
+/// Pack the head plus only those FIFO followers that fit whole in `row_cap`.
+///
+/// A follower that cannot fit is left for the next step; slicing it here would
+/// add a prefill request launch for a tiny fragment.
+fn pack_whole_followers(
+    first_rows: usize,
+    followers: &[PrefillQueueState],
+    row_cap: usize,
+) -> Vec<usize> {
+    let mut prefill = vec![first_rows];
+    let mut total = first_rows;
+    for state in followers {
+        if state.remaining_tokens == 0 {
+            break;
+        }
+        if total.saturating_add(state.remaining_tokens) <= row_cap {
+            total = total.saturating_add(state.remaining_tokens);
+            prefill.push(state.remaining_tokens);
+        } else {
+            break;
+        }
+    }
+    prefill
+}
+
+/// FIFO prompt slices under a hard row budget.
+fn pack_fifo(prefilling: &[PrefillQueueState], budget: usize) -> Vec<usize> {
     let mut remaining = budget;
     let mut prefill = Vec::new();
     for state in prefilling {
@@ -73,6 +241,23 @@ pub(super) fn plan_step(
             break;
         }
     }
+    prefill
+}
+
+/// Pack FIFO prompt slices into `budget`; decode rows do not consume it.
+/// A prompt crossing the budget resumes at the queue front on the next step.
+pub(super) fn plan_step(
+    active_decodes: usize,
+    budget: usize,
+    prefilling: &[PrefillQueueState],
+    load: StepLoadSignals,
+    policy: StepPolicy,
+) -> StepPlan {
+    assert!(
+        budget > 0,
+        "Qwen3.5 scheduler requires a positive prefill budget"
+    );
+    let prefill = plan_prefill_rows(active_decodes, prefilling, budget, load, policy);
     StepPlan {
         decode: active_decodes > 0,
         prefill,
@@ -280,12 +465,36 @@ mod tests {
             .collect()
     }
 
+    /// Build a policy whose fitted prefill row cap is exactly `step_cap` for
+    /// `active_decodes`.
+    fn stall_policy_for_cap(step_cap: usize, active_decodes: usize) -> StepPolicy {
+        let cost_model = StepCostModel::H20_QWEN35_4B;
+        let max_stall_us = cost_model
+            .base_us
+            .saturating_add(
+                cost_model
+                    .us_per_decode_row
+                    .saturating_mul(active_decodes as u64),
+            )
+            .saturating_add(
+                cost_model
+                    .us_per_prefill_row
+                    .saturating_mul(step_cap as u64),
+            );
+        StepPolicy::StallBounded {
+            max_stall_us,
+            cost_model,
+        }
+    }
+
     #[test]
     fn default_budget_is_one_standard_prompt_chunk() {
         let plan = plan_step(
             1,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
             &four_standard_prompts(),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
         );
         assert!(plan.decode);
         assert_eq!(plan.prefill, vec![STANDARD_PROMPT_CHUNK]);
@@ -295,20 +504,38 @@ mod tests {
 
     #[test]
     fn plan_packs_whole_prompts_in_fifo_order() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[300, 700, 900, 1500]));
+        let plan = plan_step(
+            1,
+            PACK_BUDGET,
+            &prompts(&[300, 700, 900, 1500]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert!(plan.decode);
         assert_eq!(plan.prefill, vec![300, 700, 900, 1500]);
     }
 
     #[test]
     fn plan_slices_the_prompt_that_crosses_the_budget() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[6000]));
+        let plan = plan_step(
+            1,
+            PACK_BUDGET,
+            &prompts(&[6000]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert_eq!(plan.prefill, vec![PACK_BUDGET]);
     }
 
     #[test]
     fn plan_slices_against_the_budget_left_by_earlier_prompts() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[2000, 3000, 1]));
+        let plan = plan_step(
+            1,
+            PACK_BUDGET,
+            &prompts(&[2000, 3000, 1]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert_eq!(plan.prefill, vec![2000, 2096]);
     }
 
@@ -316,7 +543,13 @@ mod tests {
     fn plan_resumes_the_sliced_tail_before_the_next_prompt() {
         // The 6000-token prompt was sliced at 4096; its tail is now the front
         // of the queue and must be finished before the next prompt moves.
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[1904, 1024]));
+        let plan = plan_step(
+            1,
+            PACK_BUDGET,
+            &prompts(&[1904, 1024]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert_eq!(plan.prefill, vec![1904, 1024]);
     }
 
@@ -326,6 +559,8 @@ mod tests {
             1,
             usize::MAX,
             &prompts(&[STANDARD_PROMPT_CHUNK, STANDARD_PROMPT_CHUNK, 7]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
         );
         assert_eq!(
             plan.prefill,
@@ -335,7 +570,13 @@ mod tests {
 
     #[test]
     fn plan_never_widens_a_smaller_budget() {
-        let plan = plan_step(1, 512, &prompts(&[STANDARD_PROMPT_CHUNK; 4]));
+        let plan = plan_step(
+            1,
+            512,
+            &prompts(&[STANDARD_PROMPT_CHUNK; 4]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert_eq!(plan.prefill, vec![512]);
     }
 
@@ -345,6 +586,8 @@ mod tests {
             1,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
             &prompts(&[0, STANDARD_PROMPT_CHUNK]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
         );
         assert!(plan.prefill.is_empty());
         assert!(plan.decode);
@@ -353,7 +596,13 @@ mod tests {
 
     #[test]
     fn plan_is_prefill_only_without_decode_work() {
-        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &prompts(&[700]));
+        let plan = plan_step(
+            0,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &prompts(&[700]),
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert!(!plan.decode);
         assert_eq!(plan.prefill, vec![700]);
         assert!(!plan.is_empty());
@@ -361,7 +610,13 @@ mod tests {
 
     #[test]
     fn plan_is_decode_only_without_prompt_work() {
-        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(
+            1,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &[],
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert!(plan.decode);
         assert!(plan.prefill.is_empty());
         assert!(!plan.is_empty());
@@ -369,14 +624,502 @@ mod tests {
 
     #[test]
     fn plan_is_empty_without_prompt_or_decode_work() {
-        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(
+            0,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &[],
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert!(plan.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "positive prefill budget")]
     fn plan_rejects_a_zero_budget() {
-        plan_step(1, 0, &[]);
+        plan_step(1, 0, &[], StepLoadSignals::default(), StepPolicy::Fixed);
+    }
+
+    #[test]
+    fn h20_cost_model_predicts_and_saturates() {
+        let model = StepCostModel::H20_QWEN35_4B;
+        assert_eq!(model.predict_step_us(0, 0), 8_200);
+        assert_eq!(
+            model.predict_step_us(1_024, 32),
+            8_200 + 74 * 1_024 + 106 * 32
+        );
+        assert_eq!(model.min_reachable_stall_us(), 8_380);
+        assert_eq!(model.min_reachable_stall_us(), model.predict_step_us(1, 1));
+        assert_eq!(model.predict_step_us(usize::MAX, usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn h20_cost_model_rows_shrink_with_active_decodes() {
+        let model = StepCostModel::H20_QWEN35_4B;
+        assert_eq!(model.max_prefill_rows_for_stall(60_000, 0), 700);
+        assert_eq!(model.max_prefill_rows_for_stall(60_000, 1), 698);
+        assert_eq!(
+            model.max_prefill_rows_for_stall(0, 0),
+            1,
+            "an exhausted budget still admits one row"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "positive prefill slope")]
+    fn cost_model_rejects_a_zero_prefill_slope() {
+        let model = StepCostModel {
+            base_us: 0,
+            us_per_prefill_row: 0,
+            us_per_decode_row: 0,
+        };
+        model.max_prefill_rows_for_stall(60_000, 0);
+    }
+
+    #[test]
+    fn stall_bounded_policy_converts_milliseconds_saturating() {
+        assert_eq!(
+            StepPolicy::stall_bounded_ms(60),
+            StepPolicy::StallBounded {
+                max_stall_us: 60_000,
+                cost_model: StepCostModel::H20_QWEN35_4B,
+            }
+        );
+        assert_eq!(
+            StepPolicy::stall_bounded_ms(0),
+            StepPolicy::StallBounded {
+                max_stall_us: 0,
+                cost_model: StepCostModel::H20_QWEN35_4B,
+            }
+        );
+        assert_eq!(
+            StepPolicy::stall_bounded_ms(u64::MAX),
+            StepPolicy::StallBounded {
+                max_stall_us: u64::MAX,
+                cost_model: StepCostModel::H20_QWEN35_4B,
+            }
+        );
+    }
+
+    #[test]
+    fn step_load_signals_sum_queue_tokens_saturating() {
+        assert_eq!(
+            StepLoadSignals::from_queue(3, &prompts(&[300, 700])),
+            StepLoadSignals {
+                pending_reqs: 3,
+                queued_prefill_tokens: 1_000,
+            }
+        );
+        assert_eq!(
+            StepLoadSignals::from_queue(
+                0,
+                &[
+                    PrefillQueueState {
+                        remaining_tokens: usize::MAX,
+                    },
+                    PrefillQueueState {
+                        remaining_tokens: 1,
+                    },
+                ],
+            )
+            .queued_prefill_tokens,
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn stall_bounded_returns_no_rows_for_an_empty_queue() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        for active_decodes in [0, 1, 8] {
+            assert!(
+                plan_prefill_rows(
+                    active_decodes,
+                    &[],
+                    1_024,
+                    StepLoadSignals::default(),
+                    policy,
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn stall_bounded_zero_budget_yields_no_rows() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        assert!(
+            plan_prefill_rows(0, &prompts(&[1_024]), 0, StepLoadSignals::default(), policy)
+                .is_empty()
+        );
+        assert!(
+            plan_prefill_rows(3, &prompts(&[1_024]), 0, StepLoadSignals::default(), policy)
+                .is_empty()
+        );
+        assert!(
+            plan_prefill_rows(
+                0,
+                &prompts(&[1_024]),
+                0,
+                StepLoadSignals::default(),
+                StepPolicy::Fixed,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn stall_bounded_empty_plan_without_prompt_or_decode_work() {
+        let plan = plan_step(
+            0,
+            1_024,
+            &[],
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn stall_bounded_plan_step_keeps_prefill_only_and_mixed_marks() {
+        let pure = plan_step(
+            0,
+            2_048,
+            &prompts(&[3_000]),
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert!(!pure.decode);
+        assert_eq!(pure.prefill, vec![2_048]);
+
+        let queue = prompts(&[1_024]);
+        let mixed = plan_step(
+            2,
+            4_096,
+            &queue,
+            StepLoadSignals::from_queue(0, &queue),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert!(mixed.decode);
+        assert_eq!(mixed.prefill, vec![512]);
+    }
+
+    #[test]
+    #[should_panic(expected = "positive prefill budget")]
+    fn stall_bounded_plan_step_rejects_a_zero_budget() {
+        plan_step(
+            1,
+            0,
+            &prompts(&[1_024]),
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+    }
+
+    #[test]
+    fn stall_bounded_decode_only_step_keeps_decoding() {
+        let plan = plan_step(
+            4,
+            1_024,
+            &[],
+            StepLoadSignals {
+                pending_reqs: 3,
+                queued_prefill_tokens: 0,
+            },
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert!(plan.decode);
+        assert!(plan.prefill.is_empty());
+    }
+
+    #[test]
+    fn stall_bounded_pure_prefill_uses_the_whole_budget_for_one_long_prompt() {
+        let rows = plan_prefill_rows(
+            0,
+            &prompts(&[3_000]),
+            2_048,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(rows, vec![2_048]);
+    }
+
+    #[test]
+    fn stall_bounded_pure_prefill_does_not_pack_a_1024_prompt_burst() {
+        let rows = plan_prefill_rows(
+            0,
+            &prompts(&[1_024, 1_024, 1_024]),
+            4_096,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(
+            rows,
+            vec![1_024],
+            "a second 1024-row prompt must not delay the first prompt's TTFT"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_pure_prefill_packs_short_prompts_within_the_stall_cap() {
+        let rows = plan_prefill_rows(
+            0,
+            &prompts(&[300, 200, 100, 100]),
+            4_096,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(rows, vec![300, 200, 100, 100]);
+        assert_eq!(rows.iter().sum::<usize>(), 700);
+    }
+
+    #[test]
+    fn stall_bounded_pure_prefill_does_not_slice_a_whole_follower() {
+        let rows = plan_prefill_rows(
+            0,
+            &prompts(&[300, 500]),
+            4_096,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(
+            rows,
+            vec![300],
+            "a follower that does not fit whole waits for the next step"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_pure_prefill_slicing_takes_the_hard_budget() {
+        let rows = plan_prefill_rows(
+            0,
+            &prompts(&[3_000, 100]),
+            500,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(
+            rows,
+            vec![500],
+            "the hard budget caps the slice and the unfinished prompt blocks the follower"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_slices_balanced_without_backlog() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        let rows = plan_prefill_rows(
+            1,
+            &prompts(&[1_024]),
+            4_096,
+            StepLoadSignals::from_queue(0, &prompts(&[1_024])),
+            policy,
+        );
+        assert_eq!(rows, vec![512]);
+        assert!(
+            StepCostModel::H20_QWEN35_4B.predict_step_us(rows[0], 1) <= 60_000,
+            "the balanced slice must respect the stall target"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_respects_a_budget_below_the_stall_cap() {
+        let rows = plan_prefill_rows(
+            1,
+            &prompts(&[3_000]),
+            300,
+            StepLoadSignals::default(),
+            StepPolicy::stall_bounded_ms(60),
+        );
+        assert_eq!(rows, vec![300]);
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_does_not_slice_a_whole_follower() {
+        let policy = stall_policy_for_cap(1_062, 1);
+        let queue = prompts(&[1_024, 1_024]);
+        let rows = plan_prefill_rows(
+            1,
+            &queue,
+            4_096,
+            StepLoadSignals::from_queue(0, &queue),
+            policy,
+        );
+        assert_eq!(
+            rows,
+            vec![1_024],
+            "must not emit a [1024, 38] follower fragment"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_packs_a_whole_follower_when_it_fits() {
+        let policy = stall_policy_for_cap(2_100, 1);
+        let queue = prompts(&[1_024, 1_024]);
+        let rows = plan_prefill_rows(
+            1,
+            &queue,
+            4_096,
+            StepLoadSignals::from_queue(0, &queue),
+            policy,
+        );
+        assert_eq!(rows, vec![1_024, 1_024]);
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_full_slices_to_merge_the_tail_with_a_whole_follower() {
+        let policy = stall_policy_for_cap(1_024, 1);
+        let target_us = StepCostModel::H20_QWEN35_4B.predict_step_us(1_024, 1);
+        let queue = prompts(&[1_500, 500]);
+        let first = plan_prefill_rows(
+            1,
+            &queue,
+            4_096,
+            StepLoadSignals::from_queue(0, &queue),
+            policy,
+        );
+        assert_eq!(first, vec![1_024]);
+
+        let remaining = prompts(&[476, 500]);
+        let second = plan_prefill_rows(
+            1,
+            &remaining,
+            4_096,
+            StepLoadSignals::from_queue(0, &remaining),
+            policy,
+        );
+        assert_eq!(second, vec![476, 500]);
+        assert!(
+            StepCostModel::H20_QWEN35_4B.predict_step_us(second.iter().sum::<usize>(), 1)
+                <= target_us
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_balances_without_slicing_the_follower() {
+        let policy = stall_policy_for_cap(550, 1);
+        let queue = prompts(&[1_024, 1_024]);
+        let first = plan_prefill_rows(
+            1,
+            &queue,
+            4_096,
+            StepLoadSignals::from_queue(0, &queue),
+            policy,
+        );
+        assert_eq!(first, vec![512]);
+
+        let remaining = prompts(&[512, 1_024]);
+        let second = plan_prefill_rows(
+            1,
+            &remaining,
+            4_096,
+            StepLoadSignals::from_queue(0, &remaining),
+            policy,
+        );
+        assert_eq!(
+            second,
+            vec![512],
+            "the tail step stays whole and never emits a follower fragment"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_packs_whole_short_prompts() {
+        let policy = stall_policy_for_cap(700, 1);
+        let queue = prompts(&[256, 256, 512]);
+        let rows = plan_prefill_rows(
+            1,
+            &queue,
+            4_096,
+            StepLoadSignals::from_queue(0, &queue),
+            policy,
+        );
+        assert_eq!(rows, vec![256, 256]);
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_balances_when_pending_cannot_supply_a_mergeable_tail() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        let rows = plan_prefill_rows(
+            1,
+            &prompts(&[1_024]),
+            4_096,
+            StepLoadSignals {
+                pending_reqs: 1,
+                queued_prefill_tokens: 1_024,
+            },
+            policy,
+        );
+        assert_eq!(
+            rows,
+            vec![512],
+            "a pending request is not a follower that can absorb the sliced tail"
+        );
+    }
+
+    #[test]
+    fn stall_bounded_mixed_step_shrinks_continuously_with_active_decodes() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        let model = StepCostModel::H20_QWEN35_4B;
+        let queue = prompts(&[4_096, 4_096]);
+        let mut previous_cap = usize::MAX;
+        for active_decodes in 1..=200 {
+            let cap = model
+                .max_prefill_rows_for_stall(60_000, active_decodes)
+                .min(4_096);
+            let rows = plan_prefill_rows(
+                active_decodes,
+                &queue,
+                4_096,
+                StepLoadSignals::from_queue(0, &queue),
+                policy,
+            );
+            let total = rows.iter().sum::<usize>();
+            assert!(total >= 1);
+            assert!(
+                total <= cap,
+                "active_decodes={active_decodes} planned {total} rows above cap {cap}"
+            );
+            assert!(
+                model.predict_step_us(total, active_decodes) <= 60_000,
+                "active_decodes={active_decodes} planned rows exceed the stall target"
+            );
+            assert!(
+                cap <= previous_cap,
+                "the row cap must not widen as active decodes grow"
+            );
+            assert!(
+                previous_cap == usize::MAX || previous_cap - cap <= 2,
+                "active_decodes={active_decodes} moved the cap by more than one decode row step"
+            );
+            previous_cap = cap;
+        }
+    }
+
+    #[test]
+    fn stall_bounded_keeps_one_row_under_an_extreme_bound() {
+        let policy = StepPolicy::StallBounded {
+            max_stall_us: 1,
+            cost_model: StepCostModel::H20_QWEN35_4B,
+        };
+        let single = plan_prefill_rows(
+            64,
+            &prompts(&[1_024]),
+            4_096,
+            StepLoadSignals::default(),
+            policy,
+        );
+        assert_eq!(single, vec![1]);
+        let backlogged = plan_prefill_rows(
+            64,
+            &prompts(&[1_024]),
+            4_096,
+            StepLoadSignals {
+                pending_reqs: 1,
+                queued_prefill_tokens: 1_024,
+            },
+            policy,
+        );
+        assert_eq!(backlogged, vec![1]);
     }
 
     #[test]
@@ -617,7 +1360,13 @@ mod tests {
         assert!(outcome.pending.is_empty());
         assert_eq!(ids(&outcome.deferred), vec![1]);
         assert!(outcome.rejected.is_empty());
-        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(
+            1,
+            crate::DEFAULT_MAX_PREFILL_TOKENS,
+            &[],
+            StepLoadSignals::default(),
+            StepPolicy::Fixed,
+        );
         assert!(
             plan.decode && plan.prefill.is_empty(),
             "active requests keep decoding when pending requests are all deferred"

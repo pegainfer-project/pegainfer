@@ -15,6 +15,7 @@ use pegainfer_frontend::vllm::ParserSelection;
 use crate::Qwen35DecodeOverlap;
 use crate::Qwen35GdnBackend;
 use crate::Qwen35LaunchOptions;
+use crate::StepPolicy;
 
 pub static MODEL_LINE: Qwen35Line = Qwen35Line;
 
@@ -36,6 +37,19 @@ struct Qwen35Cli {
     /// artifact and SM120/Hv32/TP1; Triton remains the default.
     #[arg(long, value_enum, default_value_t = Qwen35GdnBackend::Triton)]
     qwen35_gdn_backend: Qwen35GdnBackend,
+
+    /// Bound mixed prefill+decode steps that have active decoders by a fitted
+    /// stall target in milliseconds. The built-in coefficients are fitted on a
+    /// single-card H20 with Qwen3.5-4B. Pure prefill steps still let the head
+    /// prompt use the full --max-prefill-tokens budget. Unset keeps the fixed
+    /// 1024-row budget; requires --decode-overlap=off.
+    #[arg(long)]
+    qwen35_prefill_stall_ms: Option<u64>,
+}
+
+fn resolve_step_policy(cli: &Qwen35Cli) -> StepPolicy {
+    cli.qwen35_prefill_stall_ms
+        .map_or(StepPolicy::Fixed, StepPolicy::stall_bounded_ms)
 }
 
 fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
@@ -55,6 +69,7 @@ pub(crate) fn launch_options(ctx: &LaunchContext<'_>) -> Qwen35LaunchOptions {
             .shared
             .max_prefill_tokens
             .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
+        step_policy: resolve_step_policy(&cli),
     }
 }
 
@@ -117,6 +132,7 @@ impl ModelLine for Qwen35Line {
                 .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
             ctx.shared.tp_size > 1,
             decode_overlap,
+            resolve_step_policy(&cli),
         )
         .map_err(|error| CliError::rule(error.to_string()))
     }
@@ -200,6 +216,70 @@ mod tests {
             ])
             .max_prefill_tokens,
             4096
+        );
+    }
+
+    #[test]
+    fn default_step_policy_is_fixed_single_and_tp() {
+        assert_eq!(
+            resolved_launch_options(&["pegainfer"]).step_policy,
+            StepPolicy::Fixed
+        );
+        assert_eq!(
+            resolved_launch_options(&["pegainfer", "--tp-size", "2", "--cuda-graph=false"])
+                .step_policy,
+            StepPolicy::Fixed
+        );
+    }
+
+    #[test]
+    fn parses_prefill_stall_ms_into_stall_bounded_policy() {
+        let policy =
+            resolved_launch_options(&["pegainfer", "--qwen35-prefill-stall-ms", "60"]).step_policy;
+        assert_eq!(
+            policy,
+            StepPolicy::StallBounded {
+                max_stall_us: 60_000,
+                cost_model: crate::StepCostModel::H20_QWEN35_4B,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_prefill_stall_ms() {
+        let error = validate_argv(&["pegainfer", "--qwen35-prefill-stall-ms", "0"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--qwen35-prefill-stall-ms must be at least 1, got 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_unreachable_prefill_stall_ms() {
+        let error = validate_argv(&["pegainfer", "--qwen35-prefill-stall-ms", "1"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least 9 ms"), "{error}");
+    }
+
+    #[test]
+    fn rejects_stall_bound_with_stream_overlap() {
+        let error = validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefill-stall-ms",
+            "60",
+            "--decode-overlap",
+            "stream",
+            "--max-batch",
+            "32",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cannot be combined with --decode-overlap=stream"),
+            "{error}"
         );
     }
 

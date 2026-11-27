@@ -10,7 +10,7 @@ mod chunked_prefill_tests;
 #[cfg(test)]
 mod e2e_tests;
 mod emit;
-mod plan;
+pub(crate) mod plan;
 mod steps;
 mod telemetry;
 mod tp;
@@ -63,7 +63,9 @@ use self::plan::ActiveKvBudget;
 use self::plan::PrefillKvBudget;
 use self::plan::PrefillQueueState;
 use self::plan::RejectReason;
+use self::plan::StepLoadSignals;
 use self::plan::StepPlan;
+use self::plan::StepPolicy;
 use self::plan::admit_pending_requests;
 use self::plan::compaction_after_retire;
 use self::plan::plan_step;
@@ -200,6 +202,7 @@ pub fn start_with_capacity(
         max_batch,
         max_prefill_tokens,
         Qwen35DecodeOverlap::Off,
+        StepPolicy::Fixed,
     )
 }
 
@@ -209,6 +212,7 @@ pub(crate) fn start_with_capacity_and_overlap(
     max_batch: usize,
     max_prefill_tokens: usize,
     decode_overlap: Qwen35DecodeOverlap,
+    step_policy: StepPolicy,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -238,6 +242,7 @@ pub(crate) fn start_with_capacity_and_overlap(
                         SchedulerBackend::Single(backend),
                         seed,
                         max_prefill_tokens,
+                        step_policy,
                     ),
                     wiring,
                 );
@@ -283,6 +288,7 @@ pub(crate) fn start_tp_with_capacity(
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
     prefix_snapshot_bytes: usize,
+    step_policy: StepPolicy,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -309,7 +315,12 @@ pub(crate) fn start_tp_with_capacity(
     Ok(Engine {
         schedulers: vec![spawn_scheduler(
             "scheduler-qwen35-tp",
-            Qwen35Scheduler::new(SchedulerBackend::Tp(backend), seed, max_prefill_tokens),
+            Qwen35Scheduler::new(
+                SchedulerBackend::Tp(backend),
+                seed,
+                max_prefill_tokens,
+                step_policy,
+            ),
         )],
         info: EngineInfo {
             servable_len: Some(servable),
@@ -385,12 +396,18 @@ struct Qwen35Scheduler {
     pending: Vec<QueuedRequest>,
     rng: StdRng,
     prefill_budget: usize,
+    step_policy: StepPolicy,
     failed: bool,
     backend: SchedulerBackend,
 }
 
 impl Qwen35Scheduler {
-    fn new(backend: SchedulerBackend, seed: u64, prefill_budget: usize) -> Self {
+    fn new(
+        backend: SchedulerBackend,
+        seed: u64,
+        prefill_budget: usize,
+        step_policy: StepPolicy,
+    ) -> Self {
         info!("scheduler ready (max_batch={})", backend.max_batch());
         Self {
             inflight_prefill: None,
@@ -399,6 +416,7 @@ impl Qwen35Scheduler {
             pending: Vec::new(),
             rng: StdRng::seed_from_u64(seed),
             prefill_budget,
+            step_policy,
             failed: false,
             backend,
         }
@@ -412,6 +430,7 @@ impl Qwen35Scheduler {
             pending,
             rng,
             prefill_budget,
+            step_policy,
             backend,
             ..
         } = self;
@@ -445,6 +464,11 @@ impl Qwen35Scheduler {
                 prefill_tokens,
                 prefill_reqs,
                 decode_n,
+                prefilling.len(),
+                prefilling
+                    .iter()
+                    .map(|p| p.req.request.prompt_tokens.len().saturating_sub(p.cursor))
+                    .sum(),
             );
             finish_result?;
         }
@@ -507,6 +531,11 @@ impl Qwen35Scheduler {
                 itl_prefill_tokens,
                 itl_prefill_reqs,
                 itl_decode_n,
+                prefilling.len(),
+                prefilling
+                    .iter()
+                    .map(|p| p.req.request.prompt_tokens.len().saturating_sub(p.cursor))
+                    .sum(),
             );
             return step_result;
         }
@@ -605,7 +634,14 @@ impl Qwen35Scheduler {
                     .saturating_sub(req.cursor),
             })
             .collect();
-        let plan = plan_step(active.len(), *prefill_budget, &prefill_queue);
+        let load = StepLoadSignals::from_queue(pending.len(), &prefill_queue);
+        let plan = plan_step(
+            active.len(),
+            *prefill_budget,
+            &prefill_queue,
+            load,
+            *step_policy,
+        );
         if !plan.is_empty() {
             let overlap = backend.overlap_enabled();
             let itl_plan_kind = match (plan.decode, plan.prefill.is_empty()) {
@@ -619,6 +655,8 @@ impl Qwen35Scheduler {
             let itl_debug = itl_debug_enabled();
             let itl_prefill_reqs = plan.prefill.len();
             let itl_decode_n = active.len();
+            let itl_queue_reqs = prefill_queue.len();
+            let itl_queue_tok: usize = prefill_queue.iter().map(|p| p.remaining_tokens).sum();
             let itl_step_start = itl_debug.then(Instant::now);
             let snapshot_stride = backend.snapshot_stride();
             let step_result = run_step(
@@ -638,6 +676,8 @@ impl Qwen35Scheduler {
                     *forwarded,
                     itl_prefill_reqs,
                     itl_decode_n,
+                    itl_queue_reqs,
+                    itl_queue_tok,
                 );
             }
             step_result?;
