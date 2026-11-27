@@ -2,7 +2,7 @@
 
 > **TL;DR:** `pegainfer-qwen35` owns the hybrid model runtime and scheduler; the server launches it through the shared step-contract `Engine`. Qwen3.8 uses the same model line.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 ## Ownership and entry points
 

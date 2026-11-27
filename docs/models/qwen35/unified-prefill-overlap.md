@@ -23,7 +23,7 @@
 > throughput `873 → 992 tok/s`, ITL p99 unchanged; TPOT returns to vLLM
 > parity (`23.8 vs 23.6 ms`).
 >
-> **Last touched:** 2026-09
+> **Last touched:** 2026-11
 
 ## Preparation
 
