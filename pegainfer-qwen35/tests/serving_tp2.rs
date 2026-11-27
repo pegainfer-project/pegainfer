@@ -81,6 +81,7 @@ async fn spawn_ready_server(
                 ..EngineLoadOptions::default()
             },
             8,
+            8,
             max_prefill_tokens,
         )
     })

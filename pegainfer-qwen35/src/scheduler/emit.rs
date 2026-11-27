@@ -5,7 +5,7 @@ use super::*;
 
 pub(super) fn prune_closed_requests<B>(
     backend: &mut B,
-    active: &mut Vec<ActiveRequest35>,
+    active_cohorts: &mut [Vec<ActiveRequest35>; 2],
     prefilling: &mut Vec<PrefillingRequest35>,
     pending: &mut Vec<QueuedRequest>,
     ledger: &mut RequestLedger,
@@ -21,16 +21,18 @@ where
             true
         }
     });
-    for idx in (0..active.len()).rev() {
-        if ledger.is_aborted(active[idx].id) {
-            debug!(
-                "request pruned before scheduling: request_id={:?} phase=decode tokens_generated={}",
-                active[idx].client_label,
-                ledger.completion_tokens(active[idx].id)
-            );
-            let removed = backend.take_active_request(active, idx);
-            backend.drop_active_state(&removed.backend_state)?;
-            ledger.retire(removed.id);
+    for active in active_cohorts.iter_mut() {
+        for idx in (0..active.len()).rev() {
+            if ledger.is_aborted(active[idx].id) {
+                debug!(
+                    "request pruned before scheduling: request_id={:?} phase=decode tokens_generated={}",
+                    active[idx].client_label,
+                    ledger.completion_tokens(active[idx].id)
+                );
+                let removed = backend.take_active_request(active, idx);
+                backend.drop_active_state(&removed.backend_state)?;
+                ledger.retire(removed.id);
+            }
         }
     }
     for idx in (0..prefilling.len()).rev() {

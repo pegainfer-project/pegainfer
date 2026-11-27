@@ -213,6 +213,7 @@ where
         info: EngineInfo {
             kv_capacity: Some(kv_capacity),
             servable_len: Some(servable),
+            max_num_seqs: None,
         },
         lora,
     }

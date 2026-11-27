@@ -84,6 +84,7 @@ impl ModelLine for EchoLine {
             info: EngineInfo {
                 kv_capacity: None,
                 servable_len: None,
+                max_num_seqs: None,
             },
             lora: None,
         }

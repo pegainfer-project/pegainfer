@@ -60,12 +60,15 @@ use rand::rngs::StdRng;
 use self::backend::*;
 use self::emit::*;
 use self::plan::ActiveKvBudget;
+use self::plan::CohortId;
 use self::plan::PrefillKvBudget;
 use self::plan::PrefillQueueState;
 use self::plan::RejectReason;
 use self::plan::StepPlan;
 use self::plan::admit_pending_requests;
+use self::plan::assign_cohort;
 use self::plan::compaction_after_retire;
+use self::plan::next_decode_cohort;
 use self::plan::plan_step;
 use self::plan::prefilling_future_pages;
 use self::plan::slot_for_new_request;
@@ -123,7 +126,9 @@ struct PrefillingRequest35 {
 enum ActiveBackendState {
     Single {
         kv: Box<RequestKv>,
-        /// Index into `BatchDecodeGraphState.slot_states`.
+        /// Decode cohort owning this request (A or B).
+        cohort: CohortId,
+        /// Slot index within this cohort's `BatchDecodeGraphState.slot_states`.
         graph_slot_idx: usize,
     },
     Tp {
@@ -137,7 +142,9 @@ enum ActiveBackendState {
 enum PrefillBackendState {
     Single {
         kv: Box<RequestKv>,
-        rec: RecurrentState,
+        /// Target cohort and slot reserved at admission; prefill writes in place without allocating a new RecurrentState.
+        cohort: CohortId,
+        slot_idx: usize,
     },
     Tp {
         request_id: RequestId,
@@ -191,22 +198,14 @@ pub const DEFAULT_MAX_PREFILL_TOKENS: usize = plan::STANDARD_PROMPT_CHUNK;
 pub fn start_with_capacity(
     model: Qwen35Model,
     seed: u64,
-    max_batch: usize,
     max_prefill_tokens: usize,
 ) -> Result<Engine> {
-    start_with_capacity_and_overlap(
-        model,
-        seed,
-        max_batch,
-        max_prefill_tokens,
-        Qwen35DecodeOverlap::Off,
-    )
+    start_with_capacity_and_overlap(model, seed, max_prefill_tokens, Qwen35DecodeOverlap::Off)
 }
 
 pub(crate) fn start_with_capacity_and_overlap(
     model: Qwen35Model,
     seed: u64,
-    max_batch: usize,
     max_prefill_tokens: usize,
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<Engine> {
@@ -216,9 +215,10 @@ pub(crate) fn start_with_capacity_and_overlap(
     );
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
-    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap)?;
+    let backend = SingleGpuBackend::new(model, decode_overlap)?;
     let total_blocks = backend.capacity_pages_for_requests();
     let block_size = backend.page_size();
+    let max_num_seqs = backend.max_resident();
     let servable = servable_len(
         backend.model().config().max_position_embeddings,
         total_blocks,
@@ -270,6 +270,7 @@ pub(crate) fn start_with_capacity_and_overlap(
                 total_blocks,
                 block_size,
             }),
+            max_num_seqs: Some(max_num_seqs),
         },
         lora: None,
     })
@@ -279,7 +280,8 @@ pub(crate) fn start_tp_with_capacity(
     model_path: &str,
     seed: u64,
     device_ordinals: &[usize],
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
     prefix_snapshot_bytes: usize,
@@ -288,14 +290,20 @@ pub(crate) fn start_tp_with_capacity(
         max_prefill_tokens > 0,
         "max_prefill_tokens must be positive: a zero budget can never schedule a prefill chunk"
     );
+    crate::capacity::ServingCapacity::validate_request(
+        decode_width,
+        max_resident,
+        device_ordinals.len(),
+    )?;
     let backend = TpSchedulerBackend::new(
         model_path,
         device_ordinals,
-        max_batch,
+        max_resident,
         max_prefill_tokens,
         enable_cuda_graph,
         prefix_snapshot_bytes,
     )?;
+    let max_num_seqs = backend.max_batch();
     let servable = servable_len(
         backend.max_position_embeddings(),
         backend.capacity_pages_for_requests(),
@@ -314,6 +322,7 @@ pub(crate) fn start_tp_with_capacity(
         info: EngineInfo {
             servable_len: Some(servable),
             kv_capacity: Some(kv_capacity),
+            max_num_seqs: Some(max_num_seqs),
         },
         lora: None,
     })
@@ -380,7 +389,10 @@ fn fail_or_retire(id: FrontendRequestId, message: impl Into<String>, ledger: &mu
 struct Qwen35Scheduler {
     // Drain asynchronous work before releasing its request allocations or backend.
     inflight_prefill: Option<InflightPrefill>,
-    active: Vec<ActiveRequest35>,
+    /// Active decode requests grouped by cohort (A/B on single GPU, A only on TP).
+    active_cohorts: [Vec<ActiveRequest35>; 2],
+    /// Next turn cursor when both cohorts are active.
+    next_decode_turn: CohortId,
     prefilling: Vec<PrefillingRequest35>,
     pending: Vec<QueuedRequest>,
     rng: StdRng,
@@ -391,10 +403,16 @@ struct Qwen35Scheduler {
 
 impl Qwen35Scheduler {
     fn new(backend: SchedulerBackend, seed: u64, prefill_budget: usize) -> Self {
-        info!("scheduler ready (max_batch={})", backend.max_batch());
+        info!(
+            "scheduler ready (decode_width={}, max_resident={}, cohorts={})",
+            backend.decode_width(),
+            backend.max_resident(),
+            backend.cohort_count(),
+        );
         Self {
             inflight_prefill: None,
-            active: Vec::new(),
+            active_cohorts: [Vec::new(), Vec::new()],
+            next_decode_turn: CohortId::A,
             prefilling: Vec::new(),
             pending: Vec::new(),
             rng: StdRng::seed_from_u64(seed),
@@ -407,7 +425,8 @@ impl Qwen35Scheduler {
     fn advance(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         let Self {
             inflight_prefill,
-            active,
+            active_cohorts,
+            next_decode_turn,
             prefilling,
             pending,
             rng,
@@ -415,7 +434,13 @@ impl Qwen35Scheduler {
             backend,
             ..
         } = self;
-        let max_batch = backend.max_batch();
+        let decode_width = backend.decode_width();
+        let max_resident = backend.max_resident();
+        backend.debug_assert_slot_conservation(
+            active_cohorts,
+            prefilling,
+            inflight_prefill.as_ref(),
+        );
 
         let prefill_ready = inflight_prefill
             .as_mut()
@@ -428,11 +453,11 @@ impl Qwen35Scheduler {
                         prefill.chunk.reqs.len(),
                     )
                 });
-            let decode_n = active.len();
+            let decode_n = active_cohorts[0].len() + active_cohorts[1].len();
             let step_start = itl_debug_enabled().then(Instant::now);
             let finish_result = finish_async_prefill(
                 backend,
-                active,
+                active_cohorts,
                 prefilling,
                 inflight_prefill
                     .take()
@@ -449,7 +474,7 @@ impl Qwen35Scheduler {
             finish_result?;
         }
 
-        prune_closed_requests(backend, active, prefilling, pending, ledger)?;
+        prune_closed_requests(backend, active_cohorts, prefilling, pending, ledger)?;
         reject_unsupported_prompt_logprobs(pending, ledger);
 
         if prefill_ready {
@@ -469,20 +494,11 @@ impl Qwen35Scheduler {
                         prefill.chunk.reqs.len(),
                     )
                 });
-            let itl_decode_n = active.len();
-            let (itl_plan_kind, step_result) = if active.is_empty() {
-                let result = finish_async_prefill(
-                    backend,
-                    active,
-                    prefilling,
-                    inflight_prefill
-                        .take()
-                        .expect("async prefill must be present before blocking wait"),
-                    ledger,
-                );
-                ("overlap_wait", result)
-            } else {
-                // Only decode advances while async prefill is in flight.
+            let active_counts = [active_cohorts[0].len(), active_cohorts[1].len()];
+            let chosen = next_decode_cohort(active_counts, *next_decode_turn);
+            let itl_decode_n = chosen.map_or(0, |(c, _)| active_cohorts[c.index()].len());
+            let (itl_plan_kind, step_result) = if let Some((cohort, next_after)) = chosen {
+                *next_decode_turn = next_after;
                 let plan = StepPlan {
                     decode: true,
                     prefill: Vec::new(),
@@ -490,7 +506,8 @@ impl Qwen35Scheduler {
                 let snapshot_stride = backend.snapshot_stride();
                 let result = run_step(
                     backend,
-                    active,
+                    Some(cohort),
+                    active_cohorts,
                     prefilling,
                     &plan,
                     inflight_prefill,
@@ -500,6 +517,17 @@ impl Qwen35Scheduler {
                 )
                 .map(|_| ());
                 ("overlap_decode", result)
+            } else {
+                let result = finish_async_prefill(
+                    backend,
+                    active_cohorts,
+                    prefilling,
+                    inflight_prefill
+                        .take()
+                        .expect("async prefill must be present before blocking wait"),
+                    ledger,
+                );
+                ("overlap_wait", result)
             };
             log_itl_step(
                 itl_step_start,
@@ -511,14 +539,16 @@ impl Qwen35Scheduler {
             return step_result;
         }
 
-        if pending.is_empty() && active.is_empty() && prefilling.is_empty() {
+        let total_active = active_cohorts[0].len() + active_cohorts[1].len();
+        if pending.is_empty() && total_active == 0 && prefilling.is_empty() {
             return Ok(());
         }
 
-        // Admit new prompts. In-flight prefills reserve their promotion slot
-        // and future KV growth, so shrink the slot/page budgets accordingly.
-        let active_budget: Vec<ActiveKvBudget> = active
+        // Admit pending requests against total resident capacity `max_resident` (128 single-GPU, 64 TP),
+        // summing future KV growth across both cohorts' active requests and in-flight prefills.
+        let active_budget: Vec<ActiveKvBudget> = active_cohorts
             .iter()
+            .flat_map(|cohort| cohort.iter())
             .map(|req| ActiveKvBudget {
                 prompt_len: req.prompt_len,
                 generated_count: ledger.completion_tokens(req.id),
@@ -539,11 +569,11 @@ impl Qwen35Scheduler {
             let page_budget = backend
                 .available_pages()
                 .saturating_sub(prefilling_future_pages(&prefilling_budget, page_size));
-            let decode_batching_slot = max_batch.saturating_sub(prefilling.len());
+            let resident_slot_cap = max_resident.saturating_sub(prefilling.len());
             let admission = admit_pending_requests(
                 admission_pending,
                 &active_budget,
-                decode_batching_slot,
+                resident_slot_cap,
                 page_size,
                 page_budget,
                 // KvPool capacity includes the CUDA Graph padding page reserved at
@@ -594,6 +624,11 @@ impl Qwen35Scheduler {
             admission_pending = admission.deferred;
         }
 
+        let active_counts = [active_cohorts[0].len(), active_cohorts[1].len()];
+        let chosen_decode = next_decode_cohort(active_counts, *next_decode_turn);
+        let decode_cohort = chosen_decode.map(|(cohort, _)| cohort);
+        let decode_rows = decode_cohort.map_or(0, |cohort| active_cohorts[cohort.index()].len());
+
         let prefill_queue: Vec<PrefillQueueState> = prefilling
             .iter()
             .map(|req| PrefillQueueState {
@@ -605,8 +640,19 @@ impl Qwen35Scheduler {
                     .saturating_sub(req.cursor),
             })
             .collect();
-        let plan = plan_step(active.len(), *prefill_budget, &prefill_queue);
+        let max_prefill_reqs = decode_width.min(max_resident);
+        let plan = plan_step(
+            decode_rows,
+            *prefill_budget,
+            max_prefill_reqs,
+            &prefill_queue,
+        );
         if !plan.is_empty() {
+            if let Some((_, next_after)) = chosen_decode
+                && plan.decode
+            {
+                *next_decode_turn = next_after;
+            }
             let overlap = backend.overlap_enabled();
             let itl_plan_kind = match (plan.decode, plan.prefill.is_empty()) {
                 (true, true) => "decode",
@@ -618,12 +664,13 @@ impl Qwen35Scheduler {
             // reports the rows the executor actually forwards.
             let itl_debug = itl_debug_enabled();
             let itl_prefill_reqs = plan.prefill.len();
-            let itl_decode_n = active.len();
+            let itl_decode_n = decode_rows;
             let itl_step_start = itl_debug.then(Instant::now);
             let snapshot_stride = backend.snapshot_stride();
             let step_result = run_step(
                 backend,
-                active,
+                decode_cohort,
+                active_cohorts,
                 prefilling,
                 &plan,
                 inflight_prefill,
@@ -655,9 +702,19 @@ impl Scheduler for Qwen35Scheduler {
         let result = self.advance(ledger);
         if result.is_err() {
             // The driver answers every open account after this returns.
-            drop(self.inflight_prefill.take());
-            self.active.clear();
-            self.prefilling.clear();
+            if let Some(inflight) = self.inflight_prefill.take() {
+                self.backend.release_chunk_slots(&inflight.chunk);
+                drop(inflight);
+            }
+            for cohort in &mut self.active_cohorts {
+                self.backend.release_active_slots(cohort);
+                cohort.clear();
+            }
+            for p in self.prefilling.drain(..) {
+                let _ = self
+                    .backend
+                    .drop_prefill_state(&p.backend_state, DropExpectation::MustExist);
+            }
             self.pending.clear();
             self.failed = true;
         }
@@ -670,6 +727,7 @@ impl Scheduler for Qwen35Scheduler {
             .inflight_prefill
             .as_ref()
             .map_or(0, |prefill| prefill.chunk.reqs.len());
+        let active_reqs = self.active_cohorts[0].len() + self.active_cohorts[1].len();
         SchedulerMetrics {
             kv_used_blocks: if self.failed {
                 // TP pages stay owned until backend teardown; zero is display-only.
@@ -678,8 +736,7 @@ impl Scheduler for Qwen35Scheduler {
                 kv_total_blocks.saturating_sub(self.backend.available_pages() as u64)
             },
             kv_total_blocks,
-            num_running_reqs: (self.active.len() + self.prefilling.len() + inflight_prefill_reqs)
-                as u64,
+            num_running_reqs: (active_reqs + self.prefilling.len() + inflight_prefill_reqs) as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
             prefix_cache: None,

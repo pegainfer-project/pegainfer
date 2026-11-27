@@ -114,6 +114,8 @@ pub struct Qwen35Executor {
     model: Qwen35Model,
     kv_cache: Qwen35PrefixCache,
     graph_state: BatchDecodeGraphState,
+    /// Reusable stack of free recurrent state slots (lowest index on top).
+    free_slots: Vec<usize>,
     active: Vec<ActiveRequest>,
 }
 
@@ -126,10 +128,12 @@ impl Qwen35Executor {
         let kv_cache = Qwen35PrefixCache::new(manager, 0)?;
         let graph_state =
             model.create_batch_decode_graph_state(kv_cache.pool().padding_block_id())?;
+        let free_slots = (0..graph_state.slot_states.len()).rev().collect();
         Ok(Self {
             model,
             kv_cache,
             graph_state,
+            free_slots,
             active: Vec::new(),
         })
     }
@@ -204,51 +208,92 @@ impl Qwen35Executor {
             .zip(plan.requests)
             .map(|(kv, req)| self.kv_cache.prefill_view(kv, req.prompt_tokens.len()))
             .collect::<Vec<_>>();
-        let mut recurrent_states: Vec<RecurrentState> = plan
-            .requests
-            .iter()
-            .map(|_| {
-                RecurrentState::new(
-                    self.model.device_ctx(),
-                    self.model.config(),
-                    self.model.geometry,
-                )
-            })
-            .collect::<Result<_>>()?;
-        let mut recurrent_refs: Vec<&mut RecurrentState> = recurrent_states.iter_mut().collect();
-        let logits = match self.model.batch_prefill_logits(
-            &prompts,
-            &views,
-            &mut recurrent_refs,
-            self.kv_cache.buffer(),
-        ) {
-            Ok(logits) => logits,
-            Err(error) => {
+        let mut assigned_slots = Vec::with_capacity(plan.requests.len());
+        for _ in 0..plan.requests.len() {
+            let slot_idx = self.free_slots.pop().ok_or_else(|| {
+                anyhow::anyhow!("Qwen3.5 logits executor out of free state slots")
+            })?;
+            if let Err(error) = self
+                .graph_state
+                .reset_slot(self.model.device_ctx(), slot_idx)
+            {
+                self.free_slots.push(slot_idx);
+                self.free_slots.extend(assigned_slots);
                 self.kv_cache.revert_scheduled_requests(&mut kv_states);
                 return Err(error);
+            }
+            assigned_slots.push(slot_idx);
+        }
+
+        let logits = {
+            let slot_ptrs: Vec<*mut RecurrentState> = assigned_slots
+                .iter()
+                .map(|&idx| &raw mut self.graph_state.slot_states[idx])
+                .collect();
+            // SAFETY: `assigned_slots` are popped from `free_slots`, so every index is distinct
+            // and points to an independent slot.
+            let mut recurrent_refs: Vec<&mut RecurrentState> =
+                slot_ptrs.into_iter().map(|p| unsafe { &mut *p }).collect();
+            match self.model.batch_prefill_logits(
+                &prompts,
+                &views,
+                &mut recurrent_refs,
+                self.kv_cache.buffer(),
+            ) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    self.free_slots.extend(assigned_slots);
+                    self.kv_cache.revert_scheduled_requests(&mut kv_states);
+                    return Err(error);
+                }
             }
         };
 
         let requested_logprobs: Vec<Option<usize>> =
             plan.requests.iter().map(|req| req.logprobs).collect();
-        let cpu_logits =
-            snapshot_requested_logprobs(self.model.device_ctx(), &logits, &requested_logprobs)?;
-        let tokens =
-            select_default_tokens_from_logits(&self.model, &logits, &mut self.graph_state.buffers)?;
+        let cpu_logits = match snapshot_requested_logprobs(
+            self.model.device_ctx(),
+            &logits,
+            &requested_logprobs,
+        ) {
+            Ok(v) => v,
+            Err(error) => {
+                self.free_slots.extend(assigned_slots);
+                self.kv_cache.revert_scheduled_requests(&mut kv_states);
+                return Err(error);
+            }
+        };
+        let tokens = match select_default_tokens_from_logits(
+            &self.model,
+            &logits,
+            &mut self.graph_state.buffers,
+        ) {
+            Ok(v) => v,
+            Err(error) => {
+                self.free_slots.extend(assigned_slots);
+                self.kv_cache.revert_scheduled_requests(&mut kv_states);
+                return Err(error);
+            }
+        };
 
         let mut results = Vec::with_capacity(plan.requests.len());
-        for (i, (req, mut kv)) in plan.requests.iter().zip(kv_states).enumerate() {
+        let mut iter = plan
+            .requests
+            .iter()
+            .zip(kv_states)
+            .zip(assigned_slots)
+            .enumerate();
+        while let Some((i, ((req, mut kv), slot_idx))) = iter.next() {
             let first_token = tokens[i];
-            self.kv_cache.apply_prefill(&mut kv, Some(first_token))?;
+            if let Err(error) = self.kv_cache.apply_prefill(&mut kv, Some(first_token)) {
+                self.free_slots.push(slot_idx);
+                self.free_slots
+                    .extend(iter.map(|(_, (_, rem_slot))| rem_slot));
+                return Err(error);
+            }
             let first_token_logprob = cpu_logits[i].as_ref().and_then(|(row, top_k)| {
                 pegainfer_sample::token_logprob_from_row(row, first_token, *top_k)
             });
-            let slot_idx = self.active.len();
-            self.graph_state.copy_state_to_slot(
-                self.model.device_ctx(),
-                &recurrent_states[i],
-                slot_idx,
-            )?;
             self.active.push(ActiveRequest {
                 request_id: req.request_id,
                 kv,
@@ -300,9 +345,11 @@ impl Qwen35Executor {
             .iter()
             .map(|req| self.kv_cache.decode_view(&req.kv))
             .collect::<Vec<_>>();
+        let slot_indices: Vec<usize> = self.active.iter().map(|req| req.graph_slot_idx).collect();
         if let Err(error) = self.model.batch_decode_graph(
             &token_ids,
             &views,
+            &slot_indices,
             self.kv_cache.buffer(),
             &mut self.graph_state,
             crate::batch_decode::DecodeGraphUse::Serve,
@@ -351,54 +398,9 @@ impl Qwen35Executor {
         else {
             return Ok(());
         };
-        self.compact_slot(idx)
-    }
-
-    /// Remove one active request and keep the dense CUDA Graph slot layout.
-    fn compact_slot(&mut self, idx: usize) -> Result<()> {
-        let last = self.active.len() - 1;
         let mut removed = self.active.swap_remove(idx);
-        let release_result = self.kv_cache.release_request(&mut removed.kv);
-
-        if idx < self.active.len() {
-            anyhow::ensure!(
-                self.active[idx].graph_slot_idx == last,
-                "Qwen3.5 logits executor slot invariant broken: active slot {} moved from graph slot {}, expected {}",
-                idx,
-                self.active[idx].graph_slot_idx,
-                last
-            );
-            for layer_idx in 0..self.graph_state.slot_states[last].layers.len() {
-                let (src_part, dst_part) = if idx < last {
-                    let (left, right) = self.graph_state.slot_states.split_at_mut(last);
-                    (
-                        &right[0].layers[layer_idx],
-                        &mut left[idx].layers[layer_idx],
-                    )
-                } else {
-                    unreachable!("idx < active.len() <= last");
-                };
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.state, &mut dst_part.state)
-                    .map_err(|e| {
-                        anyhow::anyhow!("compact Qwen3.5 logits executor state copy failed: {e}")
-                    })?;
-                self.model
-                    .device_ctx()
-                    .stream
-                    .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "compact Qwen3.5 logits executor conv_state copy failed: {e}"
-                        )
-                    })?;
-            }
-            self.graph_state.slot_states[idx].seq_len = self.graph_state.slot_states[last].seq_len;
-            self.active[idx].graph_slot_idx = idx;
-        }
-        release_result
+        self.free_slots.push(removed.graph_slot_idx);
+        self.kv_cache.release_request(&mut removed.kv)
     }
 }
 

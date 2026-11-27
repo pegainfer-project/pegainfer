@@ -187,4 +187,7 @@ pub struct EngineInfo {
     /// Longest servable request in tokens, or an explicit `None` to leave the
     /// protocol stack's max-length validation at the model context window.
     pub servable_len: Option<u32>,
+    /// Maximum concurrent resident sequences declared by the engine (reported as
+    /// `max_num_seqs` on the handshake; `None` falls back to the frontend default).
+    pub max_num_seqs: Option<usize>,
 }

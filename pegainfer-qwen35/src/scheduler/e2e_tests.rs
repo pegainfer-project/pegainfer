@@ -839,6 +839,7 @@ fn test_e2e_qwen35_scheduler_tp2() {
             ..EngineLoadOptions::default()
         },
         8,
+        8,
         crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 scheduler");
@@ -871,6 +872,7 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
             ..EngineLoadOptions::default()
         },
         8,
+        8,
         crate::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("Failed to start Qwen3.5 TP2 graph scheduler");
@@ -879,4 +881,270 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
 
     let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&mut handle, &tokenizer, max_context_tokens, "TP2 graph");
+}
+
+#[test]
+fn test_e2e_qwen35_dual_cohort_c128_and_slot_reuse() {
+    pegainfer_frontend::logging::init_default();
+    let Some(model_path) =
+        common::model_path_or_skip("test_e2e_qwen35_dual_cohort_c128_and_slot_reuse")
+    else {
+        return;
+    };
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let engine = crate::start_engine(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        64,
+        128,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
+    )
+    .expect("Failed to start Qwen3.5 dual-cohort c128 scheduler");
+    assert_eq!(
+        engine.info.max_num_seqs,
+        Some(128),
+        "single-GPU dual-cohort engine must report max_num_seqs=128"
+    );
+    let mut handle = EngineHarness::new(engine);
+
+    let encoded_cases: Vec<(&str, Vec<u32>)> = CASES
+        .iter()
+        .map(|case| {
+            (
+                case.name,
+                tokenizer.encode(case.prompt, false).expect("encode failed"),
+            )
+        })
+        .collect();
+    let (math_ref_tokens, _) = generate_tokens(&mut handle, &tokenizer, CASES[2].prompt, 8);
+    assert!(!math_ref_tokens.is_empty());
+
+    // 1) c=64 regression: single cohort A serves 64 concurrent requests.
+    {
+        let mut guards = Vec::with_capacity(64);
+        for i in 0..64 {
+            let (name, prompt_tokens) = &encoded_cases[i % encoded_cases.len()];
+            let mut req = common::request(prompt_tokens.clone(), SamplingParams::default(), 16);
+            req.client_label = Some(format!("c64-{i}-{name}").into());
+            guards.push((i, *name, handle.submit(req)));
+        }
+        for (i, name, guard) in guards {
+            let res = collect_generation_with_timeout(
+                &mut handle,
+                &guard,
+                &format!("c64-{i}-{name}"),
+                None,
+                std::time::Duration::from_secs(60),
+            );
+            assert!(!res.tokens.is_empty(), "c64-{i} produced no tokens");
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c64-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
+
+    // 2) c=128 dual-cohort A/B alternation + cross-cohort mid-stream cancellation.
+    {
+        let mut guards = Vec::with_capacity(128);
+        for i in 0..128 {
+            let (name, prompt_tokens) = &encoded_cases[i % encoded_cases.len()];
+            let mut req = common::request(
+                prompt_tokens.clone(),
+                SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                64,
+            );
+            req.client_label = Some(format!("c128-{i}-{name}").into());
+            guards.push((i, *name, handle.submit(req)));
+        }
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let mut observed_running = 0u64;
+        loop {
+            let snapshot = handle.metrics();
+            observed_running = observed_running.max(snapshot.num_running_reqs);
+            if observed_running > 64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for >64 running requests; peak={observed_running}, last={snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        info!("  PASS: observed dual-cohort num_running_reqs={observed_running} (>64)");
+
+        // Cancel 8 requests on each side (abort after first token) to verify cross-cohort slot reclamation.
+        let mut kept = Vec::with_capacity(112);
+        for (i, name, guard) in guards {
+            let cancel_a = (8..16).contains(&i);
+            let cancel_b = (72..80).contains(&i);
+            if cancel_a || cancel_b {
+                wait_for_first_token(&mut handle, &guard, &format!("c128-cancel-{i}"));
+                guard.abort();
+            } else {
+                kept.push((i, name, guard));
+            }
+        }
+        for (i, name, guard) in kept {
+            let res = collect_generation_with_timeout(
+                &mut handle,
+                &guard,
+                &format!("c128-{i}-{name}"),
+                None,
+                std::time::Duration::from_secs(90),
+            );
+            assert!(!res.tokens.is_empty(), "c128-{i} produced no tokens");
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c128-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
+
+    // 3) Verify reuse and state reset across all 128 slots (no leaks, no cross-request contamination).
+    {
+        let mut guards = Vec::with_capacity(128);
+        for i in 0..128 {
+            let mut req = common::request(encoded_cases[2].1.clone(), SamplingParams::default(), 8);
+            req.client_label = Some(format!("c128-reuse-{i}").into());
+            guards.push((i, handle.submit(req)));
+        }
+        for (i, guard) in guards {
+            let res = collect_generation_with_timeout(
+                &mut handle,
+                &guard,
+                &format!("c128-reuse-{i}"),
+                None,
+                std::time::Duration::from_secs(90),
+            );
+            assert_eq!(
+                res.tokens[0], math_ref_tokens[0],
+                "c128-reuse-{i} first token diverged from clean greedy reference (possible state leak)"
+            );
+            assert!(
+                matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+                "c128-reuse-{i} unexpected finish reason: {:?}",
+                res.finish_reason
+            );
+        }
+    }
+}
+
+#[test]
+fn test_e2e_qwen35_dual_cohort_shared_sm_overlap() {
+    pegainfer_frontend::logging::init_default();
+    let Some(model_path) =
+        common::model_path_or_skip("test_e2e_qwen35_dual_cohort_shared_sm_overlap")
+    else {
+        return;
+    };
+
+    let tokenizer = common::load_tokenizer(&model_path);
+    let engine = crate::start_engine_with_capacity_and_overlap(
+        Path::new(&model_path),
+        EngineLoadOptions {
+            enable_cuda_graph: true,
+            device_ordinals: vec![0],
+            seed: 42,
+            ..EngineLoadOptions::default()
+        },
+        8,
+        16,
+        crate::DEFAULT_MAX_PREFILL_TOKENS,
+        crate::Qwen35DecodeOverlap::SharedSm,
+        0,
+    )
+    .expect("Failed to start Qwen3.5 dual-cohort SharedSm scheduler");
+    assert_eq!(engine.info.max_num_seqs, Some(16));
+    let mut handle = EngineHarness::new(engine);
+
+    let prompt = tokenizer
+        .encode("The capital of France is", false)
+        .expect("encode failed");
+    let long_text = "Rust ownership prevents data races across threads and streams. ".repeat(48);
+    let long_prompt = tokenizer.encode(&long_text, false).expect("encode long");
+
+    let ref_guard = handle.submit(common::request(
+        prompt.clone(),
+        SamplingParams::default(),
+        8,
+    ));
+    let ref_res = collect_generation(&mut handle, &ref_guard, "shared-sm-dual-ref", None);
+    assert_eq!(ref_res.tokens.len(), 8);
+
+    // Fill cohort A and spill into cohort B while overlapping long-prompt prefills on the prefill stream.
+    let mut guards = Vec::with_capacity(16);
+    for i in 0..16 {
+        let p = if i % 4 == 0 {
+            long_prompt.clone()
+        } else {
+            prompt.clone()
+        };
+        let mut req = common::request(p, SamplingParams::default(), 16);
+        req.client_label = Some(format!("shared-sm-dual-{i}").into());
+        guards.push((i, i % 4 == 0, handle.submit(req)));
+    }
+    let mut kept = Vec::new();
+    for (i, is_long, guard) in guards {
+        if i == 3 || i == 11 {
+            wait_for_first_token(&mut handle, &guard, &format!("shared-sm-cancel-{i}"));
+            guard.abort();
+        } else {
+            kept.push((i, is_long, guard));
+        }
+    }
+    for (i, is_long, guard) in kept {
+        let res = collect_generation_with_timeout(
+            &mut handle,
+            &guard,
+            &format!("shared-sm-dual-{i}"),
+            None,
+            std::time::Duration::from_secs(60),
+        );
+        assert!(
+            matches!(res.finish_reason, FinishReason::Length | FinishReason::Stop),
+            "shared-sm-dual-{i} unexpected finish: {:?}",
+            res.finish_reason
+        );
+        if !is_long {
+            assert_eq!(
+                res.tokens[0], ref_res.tokens[0],
+                "shared-sm-dual-{i} first token diverged under SharedSm dual-cohort overlap"
+            );
+        }
+    }
+
+    // Re-fill all 16 slots after cancellations to confirm zero slot leak or state corruption.
+    let reuse_guards: Vec<_> = (0..16)
+        .map(|i| {
+            let mut req = common::request(prompt.clone(), SamplingParams::default(), 8);
+            req.client_label = Some(format!("shared-sm-reuse-{i}").into());
+            (i, handle.submit(req))
+        })
+        .collect();
+    for (i, guard) in reuse_guards {
+        let res = collect_generation_with_timeout(
+            &mut handle,
+            &guard,
+            &format!("shared-sm-reuse-{i}"),
+            None,
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(
+            res.tokens[0], ref_res.tokens[0],
+            "shared-sm-reuse-{i} diverged after slot reuse"
+        );
+    }
 }

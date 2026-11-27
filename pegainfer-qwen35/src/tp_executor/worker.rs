@@ -897,9 +897,11 @@ impl TpWorkerState {
         // KV views arrive in row (slot) order; page tables stay per-step H2D via
         // sync_paged_views inside batch_decode_graph.
         let token_ids: Vec<u32> = requests.iter().map(|request| request.token_id).collect();
+        let slot_indices: Vec<usize> = (0..token_ids.len()).collect();
         self.model.batch_decode_graph(
             &token_ids,
             kv_views,
+            &slot_indices,
             self.model.kv_buffer(),
             graph_state,
             DecodeGraphUse::Replay,
@@ -1071,6 +1073,7 @@ impl TpWorkerState {
         self.model.batch_decode_graph_padded(
             &[0u32],
             &[synthetic_view],
+            &[0],
             self.model.kv_buffer(),
             graph_state,
             graph_use,

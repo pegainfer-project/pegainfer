@@ -10,6 +10,7 @@
 
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
@@ -48,6 +49,9 @@ pub(crate) struct LinearStatePointerTables {
     pub(crate) state_ptrs: Vec<CudaSlice<u64>>,
     pub(crate) conv_state_ptrs: Vec<CudaSlice<u64>>,
     capacity: usize,
+    /// Last `(active_slots, padded_bs)` synced to GPU to avoid redundant H2D during steady decode.
+    last_active_slots: Vec<usize>,
+    last_padded_bs: usize,
 }
 
 /// Per-layer element counts shared by allocation and reservation:
@@ -85,6 +89,33 @@ impl RecurrentState {
         Ok(Self { layers, seq_len: 0 })
     }
 
+    /// Zeros recurrent/conv state in place on GPU before reusing a returned slot (no reallocation).
+    pub(crate) fn reset(&mut self, ctx: &DeviceContext) -> Result<()> {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            ctx.stream
+                .memset_zeros(&mut layer.state)
+                .map_err(|e| anyhow::anyhow!("reset recurrent state layer {layer_idx}: {e}"))?;
+            ctx.stream
+                .memset_zeros(&mut layer.conv_state.data)
+                .map_err(|e| anyhow::anyhow!("reset conv state layer {layer_idx}: {e}"))?;
+        }
+        self.seq_len = 0;
+        Ok(())
+    }
+
+    /// Returns the fixed device pointers `(state_ptrs, conv_state_ptrs)` across all linear layers for this slot.
+    pub(crate) fn layer_device_ptrs(&self, ctx: &DeviceContext) -> (Vec<u64>, Vec<u64>) {
+        let mut state_ptrs = Vec::with_capacity(self.layers.len());
+        let mut conv_ptrs = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (s_ptr, _gs) = layer.state.device_ptr(&ctx.stream);
+            let (c_ptr, _gc) = layer.conv_state.data.device_ptr(&ctx.stream);
+            state_ptrs.push(s_ptr);
+            conv_ptrs.push(c_ptr);
+        }
+        (state_ptrs, conv_ptrs)
+    }
+
     /// Copy one complete target-model recurrent state into this allocation.
     pub(crate) fn copy_from(&mut self, ctx: &DeviceContext, src: &Self) -> Result<()> {
         anyhow::ensure!(
@@ -107,6 +138,12 @@ impl RecurrentState {
 }
 
 impl LinearStatePointerTables {
+    /// Estimates GPU memory (bytes) for the linear-layer pointer tables.
+    pub(crate) fn estimate_bytes(config: &Config35, capacity: usize) -> usize {
+        let num_linear_layers = config.num_hidden_layers - config.num_full_attention_layers();
+        num_linear_layers * capacity * 2 * std::mem::size_of::<u64>()
+    }
+
     /// Allocate zeroed per-layer tables with room for `capacity` rows. Rows
     /// carry no pointers until `refill_from_recurrent_refs` writes them.
     pub(crate) fn with_capacity(
@@ -130,6 +167,8 @@ impl LinearStatePointerTables {
             state_ptrs,
             conv_state_ptrs,
             capacity,
+            last_active_slots: Vec::new(),
+            last_padded_bs: 0,
         })
     }
 
@@ -200,6 +239,80 @@ impl LinearStatePointerTables {
                     anyhow::anyhow!("copy {label} conv state pointer table {layer_idx}: {e}")
                 })?;
         }
+        self.last_active_slots.clear();
+        self.last_padded_bs = 0;
+        Ok(())
+    }
+
+    /// Refreshes the fixed-address pointer tables for the cohort's active slots:
+    /// - `0..active_slots.len()` point to the active request slots;
+    /// - `active_slots.len()..padded_bs` point to the shared padding state so decode padding
+    ///   never overwrites slots currently undergoing prefill in the same cohort.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_slots(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_state_ptrs: &[Vec<u64>],
+        slot_conv_ptrs: &[Vec<u64>],
+        active_slots: &[usize],
+        padding_state_ptrs: &[u64],
+        padding_conv_ptrs: &[u64],
+        padded_bs: usize,
+        label: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            active_slots.len() <= padded_bs,
+            "{label} active_slots {} exceeds padded_bs {padded_bs}",
+            active_slots.len()
+        );
+        anyhow::ensure!(
+            padded_bs <= self.capacity,
+            "{label} padded_bs {padded_bs} exceeds pointer table capacity {}",
+            self.capacity
+        );
+        if self.last_padded_bs == padded_bs && self.last_active_slots == active_slots {
+            return Ok(());
+        }
+
+        let num_linear_layers = self.state_ptrs.len();
+        let mut host_state = Vec::with_capacity(padded_bs);
+        let mut host_conv = Vec::with_capacity(padded_bs);
+        for layer_idx in 0..num_linear_layers {
+            host_state.clear();
+            host_conv.clear();
+            for &slot_idx in active_slots {
+                anyhow::ensure!(
+                    slot_idx < slot_state_ptrs.len(),
+                    "{label} slot_idx {slot_idx} out of range ({})",
+                    slot_state_ptrs.len()
+                );
+                host_state.push(slot_state_ptrs[slot_idx][layer_idx]);
+                host_conv.push(slot_conv_ptrs[slot_idx][layer_idx]);
+            }
+            for _ in active_slots.len()..padded_bs {
+                host_state.push(padding_state_ptrs[layer_idx]);
+                host_conv.push(padding_conv_ptrs[layer_idx]);
+            }
+            ctx.stream
+                .memcpy_htod(
+                    host_state.as_slice(),
+                    &mut self.state_ptrs[layer_idx].slice_mut(0..padded_bs),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("sync {label} linear state pointer table {layer_idx}: {e}")
+                })?;
+            ctx.stream
+                .memcpy_htod(
+                    host_conv.as_slice(),
+                    &mut self.conv_state_ptrs[layer_idx].slice_mut(0..padded_bs),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("sync {label} conv state pointer table {layer_idx}: {e}")
+                })?;
+        }
+        self.last_active_slots.clear();
+        self.last_active_slots.extend_from_slice(active_slots);
+        self.last_padded_bs = padded_bs;
         Ok(())
     }
 

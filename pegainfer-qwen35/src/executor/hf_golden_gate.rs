@@ -698,10 +698,12 @@ fn build_executor(model: crate::weights::Qwen35Model) -> Qwen35Executor {
     let graph_state = model
         .create_batch_decode_graph_state(kv_cache.pool().padding_block_id())
         .expect("capture Qwen3.5 logits executor graph");
+    let free_slots = (0..graph_state.slot_states.len()).rev().collect();
     Qwen35Executor {
         model,
         kv_cache,
         graph_state,
+        free_slots,
         active: Vec::new(),
     }
 }

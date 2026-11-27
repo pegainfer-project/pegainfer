@@ -1515,6 +1515,7 @@ async fn serve_schedulers_as(
         info: EngineInfo {
             kv_capacity: None,
             servable_len: None,
+            max_num_seqs: None,
         },
         lora: None,
     };

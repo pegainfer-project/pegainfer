@@ -69,6 +69,7 @@ fn sampling_params_steer_the_qwen35_sampler() {
             ..EngineLoadOptions::default()
         },
         4,
+        4,
         pegainfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS,
     )
     .expect("failed to start Qwen3.5 engine");

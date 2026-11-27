@@ -26,11 +26,12 @@ struct Qwen35Cli {
     /// Per-rank GPU budget in MiB for joint prefix snapshots; zero disables reuse.
     #[arg(long, default_value_t = 0)]
     qwen35_prefix_cache_mib: usize,
-    /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
-    /// the next graph bucket but admits only this many scheduler slots; defaults
-    /// to 64.
+    /// Per-step decode width limit (1..=64, default 64).
     #[arg(long)]
-    max_batch: Option<usize>,
+    decode_width: Option<usize>,
+    /// Max resident requests per instance (single-GPU default 128 = 2 x decode_width; TP default 64, single cohort only).
+    #[arg(long)]
+    max_resident: Option<usize>,
 
     /// GDN prefill backend. The FlashInfer candidate requires a build-linked
     /// artifact and SM120/Hv32/TP1; Triton remains the default.
@@ -42,15 +43,25 @@ fn cli(ctx: &LaunchContext<'_>) -> Qwen35Cli {
     Qwen35Cli::from_arg_matches(ctx.matches).expect("Qwen35Cli parses from the merged command")
 }
 
+fn resolve_capacity_args(cli: &Qwen35Cli, tp_size: usize) -> (usize, usize) {
+    let decode_width = cli.decode_width.unwrap_or(crate::DEFAULT_DECODE_WIDTH);
+    let max_resident = cli
+        .max_resident
+        .unwrap_or_else(|| crate::ServingCapacity::default_max_resident(decode_width, tp_size));
+    (decode_width, max_resident)
+}
+
 pub(crate) fn launch_options(ctx: &LaunchContext<'_>) -> Qwen35LaunchOptions {
     let cli = cli(ctx);
+    let (decode_width, max_resident) = resolve_capacity_args(&cli, ctx.shared.tp_size);
     Qwen35LaunchOptions {
         device_ordinal: ctx.shared.device_ordinal,
         tp_size: ctx.shared.tp_size,
         cuda_graph: ctx.shared.cuda_graph,
         gdn_backend: cli.qwen35_gdn_backend,
         prefix_cache_mib: cli.qwen35_prefix_cache_mib,
-        max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+        decode_width,
+        max_resident,
         max_prefill_tokens: ctx
             .shared
             .max_prefill_tokens
@@ -110,12 +121,14 @@ impl ModelLine for Qwen35Line {
                 "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
             ));
         }
+        let (decode_width, max_resident) = resolve_capacity_args(&cli, ctx.shared.tp_size);
         crate::check_launch(
-            cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
+            decode_width,
+            max_resident,
             ctx.shared
                 .max_prefill_tokens
                 .unwrap_or(crate::DEFAULT_MAX_PREFILL_TOKENS),
-            ctx.shared.tp_size > 1,
+            ctx.shared.tp_size,
             decode_overlap,
         )
         .map_err(|error| CliError::rule(error.to_string()))
@@ -242,23 +255,34 @@ mod tests {
     }
 
     #[test]
+    fn default_capacity_is_128_single_gpu_and_64_tp2() {
+        let single = resolved_launch_options(&["pegainfer"]);
+        assert_eq!(single.decode_width, 64);
+        assert_eq!(single.max_resident, 128);
+
+        let tp2 = resolved_launch_options(&["pegainfer", "--tp-size", "2", "--cuda-graph=false"]);
+        assert_eq!(tp2.decode_width, 64);
+        assert_eq!(tp2.max_resident, 64);
+    }
+
+    #[test]
     fn accepts_shared_stream_overlap() {
-        let max_batch = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
+        let width = crate::MAX_SHARED_SM_DECODE_BATCH.to_string();
         validate_argv(&[
             "pegainfer",
             "--decode-overlap",
             "stream",
-            "--max-batch",
-            &max_batch,
+            "--decode-width",
+            &width,
         ])
         .expect("Qwen3.5 should accept shared-stream overlap");
     }
 
     #[test]
-    fn rejects_stream_overlap_default_max_batch() {
+    fn rejects_stream_overlap_default_decode_width() {
         let error = validate_argv(&["pegainfer", "--decode-overlap", "stream"])
-            .expect_err("Qwen3.5 should reject stream overlap at the default max_batch");
-        assert!(error.to_string().contains("max-batch"));
+            .expect_err("Qwen3.5 should reject stream overlap at the default decode_width");
+        assert!(error.to_string().contains("decode-width"));
         assert!(
             error
                 .to_string()
@@ -274,18 +298,40 @@ mod tests {
     }
 
     #[test]
-    fn accepts_non_bucket_scheduler_max_batch() {
-        validate_argv(&["pegainfer", "--max-batch", "5"])
-            .expect("Qwen3.5 should accept scheduler max_batch between decode buckets");
+    fn accepts_non_bucket_decode_width_and_resident_override() {
+        validate_argv(&["pegainfer", "--decode-width", "5", "--max-resident", "10"])
+            .expect("Qwen3.5 should accept decode_width between buckets with 2 cohorts");
     }
 
     #[test]
-    fn rejects_zero_scheduler_max_batch() {
-        let error = validate_argv(&["pegainfer", "--max-batch", "0"])
-            .expect_err("Qwen3.5 should reject zero scheduler max_batch");
+    fn rejects_zero_decode_width_and_tp2_dual_cohort() {
+        let error = validate_argv(&["pegainfer", "--decode-width", "0"])
+            .expect_err("Qwen3.5 should reject zero decode_width");
         assert!(
-            error.to_string().contains("--max-batch must be in 1..="),
+            error.to_string().contains("decode_width must be in 1..="),
             "unexpected error: {error}"
+        );
+
+        let tp2_err = validate_argv(&[
+            "pegainfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--max-resident",
+            "128",
+        ])
+        .expect_err("TP2 must reject max_resident > decode_width");
+        assert!(
+            tp2_err.to_string().contains("single cohort"),
+            "unexpected error: {tp2_err}"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_max_batch_flag() {
+        assert!(
+            validate_argv(&["pegainfer", "--max-batch", "64"]).is_err(),
+            "legacy --max-batch flag must no longer be accepted"
         );
     }
 

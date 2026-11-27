@@ -279,6 +279,7 @@ pub fn launch(model_path: &Path) -> Result<Engine> {
         info: EngineInfo {
             kv_capacity: None,
             servable_len: Some(u32::try_from(MAX_TOKENS)?),
+            max_num_seqs: None,
         },
         lora: None,
     })

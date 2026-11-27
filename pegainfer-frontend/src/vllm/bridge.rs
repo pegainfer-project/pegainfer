@@ -96,6 +96,7 @@ impl LocalEngineBridge {
             self.data_parallel_size,
             self.max_model_len,
             self.handle.kv_capacity(),
+            None,
             self.metrics_watch.clone(),
             None,
             &shutdown,
@@ -758,6 +759,7 @@ async fn connect_link(
     data_parallel_size: u32,
     max_model_len: u32,
     kv_capacity: Option<crate::engine::KvCapacity>,
+    max_num_seqs: Option<usize>,
     metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
     engine_dead: Option<CancellationToken>,
     shutdown: &CancellationToken,
@@ -795,9 +797,9 @@ async fn connect_link(
         pipeline_parallel_size: 1,
         decode_context_parallel_size: 1,
         data_parallel_rank: engine_index,
-        // Discovery metadata for gRPC control; HTTP completions do not admit
-        // against these caps. Keep them above any sim concurrency we bench.
-        max_num_seqs: 8192,
+        // Discovery metadata for gRPC control; report the engine's declared
+        // max_num_seqs when available (e.g. 128 single-GPU / 64 TP2 for Qwen3.5).
+        max_num_seqs: max_num_seqs.unwrap_or(8192) as u64,
         max_num_batched_tokens: u64::from(max_model_len),
         instance_id: format!("pegainfer-local-{engine_index}"),
         supports_lora: false,
@@ -821,8 +823,9 @@ async fn connect_link(
     };
     info!(
         "local engine {engine_index} KV capacity: {kv_capacity:?} -> \
-         kv_cache_size_tokens={kv_cache_size_tokens:?} \
-         kv_cache_max_concurrency={kv_cache_max_concurrency:?}"
+         max_num_seqs={} kv_cache_size_tokens={kv_cache_size_tokens:?} \
+         kv_cache_max_concurrency={kv_cache_max_concurrency:?}",
+        ready.max_num_seqs
     );
     let mut input = DealerSocket::with_options(socket_options);
     let mut output = PushSocket::new();

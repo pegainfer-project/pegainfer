@@ -8,6 +8,7 @@
 
 mod batch_decode;
 pub(crate) mod batch_decode_graph;
+pub mod capacity;
 pub(crate) mod config;
 mod decode_buffers;
 mod executor;
@@ -35,14 +36,18 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
+pub use capacity::ServingCapacity;
 pub(crate) use config::probe_config_json;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
 
-/// Maximum supported Qwen3.5 decode scheduler slots.
-const MAX_DECODE_BATCH: usize = batch_decode_graph::MAX_BATCH;
+/// Default per-step decode width limit (64).
+pub const DEFAULT_DECODE_WIDTH: usize = capacity::DEFAULT_DECODE_WIDTH;
+
+/// Default single-GPU max resident requests (2 x 64 = 128).
+pub const DEFAULT_SINGLE_GPU_MAX_RESIDENT: usize = capacity::DEFAULT_SINGLE_GPU_MAX_RESIDENT;
 
 /// Current safe Qwen3.5 Shared-SM overlap admission cap.
 ///
@@ -117,13 +122,15 @@ impl std::fmt::Display for Qwen35GdnBackend {
 pub fn start_engine(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
 ) -> Result<Engine> {
     start_engine_with_capacity_and_overlap(
         model_path,
         options,
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
         Qwen35DecodeOverlap::Off,
         0,
@@ -139,7 +146,10 @@ pub struct Qwen35LaunchOptions {
     /// TP decode captures CUDA Graphs when the rank-local decode GQA group has
     /// a compiled kernel; uncompiled groups stay on the eager path.
     cuda_graph: bool,
-    max_batch: usize,
+    /// Per-step decode width (1..=64, default 64).
+    decode_width: usize,
+    /// Max resident requests per instance (single-GPU default 128, TP default 64).
+    max_resident: usize,
     max_prefill_tokens: usize,
     gdn_backend: Qwen35GdnBackend,
     prefix_cache_mib: usize,
@@ -151,7 +161,8 @@ impl Qwen35LaunchOptions {
         device_ordinal: usize,
         tp_size: usize,
         cuda_graph: bool,
-        max_batch: usize,
+        decode_width: usize,
+        max_resident: usize,
         max_prefill_tokens: usize,
         prefix_cache_mib: usize,
     ) -> Self {
@@ -159,7 +170,8 @@ impl Qwen35LaunchOptions {
             device_ordinal,
             tp_size,
             cuda_graph,
-            max_batch,
+            decode_width,
+            max_resident,
             max_prefill_tokens,
             prefix_cache_mib,
             gdn_backend: Qwen35GdnBackend::Triton,
@@ -192,7 +204,8 @@ pub fn launch_with_options(
             ep_backend: EpBackend::Nccl,
             seed: 42,
         },
-        options.max_batch,
+        options.decode_width,
+        options.max_resident,
         options.max_prefill_tokens,
         decode_overlap,
         options.gdn_backend,
@@ -203,26 +216,24 @@ pub fn launch_with_options(
 /// Launch rules every caller meets. The CLI checks them before anything loads,
 /// and the launch checks them again for callers that skip the CLI.
 pub(crate) fn check_launch(
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
-    tensor_parallel: bool,
+    tp_world_size: usize,
     decode_overlap: Qwen35DecodeOverlap,
 ) -> Result<()> {
-    anyhow::ensure!(
-        (1..=MAX_DECODE_BATCH).contains(&max_batch),
-        "Qwen3.5 --max-batch must be in 1..={MAX_DECODE_BATCH}, got {max_batch}"
-    );
+    ServingCapacity::validate_request(decode_width, max_resident, tp_world_size)?;
     anyhow::ensure!(
         max_prefill_tokens > 0,
         "Qwen3.5 --max-prefill-tokens must be at least 1, got {max_prefill_tokens}"
     );
     if decode_overlap == Qwen35DecodeOverlap::SharedSm {
         anyhow::ensure!(
-            max_batch <= MAX_SHARED_SM_DECODE_BATCH,
-            "Qwen3.5 --decode-overlap=stream requires --max-batch <= {MAX_SHARED_SM_DECODE_BATCH}, got {max_batch}; larger decode buckets still fall back to the prefill GEMM handle"
+            decode_width <= MAX_SHARED_SM_DECODE_BATCH,
+            "Qwen3.5 --decode-overlap=stream requires --decode-width <= {MAX_SHARED_SM_DECODE_BATCH}, got {decode_width}; larger decode buckets still fall back to the prefill GEMM handle"
         );
     }
-    if tensor_parallel {
+    if tp_world_size > 1 {
         anyhow::ensure!(
             decode_overlap == Qwen35DecodeOverlap::Off,
             "Qwen3.5 --decode-overlap is single-GPU only; tensor parallelism has no prefill/decode overlap"
@@ -234,7 +245,8 @@ pub(crate) fn check_launch(
 pub fn start_engine_with_capacity_and_overlap(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
     decode_overlap: Qwen35DecodeOverlap,
     prefix_cache_mib: usize,
@@ -242,7 +254,8 @@ pub fn start_engine_with_capacity_and_overlap(
     start_engine_with_backend(
         model_path,
         options,
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
         decode_overlap,
         Qwen35GdnBackend::Triton,
@@ -250,10 +263,12 @@ pub fn start_engine_with_capacity_and_overlap(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_engine_with_backend(
     model_path: &Path,
     options: EngineLoadOptions,
-    max_batch: usize,
+    decode_width: usize,
+    max_resident: usize,
     max_prefill_tokens: usize,
     decode_overlap: Qwen35DecodeOverlap,
     gdn_backend: Qwen35GdnBackend,
@@ -265,10 +280,12 @@ fn start_engine_with_backend(
         seed,
         ..
     } = options;
+    let tp_world_size = device_ordinals.len().max(1);
     check_launch(
-        max_batch,
+        decode_width,
+        max_resident,
         max_prefill_tokens,
-        device_ordinals.len() > 1,
+        tp_world_size,
         decode_overlap,
     )?;
     let prefix_snapshot_bytes = prefix_cache_mib
@@ -286,7 +303,8 @@ fn start_engine_with_backend(
             model_path,
             seed,
             &device_ordinals,
-            max_batch,
+            decode_width,
+            max_resident,
             max_prefill_tokens,
             enable_cuda_graph,
             prefix_snapshot_bytes,
@@ -319,15 +337,10 @@ fn start_engine_with_backend(
             tensor_parallel: None,
             prefix_snapshot_bytes,
         },
-        max_batch,
+        decode_width,
+        max_resident,
     )?;
-    scheduler::start_with_capacity_and_overlap(
-        model,
-        seed,
-        max_batch,
-        max_prefill_tokens,
-        decode_overlap,
-    )
+    scheduler::start_with_capacity_and_overlap(model, seed, max_prefill_tokens, decode_overlap)
 }
 
 #[cfg(test)]
@@ -347,7 +360,8 @@ mod tests {
             device_ordinal: 3,
             tp_size: 0,
             cuda_graph: false,
-            max_batch: 1,
+            decode_width: 1,
+            max_resident: 1,
             max_prefill_tokens: 1,
             gdn_backend: super::Qwen35GdnBackend::Triton,
             prefix_cache_mib: 0,
@@ -368,6 +382,7 @@ mod tests {
                 ep_backend: EpBackend::Nccl,
                 seed: 42,
             },
+            1,
             1,
             1,
             Qwen35DecodeOverlap::SharedSm,

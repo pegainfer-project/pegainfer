@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -25,10 +26,12 @@ use pegainfer_core::weight_loader::mmap_shards;
 use pegainfer_kv_cache::KvBuffer;
 use safetensors::SafeTensors;
 
+use super::capacity::ServingCapacity;
 use super::config::Config35;
 use super::config::LayerType;
 use super::config::LocalGeometry;
 use super::config::TensorParallelConfig;
+use super::recurrent_state::RecurrentState;
 pub(crate) mod layers;
 pub(crate) use layers::FullAttentionLayer;
 pub(crate) use layers::LayerKind;
@@ -76,16 +79,8 @@ pub struct Qwen35Model {
     pub(super) decode_kv_layout: DecodeKvLayout,
     /// Rank-local physical full-attention KV storage.
     kv_buffer: KvBuffer,
-    /// Complete recurrent snapshot slots reserved by the load-time budget.
-    prefix_snapshot_slots: usize,
-    /// Decode-slot count the recurrent-state reserve was sized for.
-    /// Physical decode capacity actually allocated (recurrent-state slots,
-    /// decode buffers, CUDA-graph slots). Always a `BATCH_BUCKETS` value.
-    reserved_decode_slots: usize,
-    /// Scheduler concurrent-request cap requested at load (`--max-batch`). May
-    /// sit below `reserved_decode_slots` when the request is not a bucket
-    /// (e.g. `--max-batch 5` allocates bucket 8 but admits at most 5). See #470.
-    pub(super) decode_admission_batch: usize,
+    /// Capacity ledger planned and frozen at startup (decode_width / max_resident / cohorts / KV / scratch).
+    capacity: ServingCapacity,
     tp_comm: Option<Comm>,
     /// -inf suppression for the tile-alignment pad rows, applied by
     /// [`Qwen35Model::output_logits_into`] (absent when the selection width
@@ -99,11 +94,6 @@ pub struct Qwen35Model {
 // startup, never shared for concurrent mutation.
 unsafe impl Send for Qwen35Model {}
 unsafe impl Sync for Qwen35Model {}
-
-/// Graph slot state + one in-flight prefill transient per decode slot.
-const STATES_PER_DECODE_SLOT: usize = 2;
-/// KV-pool floor, also the low-memory fail-fast threshold.
-const MIN_KV_PAGES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DecodeProjection {
@@ -146,7 +136,7 @@ impl CandidateDecodeGemm {
             "decode target must use a cuBLASLt decode bucket"
         );
         anyhow::ensure!(
-            self.batch <= model.reserved_decode_slots,
+            self.batch <= model.capacity.max_graph_bucket(),
             "decode target exceeds allocated decode capacity"
         );
         if self.recipe.get().is_none() {
@@ -199,14 +189,11 @@ fn candidate_decode_targets(
 }
 
 impl Qwen35Model {
-    /// `max_batch` is the requested concurrent-request cap in `1..=MAX_BATCH`.
-    /// It need not be a decode bucket: the physical decode capacity is rounded
-    /// up to the next `BATCH_BUCKETS` value while the scheduler still admits at
-    /// most `max_batch` (see #470 and `decode_admission_batch`).
+    /// Loads a single-GPU model with capacity planned for `(decode_width, max_resident)` (used by tests/executors).
     pub(crate) fn from_safetensors(
         model_path: &str,
         device_ordinal: usize,
-        max_batch: usize,
+        decode_width: usize,
         prefix_snapshot_bytes: usize,
     ) -> Result<Self> {
         Self::from_safetensors_with_runtime_and_capacity(
@@ -216,35 +203,31 @@ impl Qwen35Model {
                 prefix_snapshot_bytes,
                 ..Default::default()
             },
-            max_batch,
+            decode_width,
+            decode_width,
         )
     }
 
     pub(crate) fn from_safetensors_with_runtime_and_capacity(
         model_path: &str,
         runtime: ModelRuntimeConfig,
-        max_batch: usize,
+        decode_width: usize,
+        max_resident: usize,
     ) -> Result<Self> {
         // Qwen3.5's logits gates ran on the batch-1 matvec; every other line
         // keeps the cublas plan it was validated on.
         pegainfer_kernels::ops::set_n1_matvec(true);
-        anyhow::ensure!(
-            (1..=super::batch_decode_graph::MAX_BATCH).contains(&max_batch),
-            "decode batch capacity must be in 1..={}, got {max_batch}",
-            super::batch_decode_graph::MAX_BATCH,
-        );
-        // Requested scheduler admission cap; physical decode capacity is the
-        // next CUDA-graph bucket >= this (e.g. `--max-batch 5` allocates bucket
-        // 8 but admits at most 5, see #470). Everything below sizes to the
-        // physical bucket; only `decode_admission_batch` keeps the request.
-        let decode_admission_batch = max_batch;
-        let max_batch = super::batch_decode_graph::bucket_for(max_batch);
+        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
+        ServingCapacity::validate_request(
+            decode_width,
+            max_resident,
+            tensor_parallel.world_size(),
+        )?;
         info!("Loading Qwen3.5 model from: {}", model_path);
         debug!("Initializing GPU device {}", runtime.device_ordinal);
         let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
 
         let mut config = Config35::from_file(model_path)?;
-        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
         let geometry =
             LocalGeometry::try_new(&config, tensor_parallel).map_err(anyhow::Error::from)?;
         // Resolve and preload exactly once, before measuring free memory or
@@ -375,26 +358,20 @@ impl Qwen35Model {
         } else {
             debug!("Decode path CUDA Graph is disabled");
         }
-        // Paged KV pool for the 8 full-attention layers.
-        let page_size = 16usize;
+        // Paged KV pool for full-attention layers, sized by ServingCapacity.
+        let page_size = super::capacity::KV_PAGE_SIZE;
         let num_full_layers = config.num_full_attention_layers();
-        let layout = pegainfer_kv_cache::KvLayout::new(
+        let decode_kv_layout = DecodeKvLayout::new(
             num_full_layers,
             geometry.local_num_key_value_heads(),
             config.head_dim,
             page_size,
-        );
-        let decode_kv_layout = DecodeKvLayout::new(
-            layout.num_layers,
-            layout.num_kv_heads,
-            layout.head_dim,
-            layout.page_size,
         )?;
-        let bytes_per_page = layout.page_stride * std::mem::size_of::<half::bf16>();
         let (free_bytes, _total_bytes) = cudarc::driver::result::mem_get_info()
             .map_err(|e| anyhow::anyhow!("cuMemGetInfo failed: {e}"))?;
-        // Reserve space for prefill scratch (GDR chunkwise + pass-wide buffers)
-        // before allocating KV pool, so prefill doesn't OOM.
+        let (cc_major, cc_minor) = ctx.ctx.compute_capability()?;
+        let split_decode_max_batch =
+            super::decode_buffers::split_decode_max_batch(cc_major * 10 + cc_minor);
         let max_prefill_len = super::prefill::SCRATCH_ESTIMATE_SEQ;
         let scratch_reserve = match &flashinfer_gdn {
             Some(backend) => super::flashinfer_gdn::FlashInferGdnChunkResources::estimate_bytes(
@@ -408,54 +385,25 @@ impl Qwen35Model {
                 super::prefill_buffers::prefill_scratch_bytes(&config, geometry, max_prefill_len)
             }
         };
-        let recurrent_reserve = STATES_PER_DECODE_SLOT
-            * max_batch
-            * super::recurrent_state::bytes_per_request(&config, geometry);
-        let prefix_snapshot_bytes = runtime.prefix_snapshot_bytes;
-        let snapshot_bytes_per_slot = super::recurrent_state::bytes_per_request(&config, geometry);
-        let snapshot_slots = prefix_snapshot_bytes / snapshot_bytes_per_slot;
-        anyhow::ensure!(
-            prefix_snapshot_bytes == 0 || snapshot_slots > 0,
-            "Qwen3.5 prefix-cache budget is {} MiB, but one recurrent/conv snapshot requires {:.3} MiB",
-            prefix_snapshot_bytes / (1024 * 1024),
-            snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
-        );
-        let snapshot_reserve = snapshot_slots * snapshot_bytes_per_slot;
-        let min_kv_bytes = MIN_KV_PAGES * bytes_per_page;
-        anyhow::ensure!(
-            free_bytes >= scratch_reserve + recurrent_reserve + snapshot_reserve + min_kv_bytes,
-            "insufficient device memory for Qwen3.5: {} MB free, but prefill scratch needs {} MB, \
-             recurrent state needs {} MB ({STATES_PER_DECODE_SLOT} x {max_batch} decode slots), \
-             prefix snapshots need {} MB ({} slots), and the minimal KV pool needs {} MB; \
-             lower the decode batch capacity (--max-batch) or the prefix-cache budget \
-             or use a smaller model",
-            free_bytes / (1024 * 1024),
-            scratch_reserve / (1024 * 1024),
-            recurrent_reserve / (1024 * 1024),
-            snapshot_reserve / (1024 * 1024),
-            snapshot_slots,
-            min_kv_bytes / (1024 * 1024),
-        );
-        let available = free_bytes - scratch_reserve - recurrent_reserve - snapshot_reserve;
-        let kv_budget = (available as f64 * 0.85) as usize;
-        let num_pages = (kv_budget / bytes_per_page).max(MIN_KV_PAGES);
-        let kv_mb = num_pages * bytes_per_page / (1024 * 1024);
-        let scratch_mb = scratch_reserve / (1024 * 1024);
-        let recurrent_mb = recurrent_reserve / (1024 * 1024);
-        let snapshot_mb = snapshot_reserve / (1024 * 1024);
-        info!(
-            "Qwen3.5 KV cache: {num_pages} pages ({kv_mb} MB), backend={}, prefill scratch reserve: {scratch_mb} MB ({scratch_reserve} bytes), recurrent-state reserve: {recurrent_mb} MB ({STATES_PER_DECODE_SLOT} x {max_batch} slots), prefix snapshots: {snapshot_slots} slots ({snapshot_mb} MB), {:.0}% of {:.0} MB free",
-            runtime.gdn_backend,
-            kv_budget as f64 / free_bytes as f64 * 100.0,
-            free_bytes as f64 / 1024.0 / 1024.0
-        );
+        let capacity = ServingCapacity::plan(
+            &config,
+            geometry,
+            decode_width,
+            max_resident,
+            runtime.enable_cuda_graph,
+            split_decode_max_batch,
+            scratch_reserve,
+            runtime.prefix_snapshot_bytes,
+            free_bytes,
+        )?;
+        capacity.log_ledger(geometry);
         let kv_buffer = KvBuffer::new(
             &ctx.stream,
             num_full_layers,
             geometry.local_num_key_value_heads(),
             config.head_dim,
-            page_size,
-            num_pages,
+            capacity.kv_page_size,
+            capacity.kv_pages,
         )?;
         // The alignment pad rows are real checkpoint embeddings but not
         // decodable tokens, so they must never win selection.
@@ -472,8 +420,12 @@ impl Qwen35Model {
             None
         };
 
-        let candidate_decode =
-            candidate_decode_targets(&config, geometry, max_batch, flashinfer_gdn.is_some());
+        let candidate_decode = candidate_decode_targets(
+            &config,
+            geometry,
+            capacity.max_graph_bucket(),
+            flashinfer_gdn.is_some(),
+        );
         Ok(Self {
             ctx,
             flashinfer_gdn,
@@ -488,9 +440,7 @@ impl Qwen35Model {
             sin_cache,
             kv_buffer,
             decode_kv_layout,
-            prefix_snapshot_slots: snapshot_slots,
-            reserved_decode_slots: max_batch,
-            decode_admission_batch,
+            capacity,
             tp_comm: None,
             pad_logit_suppress,
         })
@@ -498,6 +448,10 @@ impl Qwen35Model {
 
     pub(crate) fn config(&self) -> &Config35 {
         &self.config
+    }
+
+    pub(crate) fn capacity(&self) -> &ServingCapacity {
+        &self.capacity
     }
 
     /// Only the GEMM tuning helper samples this directly; logits go through
@@ -552,7 +506,7 @@ impl Qwen35Model {
     }
 
     pub(crate) fn prefix_snapshot_slots(&self) -> usize {
-        self.prefix_snapshot_slots
+        self.capacity.prefix_snapshot_slots
     }
 
     pub(crate) fn attach_tp_comm(&mut self, comm: Comm) {
@@ -637,13 +591,14 @@ impl Qwen35Model {
         let down_samples = sample_mats(self.layers.iter().map(|layer| &layer.mlp.down_proj));
         let lm_head_samples = sample_mats([self.output_projection()]);
 
+        let max_tuned_bucket = self.capacity.max_graph_bucket();
         for &n in super::batch_decode_graph::BATCH_BUCKETS
             .iter()
             .filter(|&&bucket| {
                 // Keep in sync with MAX_SHARED_SM_DECODE_BATCH: buckets above
                 // GEMM_LT_MAX_N do not have an independent tuned decode GEMM
                 // route today, so Shared-SM overlap rejects them at startup.
-                bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= self.reserved_decode_slots
+                bucket <= crate::ops::GEMM_LT_MAX_N && bucket <= max_tuned_bucket
             })
         {
             tune_if_nonempty(ctx, &full_q_samples, full_q, n)?;
@@ -681,26 +636,61 @@ impl Qwen35Model {
         Ok(None)
     }
 
-    /// Create the CUDA Graph batch decode state at the loaded capacity.
+    /// Creates the shared CUDA Graph padding recurrent state used across all single-GPU cohorts.
+    pub(crate) fn create_padding_recurrent_state(&self) -> Result<Arc<RecurrentState>> {
+        Ok(Arc::new(RecurrentState::new(
+            &self.ctx,
+            &self.config,
+            self.geometry,
+        )?))
+    }
+
+    /// Creates CUDA Graph batch decode state for one single-GPU cohort (slot pool + shared padding state).
+    pub(crate) fn create_batch_decode_graph_state_for_cohort(
+        &self,
+        slot_capacity: usize,
+        padding_page_id: i32,
+        padding_state: Arc<RecurrentState>,
+    ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
+        anyhow::ensure!(
+            slot_capacity <= self.capacity.decode_width,
+            "requested cohort capacity {slot_capacity} exceeds loaded decode_width {}",
+            self.capacity.decode_width
+        );
+        super::batch_decode_graph::BatchDecodeGraphState::with_capacity_and_padding(
+            &self.ctx,
+            &self.config,
+            self.geometry,
+            self.kv_buffer.layout().page_size,
+            padding_page_id,
+            slot_capacity,
+            padding_state,
+        )
+    }
+
+    /// Creates a single-cohort CUDA Graph batch decode state (used by tests and logits executor).
     pub(crate) fn create_batch_decode_graph_state(
         &self,
         padding_page_id: i32,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
-        self.create_batch_decode_graph_state_with_capacity(
-            self.reserved_decode_slots,
+        let padding_state = self.create_padding_recurrent_state()?;
+        self.create_batch_decode_graph_state_for_cohort(
+            self.capacity.cohort_widths[0],
             padding_page_id,
+            padding_state,
         )
     }
 
+    /// Creates the fixed-layout single-cohort CUDA Graph batch decode state for TP mode.
     pub(crate) fn create_batch_decode_graph_state_with_capacity(
         &self,
         max_batch: usize,
         padding_page_id: i32,
     ) -> anyhow::Result<super::batch_decode_graph::BatchDecodeGraphState> {
         anyhow::ensure!(
-            max_batch <= self.reserved_decode_slots,
+            max_batch <= self.capacity.max_graph_bucket(),
             "requested graph capacity {max_batch} exceeds loaded capacity {}",
-            self.reserved_decode_slots
+            self.capacity.max_graph_bucket()
         );
         super::batch_decode_graph::BatchDecodeGraphState::with_capacity(
             &self.ctx,

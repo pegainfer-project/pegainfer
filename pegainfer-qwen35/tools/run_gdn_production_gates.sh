@@ -118,7 +118,7 @@ http_request() {
   fi
   local port
   port="$("$python" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-  timeout --kill-after=10s 5m "$binary" --model-path "$model" --port "$port" --max-batch 8 \
+  timeout --kill-after=10s 5m "$binary" --model-path "$model" --port "$port" --decode-width 8 --max-resident 8 \
     --max-prefill-tokens "$max_prefill_tokens" --decode-overlap stream "$@" \
     >"$log_root/$label-server.log" 2>&1 &
   server_pid=$!
@@ -179,7 +179,7 @@ expect_startup_rejection() {
   local label="$1" binary="$2" message="$3"
   shift 3
   local status=0
-  timeout 180 "$binary" --model-path "$model" --max-batch 4 \
+  timeout 180 "$binary" --model-path "$model" --decode-width 4 --max-resident 4 \
     --qwen35-gdn-backend flashinfer-candidate "$@" \
     >"$log_root/$label.log" 2>&1 || status=$?
   [[ "$status" -gt 0 && "$status" -lt 124 ]] || {
