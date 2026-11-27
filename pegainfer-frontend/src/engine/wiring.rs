@@ -157,6 +157,21 @@ pub struct LiveScheduler {
     /// The driver thread. Joined by the server at shutdown, after the handles
     /// (and with them the submit senders) are dropped.
     pub join: std::thread::JoinHandle<()>,
+    /// Liveness of this scheduler's driver. Shared with the frontend's
+    /// watchdog; a driver that stops stepping, or reports a fatal error,
+    /// turns this into a failed engine.
+    pub health: super::health::EngineHealth,
+}
+
+impl Engine {
+    /// The engine's liveness, one handle per scheduler. Every scheduler is a
+    /// served partition, so a failure in any of them fails the engine.
+    pub fn healths(&self) -> Vec<super::health::EngineHealth> {
+        self.schedulers
+            .iter()
+            .map(|scheduler| scheduler.health.clone())
+            .collect()
+    }
 }
 
 /// What `ModelLine::launch` returns during the contract migration: either a

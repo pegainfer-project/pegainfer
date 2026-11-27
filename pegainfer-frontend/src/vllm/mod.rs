@@ -38,8 +38,10 @@ use vllm_text::backend::hf::HfOverrides;
 
 use crate::engine::LaunchedEngine;
 
+mod admission;
 mod bridge;
 mod history;
+mod http;
 mod lora;
 mod reasoning_effort;
 mod request_contract;
@@ -288,22 +290,29 @@ where
     let input_listener_fd = UnixListener::bind(namespace.join("input.sock"))?.into_raw_fd();
     let output_listener_fd = UnixListener::bind(namespace.join("output.sock"))?.into_raw_fd();
 
+    let health_slot = http::new_health_slot();
+    let admission = admission::Admission::new();
+
     // The HTTP server runs concurrently with the engine load: vllm-server
     // spends ~1s loading the tokenizer and chat templates before it waits for
     // an engine to register, so neither waits on the other. This task attaches
     // the bridge once the engine resolves and runs it to completion; on engine
     // failure it cancels the server so the error surfaces instead of hanging
     // in the registration wait.
-    let server_shutdown = shutdown.child_token();
-    // The bridge outlives the server: the server drains its requests on
-    // shutdown and fails if the engine disconnects first, so the bridge stops
-    // only once the server returns.
-    let bridge_shutdown = CancellationToken::new();
+    // The signal token only starts the frontend drain; the server token stays
+    // alive until the drain finishes so the listener keeps answering /ready
+    // 503 and refuses new work while in-flight requests complete.
+    let server_shutdown = CancellationToken::new();
+    // The bridge must outlive the drain: requests still travel through it.
+    // It goes away with the server once the drain has finished.
+    let bridge_shutdown = server_shutdown.child_token();
     let engine_task = tokio::spawn({
         let server_shutdown = server_shutdown.clone();
         let bridge_shutdown = bridge_shutdown.clone();
         let input_address = input_address.clone();
         let output_address = output_address.clone();
+        let health_slot = health_slot.clone();
+        let admission = admission.clone();
         async move {
             let launched = match engine.await {
                 Ok(launched) => launched,
@@ -337,6 +346,7 @@ where
                             engine_index: engine_index as u32,
                             data_parallel_size,
                             metrics_watch: handle.metrics_watch_for(engine_index),
+                            admission: admission.clone(),
                         };
                         let shutdown = bridge_shutdown.clone();
                         bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
@@ -352,6 +362,10 @@ where
                              exposes {actual_schedulers} schedulers"
                         );
                     }
+                    let healths = engine.healths();
+                    if !healths.is_empty() {
+                        http::publish_health(&health_slot, healths);
+                    }
                     let info = engine.info;
                     let servable_limit = info.servable_len.map(|cap| max_model_len.min(cap));
                     let max_model_len = servable_limit.unwrap_or(max_model_len);
@@ -365,6 +379,7 @@ where
                             max_model_len,
                             engine_index: engine_index as u32,
                             data_parallel_size,
+                            admission: admission.clone(),
                         };
                         let shutdown = bridge_shutdown.clone();
                         bridges.spawn(async move { (engine_index, bridge.run(shutdown).await) });
@@ -397,7 +412,16 @@ where
                     }
                 }
             }
-            if bridge_error.is_some() {
+            if let Some(error) = &bridge_error {
+                let healths = health_slot.read().expect("health slot poisoned").clone();
+                if let Some(healths) = healths {
+                    for health in &healths {
+                        health.mark_failed(format!("{error:#}"));
+                    }
+                    // Keep the listener up long enough for /health to report
+                    // 503 before the process winds down.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
                 server_shutdown.cancel();
                 bridge_shutdown.cancel();
                 // Let the other bridges abort their requests and flush their output.
@@ -443,6 +467,32 @@ where
     };
     let effort_aliases = reasoning_effort::probe_effort_aliases(&model_id, backends.as_ref());
     let boundary = backends.map(|b| Arc::new(history::Boundary::new(&b)));
+
+    // Compose the caller's router extension (e.g. LoRA) underneath the
+    // health/ready/metrics routes and the admission gate. The request-shaping
+    // layers stay outermost so the boundary sees the rendered template.
+    let extension = {
+        let health_slot = health_slot.clone();
+        let admission = admission.clone();
+        move |router: Router| {
+            let router = reasoning_effort::normalize_chat_requests(
+                history::mark_history(extend_router(router), boundary),
+                effort_aliases,
+            );
+            http::routes(health_slot.clone(), admission, router)
+        }
+    };
+    http::start_watchdog(
+        health_slot.clone(),
+        admission.clone(),
+        server_shutdown.clone(),
+    );
+    http::drain_on_shutdown(
+        shutdown.clone(),
+        health_slot.clone(),
+        admission.clone(),
+        server_shutdown.clone(),
+    );
 
     let config = Config {
         transport_mode: TransportMode::Bootstrapped {
@@ -514,22 +564,16 @@ where
         keep_alive_on_engine_death: false,
         grpc_listener_mode: None,
         manages_engine: false,
-        shutdown_timeout: Duration::from_secs(10),
+        // The frontend drain owns the 30s budget: 22s of request drain plus a
+        // 2s health window leave this 5s force-stop inside it.
+        shutdown_timeout: Duration::from_secs(5),
         stream_interval: NonZeroU32::MIN,
         keep_alive_timeout: DEFAULT_KEEP_ALIVE_TIMEOUT,
         profiler: None,
         tls: None,
     };
 
-    let result = vllm_server::serve_with_router_extension(config, server_shutdown, move |router| {
-        // Effort normalization is outermost so the boundary measures the
-        // template under the value the route will render with.
-        reasoning_effort::normalize_chat_requests(
-            history::mark_history(extend_router(router), boundary),
-            effort_aliases,
-        )
-    })
-    .await;
+    let result = vllm_server::serve_with_router_extension(config, server_shutdown, extension).await;
     // Stop the bridge (no-op if the caller's shutdown already cancelled it),
     // then collect the engine task. If the server failed while the engine is
     // still loading, the uncancellable blocking load must finish first.
@@ -578,22 +622,38 @@ fn resolve_max_model_len(model_path: &Path, max_model_len: Option<u32>) -> u32 {
     })
 }
 
-/// Cancel `token` on the first CTRL+C. Installing the handler replaces the
-/// default SIGINT kill behavior — only call this once whatever the token
+/// Cancel `token` on the first SIGINT or SIGTERM. Installing the handlers
+/// replaces the default kill behavior — only call this once whatever the token
 /// guards can actually wind down (e.g. after an uncancellable blocking engine
-/// load has finished), otherwise CTRL+C turns into a no-op wait.
-pub fn cancel_token_on_ctrl_c(token: &CancellationToken) {
+/// load has finished), otherwise the signal turns into a no-op wait.
+pub fn cancel_token_on_signal(token: &CancellationToken) {
     let shutdown = token.clone();
     tokio::spawn(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            warn!("failed to install CTRL+C handler: {error}");
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            use tokio::signal::unix::signal;
+            let mut interrupt =
+                signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            let mut terminate =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                warn!("failed to install CTRL+C handler: {error}");
+            }
         }
         shutdown.cancel();
     });
 }
 
-pub fn shutdown_token_from_ctrl_c() -> CancellationToken {
+pub fn shutdown_token_from_signals() -> CancellationToken {
     let token = CancellationToken::new();
-    cancel_token_on_ctrl_c(&token);
+    cancel_token_on_signal(&token);
     token
 }

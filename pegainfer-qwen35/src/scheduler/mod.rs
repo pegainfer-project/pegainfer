@@ -33,6 +33,7 @@ use log::info;
 use log::warn;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_frontend::engine::Engine;
+use pegainfer_frontend::engine::EngineHealth;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
 use pegainfer_frontend::engine::KvCapacity;
@@ -46,7 +47,7 @@ use pegainfer_frontend::engine::Scheduler;
 use pegainfer_frontend::engine::SchedulerMetrics;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::TokenLogprob;
-use pegainfer_frontend::engine::drive;
+use pegainfer_frontend::engine::drive_with_health;
 use pegainfer_frontend::engine::panic_message;
 use pegainfer_frontend::engine::scheduler_pair;
 use pegainfer_frontend::engine::spawn_scheduler;
@@ -227,19 +228,22 @@ pub(crate) fn start_with_capacity_and_overlap(
 
     let (handle, wiring) = scheduler_pair();
     let (startup_tx, startup_rx) = std_mpsc::channel();
+    let health = EngineHealth::new();
+    let drive_health = health.clone();
 
     let join_handle = thread::Builder::new()
         .name("scheduler-qwen35".into())
         .spawn(move || match bind_model_thread(backend.model()) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                drive(
+                drive_with_health(
                     Qwen35Scheduler::new(
                         SchedulerBackend::Single(backend),
                         seed,
                         max_prefill_tokens,
                     ),
                     wiring,
+                    &drive_health,
                 );
             }
             Err(err) => {
@@ -263,6 +267,7 @@ pub(crate) fn start_with_capacity_and_overlap(
         schedulers: vec![LiveScheduler {
             handle,
             join: join_handle,
+            health,
         }],
         info: EngineInfo {
             servable_len: Some(servable),

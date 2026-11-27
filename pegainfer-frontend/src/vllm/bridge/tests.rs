@@ -14,6 +14,12 @@ use crate::engine::FinishReason;
 use crate::engine::RequestAbortReason;
 use crate::engine::TokenLogprob;
 
+fn permit() -> AdmissionPermit {
+    Admission::new()
+        .try_acquire()
+        .expect("fresh admission has a permit")
+}
+
 /// Test harness that exercises the bridge's demux path directly: register
 /// requests, emit tagged events onto the shared channel, drain one ready
 /// burst at a time, and inspect the coalesced outputs — the same flow the
@@ -57,6 +63,7 @@ impl Demux {
                 Arc::clone(&abort_reason),
                 fastrace::Span::noop(),
                 stop_sentinel_id,
+                permit(),
             ),
         );
         abort_reason

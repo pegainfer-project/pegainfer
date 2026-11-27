@@ -44,11 +44,17 @@ pub trait Scheduler: Send {
 /// frontend end. `name` names the OS thread (shows in `top`/gdb).
 pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> LiveScheduler {
     let (handle, backend) = scheduler_pair();
+    let health = super::health::EngineHealth::new();
+    let drive_health = health.clone();
     let join = std::thread::Builder::new()
         .name(name.to_string())
-        .spawn(move || drive(scheduler, backend))
+        .spawn(move || drive_with_health(scheduler, backend, &drive_health))
         .expect("failed to spawn scheduler thread");
-    LiveScheduler { handle, join }
+    LiveScheduler {
+        handle,
+        join,
+        health,
+    }
 }
 
 /// The polling loop. Exits when the frontend is gone (submission channel
@@ -56,15 +62,29 @@ pub fn spawn_scheduler<S: Scheduler + 'static>(name: &str, scheduler: S) -> Live
 /// reports a fatal error. An idle iteration (nothing running or waiting) ends
 /// in a [`std::hint::spin_loop`] before the next probe; busy iterations never
 /// pause.
-pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
+pub fn drive<S: Scheduler>(scheduler: S, backend: SchedulerBackend) {
+    drive_with_health(scheduler, backend, &super::health::EngineHealth::new());
+}
+
+/// [`drive`] for callers that own the scheduler's liveness handle (the
+/// frontend watchdog reads it instead of spinning up a second health view).
+pub fn drive_with_health<S: Scheduler>(
+    mut scheduler: S,
+    backend: SchedulerBackend,
+    health: &super::health::EngineHealth,
+) {
     let SchedulerBackend {
         submissions,
         mut ledger,
         metrics,
         exit_guard: _exit_guard,
     } = backend;
+    health.mark_ready();
     let mut submissions_open = true;
     loop {
+        // A driver that stops stepping (stuck `step`, panicked thread) stops
+        // refreshing this, which is what the frontend watchdog watches.
+        health.beat();
         loop {
             match submissions.try_recv() {
                 Ok(envelope) => {
@@ -87,6 +107,7 @@ pub fn drive<S: Scheduler>(mut scheduler: S, backend: SchedulerBackend) {
             // the write-off reaches them all — including any the scheduler
             // lost track of — with the real error attached.
             log::error!("scheduler fatal, engine winding down: {error:#}");
+            health.mark_failed(format!("{error:#}"));
             ledger.fail_all(&format!("engine fatal: {error:#}"));
             ledger.commit_step(false);
             return;
@@ -332,6 +353,18 @@ mod tests {
         assert!(
             message.contains("injected fatal"),
             "the write-off must carry the real error: {message}"
+        );
+        assert_eq!(
+            partition.health.phase(),
+            crate::engine::EnginePhase::Failed,
+            "a fatal step must turn the engine health failed"
+        );
+        assert!(
+            partition
+                .health
+                .failure()
+                .expect("failed health carries the error")
+                .contains("injected fatal")
         );
         partition
             .join

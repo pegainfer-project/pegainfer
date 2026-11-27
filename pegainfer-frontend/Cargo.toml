@@ -13,6 +13,7 @@ colored = { workspace = true }
 crossbeam-channel = { workspace = true }
 fastrace = { workspace = true }
 fastrace-opentelemetry = { workspace = true }
+futures = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
 logforth = { workspace = true }

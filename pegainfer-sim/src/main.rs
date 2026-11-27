@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
         pegainfer_frontend::vllm::ParserSelection::Auto,
         args.port,
         Some(runtime.max_model_len),
-        pegainfer_frontend::vllm::shutdown_token_from_ctrl_c(),
+        pegainfer_frontend::vllm::shutdown_token_from_signals(),
     )
     .await
 }

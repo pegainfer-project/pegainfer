@@ -92,7 +92,7 @@ async fn spawn_ready_server(
     let shutdown = CancellationToken::new();
     let server_shutdown = shutdown.clone();
     let mut task = tokio::spawn(async move {
-        pegainfer_frontend::vllm::serve(
+        Box::pin(pegainfer_frontend::vllm::serve(
             std::future::ready(Ok(pegainfer_frontend::engine::LaunchedEngine::Stepped(
                 handle,
             ))),
@@ -102,7 +102,7 @@ async fn spawn_ready_server(
             port,
             None,
             server_shutdown,
-        )
+        ))
         .await
     });
 

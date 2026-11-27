@@ -66,6 +66,9 @@ use crate::engine::SpecDecodeCounters;
 use crate::engine::TokenEvent;
 use crate::engine::TokenSink;
 use crate::engine::TokenStreamReceiver;
+use crate::vllm::admission::Admission;
+use crate::vllm::admission::AdmissionPermit;
+use crate::vllm::admission::Reject;
 use crate::vllm::wire::convert_finish_reason;
 use crate::vllm::wire::convert_sampling;
 use crate::vllm::wire::lora_adapter_from_sampling_params;
@@ -81,6 +84,7 @@ pub(crate) struct LocalEngineBridge {
     pub(crate) engine_index: u32,
     pub(crate) data_parallel_size: u32,
     pub(crate) metrics_watch: Option<watch::Receiver<SchedulerMetrics>>,
+    pub(crate) admission: Arc<Admission>,
 }
 
 impl LocalEngineBridge {
@@ -263,6 +267,17 @@ impl LocalEngineBridge {
                 Some(rejection(unsupported)),
             );
         }
+        let params = convert_sampling(&sampling_params);
+        if let Err(reason) = params.validate() {
+            let message = format!("invalid sampling parameters: {reason}");
+            warn!("request {request_id} rejected: {message}");
+            return send_refusal(
+                self.engine_index,
+                output_tx,
+                request_id,
+                Some(rejection(message)),
+            );
+        }
         let lora_adapter = match lora_adapter_from_sampling_params(&sampling_params) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -285,6 +300,23 @@ impl LocalEngineBridge {
             sampling_params.eos_token_id,
             &sampling_params.stop_token_ids,
         );
+
+        // One HTTP completion may expand into many engine requests (`prompt[]`,
+        // `n`, `best_of`). The HTTP gate admits the connection; this gate caps
+        // the generation work the scheduler actually receives.
+        let permit = match self.admission.try_acquire() {
+            Ok(permit) => permit,
+            Err(reject) => {
+                let message = engine_admission_message(reject);
+                warn!("request {request_id} rejected: {message}");
+                return send_refusal(
+                    self.engine_index,
+                    output_tx,
+                    request_id,
+                    Some(rejection(message.to_string())),
+                );
+            }
+        };
 
         let tag: RequestTag = Arc::from(request_id.as_str());
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
@@ -311,7 +343,7 @@ impl LocalEngineBridge {
                 queued_at_unix_s: Some(request.arrival_time),
                 data_parallel_rank: Some(self.engine_index as usize),
                 prompt_tokens,
-                params: convert_sampling(&sampling_params),
+                params,
                 max_tokens: sampling_params.max_tokens as usize,
                 lora_adapter,
                 kv_transfer_params,
@@ -323,7 +355,7 @@ impl LocalEngineBridge {
 
         streams.insert(
             tag,
-            RequestStreamState::new(abort_reason, trace_root, stop_sentinel_id),
+            RequestStreamState::new(abort_reason, trace_root, stop_sentinel_id, permit),
         );
         Ok(())
     }
@@ -344,6 +376,8 @@ struct RequestStreamState {
     /// output. Keep an EOS or explicit stop token as that removable sentinel.
     stop_sentinel_id: Option<u32>,
     abort_reason: Arc<AtomicU8>,
+    /// Engine-side admission permit; released when the request leaves `streams`.
+    _permit: AdmissionPermit,
     has_emitted_tokens: bool,
     /// Request-lifetime root span (submit → finish). The scheduler opens
     /// queue/prefill/decode as children of this via the `SpanContext` passed in
@@ -357,13 +391,19 @@ struct RequestStreamState {
 }
 
 impl RequestStreamState {
-    fn new(abort_reason: Arc<AtomicU8>, trace_root: Span, stop_sentinel_id: Option<u32>) -> Self {
+    fn new(
+        abort_reason: Arc<AtomicU8>,
+        trace_root: Span,
+        stop_sentinel_id: Option<u32>,
+        permit: AdmissionPermit,
+    ) -> Self {
         Self {
             first_token_events: None,
             first_token_prefill_stats: None,
             kv_transfer_params: None,
             stop_sentinel_id,
             abort_reason,
+            _permit: permit,
             has_emitted_tokens: false,
             trace_root,
         }
@@ -909,6 +949,13 @@ async fn output_loop(
 /// The error for a request refused because of what it asks for: upstream
 /// answers a validation error with a 400 carrying `message`. Engine faults
 /// carry no error and stay a 500.
+pub(super) fn engine_admission_message(reject: Reject) -> &'static str {
+    match reject {
+        Reject::Draining => "server is draining; retry later",
+        Reject::Full | Reject::Deadline => "engine admission queue is full; retry later",
+    }
+}
+
 fn rejection(message: String) -> RequestError {
     RequestError {
         code: RequestError::VALIDATION_ERROR.to_string(),
