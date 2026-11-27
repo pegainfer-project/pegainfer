@@ -24,6 +24,7 @@ rmpv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }

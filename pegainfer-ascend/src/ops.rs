@@ -1,9 +1,11 @@
 //! BF16 eager operators for the first Ascend Qwen3 execution path.
 //!
 //! Every public operator takes the device lock exactly once (`Device::run`) and
-//! submits on that stream. Executors are destroyed after use, except GEMM: CANN
-//! 9.2.1 double-frees `aclDestroyAclOpExecutor` for larger MatMul workspaces, so
-//! those executors are cached and retained for the process lifetime.
+//! submits on that stream. Executor ownership follows CANN: the non-repeatable
+//! executor returned by `*GetWorkspaceSize` is released by CANN after the op
+//! runs and must not be destroyed (`aclDestroyAclOpExecutor` double-frees on
+//! CANN 9.2.1). The GEMM-family ops cache a *repeatable* executor instead; CANN
+//! does not reclaim those, so `Device` destroys them on drop.
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::hash::Hash;
@@ -129,8 +131,8 @@ impl Drop for Tensors {
     }
 }
 
-/// Cached GEMM descriptors live for the process, so their arrays are leaked
-/// deliberately (a bounded, one-per-shape allocation).
+/// Descriptors for cached executors are destroyed with the device; their
+/// shape/stride arrays are leaked deliberately (bounded, one per shape).
 fn mk_tensor_owned(shape: &[i64], dtype: u32, ptr: *mut c_void) -> *mut sys::aclTensor {
     let dims: &'static [i64] = Box::leak(shape.to_vec().into_boxed_slice());
     let st: &'static [i64] = Box::leak(strides(shape).into_boxed_slice());
@@ -185,38 +187,6 @@ impl Drop for Workspace {
     }
 }
 
-/// Run one ACLNN op on an already-bound stream. The caller holds the device lock.
-#[allow(dead_code)]
-fn run_locked(
-    stream: *mut c_void,
-    prepare: impl FnOnce(&mut u64, &mut *mut sys::aclOpExecutor) -> i32,
-    launch: impl FnOnce(*mut c_void, u64, *mut sys::aclOpExecutor, *mut c_void) -> i32,
-) -> Result<()> {
-    let mut ws = 0u64;
-    let mut executor = std::ptr::null_mut();
-    let status = prepare(&mut ws, &mut executor);
-    if status != 0 {
-        if !executor.is_null() {
-            {
-                sys::aclDestroyAclOpExecutor(executor);
-            }
-        }
-        return crate::device::check(status);
-    }
-    let workspace = Workspace::new(ws)?;
-    let status = launch(workspace.0, ws, executor, stream);
-    let synced = if status == 0 {
-        sys::aclrtSynchronizeStream(stream)
-    } else {
-        0
-    };
-    {
-        sys::aclDestroyAclOpExecutor(executor);
-    }
-    crate::device::check(status)?;
-    crate::device::check(synced)
-}
-
 /// Run a cached executor on an already-bound stream.
 fn run_cached(
     d: &Device,
@@ -237,11 +207,13 @@ fn run_cached(
     crate::device::check(synced)
 }
 
-/// Like `run_locked`, but retains the executor. IFA V4's executor destroy aborts
-/// with a double free once its tensor descriptors are cached, so attention
-/// keeps one executor per call. This is a known CANN 9.2.1 limitation; it is
-/// bounded by the number of attention calls in a run.
-fn run_keep_locked(
+/// Run a one-shot ACLNN op. CANN owns the non-repeatable executor returned by
+/// `*GetWorkspaceSize` and releases it after execution; destroying it here
+/// double-frees on CANN 9.2.1 (reproduced for MatMul, AddRmsNorm and IFA in
+/// `aclnn-smoke/smoke_exec_lifecycle.cpp`). A 1000-iteration loop keeps RSS
+/// flat, so not destroying it leaks nothing. The caller owns and frees the
+/// workspace.
+fn run_oneshot(
     stream: *mut c_void,
     prepare: impl FnOnce(&mut u64, &mut *mut sys::aclOpExecutor) -> i32,
     launch: impl FnOnce(*mut c_void, u64, *mut sys::aclOpExecutor, *mut c_void) -> i32,
@@ -293,7 +265,7 @@ pub fn embedding(
             out.as_mut_ptr().cast(),
             "embedding out",
         )?;
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tw, ti, to, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
@@ -350,8 +322,8 @@ pub fn gemm(
                 tx, tw, to, 0, &mut ws, &mut ex,
             ))?;
             crate::device::check(sys::aclSetAclOpExecutorRepeatable(ex))?;
-            // The executor keeps references to these descriptors, and CANN 9.2.1
-            // cannot destroy the executor safely; retain both for the process.
+            // The repeatable executor keeps references to these descriptors;
+            // `Device::drop` destroys the executor first, then the tensors.
             d.keep_tensors(vec![tx, tw, to]);
             Ok((ex as usize, ws))
         })?;
@@ -404,7 +376,7 @@ pub fn norm(
             "norm out",
         )?;
         let tr = t.mk(&[rows as i64, 1], sys::ACL_FLOAT, rstd, "norm rstd")?;
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| sys::aclnnRmsNormGetWorkspaceSize(tx, tw, f64::from(eps), ty, tr, ws, ex),
             |p, n, ex, s| sys::aclnnRmsNorm(p, n, ex, s),
@@ -462,8 +434,8 @@ pub fn add(
     })
 }
 
-/// Cached `out = a * b`. Mul's executor destroy aborts on CANN 9.2.1, so the
-/// executor and its descriptors are retained; all addresses must be stable.
+/// Cached `out = a * b`. The repeatable executor and its descriptors are
+/// destroyed with the device; all addresses must stay stable.
 fn mul_locked(
     d: &Device,
     stream: *mut c_void,
@@ -516,7 +488,7 @@ pub fn silu(
     let b_ptr = b.as_ptr().cast_mut().cast();
     let out_ptr = out.as_mut_ptr().cast();
     d.run(|stream| {
-        // The activation lands in process-lifetime scratch so the cached
+        // The activation lands in device-lifetime scratch so the cached
         // executors see stable addresses.
         let activated = d.scratch_locked(n * 2)?;
         let cache_key = key(
@@ -605,12 +577,12 @@ pub fn rope(
             sin_rows,
             "rope sin rows",
         )?;
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tcos, tp, crows, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
         )?;
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tsin, tp, srows, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
@@ -640,7 +612,7 @@ pub fn rope(
             "rope sin view",
         )?;
         let mode = c"half";
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| {
                 sys::aclnnApplyRotaryPosEmbV2GetWorkspaceSize(
@@ -755,12 +727,12 @@ pub fn cache(
                 2,
                 "cache v out",
             )?;
-            run_keep_locked(
+            run_oneshot(
                 stream,
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(kc, 1, index, src_k, kc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
             )?;
-            run_keep_locked(
+            run_oneshot(
                 stream,
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(vc, 1, index, src_v, vc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
@@ -847,19 +819,22 @@ pub fn attention(
             let klist = sys::aclCreateTensorList(karr.as_ptr(), 1);
             let vlist = sys::aclCreateTensorList(varr.as_ptr(), 1);
             ensure!(!klist.is_null() && !vlist.is_null(), "tensor list");
+            // CANN 9.2.1 double-frees when a tensor list and a tensor it
+            // contains are both destroyed, so `tensors` keeps only the
+            // standalone query/output descriptors; the lists own K/V.
             Ok(crate::device::Descs {
-                tensors: vec![tq as usize, tc as usize, tv as usize, to as usize],
+                tensors: vec![tq as usize, to as usize],
                 lists: vec![klist as usize, vlist as usize],
             })
         })?;
         let tq = descs.tensors[0] as *mut sys::aclTensor;
-        let to = descs.tensors[3] as *mut sys::aclTensor;
+        let to = descs.tensors[1] as *mut sys::aclTensor;
         let klist = descs.lists[0] as *mut sys::aclTensorList;
         let vlist = descs.lists[1] as *mut sys::aclTensorList;
         let actual = d.int_array(seq_len)? as *mut sys::aclIntArray;
         d.run(|stream| {
             let layout = c"BNSD";
-            run_keep_locked(
+            run_oneshot(
                 stream,
                 |ws, ex| {
                     sys::aclnnIncreFlashAttentionV4GetWorkspaceSize(
@@ -919,7 +894,7 @@ pub fn top1(
             ids.as_mut_ptr().cast(),
             "argmax out",
         )?;
-        run_keep_locked(
+        run_oneshot(
             stream,
             |ws, ex| sys::aclnnArgMaxGetWorkspaceSize(tx, 1, false, to, ws, ex),
             |p, n, ex, s| sys::aclnnArgMax(p, n, ex, s),

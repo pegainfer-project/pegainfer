@@ -345,6 +345,88 @@ fn rope_matches_reference_for_positions() -> Result<()> {
     Ok(())
 }
 
+/// Regression for the executor ownership model: non-repeatable executors are
+/// released by CANN, repeatable ones and cached descriptors are released when
+/// the device drops. A second device after the first teardown proves the
+/// cleanup did not finalize the process-wide ACL runtime.
+#[test]
+#[ignore = "requires an explicitly selected Ascend device"]
+fn repeated_operators_survive_device_teardown() -> Result<()> {
+    let (rows, h, n, vocab) = (8usize, 256usize, 512usize, 512usize);
+    let x = fill(rows * h, 201);
+    let w = fill(h * n, 202);
+    let vec_a = fill(rows * h, 203);
+    let vec_b = fill(rows * h, 204);
+    let embed_w = fill(vocab * h, 205);
+    let logits = fill(rows * vocab, 206);
+    let ids = fill(rows, 207)
+        .iter()
+        .map(|v| (v.to_f32().abs() as u32) % vocab as u32)
+        .collect::<Vec<_>>();
+    let (heads, kv_heads, dim, context) = (4usize, 2usize, 128usize, 64usize);
+    let attn_q = fill(heads * dim, 208);
+    let attn_k = fill(kv_heads * dim, 209);
+    let attn_v = fill(kv_heads * dim, 210);
+    {
+        let device = Device::new(0)?;
+        let dx = device.from_slice(&x)?;
+        let dw = device.from_slice(&w)?;
+        let da = device.from_slice(&vec_a)?;
+        let db = device.from_slice(&vec_b)?;
+        let de = device.from_slice(&embed_w)?;
+        let dids = device.from_slice(&ids)?;
+        let dl = device.from_slice(&logits)?;
+        let mut dgemm = device.zeros::<bf16>(rows * n)?;
+        let mut dnorm = device.zeros::<bf16>(rows * h)?;
+        let mut dsilu = device.zeros::<bf16>(rows * h)?;
+        let mut dadd = device.zeros::<bf16>(rows * h)?;
+        let mut dembed = device.zeros::<bf16>(rows * h)?;
+        let mut dtop = device.zeros::<u32>(rows)?;
+        let mut dkeys = device.zeros::<bf16>(context * kv_heads * dim)?;
+        let mut dvals = device.zeros::<bf16>(context * kv_heads * dim)?;
+        let dq = device.from_slice(&attn_q)?;
+        let dk = device.from_slice(&attn_k)?;
+        let dv = device.from_slice(&attn_v)?;
+        let mut dattn = device.zeros::<bf16>(heads * dim)?;
+        for _ in 0..200 {
+            ops::gemm(&device, &dw, &dx, &mut dgemm, rows, n, h)?;
+            ops::norm(&device, &dx, &dw, &mut dnorm, rows, h, 1e-6)?;
+            ops::silu(&device, &da, &db, &mut dsilu, rows * h)?;
+            ops::add(&device, &da, &db, &mut dadd, rows * h)?;
+            ops::embedding(&device, &de, &dids, &mut dembed, rows, h, vocab)?;
+            ops::top1(&device, &dl, &mut dtop, rows, vocab)?;
+        }
+        let shape = ops::AttentionShape {
+            rows: 1,
+            heads,
+            kv_heads,
+            dim,
+            context,
+            capacity: 1,
+        };
+        for pos in 0..64usize {
+            let p = device.from_slice(&[pos as i32])?;
+            ops::cache(&device, &dk, &dv, &mut dkeys, &mut dvals, &[0], &p, shape)?;
+            ops::attention(
+                &device,
+                &dq,
+                &dkeys,
+                &dvals,
+                &mut dattn,
+                &[0],
+                &[pos as i32],
+                shape,
+            )?;
+        }
+    }
+    // Teardown ran; ACL itself must still be usable for a fresh device.
+    let again = Device::new(0)?;
+    let probe = again.from_slice(&fill(8, 211))?;
+    ensure!(probe.read(8)?.len() == 8, "probe read failed");
+    println!("repeated operators + teardown ok");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an explicitly selected Ascend device"]
 fn embedding_gathers_rows() -> Result<()> {

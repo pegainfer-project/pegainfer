@@ -3657,6 +3657,7 @@ dependencies = [
  "fastrace-opentelemetry",
  "futures",
  "http-body-util",
+ "libc",
  "log",
  "logforth",
  "opentelemetry",

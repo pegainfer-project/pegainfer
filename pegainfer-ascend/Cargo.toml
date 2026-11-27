@@ -33,5 +33,9 @@ required-features = ["ascend"]
 name = "golden"
 required-features = ["ascend"]
 
+[[test]]
+name = "soak"
+required-features = ["ascend"]
+
 [lints]
 workspace = true

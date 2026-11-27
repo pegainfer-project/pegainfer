@@ -578,18 +578,40 @@ fn resolve_max_model_len(model_path: &Path, max_model_len: Option<u32>) -> u32 {
     })
 }
 
+static SIGINT_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn note_sigint(_: libc::c_int) {
+    SIGINT_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Cancel `token` on the first CTRL+C. Installing the handler replaces the
 /// default SIGINT kill behavior — only call this once whatever the token
 /// guards can actually wind down (e.g. after an uncancellable blocking engine
 /// load has finished), otherwise CTRL+C turns into a no-op wait.
+///
+/// CANN 9.2.1 installs its own SIGINT handler after the process has been up
+/// for a few minutes, which turns CTRL+C into a signal exit instead of the
+/// frontend's graceful path. Re-install ours on a short period and poll the
+/// flag here; the handler itself only stores an atomic.
 pub fn cancel_token_on_ctrl_c(token: &CancellationToken) {
     let shutdown = token.clone();
-    tokio::spawn(async move {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            warn!("failed to install CTRL+C handler: {error}");
-        }
-        shutdown.cancel();
-    });
+    let spawned = std::thread::Builder::new()
+        .name("ctrl-c".into())
+        .spawn(move || {
+            loop {
+                unsafe {
+                    // `note_sigint` only stores to an atomic, which is async-signal-safe.
+                    libc::signal(libc::SIGINT, note_sigint as *const () as libc::sighandler_t);
+                }
+                if SIGINT_RECEIVED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    shutdown.cancel();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    if let Err(error) = spawned {
+        warn!("failed to install CTRL+C handler: {error}");
+    }
 }
 
 pub fn shutdown_token_from_ctrl_c() -> CancellationToken {

@@ -211,18 +211,18 @@ def main():
                 sock.close()
             proc.send_signal(signal.SIGINT)
             try:
-                proc.wait(timeout=20)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
             report["server_exit_code"] = proc.returncode
-            # CANN 9.2.1 installs its own SIGINT disposition, so the Ascend
-            # process exits on the signal instead of running the frontend's
-            # graceful path. Both 0 and SIGINT are accepted; SIGKILL is not.
-            report["shutdown"] = "graceful" if proc.returncode == 0 else "signal"
-            if report["passed"] and proc.returncode not in (0, -signal.SIGINT):
+            log_text = (output / "server.log").read_text(errors="replace")
+            drained = "scheduler drained after frontend shutdown" in log_text
+            report["shutdown"] = "graceful" if proc.returncode == 0 and drained else "signal"
+            if report["passed"] and report["shutdown"] != "graceful":
                 report["passed"] = False
-                report["error"] = f"server exit code {proc.returncode}"
+                report["error"] = (
+                    f"shutdown was not graceful: exit={proc.returncode} drained={drained}")
             (output / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     assert report["passed"], report.get("error")
 

@@ -3,6 +3,13 @@
 //! Every submission rebinds the ACL context on the calling thread and is
 //! serialized by a mutex. Host copies complete before returning. Buffers retain
 //! the device and synchronize before free.
+//!
+//! Executor ownership has two halves. CANN owns the *non-repeatable* executor
+//! returned by an ACLNN `*GetWorkspaceSize` call and releases it after the op
+//! runs, so the backend never destroys those (doing so double-frees on CANN
+//! 9.2.1, measured in `aclnn-smoke/smoke_exec_lifecycle.cpp`). *Repeatable*
+//! executors are not reclaimed by CANN: they are cached here and destroyed
+//! together with their descriptors when the device is dropped.
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ffi::c_void;
@@ -52,19 +59,21 @@ struct Inner {
     context: *mut c_void,
     stream: *mut c_void,
     lock: Mutex<()>,
-    /// GEMM executors are cached because `aclDestroyAclOpExecutor` aborts with a
-    /// double free for larger MatMul workspaces in CANN 9.2.1. Tensors and
-    /// executors are intentionally retained for the process lifetime.
+    /// Repeatable executors, one per (op, shape, address). CANN does not
+    /// reclaim these, so `Drop` destroys them.
     gemm_cache: Mutex<HashMap<u64, (usize, u64)>>,
+    /// Tensor descriptors referenced by the cached repeatable executors.
+    /// Destroyed after the executors in `Drop`.
     keepalive: Mutex<Vec<*mut sys::aclTensor>>,
-    /// Process-lifetime device scratch, keyed by byte size. Cached executors
-    /// capture tensor addresses, so their inputs must stay at a stable address.
+    /// Device scratch, keyed by byte size. Cached executors capture tensor
+    /// addresses, so their inputs must stay at a stable address. Freed in
+    /// `Drop`.
     scratch: Mutex<HashMap<usize, usize>>,
-    /// Long-lived attention descriptors. Destroying them between IFA calls
-    /// aborts on CANN 9.2.1, so they are cached and reused by address.
+    /// Attention descriptors. Destroying them between IFA calls aborts on
+    /// CANN 9.2.1, so they are cached and reused by address. Freed in `Drop`.
     descs: Mutex<HashMap<u64, Descs>>,
-    /// IFA takes a host `aclIntArray`; caching one per sequence length avoids
-    /// destroy paths that abort on CANN 9.2.1.
+    /// IFA takes a host `aclIntArray`; one is cached per sequence length and
+    /// freed in `Drop`.
     int_arrays: Mutex<HashMap<i64, usize>>,
 }
 // All access is serialized by `lock`; the raw handles are only touched under it.
@@ -73,14 +82,63 @@ unsafe impl Sync for Inner {}
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Deliberately do not tear down the ACL context here: on CANN 9.2.1 the
-        // destroy/reset/finalize sequence can hang process exit, including a
-        // SIGTERM shutdown. The process owns the device exclusively, so the OS
-        // reclaims the context and device memory when it exits.
-        let _ = (self.device_id, self.stream, self.context);
+        // A normal shutdown drops the engine (and with it every buffer) on the
+        // driver thread, so release everything this device retained instead of
+        // leaving it to the OS. Order matters: repeatable executors reference
+        // their tensor descriptors, and both reference device scratch.
+        //
+        // `aclrtResetDevice` / `aclFinalize` stay out of this path on purpose:
+        // unit tests create several short-lived devices in one process, and
+        // CANN 9.2.1 can hang in finalize at exit. Nothing this device owns is
+        // left behind.
+        let _ = sys::aclrtSetCurrentContext(self.context);
+        let _ = sys::aclrtSynchronizeStream(self.stream);
+
+        if let Ok(cache) = self.gemm_cache.get_mut() {
+            for (executor, _) in cache.values() {
+                if *executor != 0 {
+                    let _ = sys::aclDestroyAclOpExecutor(*executor as *mut sys::aclOpExecutor);
+                }
+            }
+            cache.clear();
+        }
+        if let Ok(keep) = self.keepalive.get_mut() {
+            for tensor in keep.drain(..) {
+                let _ = sys::aclDestroyTensor(tensor);
+            }
+        }
+        if let Ok(descs) = self.descs.get_mut() {
+            for d in descs.values() {
+                for &tensor in &d.tensors {
+                    let _ = sys::aclDestroyTensor(tensor as *const sys::aclTensor);
+                }
+                for &list in &d.lists {
+                    let _ = sys::aclDestroyTensorList(list as *const sys::aclTensorList);
+                }
+            }
+            descs.clear();
+        }
+        if let Ok(arrays) = self.int_arrays.get_mut() {
+            for &array in arrays.values() {
+                let _ = sys::aclDestroyIntArray(array as *const sys::aclIntArray);
+            }
+            arrays.clear();
+        }
+        if let Ok(scratch) = self.scratch.get_mut() {
+            for &ptr in scratch.values() {
+                let _ = sys::aclrtFree(ptr as *mut c_void);
+            }
+            scratch.clear();
+        }
+
+        let _ = sys::aclrtDestroyStream(self.stream);
+        let _ = sys::aclrtDestroyContext(self.context);
     }
 }
 
+/// Cached attention descriptors. `tensors` holds only descriptors that are not
+/// members of a list: CANN 9.2.1 double-frees if both a list and a tensor it
+/// contains are destroyed. The lists own their member tensors.
 #[derive(Clone)]
 pub(crate) struct Descs {
     pub(crate) tensors: Vec<usize>,
@@ -228,7 +286,7 @@ impl Device {
         Ok(entry)
     }
 
-    /// Stable device scratch for cached executors. Never freed before exit.
+    /// Stable device scratch for cached executors, released in `Drop`.
     /// The caller must already hold the device lock (`Device::run`).
     pub(crate) fn scratch_locked(&self, bytes: usize) -> Result<*mut std::ffi::c_void> {
         if bytes == 0 {
