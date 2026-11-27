@@ -505,8 +505,9 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
 pub enum Hd256Prefill<'a> {
     /// Run dense attention for the whole chunk using the caller's plan.
     Dense(&'a PrefillPagedPlan),
-    /// Append K/V using the full page table and compute dense output for the
-    /// first `rows` queries. The caller fills the remaining output rows.
+    /// Append K/V for the whole chunk and compute dense output for the first `rows` queries.
+    /// `pages` must contain exactly `(start_pos + seq_len).div_ceil(page_size)` entries.
+    /// The caller fills the remaining output rows.
     DensePrefix { pages: &'a [i32], rows: usize },
 }
 
