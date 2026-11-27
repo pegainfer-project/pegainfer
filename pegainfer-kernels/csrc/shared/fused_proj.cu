@@ -62,6 +62,41 @@ __global__ void silu_mul_fused_kernel(
   }
 }
 
+// ============================================================================
+// The same SiLU-mul over a gate+up pair interleaved into adjacent columns.
+// Column-major: token j at offset j * 2*I.
+//   gate = combined[j * 2*I + 2*i]     for i in [0, I)
+//   up   = combined[j * 2*I + 2*i + 1] for i in [0, I)
+//   out[j * I + i] = bf16(bf16(silu(bf16(gate))) * bf16(up))
+//
+// This is the layout the routed experts' gate_up GEMM produces once its weight
+// slab is interleaved to `[g0, u0, g1, u1, ...]`, which is what lets the
+// grouped leg fold this activation into its epilogue. Both variants round the
+// stored gate and up to bf16 first, as the GEMM's own bf16 store would.
+// ============================================================================
+
+__global__ void silu_mul_fused_interleaved_kernel(
+    const __nv_bfloat16 *__restrict__ gate_up, // [2*I, bs] col-major, gate/up paired
+    __nv_bfloat16 *__restrict__ out,            // [I, bs] col-major
+    int intermediate_size, int bs) {
+
+  int total = intermediate_size * bs;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+       idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int col = idx / intermediate_size;
+    int row = idx % intermediate_size;
+
+    int src_offset = col * 2 * intermediate_size + 2 * row;
+    float g = __bfloat162float(gate_up[src_offset]);
+    float u = __bfloat162float(gate_up[src_offset + 1]);
+
+    float silu_g = g / (1.0f + expf(-g));
+    float silu_bf16 = __bfloat162float(__float2bfloat16(silu_g));
+    out[idx] = __float2bfloat16(silu_bf16 * u);
+  }
+}
+
 extern "C" {
 
 int split_qkv_cuda(
@@ -84,6 +119,17 @@ int silu_mul_fused_cuda(
   int block = 256;
   int grid = (total + block - 1) / block;
   silu_mul_fused_kernel<<<grid, block, 0, stream>>>(
+      gate_up, out, intermediate_size, bs);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int silu_mul_fused_interleaved_cuda(
+    const __nv_bfloat16 *gate_up, __nv_bfloat16 *out,
+    int intermediate_size, int bs, cudaStream_t stream) {
+  int total = intermediate_size * bs;
+  int block = 256;
+  int grid = (total + block - 1) / block;
+  silu_mul_fused_interleaved_kernel<<<grid, block, 0, stream>>>(
       gate_up, out, intermediate_size, bs);
   return static_cast<int>(cudaGetLastError());
 }

@@ -1790,21 +1790,7 @@ pub fn qwen4_moe_grouped_gemm_into(
         x.seq_len,
         n
     );
-    ensure!(
-        indptr.len() > geometry.experts,
-        "MoE grouped GEMM: indptr holds {} i32, needs {}",
-        indptr.len(),
-        geometry.experts + 1
-    );
-    // The kernel moves operands and the epilogue in 8-element (16 B) vectors,
-    // so both strides must be whole vectors.
-    ensure!(
-        n.is_multiple_of(8) && x.hidden_dim.is_multiple_of(8),
-        "MoE grouped GEMM: n {n} and k {} must be multiples of 8",
-        x.hidden_dim
-    );
-    x.checked_extent("MoE grouped GEMM x")?;
-    out.checked_extent("MoE grouped GEMM out")?;
+    check_grouped_operands(geometry, x, weight, n, out, indptr)?;
     if x.seq_len == 0 {
         return Ok(());
     }
@@ -1836,6 +1822,183 @@ pub fn qwen4_moe_grouped_gemm_into(
     }
     .result()
     .map_err(|err| anyhow!("Qwen3.8-FN MoE grouped GEMM ({pairs} pairs) launch failed: {err}"))
+}
+
+/// One grouped gate_up GEMM with the SiLU-mul folded into its epilogue:
+/// `out[indptr[e]..] = silu_mul(x[indptr[e]..] @ weight[e]^T)` for every expert,
+/// in one launch.
+///
+/// `weight` is the **interleaved** expert bank built by
+/// [`qwen4_moe_gate_up_interleave_into`] — `experts * 2 * n` rows, each expert's
+/// slab holding `[g0, u0, g1, u1, ...]` — and `out` the `[pairs, n]` activated
+/// slot output. The GEMM still computes `2 * n` columns per row; the epilogue
+/// stores one column per adjacent (gate, up) pair, which is what saves the
+/// unfused leg's `[pairs, 2 * n]` bf16 round trip through global memory.
+///
+/// Numerics: the epilogue reproduces the reference activation's rounding — the
+/// accumulated gate and up are rounded to bf16 (the bf16 store the unfused leg
+/// would make), the SiLU runs in f32, and the product is rounded to bf16 — so
+/// this holds the same bound against the per-expert GEMM plus
+/// [`silu_mul_fused_interleaved_batch_into`] that the grouped GEMM holds against
+/// the per-expert GEMMs.
+#[allow(clippy::too_many_arguments)]
+pub fn qwen4_moe_grouped_gate_up_silu_into(
+    ctx: &DeviceContext,
+    geometry: &Qwen4MoeGeometry,
+    x: &HiddenStates,
+    weight: &DeviceMatrix,
+    n: usize,
+    indptr: &CudaSlice<i32>,
+    scratch: &mut Qwen4GroupedGemmScratch,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    geometry.validate()?;
+    ensure!(
+        weight.rows == geometry.experts * 2 * n && weight.cols == x.hidden_dim,
+        "MoE grouped gate_up GEMM: weight is {}x{}, needs {}x{}",
+        weight.rows,
+        weight.cols,
+        geometry.experts * 2 * n,
+        x.hidden_dim
+    );
+    ensure!(
+        out.hidden_dim == n && out.seq_len == x.seq_len,
+        "MoE grouped gate_up GEMM: out is {}x{}, needs {}x{}",
+        out.seq_len,
+        out.hidden_dim,
+        x.seq_len,
+        n
+    );
+    check_grouped_operands(geometry, x, weight, 2 * n, out, indptr)?;
+    if x.seq_len == 0 {
+        return Ok(());
+    }
+    let pairs = checked_i32(x.seq_len, "MoE grouped gate_up GEMM pairs")?;
+    let experts = checked_i32(geometry.experts, "MoE grouped gate_up GEMM experts")?;
+    let n = checked_i32(n, "MoE grouped gate_up GEMM n")?;
+    let k = checked_i32(x.hidden_dim, "MoE grouped gate_up GEMM k")?;
+    let threadblocks = checked_i32(
+        scratch.threadblocks,
+        "MoE grouped gate_up GEMM threadblocks",
+    )?;
+    let args_bytes = scratch.args.len();
+    let (x_ptr, _x_guard) = x.data.device_ptr(&ctx.stream);
+    let (w_ptr, _w_guard) = weight.data.device_ptr(&ctx.stream);
+    let (out_ptr, _out_guard) = out.data.device_ptr_mut(&ctx.stream);
+    let (indptr_ptr, _indptr_guard) = indptr.device_ptr(&ctx.stream);
+    let (args_ptr, _args_guard) = scratch.args.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_gate_up_silu_cuda(
+            x_ptr as *const ffi::Half,
+            w_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            indptr_ptr as *const i32,
+            args_ptr as *mut core::ffi::c_void,
+            args_bytes,
+            experts,
+            n,
+            k,
+            threadblocks,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| {
+        anyhow!("Qwen3.8-FN MoE grouped gate_up SiLU GEMM ({pairs} pairs) launch failed: {err}")
+    })
+}
+
+/// Interleaves the gate and up halves of every expert's `[2 * half, k]`
+/// `gate_up` slab from `gate_up` into `out`: `out[2j] = gate_up[j]`,
+/// `out[2j + 1] = gate_up[half + j]`, one 16 B vector per thread.
+///
+/// The routed gate_up GEMM's 128-column N tile has to hold both halves of every
+/// pair for its epilogue to fold the SiLU ([`qwen4_moe_grouped_gate_up_silu_into`]),
+/// and the checkpoint stores them split. The permute runs on the device into a
+/// separate slab: it is a pure gather with one writer per vector, so there is no
+/// ordering to get wrong, unlike an in-place cycle walk over the same block,
+/// whose failure mode would be silently permuted weights.
+pub fn qwen4_moe_gate_up_interleave_into(
+    ctx: &DeviceContext,
+    gate_up: &DeviceMatrix,
+    experts: usize,
+    half: usize,
+    out: &mut DeviceMatrix,
+) -> Result<()> {
+    ensure!(
+        gate_up.rows == experts * 2 * half,
+        "gate_up interleave: source is {}x{}, needs {}x{}",
+        gate_up.rows,
+        gate_up.cols,
+        experts * 2 * half,
+        gate_up.cols
+    );
+    ensure!(
+        out.rows == gate_up.rows && out.cols == gate_up.cols,
+        "gate_up interleave: destination is {}x{}, needs {}x{}",
+        out.rows,
+        out.cols,
+        gate_up.rows,
+        gate_up.cols
+    );
+    ensure!(
+        gate_up.cols.is_multiple_of(8),
+        "gate_up interleave: width {} must be a multiple of 8",
+        gate_up.cols
+    );
+    let experts = checked_i32(experts, "gate_up interleave experts")?;
+    let half = checked_i32(half, "gate_up interleave half")?;
+    let width = checked_i32(gate_up.cols, "gate_up interleave width")?;
+    let (src_ptr, _src_guard) = gate_up.data.device_ptr(&ctx.stream);
+    let (dst_ptr, _dst_guard) = out.data.device_ptr_mut(&ctx.stream);
+    unsafe {
+        ffi::qwen4_moe_gate_up_interleave_cuda(
+            src_ptr as *const ffi::Half,
+            dst_ptr as *mut ffi::Half,
+            experts,
+            half,
+            width,
+            active_cu_stream(ctx),
+        )
+    }
+    .result()
+    .map_err(|err| anyhow!("Qwen3.8-FN gate_up interleave launch failed: {err}"))
+}
+
+/// The grouped legs' shared boundary: `indptr` wide enough for the routing, both
+/// the GEMM's column count and the contraction width whole 8-element vectors,
+/// and both activation buffers in range. `gemm_n` is the GEMM's own column count
+/// — `2 * n` on the fused gate_up leg, whose epilogue stores half of it.
+fn check_grouped_operands(
+    geometry: &Qwen4MoeGeometry,
+    x: &HiddenStates,
+    weight: &DeviceMatrix,
+    gemm_n: usize,
+    out: &HiddenStates,
+    indptr: &CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        indptr.len() > geometry.experts,
+        "MoE grouped GEMM: indptr holds {} i32, needs {}",
+        indptr.len(),
+        geometry.experts + 1
+    );
+    // The kernel moves operands and the epilogue in 8-element (16 B) vectors,
+    // so both strides must be whole vectors.
+    ensure!(
+        gemm_n.is_multiple_of(8) && x.hidden_dim.is_multiple_of(8),
+        "MoE grouped GEMM: n {gemm_n} and k {} must be multiples of 8",
+        x.hidden_dim
+    );
+    ensure!(
+        weight.cols == x.hidden_dim,
+        "MoE grouped GEMM: weight's contraction width {} is not x's k {}",
+        weight.cols,
+        x.hidden_dim
+    );
+    x.checked_extent("MoE grouped GEMM x")?;
+    out.checked_extent("MoE grouped GEMM out")?;
+    Ok(())
 }
 
 #[cfg(test)]
