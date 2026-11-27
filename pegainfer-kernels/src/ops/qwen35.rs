@@ -500,12 +500,22 @@ pub fn paged_attention_batch_decode_via_prefill_hd256_into(
     Ok(())
 }
 
-/// Gated full attention over one prompt chunk at head dim 256, the Qwen3.5
+/// The dense queries of a single-prompt HD256 prefill.
+#[derive(Clone, Copy)]
+pub enum Hd256Prefill<'a> {
+    /// Run dense attention for the whole chunk using the caller's plan.
+    Dense(&'a PrefillPagedPlan),
+    /// Append K/V for the whole chunk and compute dense output for the first `rows` queries.
+    /// `pages` must contain exactly `(start_pos + seq_len).div_ceil(page_size)` entries.
+    /// The caller fills the remaining output rows.
+    DensePrefix { pages: &'a [i32], rows: usize },
+}
+
+/// Gated attention over one prompt chunk at head dim 256, the Qwen3.5
 /// shape: `q_full` holds `[q | gate]` per head, `k` and `v` the projections.
 /// `(1 + w)` q/k norm and partial RoPE from `start_pos`, K/V written into the
-/// pool at `layer` over the plan's pages, causal FlashInfer prefill, then the
-/// sigmoid of the gate half on `output`. `q_prepped` keeps the normed and
-/// rotated Q.
+/// pool at `layer` for every input row, causal FlashInfer prefill and the
+/// sigmoid gate for the dense prefix. `q_prepped` keeps the normed and rotated Q.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_prefill_hd256_into(
     ctx: &DeviceContext,
@@ -519,7 +529,7 @@ pub fn attention_prefill_hd256_into(
     kv_buffer: &CudaSlice<bf16>,
     layout: &PagedKvLayout,
     layer: usize,
-    plan: &PrefillPagedPlan,
+    prefill: Hd256Prefill<'_>,
     start_pos: usize,
     rotary_dim: usize,
     rms_eps: f32,
@@ -548,21 +558,14 @@ pub fn attention_prefill_hd256_into(
     );
     let seq_len = q_full.seq_len;
     anyhow::ensure!(
-        [
-            k.seq_len,
-            v.seq_len,
-            q_prepped.seq_len,
-            output.seq_len,
-            plan.total_tokens
-        ]
-        .iter()
-        .all(|&rows| rows == seq_len),
-        "hd256 prefill rows: q_full {seq_len} k {} v {} q {} output {} plan {}",
+        [k.seq_len, v.seq_len, q_prepped.seq_len, output.seq_len]
+            .iter()
+            .all(|&rows| rows == seq_len),
+        "hd256 prefill rows: q_full {seq_len} k {} v {} q {} output {}",
         k.seq_len,
         v.seq_len,
         q_prepped.seq_len,
-        output.seq_len,
-        plan.total_tokens
+        output.seq_len
     );
     q_full.checked_extent("hd256 prefill q_full")?;
     k.checked_extent("hd256 prefill k")?;
@@ -584,17 +587,66 @@ pub fn attention_prefill_hd256_into(
         num_kv_heads,
         false,
     )?;
-    anyhow::ensure!(
-        plan.max_page_index < num_pages,
-        "hd256 prefill plan references page {} but the pool holds {num_pages} pages; the kernels \
-         compute addresses from page ids with no device-side bounds check",
-        plan.max_page_index
-    );
-    anyhow::ensure!(
-        plan.max_last_page_len <= page_size,
-        "hd256 prefill plan last page length {} exceeds page_size {page_size}",
-        plan.max_last_page_len
-    );
+    let prefix_plan;
+    let append_pages;
+    let (dense, pages) = match prefill {
+        Hd256Prefill::Dense(plan) => {
+            anyhow::ensure!(
+                plan.total_tokens == seq_len,
+                "hd256 prefill plan has {} rows for a {seq_len}-row chunk",
+                plan.total_tokens
+            );
+            anyhow::ensure!(
+                plan.max_page_index < num_pages && plan.max_last_page_len <= page_size,
+                "hd256 prefill plan: maximum page {} with last-page length {} for {num_pages} pages of {page_size} tokens",
+                plan.max_page_index,
+                plan.max_last_page_len
+            );
+            (Some(plan), &plan.page_indices_d)
+        }
+        Hd256Prefill::DensePrefix { pages, rows } => {
+            let end = start_pos
+                .checked_add(seq_len)
+                .context("hd256 prefill end")?;
+            crate::ops::checked_i32(end, "hd256 prefill end")?;
+            anyhow::ensure!(
+                seq_len != 0 && rows <= seq_len && pages.len() == end.div_ceil(layout.page_size),
+                "hd256 prefill: {rows} dense rows in a {seq_len}-row chunk at {start_pos}, {} pages",
+                pages.len()
+            );
+
+            anyhow::ensure!(
+                pages.iter().all(|p| (0..num_pages).contains(p)),
+                "hd256 prefill page id outside the K/V pool range 0..{num_pages}"
+            );
+
+            let dense_end = start_pos + rows;
+            prefix_plan = if rows > 0 {
+                Some(PrefillPagedPlan::new_with_cta_tile_q(
+                    ctx,
+                    &pages[..dense_end.div_ceil(layout.page_size)],
+                    (dense_end - 1) % layout.page_size + 1,
+                    start_pos,
+                    rows,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    0,
+                )?)
+            } else {
+                None
+            };
+
+            let page_ids = match &prefix_plan {
+                Some(plan) if plan.page_indices_d.len() == pages.len() => &plan.page_indices_d,
+                _ => {
+                    append_pages = ctx.stream.clone_htod(pages)?;
+                    &append_pages
+                }
+            };
+            (prefix_plan.as_ref(), page_ids)
+        }
+    };
     let start_pos_d: CudaSlice<i32> = ctx.stream.clone_htod(&[crate::ops::checked_i32(
         start_pos,
         "hd256 prefill start_pos",
@@ -611,16 +663,7 @@ pub fn attention_prefill_hd256_into(
     let (qp_ptr, _gqp) = q_prepped.data.device_ptr_mut(&ctx.stream);
     let (buf_ptr, _gbuf) = kv_buffer.device_ptr(&ctx.stream);
     let (sp_ptr, _gsp) = start_pos_d.device_ptr(&ctx.stream);
-    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
-    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
-    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
-    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
-    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
-    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
-    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
-    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
-    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
+    let (pages_ptr, _gpages) = pages.device_ptr(&ctx.stream);
     let stream = crate::tensor::active_cu_stream(ctx);
 
     unsafe {
@@ -636,7 +679,7 @@ pub fn attention_prefill_hd256_into(
             buf_ptr as *mut ffi::Half,
             k_offset,
             v_offset,
-            pi_ptr as *const i32,
+            pages_ptr as *const i32,
             num_q_heads as i32,
             num_kv_heads as i32,
             seq_len as i32,
@@ -648,6 +691,20 @@ pub fn attention_prefill_hd256_into(
             stream,
         );
     }
+    let Some(plan) = dense else {
+        return Ok(());
+    };
+    let dense_rows = plan.total_tokens;
+    let (out_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
+    let (pi_ptr, _gpi) = plan.page_indices_d.device_ptr(&ctx.stream);
+    let (pip_ptr, _gpip) = plan.page_indptr_d.device_ptr(&ctx.stream);
+    let (lpl_ptr, _glpl) = plan.last_page_len_d.device_ptr(&ctx.stream);
+    let (qi_ptr, _gqi) = plan.q_indptr_d.device_ptr(&ctx.stream);
+    let (ri_ptr, _gri) = plan.request_indices_d.device_ptr(&ctx.stream);
+    let (qti_ptr, _gqti) = plan.qo_tile_indices_d.device_ptr(&ctx.stream);
+    let (kti_ptr, _gkti) = plan.kv_tile_indices_d.device_ptr(&ctx.stream);
+    let (kcs_ptr, _gkcs) = plan.kv_chunk_size_d.device_ptr(&ctx.stream);
+    let (tnr_ptr, _gtnr) = plan.total_num_rows_d.device_ptr(&ctx.stream);
     let result = unsafe {
         ffi::batch_prefill_paged_cuda_hd256(
             qp_ptr as *const ffi::Half,
@@ -668,7 +725,7 @@ pub fn attention_prefill_hd256_into(
             num_kv_heads as i32,
             head_dim as i32,
             layout.page_size as i32,
-            seq_len as i32,
+            dense_rows as i32,
             plan.batch_size(),
             plan.num_tiles,
             stride_page,
@@ -678,7 +735,7 @@ pub fn attention_prefill_hd256_into(
     };
     if result != 0 {
         anyhow::bail!(
-            "batch_prefill_paged_cuda_hd256 failed for layer {layer}, seq_len={seq_len}, tiles={}, \
+            "batch_prefill_paged_cuda_hd256 failed for layer {layer}, rows={dense_rows}, tiles={}, \
              qo_heads={num_q_heads}, kv_heads={num_kv_heads}: {result}{}",
             plan.num_tiles,
             crate::ops::ffi_exception_message(result)
@@ -689,7 +746,7 @@ pub fn attention_prefill_hd256_into(
             qf_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             num_q_heads as i32,
-            seq_len as i32,
+            dense_rows as i32,
             stream,
         );
     }

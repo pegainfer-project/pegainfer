@@ -23,6 +23,7 @@ pub(crate) const PREFILL_CHUNK_LEN: usize = SCRATCH_ESTIMATE_SEQ;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 use pegainfer_kernels::ops::GdrChunkwiseScratch35;
+use pegainfer_kernels::ops::Hd256Prefill;
 use pegainfer_kernels::ops::attention_prefill_hd256_into;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
@@ -462,7 +463,7 @@ impl Qwen35Model {
             kv.buffer,
             &kv.layout.kernel_layout(),
             *full_idx,
-            kv.plan,
+            Hd256Prefill::Dense(kv.plan),
             kv.base_pos,
             c.rotary_dim,
             c.rms_norm_eps,

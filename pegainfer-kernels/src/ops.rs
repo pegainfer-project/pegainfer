@@ -293,6 +293,8 @@ pub use qwen35::GDN_AOT_VALUE_HEAD_DIM;
 #[cfg(feature = "qwen35")]
 pub use qwen35::GdrChunkwiseScratch35;
 #[cfg(feature = "qwen35")]
+pub use qwen35::Hd256Prefill;
+#[cfg(feature = "qwen35")]
 pub use qwen35::LINEAR_CONV_MAX_KERNEL_DIM;
 #[cfg(feature = "qwen35")]
 pub use qwen35::Qwen35DecodeGemm;
