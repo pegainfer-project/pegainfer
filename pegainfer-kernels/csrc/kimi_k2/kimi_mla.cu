@@ -817,6 +817,12 @@ int kimi_mla_paged_kv_append_cuda(void* ckv_cache,
   PEGAINFER_FFI_GUARD_END(-1)
 }
 
+// Decode MLA attention split over KV tiles: one CTA per (batch row, KV tile),
+// so `rows == batch_size * tiles` gives every batch row `rows / batch_size`
+// tiles. `row_batch` names the batch row whose query and paged KV a CTA reads,
+// `row_valid` masks the rows a step leaves empty, and `row_indptr` groups each
+// batch row's rows for the merge that follows, with `partial_ckv`/`partial_lse`
+// as its `rows`-row workspace.
 int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
                                           void* q_pe,
                                           void* output,
@@ -828,6 +834,10 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
                                           IdType* request_indices,
                                           IdType* kv_tile_indices,
                                           IdType* kv_chunk_size_ptr,
+                                          IdType* row_indptr,
+                                          const uint8_t* row_valid,
+                                          void* partial_ckv,
+                                          float* partial_lse,
                                           int num_qo_heads,
                                           int64_t ckv_stride_page,
                                           int64_t ckv_stride_n,
@@ -835,10 +845,11 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
                                           int64_t kpe_stride_n,
                                           int page_size,
                                           int batch_size,
+                                          int rows,
                                           float sm_scale,
                                           cudaStream_t stream) {
   PEGAINFER_FFI_GUARD_BEGIN
-  if (num_qo_heads <= 0 || page_size <= 0 || batch_size <= 0) {
+  if (num_qo_heads <= 0 || page_size <= 0 || batch_size <= 0 || rows < batch_size) {
     return static_cast<int>(cudaErrorInvalidValue);
   }
 
@@ -860,14 +871,17 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
       /*rope_scale=*/1.0f,
       /*rope_theta=*/1.0e6f);
 
-  params.padded_batch_size = static_cast<uint32_t>(batch_size);
+  params.padded_batch_size = static_cast<uint32_t>(rows);
   params.request_indices = request_indices;
   params.kv_tile_indices = kv_tile_indices;
-  params.o_indptr = nullptr;
+  params.o_indptr = row_indptr;
   params.kv_chunk_size_ptr = kv_chunk_size_ptr;
-  params.block_valid_mask = nullptr;
-  params.partition_kv = false;
+  // FlashInfer reads the mask through a non-const `bool*` field; the bytes stay
+  // read-only here.
+  params.block_valid_mask = const_cast<bool*>(reinterpret_cast<const bool*>(row_valid));
 
+  // A non-null `tmp_v` selects the launcher's split-KV path: per-tile decode
+  // over the `rows` grid, then a merge of each batch row's rows into `output`.
   return static_cast<int>(
       flashinfer::BatchDecodeWithPagedKVCacheDispatchedMLA<
           /*HEAD_DIM_CKV=*/kKvLoraRank,
@@ -875,8 +889,8 @@ int kimi_flashinfer_batch_decode_mla_cuda(void* q_nope,
           Variant,
           MlaDecodeParamsT>(
           params,
-          /*tmp_v=*/nullptr,
-          /*tmp_s=*/nullptr,
+          reinterpret_cast<DType*>(partial_ckv),
+          partial_lse,
           /*enable_pdl=*/false,
           stream));
   PEGAINFER_FFI_GUARD_END(-1)

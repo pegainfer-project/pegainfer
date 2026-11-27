@@ -35,7 +35,9 @@ pub(super) trait ForwardExecutor {
         seed: u64,
     ) -> Result<KimiOneTokenForwardReport>;
 
-    /// Return exactly one report per input row, in the same order.
+    /// Return exactly one report per input row, in the same order. The batch is
+    /// row-indexed: input row `r` is the request's row in the decode arena
+    /// (query, page-table row and KV tiles all live at `r`).
     /// `kv_pages` carries one CSR row per input row, covering that request's
     /// KV including this step's append.
     #[allow(clippy::too_many_arguments)]
@@ -43,7 +45,6 @@ pub(super) trait ForwardExecutor {
         &self,
         token_ids: &[u32],
         append_positions: &[usize],
-        slots: &[usize],
         decode_batch_size: usize,
         kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],

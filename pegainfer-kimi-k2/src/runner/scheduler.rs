@@ -50,7 +50,6 @@ struct ActiveKimiRequest {
     completion_tokens: usize,
     max_tokens: usize,
     last_token: u32,
-    slot: usize,
     decode_batch_size: usize,
     options: KimiRowOptions,
     /// Pool pages backing this request's KV; dropping the request releases
@@ -73,7 +72,6 @@ impl KimiK2Scheduler {
             .map(|idx| 100 + (idx % 1000) as u32)
             .collect::<Vec<_>>();
         let warm_positions = vec![0; KIMI_RUNNER_MAX_BATCH];
-        let warm_slots = (0..KIMI_RUNNER_MAX_BATCH).collect::<Vec<_>>();
         let warm_rows = vec![KimiRowOptions::default(); KIMI_RUNNER_MAX_BATCH];
         // Warm rows all ride the padding page: garbage in, output discarded.
         let warm_pages = KimiKvStepPages::new(
@@ -84,7 +82,6 @@ impl KimiK2Scheduler {
             .forward_decode_batch(
                 &warm_tokens,
                 &warm_positions,
-                &warm_slots,
                 KIMI_RUNNER_MAX_BATCH,
                 &warm_pages,
                 &warm_rows,
@@ -217,7 +214,7 @@ impl KimiK2Scheduler {
         let mut decode_admissions = Vec::with_capacity(KIMI_DECODE_ADMISSION_MICROBATCH);
         for (slot, req) in prefill_reqs.into_iter().enumerate() {
             if req.prompt_tokens.len() == 1 {
-                decode_admissions.push((slot, req));
+                decode_admissions.push(req);
                 if decode_admissions.len() == KIMI_DECODE_ADMISSION_MICROBATCH {
                     self.decode_admission_microbatch(
                         std::mem::take(&mut decode_admissions),
@@ -254,7 +251,6 @@ impl KimiK2Scheduler {
                 .iter()
                 .map(|req| req.prompt_len + req.completion_tokens - 1)
                 .collect::<Vec<_>>();
-            let slots = active.iter().map(|req| req.slot).collect::<Vec<_>>();
             let rows = active.iter().map(|req| req.options).collect::<Vec<_>>();
             // Allocate this step's pages. Full-lifetime reservation makes
             // exhaustion impossible; a failure here is an accounting bug.
@@ -285,7 +281,6 @@ impl KimiK2Scheduler {
             let reports = match self.executor.forward_decode_batch(
                 &token_ids,
                 &append_positions,
-                &slots,
                 decode_batch_size,
                 &kv_pages,
                 &rows,
@@ -488,7 +483,6 @@ impl KimiK2Scheduler {
             completion_tokens,
             max_tokens: req.max_tokens,
             last_token,
-            slot,
             decode_batch_size,
             options,
             kv,
@@ -497,7 +491,7 @@ impl KimiK2Scheduler {
 
     fn decode_admission_microbatch(
         &mut self,
-        group: Vec<(usize, GenerateRequest)>,
+        group: Vec<GenerateRequest>,
         decode_batch_size: usize,
         active: &mut Vec<ActiveKimiRequest>,
     ) {
@@ -505,39 +499,34 @@ impl KimiK2Scheduler {
         // KV lifecycle is still a prefill of one token. Prefix matching
         // always leaves ≥1 token uncached, so cached_tokens is 0 here.
         let mut group_kv = Vec::with_capacity(group.len());
-        for (slot, req) in group {
+        for req in group {
             let Some((kv, _cached_tokens)) = self.schedule_request_kv(&req) else {
                 continue;
             };
-            group_kv.push((slot, req, kv));
+            group_kv.push((req, kv));
         }
         if group_kv.is_empty() {
             return;
         }
         let token_ids = group_kv
             .iter()
-            .map(|(_, req, _)| req.prompt_tokens[0])
+            .map(|(req, _)| req.prompt_tokens[0])
             .collect::<Vec<_>>();
         let append_positions = vec![0; token_ids.len()];
-        let slots = group_kv
-            .iter()
-            .map(|(slot, _, _)| *slot)
-            .collect::<Vec<_>>();
         let rows = group_kv
             .iter()
-            .map(|(_, req, _)| row_options(req))
+            .map(|(req, _)| row_options(req))
             .collect::<Vec<_>>();
         let kv_pages = KimiKvStepPages::new(
             group_kv
                 .iter()
-                .map(|(_, _, kv)| kv.step_page_indices(1))
+                .map(|(_, kv)| kv.step_page_indices(1))
                 .collect(),
             self.pool.padding_block_id(),
         );
         let reports = match self.executor.forward_decode_batch(
             &token_ids,
             &append_positions,
-            &slots,
             decode_batch_size,
             &kv_pages,
             &rows,
@@ -551,7 +540,7 @@ impl KimiK2Scheduler {
                     self.executor.worker_count()
                 );
                 error!("{message}");
-                for (_, req, _) in group_kv {
+                for (req, _) in group_kv {
                     let _ = req.token_tx.send(TokenEvent::Error {
                         message: message.clone(),
                         prompt_tokens: req.prompt_tokens.len(),
@@ -561,7 +550,7 @@ impl KimiK2Scheduler {
                 return;
             }
         };
-        for ((slot, req, mut kv), report) in group_kv.into_iter().zip(reports) {
+        for ((req, mut kv), report) in group_kv.into_iter().zip(reports) {
             let token_id = report.local_next_token_global_id;
             if let Err(err) = kv.apply_prefill(token_id, &self.pool) {
                 let message = format!("Kimi-K2 admission KV bookkeeping failed: {err:#}");
@@ -607,7 +596,6 @@ impl KimiK2Scheduler {
                 completion_tokens,
                 max_tokens: req.max_tokens,
                 last_token: token_id,
-                slot,
                 decode_batch_size,
                 options,
                 kv,
@@ -639,7 +627,6 @@ mod tests {
         Decode {
             token_ids: Vec<u32>,
             append_positions: Vec<usize>,
-            slots: Vec<usize>,
             decode_batch_size: usize,
             kv_row_pages: Vec<usize>,
         },
@@ -695,7 +682,6 @@ mod tests {
             &self,
             token_ids: &[u32],
             append_positions: &[usize],
-            slots: &[usize],
             decode_batch_size: usize,
             kv_pages: &KimiKvStepPages,
             _rows: &[KimiRowOptions],
@@ -704,15 +690,13 @@ mod tests {
             self.calls.lock().unwrap().push(ForwardCall::Decode {
                 token_ids: token_ids.to_vec(),
                 append_positions: append_positions.to_vec(),
-                slots: slots.to_vec(),
                 decode_batch_size,
                 kv_row_pages: kv_row_pages(kv_pages),
             });
             Ok(token_ids
                 .iter()
-                .zip(slots)
                 .enumerate()
-                .map(|(row, (token_id, slot))| report(*slot, *token_id, 2000 + row as u32))
+                .map(|(row, token_id)| report(row, *token_id, 2000 + row as u32))
                 .collect())
         }
 
@@ -725,10 +709,10 @@ mod tests {
         }
     }
 
-    fn report(slot: usize, input_token_id: u32, next_token_id: u32) -> KimiOneTokenForwardReport {
+    fn report(row: usize, input_token_id: u32, next_token_id: u32) -> KimiOneTokenForwardReport {
         KimiOneTokenForwardReport {
             rank: 0,
-            batch_slot: slot,
+            batch_row: row,
             input_token_id,
             local_next_token_id: next_token_id,
             local_next_token_global_id: next_token_id,
@@ -801,7 +785,6 @@ mod tests {
                 ForwardCall::Decode {
                     token_ids: vec![11],
                     append_positions: vec![0],
-                    slots: vec![0],
                     decode_batch_size: 3,
                     kv_row_pages: vec![1],
                 },
@@ -815,7 +798,6 @@ mod tests {
                 ForwardCall::Decode {
                     token_ids: vec![44],
                     append_positions: vec![0],
-                    slots: vec![2],
                     decode_batch_size: 3,
                     kv_row_pages: vec![1],
                 },

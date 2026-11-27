@@ -87,7 +87,6 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         &self,
         token_ids: &[u32],
         append_positions: &[usize],
-        slots: &[usize],
         decode_batch_size: usize,
         kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
@@ -99,12 +98,11 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
         if token_ids.is_empty() {
             bail!("Kimi batch decode requires at least one token");
         }
-        if token_ids.len() != append_positions.len() || token_ids.len() != slots.len() {
+        if token_ids.len() != append_positions.len() {
             bail!(
-                "Kimi batch decode input mismatch: tokens={}, positions={}, slots={}",
+                "Kimi batch decode input mismatch: tokens={}, positions={}",
                 token_ids.len(),
-                append_positions.len(),
-                slots.len()
+                append_positions.len()
             );
         }
         for row in rows {
@@ -117,7 +115,6 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                 worker.forward_decode_batch_next_tokens_async(
                     token_ids.to_vec(),
                     append_positions.to_vec(),
-                    slots.to_vec(),
                     decode_batch_size,
                     kv_pages.clone(),
                     vec![KimiRowOptions::default(); token_ids.len()],
@@ -146,7 +143,7 @@ impl ForwardExecutor for Tp8Dp1ForwardExecutor {
                 token_ids.len()
             );
             for (row, report) in reports.iter().enumerate() {
-                validate_one_token_report(report, "decode", slots[row], token_ids[row])?;
+                validate_one_token_report(report, "decode", row, token_ids[row])?;
             }
         }
         let mut selected = Vec::with_capacity(token_ids.len());
@@ -229,15 +226,15 @@ fn ensure_tp8_row(row: &KimiRowOptions) -> Result<()> {
 fn validate_one_token_report(
     report: &KimiOneTokenForwardReport,
     phase: &str,
-    expected_slot: usize,
+    expected_row: usize,
     expected_input_token: u32,
 ) -> Result<()> {
     ensure!(
-        report.batch_slot == expected_slot,
-        "Kimi {phase} rank {} report slot mismatch: got {}, expected {}",
+        report.batch_row == expected_row,
+        "Kimi {phase} rank {} report row mismatch: got {}, expected {}",
         report.rank,
-        report.batch_slot,
-        expected_slot
+        report.batch_row,
+        expected_row
     );
     ensure!(
         report.input_token_id == expected_input_token,
