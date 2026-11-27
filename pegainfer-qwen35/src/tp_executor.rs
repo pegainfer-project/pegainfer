@@ -47,6 +47,7 @@ use crate::prefill_buffers::prefill_scratch_bytes;
 use crate::prefix_cache::Qwen35PrefixCache;
 use crate::prefix_cache::RecurrentStateStore;
 use crate::prefix_cache::SnapshotGuard;
+use crate::prefix_cache::SnapshotTier;
 use crate::recurrent_state::LinearStatePointerTables;
 use crate::recurrent_state::RecurrentState;
 use crate::weights::ModelRuntimeConfig;
@@ -112,8 +113,14 @@ pub(crate) struct TpSlotCompaction {
 enum TpWorkerCommand {
     RestoreRequest {
         request_id: RequestId,
-        snapshot_slot: Option<usize>,
+        snapshot: Option<(SnapshotTier, usize)>,
         boundary: usize,
+        start: Arc<TpCommandStartGate>,
+        resp: mpsc::Sender<TpWorkerResponse>,
+    },
+    SpillSnapshot {
+        gpu_slot: usize,
+        host_slot: usize,
         start: Arc<TpCommandStartGate>,
         resp: mpsc::Sender<TpWorkerResponse>,
     },
@@ -470,13 +477,23 @@ impl Qwen35TpExecutor {
             };
             let kv = self.request_kvs.get_mut(&chunk.request_id).unwrap();
             let boundary = self.kv_cache.apply_prefill(kv, first_token)?;
-            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
+            if let Some(plan) = self.kv_cache.plan_reserve_snapshot(kv, boundary)? {
+                if let Some(spill) = plan.spill() {
+                    if let Err(error) =
+                        self.broadcast_spill_snapshot(spill.gpu_slot, spill.host_slot)
+                    {
+                        self.kv_cache.abort_reserve_snapshot(&plan);
+                        return Err(error);
+                    }
+                }
+                let reservation = plan.reservation();
+                self.kv_cache.commit_reserve_snapshot(&plan);
                 match self.broadcast_save_snapshot(chunk.request_id, reservation.recurrent_slot()) {
                     Ok(positions) if positions.iter().all(|&p| p == boundary) => {
                         self.kv_cache.publish_snapshot(reservation);
                     }
                     result => {
-                        self.kv_cache.abort_snapshot(reservation);
+                        self.kv_cache.abort_snapshot(&reservation);
                         let positions = result?;
                         anyhow::bail!(
                             "TP snapshot boundary mismatch: {positions:?}, expected {boundary}"
@@ -538,8 +555,10 @@ impl Qwen35TpExecutor {
             )
             .map_err(TpBeginRequestError::Recoverable)?;
         let boundary = restore.as_ref().map_or(0, SnapshotGuard::boundary);
-        let snapshot_slot = restore.as_ref().map(SnapshotGuard::recurrent_slot);
-        let positions = match self.broadcast_restore_request(request_id, snapshot_slot, boundary) {
+        let snapshot = restore
+            .as_ref()
+            .map(|guard| (guard.tier(), guard.recurrent_slot()));
+        let positions = match self.broadcast_restore_request(request_id, snapshot, boundary) {
             Ok(positions) => positions,
             Err(error) => {
                 let _ = self.kv_cache.release_request(&mut kv);
@@ -611,13 +630,13 @@ impl Qwen35TpExecutor {
     fn broadcast_restore_request(
         &self,
         request_id: RequestId,
-        snapshot_slot: Option<usize>,
+        snapshot: Option<(SnapshotTier, usize)>,
         boundary: usize,
     ) -> Result<Vec<usize>> {
         let resp_rx = self.dispatch_mutating("RestoreRequest", |start, resp| {
             TpWorkerCommand::RestoreRequest {
                 request_id,
-                snapshot_slot,
+                snapshot,
                 boundary,
                 start,
                 resp,
@@ -630,6 +649,25 @@ impl Qwen35TpExecutor {
             "RestoreRequest",
             &self.poison,
         )
+    }
+
+    fn broadcast_spill_snapshot(&self, gpu_slot: usize, host_slot: usize) -> Result<()> {
+        let resp_rx = self.dispatch_mutating("SpillSnapshot", |start, resp| {
+            TpWorkerCommand::SpillSnapshot {
+                gpu_slot,
+                host_slot,
+                start,
+                resp,
+            }
+        })?;
+        let responses =
+            recv_runtime_responses(&resp_rx, self.world_size, "SpillSnapshot", &self.poison)?;
+        validate_dispatched_responses(
+            validate_ack_responses(responses, self.world_size, "spill snapshot"),
+            "SpillSnapshot",
+            &self.poison,
+        )?;
+        Ok(())
     }
 
     fn broadcast_save_snapshot(
@@ -683,6 +721,7 @@ impl Qwen35TpExecutor {
             max_batch,
             max_prefill_tokens,
             0,
+            0,
         )
     }
 
@@ -693,6 +732,7 @@ impl Qwen35TpExecutor {
         max_batch: usize,
         max_prefill_tokens: usize,
         prefix_snapshot_bytes: usize,
+        host_slot_count: usize,
     ) -> Result<Self> {
         validate_cuda_ordinals(device_ordinals)?;
         anyhow::ensure!(
@@ -757,9 +797,10 @@ impl Qwen35TpExecutor {
                 .all(|m| m.prefix_snapshot_slots() == snapshot_slots),
             "TP snapshot slot counts differ"
         );
-        let kv_cache = Qwen35PrefixCache::new(
+        let kv_cache = Qwen35PrefixCache::new_with_host(
             KvCacheManager::from_buffer(first.kv_buffer().clone(), min_capacity_pages)?,
             snapshot_slots,
+            host_slot_count,
         )?;
         let padding_block_id = kv_cache.pool().padding_block_id();
         let capacity_pages_for_requests = min_capacity_pages.saturating_sub(1);
@@ -783,6 +824,7 @@ impl Qwen35TpExecutor {
                 max_prefill_tokens,
                 graph_enabled,
                 padding_block_id,
+                host_slot_count,
                 nccl_id,
                 Arc::clone(&startup_gate),
                 Arc::clone(&effective_max_batch),

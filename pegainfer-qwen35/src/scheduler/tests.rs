@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use pegainfer_frontend::engine::EosPolicy;
 use pegainfer_frontend::engine::RequestUpdate;
+use pegainfer_frontend::engine::StepReceiver;
 use pegainfer_frontend::engine::StopCause;
 use pegainfer_frontend::engine::StopPolicy;
 use pegainfer_frontend::engine::Terminal;
@@ -696,6 +697,53 @@ fn prompt_logprobs_filter_rejects_unsupported_requests() {
     }) if feature == "prompt_logprobs"));
 }
 
+struct HostRun {
+    cached_tokens: usize,
+    tokens: Vec<u32>,
+}
+
+fn finish_one(
+    handle: &mut pegainfer_frontend::engine::SchedulerHandle,
+    steps: &mut StepReceiver,
+    request: pegainfer_frontend::engine::Request,
+) -> HostRun {
+    let control = handle.submit(request);
+    let mut cached_tokens = 0;
+    let mut tokens = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match steps.try_recv() {
+            Ok(step) => {
+                for update in step.updates {
+                    if update.id != control.id() {
+                        continue;
+                    }
+                    tokens.extend(update.tokens);
+                    if let Some(hit) = update.cached_tokens {
+                        cached_tokens = hit;
+                    }
+                    if let Some(Terminal::Finished { .. }) = update.terminal {
+                        return HostRun {
+                            cached_tokens,
+                            tokens,
+                        };
+                    }
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for host snapshot request"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("scheduler exited before host snapshot request finished")
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires two CUDA devices and Qwen3.5 weights"]
 fn tp2_scheduler_runs_forced_mixed_steps() {
@@ -704,7 +752,7 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
+    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0, 0)
         .expect("start TP2 scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();
@@ -743,6 +791,50 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
             }
         }
     }
+    drop(handle);
+    join.join().expect("scheduler thread panicked");
+}
+
+#[test]
+#[ignore = "requires two CUDA devices and Qwen3.5 weights"]
+fn tp2_host_snapshot_spill_and_hit() {
+    let Some(model_path) =
+        crate::test_fixture::model_path_or_skip("tp2_host_snapshot_spill_and_hit")
+    else {
+        return;
+    };
+    // 64 MiB is two GPU snapshots for Qwen3.5-4B TP2. Three distinct
+    // prefixes force one GPU snapshot into the host slab; re-requesting the
+    // first prefix then has to restore from host.
+    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 64 << 20, 1)
+        .expect("start TP2 host-snapshot scheduler");
+    let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
+    let mut steps = handle.take_steps().unwrap();
+
+    let prompt_a = vec![151_646; 320];
+    let prompt_b = vec![9707; 320];
+    let prompt_c = vec![12_345; 320];
+    let run_a = finish_one(
+        &mut handle,
+        &mut steps,
+        test_request("host-a", prompt_a.clone(), 8),
+    );
+    assert_eq!(run_a.cached_tokens, 0);
+    let run_b = finish_one(&mut handle, &mut steps, test_request("host-b", prompt_b, 8));
+    assert_eq!(run_b.cached_tokens, 0);
+    let run_c = finish_one(&mut handle, &mut steps, test_request("host-c", prompt_c, 8));
+    assert_eq!(run_c.cached_tokens, 0);
+    let run_a2 = finish_one(
+        &mut handle,
+        &mut steps,
+        test_request("host-a-again", prompt_a, 8),
+    );
+    assert_eq!(run_a2.cached_tokens, 256);
+    assert_eq!(
+        run_a2.tokens, run_a.tokens,
+        "TP host restore must reproduce the cold output"
+    );
+
     drop(handle);
     join.join().expect("scheduler thread panicked");
 }

@@ -180,13 +180,25 @@ impl SingleGpuBackend {
                 "Qwen3.5 prefill apply position mismatch: kv={boundary}, recurrent={}",
                 rec.seq_len
             );
-            if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
+            if let Some(plan) = self.kv_cache.plan_reserve_snapshot(kv, boundary)? {
+                if let Some(spill) = plan.spill() {
+                    if let Err(error) = self.recurrent_store.spill_to_host(
+                        self.model.device_ctx(),
+                        spill.gpu_slot,
+                        spill.host_slot,
+                    ) {
+                        self.kv_cache.abort_reserve_snapshot(&plan);
+                        return Err(error);
+                    }
+                }
+                let reservation = plan.reservation();
+                self.kv_cache.commit_reserve_snapshot(&plan);
                 if let Err(error) = self.recurrent_store.save(
                     self.model.device_ctx(),
                     reservation.recurrent_slot(),
                     rec,
                 ) {
-                    self.kv_cache.abort_snapshot(reservation);
+                    self.kv_cache.abort_snapshot(&reservation);
                     return Err(error);
                 }
                 self.kv_cache.publish_snapshot(reservation);
@@ -230,16 +242,22 @@ impl SingleGpuBackend {
         model: Qwen35Model,
         max_batch: usize,
         decode_overlap: Qwen35DecodeOverlap,
+        host_slot_count: usize,
     ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
         let manager =
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
-        let kv_cache = Qwen35PrefixCache::new(manager, model.prefix_snapshot_slots())?;
-        let recurrent_store = RecurrentStateStore::new(
+        let kv_cache = Qwen35PrefixCache::new_with_host(
+            manager,
+            model.prefix_snapshot_slots(),
+            host_slot_count,
+        )?;
+        let recurrent_store = RecurrentStateStore::new_with_host(
             model.device_ctx(),
             model.config(),
             model.geometry,
             model.prefix_snapshot_slots(),
+            host_slot_count,
         )?;
         debug_assert_eq!(recurrent_store.len(), kv_cache.snapshot_slots());
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
@@ -321,11 +339,24 @@ impl SingleGpuBackend {
             )
             .map_err(AdmissionError::Recoverable)?;
         let cached_tokens = if let Some(restore) = restore {
-            if let Err(error) = self.recurrent_store.restore(
-                self.model.device_ctx(),
-                restore.recurrent_slot(),
-                &mut rec,
-            ) {
+            let ctx = self.model.device_ctx();
+            let restored = if restore.tier() == crate::prefix_cache::SnapshotTier::Host {
+                match self.recurrent_store.restore_from_host(
+                    ctx,
+                    restore.recurrent_slot(),
+                    &mut rec,
+                ) {
+                    Ok(()) => {
+                        rec.seq_len = restore.boundary();
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.recurrent_store
+                    .restore(ctx, restore.recurrent_slot(), &mut rec)
+            };
+            if let Err(error) = restored {
                 let _ = self.kv_cache.release_request(&mut kv);
                 return Err(AdmissionError::Recoverable(error));
             }
@@ -641,6 +672,7 @@ impl TpSchedulerBackend {
         max_prefill_tokens: usize,
         enable_cuda_graph: bool,
         prefix_snapshot_bytes: usize,
+        host_slot_count: usize,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits_and_prefix(
             model_path,
@@ -649,6 +681,7 @@ impl TpSchedulerBackend {
             max_batch,
             max_prefill_tokens,
             prefix_snapshot_bytes,
+            host_slot_count,
         )?;
         Ok(Self {
             executor,

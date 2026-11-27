@@ -200,6 +200,7 @@ pub fn start_with_capacity(
         max_batch,
         max_prefill_tokens,
         Qwen35DecodeOverlap::Off,
+        0,
     )
 }
 
@@ -209,6 +210,7 @@ pub(crate) fn start_with_capacity_and_overlap(
     max_batch: usize,
     max_prefill_tokens: usize,
     decode_overlap: Qwen35DecodeOverlap,
+    host_slot_count: usize,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -216,7 +218,7 @@ pub(crate) fn start_with_capacity_and_overlap(
     );
     // Static instance cap for the vLLM bridge's max_model_len. Live admission
     // still uses the current page budget inside the scheduler loop.
-    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap)?;
+    let backend = SingleGpuBackend::new(model, max_batch, decode_overlap, host_slot_count)?;
     let total_blocks = backend.capacity_pages_for_requests();
     let block_size = backend.page_size();
     let servable = servable_len(
@@ -283,6 +285,7 @@ pub(crate) fn start_tp_with_capacity(
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
     prefix_snapshot_bytes: usize,
+    host_slot_count: usize,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -295,6 +298,7 @@ pub(crate) fn start_tp_with_capacity(
         max_prefill_tokens,
         enable_cuda_graph,
         prefix_snapshot_bytes,
+        host_slot_count,
     )?;
     let servable = servable_len(
         backend.max_position_embeddings(),

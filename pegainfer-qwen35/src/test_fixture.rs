@@ -157,6 +157,7 @@ impl GdnAcceptance {
             max_batch,
             max_prefill_tokens,
             overlap,
+            0,
         )
     }
 }
