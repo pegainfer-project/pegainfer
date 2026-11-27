@@ -379,4 +379,27 @@ mod tests {
 
         assert!(err.contains("single-GPU only"));
     }
+
+    #[test]
+    fn rejects_zero_prefill_budget_before_loading_model() {
+        let err = start_engine_with_capacity_and_overlap(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            1,
+            0,
+            Qwen35DecodeOverlap::Off,
+            0,
+        )
+        .err()
+        .expect("zero prefill budget should reject the launch")
+        .to_string();
+
+        assert!(err.contains("at least 1"));
+    }
 }

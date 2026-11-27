@@ -2,7 +2,7 @@
 
 > **TL;DR:** Qwen3.5 TP uses rank-local model state behind one step-contract scheduler, with start-gated mixed execution, ID-aligned results and acknowledged retirement. Decode is batched eager or pre-captured CUDA Graph replay when the decode GQA group is compiled. Remaining TP work: perf gates.
 >
-> **Last touched:** 2026-10
+> **Last touched:** 2026-11
 
 ## Runtime ownership
 

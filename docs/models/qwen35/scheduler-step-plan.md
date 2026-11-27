@@ -30,10 +30,10 @@ on both single-GPU and TP launches.
   before loading, and `check_launch` rejects it again for callers that skip
   the CLI.
 - The executor starts from the planned prompts and rows. The one shortening
-  left is the prefix cache: `take_prefill_chunks` may trim the last chunk to a
-  256-token snapshot boundary so a snapshot lands on a stride. A chunk that
-  cannot reach the next boundary runs as planned. Telemetry reports the rows
-  actually forwarded, not the planned count.
+  left is the prefix cache: `take_prefill_chunks` may trim a scheduled
+  prompt's chunk to a 256-token snapshot boundary so a snapshot lands on a
+  stride. A chunk that cannot reach the next boundary runs as planned.
+  Telemetry reports the rows actually forwarded, not the planned count.
 
 ## Driver
 
