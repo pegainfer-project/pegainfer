@@ -165,6 +165,7 @@ fn first_decode_logits(
     model.batch_decode_graph(
         &[token],
         &[cache.decode_view(kv)],
+        &[0],
         cache.buffer(),
         &mut graph,
         crate::batch_decode::DecodeGraphUse::Serve,

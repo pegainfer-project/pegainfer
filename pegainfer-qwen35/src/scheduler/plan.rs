@@ -1,3 +1,53 @@
+/// Decode cohort identifier: single-GPU dual-cohort alternates A/B; TP and single-cohort use A only.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) enum CohortId {
+    A = 0,
+    B = 1,
+}
+
+impl CohortId {
+    pub(super) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(super) const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+}
+
+/// Selects the target cohort on admission: fills A first so `c <= decode_width` stays on A only,
+/// spilling into B only once A is full.
+pub(super) fn assign_cohort(cohort_free: [usize; 2]) -> Option<CohortId> {
+    if cohort_free[CohortId::A.index()] > 0 {
+        Some(CohortId::A)
+    } else if cohort_free[CohortId::B.index()] > 0 {
+        Some(CohortId::B)
+    } else {
+        None
+    }
+}
+
+/// Selects which cohort decodes on this step and the next turn cursor:
+/// - Only A active: run A (`c <= 64` behavior unchanged);
+/// - Only B active: run B;
+/// - Both A and B active: strictly alternate (A -> B -> A -> B).
+pub(super) fn next_decode_cohort(
+    active_counts: [usize; 2],
+    next_turn: CohortId,
+) -> Option<(CohortId, CohortId)> {
+    let a = active_counts[CohortId::A.index()] > 0;
+    let b = active_counts[CohortId::B.index()] > 0;
+    match (a, b) {
+        (false, false) => None,
+        (true, false) => Some((CohortId::A, CohortId::A)),
+        (false, true) => Some((CohortId::B, CohortId::B)),
+        (true, true) => Some((next_turn, next_turn.other())),
+    }
+}
+
 pub(super) struct AdmissionOutcome<T> {
     pub(super) pending: Vec<T>,
     pub(super) deferred: Vec<T>,
@@ -49,11 +99,13 @@ impl StepPlan {
     }
 }
 
-/// Pack FIFO prompt slices into `budget`; decode rows do not consume it.
-/// A prompt crossing the budget resumes at the queue front on the next step.
+/// Pack FIFO prompt slices into `budget` and at most `max_prefill_reqs` prompts
+/// (bounded by decode `SampleScratch` width); decode rows do not consume `budget`.
+/// A prompt crossing the budget stays at the queue front and resumes on the next step.
 pub(super) fn plan_step(
     active_decodes: usize,
     budget: usize,
+    max_prefill_reqs: usize,
     prefilling: &[PrefillQueueState],
 ) -> StepPlan {
     assert!(
@@ -63,6 +115,9 @@ pub(super) fn plan_step(
     let mut remaining = budget;
     let mut prefill = Vec::new();
     for state in prefilling {
+        if prefill.len() >= max_prefill_reqs {
+            break;
+        }
         let rows = state.remaining_tokens.min(remaining);
         if rows == 0 {
             break;
@@ -285,6 +340,7 @@ mod tests {
         let plan = plan_step(
             1,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
+            64,
             &four_standard_prompts(),
         );
         assert!(plan.decode);
@@ -295,20 +351,20 @@ mod tests {
 
     #[test]
     fn plan_packs_whole_prompts_in_fifo_order() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[300, 700, 900, 1500]));
+        let plan = plan_step(1, PACK_BUDGET, 64, &prompts(&[300, 700, 900, 1500]));
         assert!(plan.decode);
         assert_eq!(plan.prefill, vec![300, 700, 900, 1500]);
     }
 
     #[test]
     fn plan_slices_the_prompt_that_crosses_the_budget() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[6000]));
+        let plan = plan_step(1, PACK_BUDGET, 64, &prompts(&[6000]));
         assert_eq!(plan.prefill, vec![PACK_BUDGET]);
     }
 
     #[test]
     fn plan_slices_against_the_budget_left_by_earlier_prompts() {
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[2000, 3000, 1]));
+        let plan = plan_step(1, PACK_BUDGET, 64, &prompts(&[2000, 3000, 1]));
         assert_eq!(plan.prefill, vec![2000, 2096]);
     }
 
@@ -316,7 +372,7 @@ mod tests {
     fn plan_resumes_the_sliced_tail_before_the_next_prompt() {
         // The 6000-token prompt was sliced at 4096; its tail is now the front
         // of the queue and must be finished before the next prompt moves.
-        let plan = plan_step(1, PACK_BUDGET, &prompts(&[1904, 1024]));
+        let plan = plan_step(1, PACK_BUDGET, 64, &prompts(&[1904, 1024]));
         assert_eq!(plan.prefill, vec![1904, 1024]);
     }
 
@@ -325,6 +381,7 @@ mod tests {
         let plan = plan_step(
             1,
             usize::MAX,
+            64,
             &prompts(&[STANDARD_PROMPT_CHUNK, STANDARD_PROMPT_CHUNK, 7]),
         );
         assert_eq!(
@@ -334,8 +391,15 @@ mod tests {
     }
 
     #[test]
+    fn plan_caps_prompt_count_to_decode_width() {
+        let queue = prompts(&vec![1; 128]);
+        let plan = plan_step(1, 1024, 64, &queue);
+        assert_eq!(plan.prefill.len(), 64);
+    }
+
+    #[test]
     fn plan_never_widens_a_smaller_budget() {
-        let plan = plan_step(1, 512, &prompts(&[STANDARD_PROMPT_CHUNK; 4]));
+        let plan = plan_step(1, 512, 64, &prompts(&[STANDARD_PROMPT_CHUNK; 4]));
         assert_eq!(plan.prefill, vec![512]);
     }
 
@@ -344,6 +408,7 @@ mod tests {
         let plan = plan_step(
             1,
             crate::DEFAULT_MAX_PREFILL_TOKENS,
+            64,
             &prompts(&[0, STANDARD_PROMPT_CHUNK]),
         );
         assert!(plan.prefill.is_empty());
@@ -353,7 +418,7 @@ mod tests {
 
     #[test]
     fn plan_is_prefill_only_without_decode_work() {
-        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &prompts(&[700]));
+        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, 64, &prompts(&[700]));
         assert!(!plan.decode);
         assert_eq!(plan.prefill, vec![700]);
         assert!(!plan.is_empty());
@@ -361,7 +426,7 @@ mod tests {
 
     #[test]
     fn plan_is_decode_only_without_prompt_work() {
-        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, 64, &[]);
         assert!(plan.decode);
         assert!(plan.prefill.is_empty());
         assert!(!plan.is_empty());
@@ -369,14 +434,68 @@ mod tests {
 
     #[test]
     fn plan_is_empty_without_prompt_or_decode_work() {
-        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(0, crate::DEFAULT_MAX_PREFILL_TOKENS, 64, &[]);
         assert!(plan.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "positive prefill budget")]
     fn plan_rejects_a_zero_budget() {
-        plan_step(1, 0, &[]);
+        plan_step(1, 0, 64, &[]);
+    }
+
+    #[test]
+    fn cohort_assignment_fills_a_before_spilling_to_b() {
+        assert_eq!(assign_cohort([64, 64]), Some(CohortId::A));
+        assert_eq!(assign_cohort([1, 64]), Some(CohortId::A));
+        assert_eq!(assign_cohort([0, 64]), Some(CohortId::B));
+        assert_eq!(assign_cohort([0, 1]), Some(CohortId::B));
+        assert_eq!(assign_cohort([0, 0]), None);
+    }
+
+    #[test]
+    fn decode_cohort_selection_stays_on_a_under_64_and_alternates_above_64() {
+        assert_eq!(next_decode_cohort([0, 0], CohortId::A), None);
+        assert_eq!(
+            next_decode_cohort([64, 0], CohortId::A),
+            Some((CohortId::A, CohortId::A))
+        );
+        assert_eq!(
+            next_decode_cohort([32, 0], CohortId::B),
+            Some((CohortId::A, CohortId::A))
+        );
+        assert_eq!(
+            next_decode_cohort([0, 12], CohortId::A),
+            Some((CohortId::B, CohortId::B))
+        );
+        let (first, turn1) = next_decode_cohort([64, 32], CohortId::A).unwrap();
+        let (second, turn2) = next_decode_cohort([64, 32], turn1).unwrap();
+        let (third, turn3) = next_decode_cohort([64, 32], turn2).unwrap();
+        assert_eq!(
+            (first, second, third),
+            (CohortId::A, CohortId::B, CohortId::A)
+        );
+        assert_eq!(turn3, CohortId::B);
+    }
+
+    #[test]
+    fn admission_admits_128_resident_requests_and_defers_129th() {
+        let pending: Vec<Pending> = (0..129).map(|i| pending_with_max(i, 16, 16)).collect();
+        let outcome = admit_pending_requests(
+            pending,
+            &[],
+            128,
+            16,
+            10_000,
+            10_000,
+            262_144,
+            |req| req.prompt_len,
+            |req| req.max_tokens,
+            |_| 0,
+        );
+        assert_eq!(outcome.pending.len(), 128);
+        assert_eq!(ids(&outcome.deferred), vec![128]);
+        assert!(outcome.rejected.is_empty());
     }
 
     #[test]
@@ -617,7 +736,7 @@ mod tests {
         assert!(outcome.pending.is_empty());
         assert_eq!(ids(&outcome.deferred), vec![1]);
         assert!(outcome.rejected.is_empty());
-        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, &[]);
+        let plan = plan_step(1, crate::DEFAULT_MAX_PREFILL_TOKENS, 64, &[]);
         assert!(
             plan.decode && plan.prefill.is_empty(),
             "active requests keep decoding when pending requests are all deferred"

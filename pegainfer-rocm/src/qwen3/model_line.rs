@@ -94,6 +94,7 @@ impl ModelLine for RocmQwen3Line {
                     block_size: 1,
                 }),
                 servable_len: Some(o.max_context as u32),
+                max_num_seqs: None,
             },
             lora: None,
         }

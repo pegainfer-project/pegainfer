@@ -116,6 +116,59 @@ pub(crate) struct BatchDecodeBuffers35 {
 }
 
 impl BatchDecodeBuffers35 {
+    /// Estimates GPU memory (bytes) for one cohort's `BatchDecodeBuffers35`
+    /// (including sampling scratch and `page_indices_d`).
+    pub(crate) fn estimate_bytes(
+        config: &Config35,
+        geometry: LocalGeometry,
+        max_batch_size: usize,
+        page_size: usize,
+        split_max_batch: usize,
+    ) -> usize {
+        let bs = max_batch_size;
+        let h = config.hidden_size;
+        let q_proj_dim = geometry.local_full_attn_gated_q_dim();
+        let q_dim = geometry.local_full_attn_q_dim();
+        let kv_dim = geometry.local_full_attn_kv_dim();
+        let qkv_dim = geometry.local_linear_qkv_dim();
+        let z_dim = geometry.local_linear_z_dim();
+        let b_dim = geometry.local_linear_num_value_heads();
+        let intermediate = geometry.local_intermediate_size();
+        let vocab = config.selection_vocab;
+
+        let bf16_elems = bs
+            * (5 * h
+                + 3 * intermediate
+                + vocab
+                + q_proj_dim
+                + 2 * q_dim
+                + 2 * kv_dim
+                + 2 * qkv_dim
+                + 3 * z_dim
+                + 2 * b_dim);
+
+        let split_rows = SPLIT_DECODE_MAX_SPLITS
+            * bs.min(split_max_batch)
+            * geometry.local_num_attention_heads();
+        let split_bytes = split_rows * (256 + 2) * std::mem::size_of::<f32>();
+
+        let max_view_pages = config.max_position_embeddings.div_ceil(page_size).max(1);
+        let page_index_capacity = bs.saturating_mul(max_view_pages);
+        let meta_bytes = (6 * bs + 1 + page_index_capacity) * std::mem::size_of::<i32>();
+
+        // Approximate SampleScratch footprint: f32 probability buffer + softmax/argmax reduction buffers.
+        let sample_probs_bytes = bs * vocab * std::mem::size_of::<f32>();
+        let sample_softmax_bytes = bs * vocab.div_ceil(8192) * 8 + 256;
+        let sample_argmax_bytes = bs * vocab.div_ceil(256) * 8;
+        let sample_overhead_bytes =
+            sample_probs_bytes + sample_softmax_bytes + sample_argmax_bytes + 64 * 1024;
+
+        bf16_elems * std::mem::size_of::<half::bf16>()
+            + split_bytes
+            + meta_bytes
+            + sample_overhead_bytes
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,

@@ -205,6 +205,7 @@ pub fn start_engine_with_partitions(config: &SimulatedEngineConfig, partitions: 
         info: EngineInfo {
             kv_capacity: None,
             servable_len: None,
+            max_num_seqs: None,
         },
         lora: None,
     }

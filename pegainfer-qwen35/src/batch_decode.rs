@@ -388,6 +388,7 @@ impl Qwen35Model {
         &self,
         token_ids: &[u32],
         views: &[KvView],
+        slot_indices: &[usize],
         kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
         graph_use: DecodeGraphUse,
@@ -396,6 +397,7 @@ impl Qwen35Model {
         self.batch_decode_graph_padded(
             token_ids,
             views,
+            slot_indices,
             kv_buffer,
             graph_state,
             graph_use,
@@ -403,16 +405,14 @@ impl Qwen35Model {
         )
     }
 
-    /// `batch_decode_graph` with the bucket chosen by the caller instead of
-    /// derived from `bs`. Rows `bs..padded_bs` are padding either way — they
-    /// ride the pool's reserved padding page and a free recurrent slot — so a
-    /// caller that only needs a *bucket* (the TP pre-capture sweep) can pass
-    /// one real row and still capture or launch the bucket-`padded_bs` graph
-    /// without holding `padded_bs` KV pages.
+    /// `batch_decode_graph` with a caller-specified bucket; rows `bs..padded_bs`
+    /// act as padding and ride the KV pool's reserved padding page and shared padding recurrent slot.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn batch_decode_graph_padded(
         &self,
         token_ids: &[u32],
         views: &[KvView],
+        slot_indices: &[usize],
         kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
         graph_use: DecodeGraphUse,
@@ -421,6 +421,10 @@ impl Qwen35Model {
         let bs = token_ids.len();
         anyhow::ensure!(bs > 0, "batch_decode_graph requires requests");
         anyhow::ensure!(bs == views.len(), "token_ids / KV views len mismatch");
+        anyhow::ensure!(
+            bs == slot_indices.len(),
+            "token_ids / slot_indices len mismatch"
+        );
         anyhow::ensure!(
             bs <= graph_state.slot_states.len(),
             "batch size {bs} exceeds decode capacity {}",
@@ -444,7 +448,13 @@ impl Qwen35Model {
             });
             // Paged-prefill attention stays eager; verify_graph records that
             // captured prefill attention under-reads growing decode KV.
-            return self.batch_decode_batched_hybrid(token_ids, views, kv_buffer, graph_state);
+            return self.batch_decode_batched_hybrid(
+                token_ids,
+                views,
+                slot_indices,
+                kv_buffer,
+                graph_state,
+            );
         }
 
         graph_state.linear_pointer_tables.validate_for(
@@ -453,19 +463,34 @@ impl Qwen35Model {
             "Qwen3.5 graph decode",
         )?;
 
-        // KvView already includes the page reserved by schedule_decode; model
-        // execution advances recurrent state but never logical RequestKv state.
+        // Validate all slot indices and positions before mutating state or syncing pointer tables.
+        let mut seen_slots = [false; crate::batch_decode_graph::MAX_BATCH];
         let mut positions = Vec::with_capacity(bs);
-        for (i, view) in views.iter().enumerate() {
+        for (row, (view, &slot_idx)) in views.iter().zip(slot_indices).enumerate() {
+            anyhow::ensure!(
+                slot_idx < graph_state.slot_states.len(),
+                "Qwen3.5 decode slot index {slot_idx} out of range ({})",
+                graph_state.slot_states.len()
+            );
+            anyhow::ensure!(
+                !seen_slots[slot_idx],
+                "Qwen3.5 decode received duplicate slot index {slot_idx} at row {row}"
+            );
+            seen_slots[slot_idx] = true;
             let pos = view.seq_len().saturating_sub(1);
             anyhow::ensure!(
-                graph_state.slot_states[i].seq_len == pos,
-                "Qwen3.5 decode position mismatch at slot {i}: recurrent={}, view_pos={pos}",
-                graph_state.slot_states[i].seq_len
+                graph_state.slot_states[slot_idx].seq_len == pos,
+                "Qwen3.5 decode position mismatch at row {row} (slot {slot_idx}): recurrent={}, view_pos={pos}",
+                graph_state.slot_states[slot_idx].seq_len
             );
             self.ensure_rope_cache_covers(pos + 1)?;
-            graph_state.slot_states[i].seq_len += 1;
             positions.push(pos as i32);
+        }
+        graph_state.sync_active_slots(&self.ctx, slot_indices, padded_bs)?;
+        // KvView already includes the page reserved by schedule_decode; model
+        // execution advances recurrent state but never logical RequestKv state.
+        for &slot_idx in slot_indices {
+            graph_state.slot_states[slot_idx].seq_len += 1;
         }
 
         graph_state.buffers.set_batch_size(padded_bs);
@@ -529,6 +554,7 @@ impl Qwen35Model {
         &self,
         token_ids: &[u32],
         views: &[KvView],
+        slot_indices: &[usize],
         kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<()> {
@@ -538,20 +564,34 @@ impl Qwen35Model {
             bs,
             "Qwen3.5 hybrid decode",
         )?;
+        let mut seen_slots = [false; crate::batch_decode_graph::MAX_BATCH];
         let mut positions_i32 = Vec::with_capacity(bs);
         let mut start_positions = Vec::with_capacity(bs);
-        for (i, view) in views.iter().enumerate() {
+        for (row, (view, &slot_idx)) in views.iter().zip(slot_indices).enumerate() {
+            anyhow::ensure!(
+                slot_idx < graph_state.slot_states.len(),
+                "Qwen3.5 hybrid decode slot index {slot_idx} out of range ({})",
+                graph_state.slot_states.len()
+            );
+            anyhow::ensure!(
+                !seen_slots[slot_idx],
+                "Qwen3.5 hybrid decode received duplicate slot index {slot_idx} at row {row}"
+            );
+            seen_slots[slot_idx] = true;
             let pos = view.seq_len().saturating_sub(1);
             anyhow::ensure!(
-                graph_state.slot_states[i].seq_len == pos,
-                "Qwen3.5 hybrid position mismatch at slot {i}: recurrent={}, view_pos={pos}",
-                graph_state.slot_states[i].seq_len
+                graph_state.slot_states[slot_idx].seq_len == pos,
+                "Qwen3.5 hybrid position mismatch at row {row} (slot {slot_idx}): recurrent={}, view_pos={pos}",
+                graph_state.slot_states[slot_idx].seq_len
             );
             self.ensure_rope_cache_covers(pos + 1)
-                .with_context(|| format!("hybrid decode rope pos={} slot={i}", pos + 1))?;
-            graph_state.slot_states[i].seq_len += 1;
+                .with_context(|| format!("hybrid decode rope pos={} slot={slot_idx}", pos + 1))?;
             positions_i32.push(pos as i32);
             start_positions.push(pos);
+        }
+        graph_state.sync_active_slots(&self.ctx, slot_indices, bs)?;
+        for &slot_idx in slot_indices {
+            graph_state.slot_states[slot_idx].seq_len += 1;
         }
 
         let bufs = &mut graph_state.buffers;

@@ -176,7 +176,7 @@ fn closed_pending_work_is_pruned() {
         |mut pending, ledger| {
             prune_closed_requests(
                 &mut LifecycleTestBackend::default(),
-                &mut Vec::new(),
+                &mut [Vec::new(), Vec::new()],
                 &mut Vec::new(),
                 &mut pending,
                 ledger,
@@ -202,9 +202,12 @@ fn closed_resident_work_is_pruned() {
         &[0, 2],
         |requests, ledger| {
             let mut requests = requests.into_iter();
-            let mut active = vec![
-                active_request(requests.next().unwrap(), 10, ledger),
-                active_request(requests.next().unwrap(), 11, ledger),
+            let mut active = [
+                vec![
+                    active_request(requests.next().unwrap(), 10, ledger),
+                    active_request(requests.next().unwrap(), 11, ledger),
+                ],
+                Vec::new(),
             ];
             let mut prefilling = vec![prefilling_request(requests.next().unwrap(), 12, ledger)];
             let mut pending: Vec<_> = requests.collect();
@@ -216,16 +219,64 @@ fn closed_resident_work_is_pruned() {
                 &mut pending,
                 ledger,
             )?;
-            assert_eq!(active.len(), 1);
-            assert_eq!(active[0].client_label.as_deref(), Some("active-open"));
+            assert_eq!(active[0].len(), 1);
+            assert_eq!(active[0][0].client_label.as_deref(), Some("active-open"));
             assert!(prefilling.is_empty());
             assert_eq!(backend.active_drops, vec![RequestId::new(10)]);
             assert_eq!(
                 backend.prefill_drops,
                 vec![(RequestId::new(12), DropExpectation::MustExist)]
             );
-            ledger.retire(active[0].id);
+            ledger.retire(active[0][0].id);
             ledger.retire(pending[0].id);
+            Ok(())
+        },
+    );
+    assert!(updates.is_empty());
+}
+
+#[test]
+fn closed_resident_work_is_pruned_across_both_cohorts() {
+    let updates = run_step(
+        vec![
+            test_request("cohort-a-closed", vec![1], 8),
+            test_request("cohort-a-open", vec![1], 8),
+            test_request("cohort-b-closed", vec![1], 8),
+            test_request("cohort-b-open", vec![1], 8),
+        ],
+        &[0, 2],
+        |requests, ledger| {
+            let mut requests = requests.into_iter();
+            let mut active = [
+                vec![
+                    active_request(requests.next().unwrap(), 20, ledger),
+                    active_request(requests.next().unwrap(), 21, ledger),
+                ],
+                vec![
+                    active_request(requests.next().unwrap(), 30, ledger),
+                    active_request(requests.next().unwrap(), 31, ledger),
+                ],
+            ];
+            let mut prefilling = Vec::new();
+            let mut pending = Vec::new();
+            let mut backend = LifecycleTestBackend::default();
+            prune_closed_requests(
+                &mut backend,
+                &mut active,
+                &mut prefilling,
+                &mut pending,
+                ledger,
+            )?;
+            assert_eq!(active[0].len(), 1);
+            assert_eq!(active[0][0].client_label.as_deref(), Some("cohort-a-open"));
+            assert_eq!(active[1].len(), 1);
+            assert_eq!(active[1][0].client_label.as_deref(), Some("cohort-b-open"));
+            assert_eq!(
+                backend.active_drops,
+                vec![RequestId::new(20), RequestId::new(30)]
+            );
+            ledger.retire(active[0][0].id);
+            ledger.retire(active[1][0].id);
             Ok(())
         },
     );
@@ -400,7 +451,7 @@ fn immediate_prefill_completion_waits_for_drop() {
             let mut request = prefilling_request(requests.remove(0), 33, ledger);
             request.step_chunk = 1;
             let chunk = ScheduledChunk::from(vec![request]);
-            let mut active = Vec::new();
+            let mut active = [Vec::new(), Vec::new()];
             let mut prefilling = Vec::new();
             let mut backend = LifecycleTestBackend::default();
             promote_or_requeue(
@@ -414,7 +465,7 @@ fn immediate_prefill_completion_waits_for_drop() {
                 },
                 ledger,
             )?;
-            assert!(active.is_empty());
+            assert!(active[0].is_empty() && active[1].is_empty());
             assert!(prefilling.is_empty());
             assert_eq!(
                 backend.prefill_drops,
@@ -446,7 +497,7 @@ fn immediate_prefill_stop_keeps_trigger_and_logprob_at_length_limit() {
         request.step_chunk = 1;
         promote_or_requeue(
             &mut LifecycleTestBackend::default(),
-            &mut Vec::new(),
+            &mut [Vec::new(), Vec::new()],
             &mut Vec::new(),
             ScheduledChunk::from(vec![request]),
             &PrefillStepArtifacts::Single {
@@ -491,7 +542,7 @@ fn immediate_prefill_drop_failure_publishes_only_terminal_error() {
             first.step_chunk = 1;
             let mut second = prefilling_request(requests.next().unwrap(), 35, ledger);
             second.step_chunk = 1;
-            let mut active = Vec::new();
+            let mut active = [Vec::new(), Vec::new()];
             let mut prefilling = Vec::new();
             let mut backend = LifecycleTestBackend {
                 fail_prefill_drop: true,
@@ -615,7 +666,7 @@ fn take_prefill_chunks_cuts_each_request_on_its_own_prompt() {
                 remaining_tokens: p.req.request.prompt_tokens.len().saturating_sub(p.cursor),
             })
             .collect();
-        let plan = plan_step(1, 1024, &queue);
+        let plan = plan_step(1, 1024, 64, &queue);
         take_prefill_chunks(&mut prefilling, &plan, stride)
             .iter()
             .map(|p| p.step_chunk)
@@ -704,7 +755,7 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
+    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 2, 1, false, 0)
         .expect("start TP2 scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();

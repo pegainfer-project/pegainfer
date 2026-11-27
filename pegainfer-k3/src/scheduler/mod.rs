@@ -166,6 +166,7 @@ where
             // No servable ceiling of K3's own yet: the protocol stack keeps
             // its max-length validation at the model context window.
             servable_len: None,
+            max_num_seqs: None,
         },
         // K3 serves no adapters.
         lora: None,

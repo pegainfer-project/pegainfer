@@ -1,14 +1,35 @@
-//! Qwen3.5 scheduler backend abstraction (single-GPU + TP).
+//! Qwen3.5 scheduler backend abstraction (single-GPU dual-cohort + TP single-cohort).
 
 use super::*;
 use crate::logprobs::LogprobSnapshot;
 use crate::tp_executor::TpBeginRequestError;
 
+/// CUDA Graph state and free-slot pool for a single decode cohort.
+struct CohortGraphState {
+    graph_state: BatchDecodeGraphState,
+    /// Free-slot stack (lowest slot index on top), popped on admission and returned on retirement/cancellation.
+    free_slots: Vec<usize>,
+}
+
+impl CohortGraphState {
+    fn new(graph_state: BatchDecodeGraphState) -> Self {
+        let capacity = graph_state.slot_states.len();
+        let free_slots = (0..capacity).rev().collect();
+        Self {
+            graph_state,
+            free_slots,
+        }
+    }
+}
+
 pub(super) struct SingleGpuBackend {
     pub(super) model: Qwen35Model,
     pub(super) kv_cache: Qwen35PrefixCache,
     recurrent_store: RecurrentStateStore,
-    graph_state: BatchDecodeGraphState,
+    /// 1 or 2 64-row cohorts (A/B); `c <= decode_width` uses cohort A only.
+    cohorts: Vec<CohortGraphState>,
+    decode_width: usize,
+    max_resident: usize,
     prefill_stream: Option<Arc<CudaStream>>,
 }
 
@@ -115,6 +136,38 @@ impl From<TpBeginRequestError> for AdmissionError {
     }
 }
 
+/// Borrows disjoint `&mut RecurrentState` handles for distinct `(CohortId, slot_idx)` targets across one or two cohorts.
+fn borrow_cohort_slots<'a>(
+    cohorts: &'a mut [CohortGraphState],
+    slots: &[(CohortId, usize)],
+) -> Result<Vec<&'a mut RecurrentState>> {
+    let mut seen = HashSet::with_capacity(slots.len());
+    let mut ptrs = Vec::with_capacity(slots.len());
+    for &(cohort, slot_idx) in slots {
+        anyhow::ensure!(
+            seen.insert((cohort, slot_idx)),
+            "duplicate Qwen3.5 prefill cohort slot ({cohort:?}, {slot_idx})"
+        );
+        let cohort_state = cohorts
+            .get_mut(cohort.index())
+            .ok_or_else(|| anyhow::anyhow!("Qwen3.5 cohort {cohort:?} is not initialized"))?;
+        let slot_cap = cohort_state.graph_state.slot_states.len();
+        let slot = cohort_state
+            .graph_state
+            .slot_states
+            .get_mut(slot_idx)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Qwen3.5 cohort {cohort:?} slot {slot_idx} exceeds capacity {slot_cap}"
+                )
+            })?;
+        ptrs.push(std::ptr::from_mut(slot));
+    }
+    // SAFETY: `seen.insert` guarantees every `(cohort, slot_idx)` is distinct, and `cohorts`
+    // is exclusively borrowed for `'a`, so every pointer targets a non-overlapping `RecurrentState`.
+    Ok(ptrs.into_iter().map(|p| unsafe { &mut *p }).collect())
+}
+
 impl SingleGpuBackend {
     fn schedule_prefill_views(
         &self,
@@ -167,17 +220,18 @@ impl SingleGpuBackend {
         chunk: &mut ScheduledChunk,
         tokens: &[u32],
     ) -> Result<()> {
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+        let ScheduledChunkBackendState::Single { kvs, slots } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU commit received TP chunk state")
         };
-        for (i, (kv, rec)) in kvs.iter_mut().zip(recs.iter()).enumerate() {
+        for (i, (kv, &(cohort, slot_idx))) in kvs.iter_mut().zip(slots.iter()).enumerate() {
             let is_final = chunk.ends[i] == chunk.reqs[i].request.prompt_tokens.len();
             let boundary = self
                 .kv_cache
                 .apply_prefill(kv, is_final.then_some(tokens[i]))?;
+            let rec = &self.cohorts[cohort.index()].graph_state.slot_states[slot_idx];
             anyhow::ensure!(
                 rec.seq_len == boundary,
-                "Qwen3.5 prefill apply position mismatch: kv={boundary}, recurrent={}",
+                "Qwen3.5 prefill apply position mismatch at ({cohort:?}, slot {slot_idx}): kv={boundary}, recurrent={}",
                 rec.seq_len
             );
             if let Some(reservation) = self.kv_cache.reserve_snapshot(kv, boundary)? {
@@ -226,12 +280,13 @@ impl SingleGpuBackend {
         );
     }
 
-    pub(super) fn new(
-        model: Qwen35Model,
-        max_batch: usize,
-        decode_overlap: Qwen35DecodeOverlap,
-    ) -> Result<Self> {
-        anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
+    pub(super) fn new(model: Qwen35Model, decode_overlap: Qwen35DecodeOverlap) -> Result<Self> {
+        let cap = *model.capacity();
+        anyhow::ensure!(
+            cap.cohort_count >= 1 && cap.cohort_count <= 2,
+            "Qwen3.5 single-GPU expects 1 or 2 cohorts, got {}",
+            cap.cohort_count
+        );
         let manager =
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
         let kv_cache = Qwen35PrefixCache::new(manager, model.prefix_snapshot_slots())?;
@@ -242,11 +297,20 @@ impl SingleGpuBackend {
             model.prefix_snapshot_slots(),
         )?;
         debug_assert_eq!(recurrent_store.len(), kv_cache.snapshot_slots());
-        let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
-        let graph_state = model.create_batch_decode_graph_state_with_capacity(
-            graph_capacity,
-            kv_cache.pool().padding_block_id(),
-        )?;
+
+        let padding_block_id = kv_cache.pool().padding_block_id();
+        let padding_state = model.create_padding_recurrent_state()?;
+        let mut cohorts = Vec::with_capacity(cap.cohort_count);
+        for i in 0..cap.cohort_count {
+            let width = cap.cohort_widths[i];
+            let graph_state = model.create_batch_decode_graph_state_for_cohort(
+                width,
+                padding_block_id,
+                Arc::clone(&padding_state),
+            )?;
+            cohorts.push(CohortGraphState::new(graph_state));
+        }
+
         let prefill_stream = match decode_overlap {
             Qwen35DecodeOverlap::Off => None,
             Qwen35DecodeOverlap::SharedSm => Some(
@@ -261,7 +325,9 @@ impl SingleGpuBackend {
             model,
             kv_cache,
             recurrent_store,
-            graph_state,
+            cohorts,
+            decode_width: cap.decode_width,
+            max_resident: cap.max_resident,
             prefill_stream,
         })
     }
@@ -270,13 +336,84 @@ impl SingleGpuBackend {
         &self.model
     }
 
-    pub(super) fn max_batch(&self) -> usize {
-        // #470: admit the requested `--max-batch`, which may sit below the loaded
-        // graph bucket (e.g. 5 on bucket 8); never exceed the physical slots.
-        self.model
-            .decode_admission_batch
-            .min(self.graph_state.slot_states.len())
-            .max(1)
+    pub(super) fn decode_width(&self) -> usize {
+        self.decode_width
+    }
+
+    pub(super) fn max_resident(&self) -> usize {
+        self.max_resident
+    }
+
+    pub(super) fn cohort_count(&self) -> usize {
+        self.cohorts.len()
+    }
+
+    fn cohort_free_counts(&self) -> [usize; 2] {
+        [
+            self.cohorts.first().map_or(0, |c| c.free_slots.len()),
+            self.cohorts.get(1).map_or(0, |c| c.free_slots.len()),
+        ]
+    }
+
+    fn alloc_slot(&mut self) -> Option<(CohortId, usize)> {
+        let cohort = assign_cohort(self.cohort_free_counts())?;
+        let slot_idx = self.cohorts[cohort.index()].free_slots.pop()?;
+        Some((cohort, slot_idx))
+    }
+
+    pub(super) fn release_slot(&mut self, cohort: CohortId, slot_idx: usize) {
+        let cohort_state = &mut self.cohorts[cohort.index()];
+        assert!(
+            slot_idx < cohort_state.graph_state.slot_states.len(),
+            "releasing out-of-range slot {slot_idx} in cohort {cohort:?}"
+        );
+        assert!(
+            !cohort_state.free_slots.contains(&slot_idx),
+            "double release of slot {slot_idx} in cohort {cohort:?}"
+        );
+        cohort_state.free_slots.push(slot_idx);
+    }
+
+    pub(super) fn release_chunk_slots(&mut self, chunk: &ScheduledChunk) {
+        if let ScheduledChunkBackendState::Single { slots, .. } = &chunk.backend_state {
+            for &(cohort, slot_idx) in slots {
+                self.release_slot(cohort, slot_idx);
+            }
+        }
+    }
+
+    pub(super) fn release_active_slots(&mut self, active: &[ActiveRequest35]) {
+        for req in active {
+            if let ActiveBackendState::Single {
+                cohort,
+                graph_slot_idx,
+                ..
+            } = req.backend_state
+            {
+                self.release_slot(cohort, graph_slot_idx);
+            }
+        }
+    }
+
+    pub(super) fn debug_assert_slot_conservation(
+        &self,
+        active_cohorts: &[Vec<ActiveRequest35>; 2],
+        prefilling: &[PrefillingRequest35],
+        inflight_prefill: Option<&InflightPrefill>,
+    ) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let free_total: usize = self.cohorts.iter().map(|c| c.free_slots.len()).sum();
+        let active_total = active_cohorts[0].len() + active_cohorts[1].len();
+        let inflight_total = inflight_prefill.map_or(0, |p| p.chunk.reqs.len());
+        debug_assert_eq!(
+            free_total + active_total + prefilling.len() + inflight_total,
+            self.max_resident,
+            "Qwen3.5 slot conservation violated: free={free_total} + active={active_total} + prefilling={} + inflight={inflight_total} != max_resident={}",
+            prefilling.len(),
+            self.max_resident
+        );
     }
 
     pub(super) fn page_size(&self) -> usize {
@@ -307,32 +444,49 @@ impl SingleGpuBackend {
         &mut self,
         req: &Request,
     ) -> Result<(PrefillBackendState, usize), AdmissionError> {
-        let mut rec = self
-            .alloc_recurrent()
-            .map_err(AdmissionError::Recoverable)?;
-        let (mut kv, restore) = self
-            .kv_cache
-            .begin_request(
-                &req.prompt_tokens,
-                req.max_tokens,
-                req.lora_adapter.as_deref(),
-                req.history_tokens,
-                true,
-            )
-            .map_err(AdmissionError::Recoverable)?;
-        let cached_tokens = if let Some(restore) = restore {
-            if let Err(error) = self.recurrent_store.restore(
-                self.model.device_ctx(),
-                restore.recurrent_slot(),
-                &mut rec,
-            ) {
-                let _ = self.kv_cache.release_request(&mut kv);
+        let (cohort, slot_idx) = self.alloc_slot().ok_or_else(|| {
+            AdmissionError::Recoverable(anyhow::anyhow!(
+                "Qwen3.5 single-GPU state pool exhausted (max_resident={})",
+                self.max_resident
+            ))
+        })?;
+        if let Err(error) = self.cohorts[cohort.index()]
+            .graph_state
+            .reset_slot(self.model.device_ctx(), slot_idx)
+        {
+            self.release_slot(cohort, slot_idx);
+            return Err(AdmissionError::Recoverable(error));
+        }
+
+        let (mut kv, restore) = match self.kv_cache.begin_request(
+            &req.prompt_tokens,
+            req.max_tokens,
+            req.lora_adapter.as_deref(),
+            req.history_tokens,
+            true,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.release_slot(cohort, slot_idx);
                 return Err(AdmissionError::Recoverable(error));
             }
-            match self.kv_cache.finish_restore(&kv, restore, &[rec.seq_len]) {
+        };
+        let cached_tokens = if let Some(restore) = restore {
+            let rec = &mut self.cohorts[cohort.index()].graph_state.slot_states[slot_idx];
+            if let Err(error) =
+                self.recurrent_store
+                    .restore(self.model.device_ctx(), restore.recurrent_slot(), rec)
+            {
+                let _ = self.kv_cache.release_request(&mut kv);
+                self.release_slot(cohort, slot_idx);
+                return Err(AdmissionError::Recoverable(error));
+            }
+            let seq_len = rec.seq_len;
+            match self.kv_cache.finish_restore(&kv, restore, &[seq_len]) {
                 Ok(tokens) => tokens,
                 Err(error) => {
                     let _ = self.kv_cache.release_request(&mut kv);
+                    self.release_slot(cohort, slot_idx);
                     return Err(AdmissionError::Recoverable(error));
                 }
             }
@@ -342,27 +496,30 @@ impl SingleGpuBackend {
         Ok((
             PrefillBackendState::Single {
                 kv: Box::new(kv),
-                rec,
+                cohort,
+                slot_idx,
             },
             cached_tokens,
         ))
     }
 
-    pub(super) fn alloc_recurrent(&self) -> Result<RecurrentState> {
-        RecurrentState::new(
-            self.model.device_ctx(),
-            self.model.config(),
-            self.model.geometry,
-        )
-    }
-
-    pub(super) fn batch_prefill_logits(&self, chunk: &mut ScheduledChunk) -> Result<HiddenStates> {
+    pub(super) fn batch_prefill_logits(
+        &mut self,
+        chunk: &mut ScheduledChunk,
+    ) -> Result<HiddenStates> {
         let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+        let ScheduledChunkBackendState::Single { kvs, slots } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU prefill received TP chunk state");
         };
         let views = self.schedule_prefill_views(kvs, &chunk.windows)?;
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let mut rec_refs = match borrow_cohort_slots(&mut self.cohorts, slots) {
+            Ok(refs) => refs,
+            Err(error) => {
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
+                return Err(error);
+            }
+        };
         let result = self.model.batch_prefill_logits(
             &window_refs,
             &views,
@@ -389,18 +546,24 @@ impl SingleGpuBackend {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Qwen3.5 decode overlap is disabled"))?;
 
-        // Request KV/recurrent state was allocated on the model stream. Order
-        // those producers before the prefill stream without blocking the host.
+        // Slot reset and KV setup are enqueued on the model stream; order the prefill stream after them.
         prefill_stream
             .join(&self.model.device_ctx().stream)
             .map_err(|err| anyhow::anyhow!("join Qwen3.5 prefill stream: {err}"))?;
 
         let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
+        let ScheduledChunkBackendState::Single { kvs, slots } = &mut chunk.backend_state else {
             anyhow::bail!("single-GPU async prefill received TP chunk state");
         };
         let views = self.schedule_prefill_views(kvs, &chunk.windows)?;
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
+        let mut rec_refs = match borrow_cohort_slots(&mut self.cohorts, slots) {
+            Ok(refs) => refs,
+            Err(error) => {
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
+                return Err(error);
+            }
+        };
         let logits = match self.model.batch_prefill_logits_on_stream(
             Arc::clone(&prefill_stream),
             &window_refs,
@@ -428,6 +591,8 @@ impl SingleGpuBackend {
                         "record Qwen3.5 async prefill event failed ({err}); stream drain failed: {sync_err}"
                     ));
                 }
+                self.kv_cache
+                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
                 return Err(anyhow::anyhow!("record Qwen3.5 async prefill event: {err}"));
             }
         };
@@ -442,49 +607,61 @@ impl SingleGpuBackend {
     pub(super) fn unified_step(
         &mut self,
         chunk: &mut ScheduledChunk,
+        decode_cohort: CohortId,
         active: &mut [ActiveRequest35],
     ) -> Result<crate::unified_forward::UnifiedStepOutput> {
-        let window_refs: Vec<&[u32]> = chunk.windows.iter().map(Vec::as_slice).collect();
-        let ScheduledChunkBackendState::Single { kvs, recs } = &mut chunk.backend_state else {
-            anyhow::bail!("single-GPU unified step received TP chunk state");
-        };
-        let prefill_views = self.schedule_prefill_views(kvs, &chunk.windows)?;
-        let mut rec_refs: Vec<&mut RecurrentState> = recs.iter_mut().collect();
-        let decode_tokens: Vec<u32> = active.iter().map(|r| r.last_token).collect();
-        let decode_views = match self.schedule_decode_views(active) {
-            Ok(views) => views,
-            Err(error) => {
-                self.kv_cache
-                    .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
+        let prefill_logits = self.batch_prefill_logits(chunk)?;
+        let decoded = if active.is_empty() {
+            false
+        } else {
+            if let Err(error) = self.decode_graph(decode_cohort, active) {
+                if let ScheduledChunkBackendState::Single { kvs, .. } = &mut chunk.backend_state {
+                    self.kv_cache
+                        .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
+                }
                 return Err(error);
             }
+            true
         };
-        let result = self.model.unified_step(
-            &window_refs,
-            &prefill_views,
-            &mut rec_refs,
-            &decode_tokens,
-            &decode_views,
-            self.kv_cache.buffer(),
-            &mut self.graph_state,
-        );
-        if result.is_err() {
-            self.kv_cache
-                .revert_scheduled_requests(kvs.iter_mut().map(Box::as_mut));
-            self.kv_cache
-                .revert_scheduled_requests(active.iter_mut().filter_map(active_request_kv));
-        }
-        result
+        Ok(crate::unified_forward::UnifiedStepOutput {
+            prefill_logits: Some(prefill_logits),
+            decoded,
+        })
     }
 
-    pub(super) fn decode_graph(&mut self, active: &mut [ActiveRequest35]) -> Result<()> {
+    pub(super) fn decode_graph(
+        &mut self,
+        cohort: CohortId,
+        active: &mut [ActiveRequest35],
+    ) -> Result<()> {
         let token_ids: Vec<u32> = active.iter().map(|r| r.last_token).collect();
+        let mut slot_indices = Vec::with_capacity(active.len());
+        for req in active.iter() {
+            match req.backend_state {
+                ActiveBackendState::Single {
+                    cohort: req_cohort,
+                    graph_slot_idx,
+                    ..
+                } => {
+                    anyhow::ensure!(
+                        req_cohort == cohort,
+                        "Qwen3.5 decode cohort mismatch: expected {cohort:?}, got {req_cohort:?}"
+                    );
+                    slot_indices.push(graph_slot_idx);
+                }
+                ActiveBackendState::Tp { .. } => {
+                    anyhow::bail!("single-GPU decode received TP active state")
+                }
+            }
+        }
         let views = self.schedule_decode_views(active)?;
+        let graph_state = &mut self.cohorts[cohort.index()].graph_state;
         let result = self.model.batch_decode_graph(
             &token_ids,
             &views,
+            &slot_indices,
             self.kv_cache.buffer(),
-            &mut self.graph_state,
+            graph_state,
             crate::batch_decode::DecodeGraphUse::Serve,
         );
         if result.is_err() {
@@ -512,7 +689,7 @@ impl SingleGpuBackend {
         let params_refs: Vec<&SamplingParams> = pending.iter().map(|r| &r.request.params).collect();
         let tokens = self.model.select_tokens_from_logits_varied(
             logits,
-            &mut self.graph_state.buffers,
+            &mut self.cohorts[CohortId::A.index()].graph_state.buffers,
             &params_refs,
             sample_seed,
         )?;
@@ -523,21 +700,21 @@ impl SingleGpuBackend {
 
     pub(super) fn sample_decode_logits(
         &mut self,
+        cohort: CohortId,
         active: &[ActiveRequest35],
         sample_seed: u64,
     ) -> Result<(Vec<u32>, Vec<Option<TokenLogprob>>)> {
         let requested_logprobs: Vec<Option<usize>> = active.iter().map(|r| r.logprobs).collect();
+        let buffers = &mut self.cohorts[cohort.index()].graph_state.buffers;
         let cpu_logits = snapshot_requested_logprobs(
             self.model.device_ctx(),
-            &self.graph_state.buffers.logits,
+            &buffers.logits,
             &requested_logprobs,
         )?;
         let params_refs: Vec<&SamplingParams> = active.iter().map(|r| &r.params).collect();
-        let tokens = self.model.select_tokens_batch_varied(
-            &mut self.graph_state.buffers,
-            &params_refs,
-            sample_seed,
-        )?;
+        let tokens = self
+            .model
+            .select_tokens_batch_varied(buffers, &params_refs, sample_seed)?;
 
         let logprobs = attached_logprobs(cpu_logits, &tokens);
         Ok((tokens, logprobs))
@@ -545,64 +722,6 @@ impl SingleGpuBackend {
 
     pub(super) fn is_stop_token(&self, token: u32) -> bool {
         self.model.is_stop_token(token)
-    }
-
-    pub(super) fn copy_recurrent_to_slot(
-        &mut self,
-        recurrent: &RecurrentState,
-        slot_idx: usize,
-    ) -> Result<()> {
-        self.graph_state
-            .copy_state_to_slot(self.model.device_ctx(), recurrent, slot_idx)
-    }
-
-    pub(super) fn compact_slot(
-        &mut self,
-        active: &mut [ActiveRequest35],
-        compaction: plan::SlotCompaction,
-    ) {
-        let src_slot = match active[compaction.moved_to].backend_state {
-            ActiveBackendState::Single { graph_slot_idx, .. } => graph_slot_idx,
-            ActiveBackendState::Tp { .. } => {
-                panic!("single-GPU slot compaction received TP active state")
-            }
-        };
-        debug_assert_eq!(src_slot, compaction.moved_from);
-
-        let ctx = self.model.device_ctx();
-        let src = &self.graph_state.slot_states[compaction.moved_from];
-        for layer_idx in 0..src.layers.len() {
-            let (src_part, dst_part) = if compaction.moved_to < compaction.moved_from {
-                let (left, right) = self
-                    .graph_state
-                    .slot_states
-                    .split_at_mut(compaction.moved_from);
-                (
-                    &right[0].layers[layer_idx],
-                    &mut left[compaction.moved_to].layers[layer_idx],
-                )
-            } else {
-                unreachable!("idx < active.len() <= last");
-            };
-
-            ctx.stream
-                .memcpy_dtod(&src_part.state, &mut dst_part.state)
-                .expect("compact slot state copy failed");
-            ctx.stream
-                .memcpy_dtod(&src_part.conv_state.data, &mut dst_part.conv_state.data)
-                .expect("compact slot conv_state copy failed");
-        }
-        self.graph_state.slot_states[compaction.moved_to].seq_len =
-            self.graph_state.slot_states[compaction.moved_from].seq_len;
-
-        match &mut active[compaction.moved_to].backend_state {
-            ActiveBackendState::Single { graph_slot_idx, .. } => {
-                *graph_slot_idx = compaction.moved_to;
-            }
-            ActiveBackendState::Tp { .. } => {
-                panic!("single-GPU slot compaction received TP active state")
-            }
-        }
     }
 }
 
@@ -749,10 +868,7 @@ impl TpSchedulerBackend {
             .drop_request_with_compaction(request_id, expectation, None)
     }
 
-    /// Remove the TP request at `idx` via swap_remove and stash the resulting
-    /// slot compaction for the paired `drop_active_state`. Mirrors
-    /// `compact_single_slot`: after the swap, slots `0..active.len()` stay
-    /// dense because the moved request's slot follows it.
+    /// Removes the TP request at `idx` via `swap_remove` and stashes slot compaction for the paired `drop_active_state`.
     pub(super) fn take_active_request(
         &mut self,
         active: &mut Vec<ActiveRequest35>,
@@ -817,10 +933,47 @@ impl SchedulerBackend {
         }
     }
 
-    pub(super) fn max_batch(&self) -> usize {
+    pub(super) fn decode_width(&self) -> usize {
         match self {
-            Self::Single(backend) => backend.max_batch(),
+            Self::Single(backend) => backend.decode_width(),
             Self::Tp(backend) => backend.max_batch(),
+        }
+    }
+
+    pub(super) fn max_resident(&self) -> usize {
+        match self {
+            Self::Single(backend) => backend.max_resident(),
+            Self::Tp(backend) => backend.max_batch(),
+        }
+    }
+
+    pub(super) fn cohort_count(&self) -> usize {
+        match self {
+            Self::Single(backend) => backend.cohort_count(),
+            Self::Tp(_) => 1,
+        }
+    }
+
+    pub(super) fn release_chunk_slots(&mut self, chunk: &ScheduledChunk) {
+        if let Self::Single(backend) = self {
+            backend.release_chunk_slots(chunk);
+        }
+    }
+
+    pub(super) fn release_active_slots(&mut self, active: &[ActiveRequest35]) {
+        if let Self::Single(backend) = self {
+            backend.release_active_slots(active);
+        }
+    }
+
+    pub(super) fn debug_assert_slot_conservation(
+        &self,
+        active_cohorts: &[Vec<ActiveRequest35>; 2],
+        prefilling: &[PrefillingRequest35],
+        inflight_prefill: Option<&InflightPrefill>,
+    ) {
+        if let Self::Single(backend) = self {
+            backend.debug_assert_slot_conservation(active_cohorts, prefilling, inflight_prefill);
         }
     }
 

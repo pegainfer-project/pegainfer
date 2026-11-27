@@ -361,6 +361,7 @@ fn start_with_knobs(
         info: EngineInfo {
             kv_capacity: None,
             servable_len: Some(servable),
+            max_num_seqs: None,
         },
         lora: None,
     })

@@ -706,6 +706,7 @@ impl Qwen35TpExecutor {
         );
 
         let world_size = device_ordinals.len();
+        crate::capacity::ServingCapacity::validate_request(max_batch, max_batch, world_size)?;
         let mut models = Vec::with_capacity(world_size);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
             models.push(Qwen35Model::from_safetensors_with_runtime_and_capacity(
@@ -717,6 +718,7 @@ impl Qwen35TpExecutor {
                     gdn_backend: crate::Qwen35GdnBackend::Triton,
                     prefix_snapshot_bytes,
                 },
+                max_batch,
                 max_batch,
             )?);
         }
@@ -817,16 +819,17 @@ impl Qwen35TpExecutor {
                 }
             }
         }
-        anyhow::ensure!(
-            min_rank_max_batch > 0,
-            "Qwen3.5 TP has no memory capacity for one recurrent request state"
-        );
-        effective_max_batch.store(min_rank_max_batch, Ordering::Release);
         if min_rank_max_batch < max_batch {
-            log::warn!(
-                "Qwen3.5 TP max_batch reduced from {max_batch} to {min_rank_max_batch} by rank-local recurrent-state memory capacity"
+            startup_gate.cancel();
+            anyhow::bail!(
+                "Qwen3.5 TP rank-local memory fits at most max_resident={min_rank_max_batch}, \
+                 below requested max_resident={max_batch}; refusing to silently downgrade"
             );
         }
+        effective_max_batch.store(min_rank_max_batch, Ordering::Release);
+        log::info!(
+            "Qwen3.5 TP{world_size} capacity ready: single cohort, decode_width={max_batch}, max_resident={min_rank_max_batch}"
+        );
         let (watchdog_done, watchdog) = match spawn_nccl_startup_watchdog() {
             Ok(watchdog) => watchdog,
             Err(err) => {

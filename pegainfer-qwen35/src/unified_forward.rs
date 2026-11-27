@@ -19,9 +19,11 @@ use pegainfer_kernels::tensor::StreamOverrideGuard;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvView;
 
+#[cfg(test)]
 use super::batch_decode_graph::BatchDecodeGraphState;
 use super::recurrent_state::RecurrentState;
 use super::weights::Qwen35Model;
+#[cfg(test)]
 use crate::batch_decode::DecodeGraphUse;
 
 pub(crate) struct UnifiedStepOutput {
@@ -98,6 +100,8 @@ impl Qwen35Model {
     /// Prefill logits are returned as `[selection_vocab, n_prefill]` in request order.
     /// Decode logits remain in `graph_state.buffers.logits`; callers sample from
     /// that batched buffer directly to avoid per-request extraction.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn unified_step(
         &self,
         prefill_prompts: &[&[u32]],
@@ -105,6 +109,7 @@ impl Qwen35Model {
         prefill_recurrent_states: &mut [&mut RecurrentState],
         decode_tokens: &[u32],
         decode_views: &[KvView],
+        decode_slot_indices: &[usize],
         kv_buffer: &KvBuffer,
         graph_state: &mut BatchDecodeGraphState,
     ) -> Result<UnifiedStepOutput> {
@@ -132,6 +137,7 @@ impl Qwen35Model {
             self.batch_decode_graph(
                 decode_tokens,
                 decode_views,
+                decode_slot_indices,
                 kv_buffer,
                 graph_state,
                 DecodeGraphUse::Serve,
@@ -217,28 +223,27 @@ mod tests {
         let mut kv = cache.pool().new_request(prompt.clone(), 2, None);
         cache.schedule_prefill(&mut kv, prompt.len()).unwrap();
         let views = [cache.prefill_view(&kv, prompt.len())];
-        let mut rec_states =
-            [RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap()];
-        let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
-        let prefill_logits = model
-            .batch_prefill_logits(&prompt_refs, &views, &mut rec_refs, cache.buffer())
+        let mut graph_state = model
+            .create_batch_decode_graph_state(cache.pool().padding_block_id())
             .unwrap();
+        let prefill_logits = {
+            let mut rec_refs: Vec<&mut RecurrentState> =
+                graph_state.slot_states.iter_mut().take(1).collect();
+            model
+                .batch_prefill_logits(&prompt_refs, &views, &mut rec_refs, cache.buffer())
+                .unwrap()
+        };
         pad_tail_is_suppressed(&prefill_logits, "prefill");
 
         let next = greedy_sample_batch(&model, &prefill_logits, 1)[0];
         cache.apply_prefill(&mut kv, Some(next)).unwrap();
-        let mut graph_state = model
-            .create_batch_decode_graph_state(cache.pool().padding_block_id())
-            .unwrap();
-        graph_state
-            .copy_state_to_slot(&model.ctx, &rec_states[0], 0)
-            .unwrap();
         cache.schedule_decode(&mut kv).unwrap();
         let decode_views = [cache.decode_view(&kv)];
         model
             .batch_decode_graph(
                 &[next],
                 &decode_views,
+                &[0],
                 cache.buffer(),
                 &mut graph_state,
                 DecodeGraphUse::Serve,
@@ -270,29 +275,12 @@ mod tests {
             .zip(prompts)
             .map(|(kv, prompt)| cache.prefill_view(kv, prompt.len()))
             .collect::<Vec<_>>();
-        let mut rec_states = [
-            RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
-            RecurrentState::new(&model.ctx, &model.config, model.geometry).unwrap(),
-        ];
-        let mut rec_refs: Vec<&mut RecurrentState> = rec_states.iter_mut().collect();
         let mut gs = model
             .create_batch_decode_graph_state(cache.pool().padding_block_id())
             .unwrap();
-        let first_logits = if unified {
-            model
-                .unified_step(
-                    &prompts,
-                    &views,
-                    &mut rec_refs,
-                    &[],
-                    &[],
-                    cache.buffer(),
-                    &mut gs,
-                )
-                .unwrap()
-                .prefill_logits
-                .unwrap()
-        } else {
+        let first_logits = {
+            let mut rec_refs: Vec<&mut RecurrentState> =
+                gs.slot_states.iter_mut().take(2).collect();
             model
                 .batch_prefill_logits(&prompts, &views, &mut rec_refs, cache.buffer())
                 .unwrap()
@@ -301,10 +289,6 @@ mod tests {
         for (kv, token) in kvs.iter_mut().zip(&first) {
             cache.apply_prefill(kv, Some(*token)).unwrap();
         }
-        gs.copy_state_to_slot(&model.ctx, &rec_states[0], 0)
-            .unwrap();
-        gs.copy_state_to_slot(&model.ctx, &rec_states[1], 1)
-            .unwrap();
         let mut tokens_a = vec![first[0]];
         let mut tokens_b = vec![first[1]];
         for _ in 1..num_steps {
@@ -318,13 +302,23 @@ mod tests {
             let tids = [*tokens_a.last().unwrap(), *tokens_b.last().unwrap()];
             if unified {
                 model
-                    .unified_step(&[], &[], &mut [], &tids, &views, cache.buffer(), &mut gs)
+                    .unified_step(
+                        &[],
+                        &[],
+                        &mut [],
+                        &tids,
+                        &views,
+                        &[0, 1],
+                        cache.buffer(),
+                        &mut gs,
+                    )
                     .unwrap();
             } else {
                 model
                     .batch_decode_graph(
                         &tids,
                         &views,
+                        &[0, 1],
                         cache.buffer(),
                         &mut gs,
                         DecodeGraphUse::Serve,

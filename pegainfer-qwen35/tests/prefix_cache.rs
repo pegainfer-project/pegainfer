@@ -42,7 +42,7 @@ fn start_engine_with_graph(
 ) -> EngineHarness {
     let handle = pegainfer_qwen35::launch_with_options(
         Path::new(model_path),
-        Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, prefix_cache_mib),
+        Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 2, 1024, prefix_cache_mib),
         pegainfer_qwen35::Qwen35DecodeOverlap::Off,
     )
     .unwrap_or_else(|err| panic!("failed to start Qwen3.5 TP{tp_size} prefix-cache engine: {err}"));
@@ -405,7 +405,7 @@ fn restore_during_live_decode(
     let start_engine = || {
         pegainfer_qwen35::launch_with_options(
             Path::new(&model_path),
-            Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 1024, 128),
+            Qwen35LaunchOptions::new(0, tp_size, cuda_graph, 2, 2, 1024, 128),
             overlap,
         )
         .map(EngineHarness::new)

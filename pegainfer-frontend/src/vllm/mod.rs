@@ -362,6 +362,7 @@ where
                             output_address: output_address.clone(),
                             scheduler: scheduler.handle,
                             kv_capacity: info.kv_capacity,
+                            max_num_seqs: info.max_num_seqs,
                             max_model_len,
                             engine_index: engine_index as u32,
                             data_parallel_size,

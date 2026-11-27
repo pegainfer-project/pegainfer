@@ -67,7 +67,8 @@ impl GdnAcceptance {
             Qwen35DecodeOverlap::Off => "off",
             Qwen35DecodeOverlap::SharedSm => "stream",
         };
-        let max_batch = max_batch.to_string();
+        let decode_width = max_batch.to_string();
+        let max_resident = max_batch.to_string();
         let max_prefill_tokens = max_prefill_tokens.to_string();
         let (shared, matches, provided) = parse_for_line(
             &crate::model_line::MODEL_LINE,
@@ -75,8 +76,10 @@ impl GdnAcceptance {
                 "pegainfer",
                 "--model-path",
                 model_path,
-                "--max-batch",
-                &max_batch,
+                "--decode-width",
+                &decode_width,
+                "--max-resident",
+                &max_resident,
                 "--max-prefill-tokens",
                 &max_prefill_tokens,
                 "--decode-overlap",
@@ -111,7 +114,8 @@ impl GdnAcceptance {
                 tensor_parallel: None,
                 prefix_snapshot_bytes: 0,
             },
-            options.max_batch,
+            options.decode_width,
+            options.max_resident,
         )?;
         self.validate_model(&model)?;
         Ok(model)
@@ -151,12 +155,6 @@ impl GdnAcceptance {
     ) -> Result<Engine> {
         // The identity-checked model is the one moved into the real scheduler.
         let model = self.load_model(model_path, max_batch, max_prefill_tokens, overlap)?;
-        crate::scheduler::start_with_capacity_and_overlap(
-            model,
-            42,
-            max_batch,
-            max_prefill_tokens,
-            overlap,
-        )
+        crate::scheduler::start_with_capacity_and_overlap(model, 42, max_prefill_tokens, overlap)
     }
 }
