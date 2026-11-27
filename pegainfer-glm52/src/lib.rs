@@ -15,6 +15,7 @@ mod bookend;
 mod config;
 mod dense;
 mod dspark;
+mod dspark_pool;
 #[cfg(test)]
 mod dspark_smoke;
 mod fp8;
@@ -582,6 +583,9 @@ struct Glm52ContextBudget {
     arena_bytes: usize,
     reserve_bytes: usize,
     budget_bytes: usize,
+    /// Bytes the DSpark draft KV pool may take (0 = disabled): carved out of
+    /// `budget_bytes` before the cap is chosen.
+    draft_pool_bytes: usize,
     /// The measured fill's floor: the legacy nominal `slots x cap` pool when
     /// the ledger says it fits, else a one-request pool (the
     /// explicit-big-cap shape the pool decoupling exists for).
@@ -679,6 +683,7 @@ fn derive_max_model_len(
     drafter: &Glm52Drafter,
     prefill_scratch_bytes: usize,
     prefill_only: bool,
+    no_prefix_cache: bool,
     moe_topo: Glm52MoeTopo,
 ) -> Result<Glm52ContextBudget> {
     let reserve_bytes = GLM52_VRAM_RESERVE_BYTES
@@ -689,6 +694,16 @@ fn derive_max_model_len(
         }
         + prefill_scratch_bytes;
     let budget_bytes = min_free_vram_bytes.saturating_sub(reserve_bytes);
+    // DSpark persistence (#590) shares the same budget: the draft pool is
+    // carved out before the cap search, so enabling it always costs context
+    // instead of overcommitting. `--no-prefix-cache` never allocates the pool
+    // (see `start_engine`), so it must not pay for it either.
+    let draft_pool_bytes = if drafter.is_dspark() && !no_prefix_cache {
+        crate::dspark_pool::resolve_budget_bytes(budget_bytes)?
+    } else {
+        0
+    };
+    let kv_budget_bytes = budget_bytes.saturating_sub(draft_pool_bytes);
     let max_model_len = if let Some(requested) = requested {
         ensure!(
             requested >= GLM52_MIN_MODEL_LEN,
@@ -723,15 +738,16 @@ fn derive_max_model_len(
         // floors at the one-request pool anyway, and FinishKv or the lazy
         // graph capture OOMs raw instead of failing at this door.
         ensure!(
-            required + glm52_graph_reserve_bytes() <= budget_bytes,
+            required + glm52_graph_reserve_bytes() <= kv_budget_bytes,
             "GLM5.2 --max-model-len {requested} needs {} of cache per rank (fixed arenas + a \
              one-request pool + {} graph reserve) but only {} fits (min rank free VRAM {} - \
-             reserve {}); lower it or free VRAM",
+             reserve {} - draft pool {}); lower it or free VRAM",
             ByteSize(required as u64),
             ByteSize(glm52_graph_reserve_bytes() as u64),
-            ByteSize(budget_bytes as u64),
+            ByteSize(kv_budget_bytes as u64),
             ByteSize(min_free_vram_bytes as u64),
             ByteSize(reserve_bytes as u64),
+            ByteSize(draft_pool_bytes as u64),
         );
         requested
     } else {
@@ -746,7 +762,7 @@ fn derive_max_model_len(
                 drafter,
                 prefill_only,
                 moe_topo,
-            )? <= budget_bytes
+            )? <= kv_budget_bytes
             {
                 lo = mid;
             } else {
@@ -757,10 +773,11 @@ fn derive_max_model_len(
         ensure!(
             derived >= GLM52_MIN_MODEL_LEN,
             "GLM5.2 free VRAM leaves a context cap of {derived} (< {GLM52_MIN_MODEL_LEN}): \
-             budget {} (min rank free VRAM {} - reserve {})",
-            ByteSize(budget_bytes as u64),
+             budget {} (min rank free VRAM {} - reserve {} - draft pool {})",
+            ByteSize(kv_budget_bytes as u64),
             ByteSize(min_free_vram_bytes as u64),
             ByteSize(reserve_bytes as u64),
+            ByteSize(draft_pool_bytes as u64),
         );
         derived
     };
@@ -772,7 +789,7 @@ fn derive_max_model_len(
     // two-phase fill between the workers' build phases.
     let nominal = glm52_nominal_pool_blocks(max_model_len);
     let floor_blocks = if glm52_cap_bytes(max_model_len, nominal, drafter, prefill_only, moe_topo)?
-        <= budget_bytes
+        <= kv_budget_bytes
     {
         nominal
     } else {
@@ -784,6 +801,7 @@ fn derive_max_model_len(
         arena_bytes: glm52_cap_bytes(max_model_len, floor_blocks, drafter, prefill_only, moe_topo)?,
         reserve_bytes,
         budget_bytes,
+        draft_pool_bytes,
     })
 }
 
@@ -862,12 +880,26 @@ fn start_engine(
     let post_weight_charge_bytes = qa_kva_twin_bytes
         .checked_add(deepgemm_vram_charge_bytes)
         .context("GLM5.2 post-weight VRAM charge overflow")?;
+    // An explicitly armed draft-pool knob without a DSpark drafter is a
+    // misconfiguration, not a silent no-op (the default ratio only applies
+    // when DSpark is on).
+    if !drafter.is_dspark()
+        && (std::env::var_os(crate::dspark_pool::ENV_BYTES).is_some()
+            || std::env::var_os(crate::dspark_pool::ENV_RATIO).is_some())
+    {
+        anyhow::bail!(
+            "{} / {} only apply to a DSpark drafter (--dflash-draft-model-path)",
+            crate::dspark_pool::ENV_BYTES,
+            crate::dspark_pool::ENV_RATIO,
+        );
+    }
     let budget = derive_max_model_len(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(post_weight_charge_bytes),
         drafter,
         glm52_prefill_scratch_reservation(prefill_only)?,
         prefill_only.is_some(),
+        no_prefix_cache,
         moe_topo,
     )?;
     if let Some(prefill) = prefill_only {
@@ -917,9 +949,18 @@ fn start_engine(
     // — when DSpark is on — the draft weights reserve plus its cap-scaled
     // states loaded after comm setup. The measured KV fill holds these back
     // alongside the graph reserve.
+    // `--no-prefix-cache` leaves the pool unallocated, so it must not be
+    // charged either.
+    let draft_pool_budget_bytes = if no_prefix_cache {
+        0
+    } else {
+        budget.draft_pool_bytes
+    };
     let post_finish_reserve_bytes = deepgemm_vram_charge_bytes
         + if drafter.is_dspark() {
-            GLM52_DSPARK_VRAM_RESERVE_BYTES + crate::dspark::glm52_dspark_arena_bytes(max_model_len)
+            GLM52_DSPARK_VRAM_RESERVE_BYTES
+                + crate::dspark::glm52_dspark_arena_bytes(max_model_len)
+                + draft_pool_budget_bytes
         } else {
             0
         };
@@ -951,6 +992,26 @@ fn start_engine(
             return Err(err);
         }
     };
+    // The pool can never cover more blocks than the target pool has, and a
+    // zero-block pool means the persistence experiment is off (DSpark keeps
+    // prefix caching disabled, exactly the pre-#590 behaviour).
+    let draft_pool_blocks = crate::dspark_pool::pool_blocks(draft_pool_budget_bytes, pool_blocks);
+    if drafter.is_dspark() {
+        log::info!(
+            "GLM5.2 DSpark draft KV pool: {draft_pool_blocks} blocks x {} tokens ({} per worker \
+             x {} worker(s), {} of the {} budget) - prefix caching {}",
+            crate::dspark_pool::DRAFT_POOL_PAGE,
+            ByteSize(crate::dspark_pool::pool_bytes(draft_pool_blocks) as u64),
+            loaded.workers.len(),
+            ByteSize(draft_pool_budget_bytes as u64),
+            ByteSize(budget.budget_bytes as u64),
+            if draft_pool_blocks > 0 {
+                "on"
+            } else {
+                "off (pool disabled)"
+            },
+        );
+    }
     let mirrored_early = moe_topo.uses_tensor_replicated_moe();
     let local_ranks_early = if mirrored_early {
         1
@@ -969,7 +1030,7 @@ fn start_engine(
             preflight_prefill_kernels(&loaded.workers)?;
         }
         if let Some(dspark_path) = drafter.dspark_path() {
-            load_dspark_drafters(&loaded.workers, dspark_path)?;
+            load_dspark_drafters(&loaded.workers, dspark_path, draft_pool_blocks)?;
         }
         ensure_post_build_headroom(&loaded.workers)?;
         let device_ordinals: Vec<usize> = (0..startup.ranks.len()).collect();
@@ -1073,6 +1134,7 @@ fn start_engine(
             runtime: store_runtime.clone(),
             max_model_len,
             no_prefix_cache,
+            draft_pool_blocks,
             moe_topo,
             load_tx: load_txs[engine_index].clone(),
             graph_dump_request: if engine_index == 0 {
@@ -1198,11 +1260,15 @@ fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
 /// the draft's embed/lm_head reuse the target's, so they are never loaded).
-fn load_dspark_drafters(workers: &[Glm52Worker], dspark_path: &Path) -> Result<()> {
+fn load_dspark_drafters(
+    workers: &[Glm52Worker],
+    dspark_path: &Path,
+    draft_pool_blocks: usize,
+) -> Result<()> {
     let started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.load_dspark_async(dspark_path))
+        .map(|worker| worker.load_dspark_async(dspark_path, draft_pool_blocks))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response.recv().map_err(|_| {
@@ -1755,6 +1821,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            false,
             TEST_TOPO,
         )
         .expect("derive")
@@ -1766,6 +1833,7 @@ mod max_model_len_tests {
             free_for(50_048, &Glm52Drafter::None, 0),
             &Glm52Drafter::None,
             0,
+            false,
             false,
             TEST_TOPO,
         )
@@ -1780,7 +1848,7 @@ mod max_model_len_tests {
         // the legacy `slots x cap` pool floors the measured fill there.
         let drafter = Glm52Drafter::NativeMtp;
         let free = free_for(50_048, &drafter, 0) + (64 << 20);
-        let budget = derive_max_model_len(Some(50_048), free, &drafter, 0, false, TEST_TOPO)
+        let budget = derive_max_model_len(Some(50_048), free, &drafter, 0, false, false, TEST_TOPO)
             .expect("derive");
         assert_eq!(budget.floor_blocks, glm52_nominal_pool_blocks(50_048));
     }
@@ -1797,9 +1865,16 @@ mod max_model_len_tests {
                 .expect("cap bytes")
             + glm52_graph_reserve_bytes()
             + (64 << 20);
-        let budget =
-            derive_max_model_len(Some(cap), free, &Glm52Drafter::None, 0, false, TEST_TOPO)
-                .expect("derive");
+        let budget = derive_max_model_len(
+            Some(cap),
+            free,
+            &Glm52Drafter::None,
+            0,
+            false,
+            false,
+            TEST_TOPO,
+        )
+        .expect("derive");
         assert_eq!(budget.floor_blocks, one_request);
         assert!(one_request < glm52_nominal_pool_blocks(cap));
     }
@@ -1826,25 +1901,56 @@ mod max_model_len_tests {
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
-            .expect("derive");
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, false, TEST_TOPO)
+                .expect("derive");
         let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
-        let dspark =
-            derive_max_model_len(None, free, &dspark_drafter, 0, false, TEST_TOPO).expect("derive");
+        let dspark = derive_max_model_len(None, free, &dspark_drafter, 0, false, false, TEST_TOPO)
+            .expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
         );
     }
 
+    /// `--no-prefix-cache` never allocates the draft pool, so it must not pay
+    /// for it: the derived cap stays at the no-pool value and the budget the
+    /// launch charges is zero.
+    #[test]
+    fn no_prefix_cache_does_not_charge_the_draft_pool() {
+        let free = free_for(50_048, &Glm52Drafter::None, 0);
+        let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
+        let pooled = derive_max_model_len(None, free, &dspark_drafter, 0, false, false, TEST_TOPO)
+            .expect("derive");
+        assert!(
+            pooled.draft_pool_bytes > 0,
+            "the default ratio funds the pool"
+        );
+        let no_cache = derive_max_model_len(None, free, &dspark_drafter, 0, false, true, TEST_TOPO)
+            .expect("derive");
+        assert_eq!(no_cache.draft_pool_bytes, 0);
+        assert!(
+            no_cache.max_model_len > pooled.max_model_len,
+            "--no-prefix-cache must derive the cap without the pool carve-out"
+        );
+    }
+
     #[test]
     fn native_mtp_lane_shrinks_the_derived_cap() {
         let free = free_for(50_048, &Glm52Drafter::None, 0);
-        let plain = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
-            .expect("derive");
-        let native_mtp =
-            derive_max_model_len(None, free, &Glm52Drafter::NativeMtp, 0, false, TEST_TOPO)
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, false, TEST_TOPO)
                 .expect("derive");
+        let native_mtp = derive_max_model_len(
+            None,
+            free,
+            &Glm52Drafter::NativeMtp,
+            0,
+            false,
+            false,
+            TEST_TOPO,
+        )
+        .expect("derive");
         assert!(
             native_mtp.max_model_len < plain.max_model_len,
             "native MTP cap-scaled KV must shrink the target context cap"
@@ -1903,6 +2009,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            false,
             TEST_TOPO,
         )
         .expect("derive");
@@ -1917,6 +2024,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            false,
             TEST_TOPO,
         )
         .expect_err("sub-minimum cap must fail");
@@ -1930,6 +2038,7 @@ mod max_model_len_tests {
             free_for(100_032, &Glm52Drafter::None, 0),
             &Glm52Drafter::None,
             0,
+            false,
             false,
             TEST_TOPO,
         )
@@ -1962,6 +2071,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            false,
             TEST_TOPO,
         )
         .expect_err("a budget below the one-request pool must fail");
@@ -1976,6 +2086,7 @@ mod max_model_len_tests {
             &Glm52Drafter::None,
             0,
             false,
+            false,
             TEST_TOPO,
         )
         .expect_err("sub-minimum cap must fail");
@@ -1989,11 +2100,19 @@ mod max_model_len_tests {
         let scratch =
             glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
         let free = free_for(100_032, &Glm52Drafter::None, 0);
-        let decode = derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, TEST_TOPO)
-            .expect("decode budget");
-        let prefill =
-            derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true, TEST_TOPO)
-                .expect("prefill budget");
+        let decode =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false, false, TEST_TOPO)
+                .expect("decode budget");
+        let prefill = derive_max_model_len(
+            None,
+            free,
+            &Glm52Drafter::None,
+            scratch,
+            true,
+            false,
+            TEST_TOPO,
+        )
+        .expect("prefill budget");
         // Prefill-only budgets the full slot count too (the prefix cache
         // retains released prefixes in the pool headroom), so its cap can
         // only trail the decode cap — by exactly the scratch reservation.

@@ -2,7 +2,7 @@
 
 **TL;DR**: The static per-slot KV partitions (slot `b` owns tokens `[b*cap, (b+1)*cap)`, identity block table) are replaced by a per-rank `pegainfer-kv-cache::BlockPool` of 64-token pages with content-hashed blocks — the Kimi #239 pattern, zero kernel changes. Admission reserves a request's full-lifetime page count (honor-or-reject), prefix caching is on by default (suffix-only prefill, `cached_tokens` reported), and the coordinator ships each step's page rows + write slots to the ranks as `Glm52StepKv`. DSpark and prefix caching are mutually exclusive (draft anchor-position assert). **jz-38 validated 2026-07-06: warm prefix TTFT 14.1 s → 0.84 s (16.9×) on a 1200-token varied prompt with byte-identical output; step-bench sweep dead even with the D5 main anchors (b1 25.4 / b8 43.2 ms, c64 1483 tok/s); oracle gates green; 9-way near-tie divergence adjudicated under the D2 cross-bucket contract.**
 
-Last touched: 2026-08
+Last touched: 2026-11
 
 ## Why the kernels needed nothing
 
@@ -126,14 +126,50 @@ A/B can't see this (solo always lands on the same rank). Cache-aware
 placement (probe every rank's pool at admission, prefer the best hit) is the
 follow-up lever.
 
-### DSpark exclusion
+### DSpark × prefix cache (paged draft KV, #590)
 
-The draft lane asserts `anchor_pos == committed + pending` context rows; a
+The draft lane asserts `anchor_pos == committed + pending` context rows, and a
 skipped prefix never produces the aux-hidden captures ({7,22,38,54,69}) the
-draft consumes, and recomputing them = running the target forward = no
-savings. Drafter on → prefix matching off (logged). Follow-up if warm-hit ×
-spec-decode matters: base-offset the draft context (draft KV starts at the
-suffix; verify keeps losslessness, accept rate near the hit degrades).
+draft projects. The Qwen3 line solved the same problem by persisting the
+projected draft K/V under the target's block ids (qwen3 #1238); GLM5.2 now
+does the same in a **bounded side pool**:
+
+- **Pool:** one K/V tensor per draft layer (`[4096, blocks x 64]`), addressed by
+  `pool_slot(page, position) = page*64 + position%64`, i.e. the target page ids
+  themselves. The draft row is 81,920 B/token vs the 656 B MLA row (~125x), so
+  the pool is explicitly budgeted: `GLM52_DSPARK_DRAFT_POOL_RATIO` (default
+  `0.10` of the KV-eligible VRAM) or `GLM52_DSPARK_DRAFT_POOL_BYTES` (absolute
+  override); blocks = `min(target pool blocks, budget / 5,242,880)`. The budget
+  is charged before the context-cap search, so enabling it costs context
+  (`max_model_len` shrinks) instead of overcommitting. Zero blocks disables the
+  pool and restores the old behaviour (DSpark → prefix cache off).
+- **Materialize:** draft K/V rows are projected one round late (inside
+  `propose`, draining the pending captures). The same round then scatters rows
+  `[cursor, cover)` into the target's page slots — after `propose`, in one
+  launch over the slot's 10 K/V pairs. `cover` stops at the last page the
+  target has provisioned (a dangling-bonus row waits one round) and at the last
+  page the draft pool itself owns, so a pool smaller than the target pool never
+  writes out of bounds. A page is **tagged** only after all 64 of its rows are
+  in the pool, and a page whose tail rows past `cover` still belong to an
+  older epoch has its tag dropped (the pool no longer holds one content for
+  the whole page; the tag pass re-establishes it once the cursor crosses the
+  page). A prefill-only turn (`max_tokens=1`) runs a materialize-only
+  round so its prompt pages still become matchable.
+- **Restore:** at admission, every matched page must be in the pool and carry
+  the same sequence hash; then the next draft round gathers the prefix into the
+  slot's dense K/V and sets `committed_len = cached`. One untagged page keeps
+  the target KV hit but marks the request **Plain** (no drafts, no captures) —
+  never read unwritten draft rows. Plain requests do not warm the pool.
+- **Scope:** rank-local, zero collectives (the drafter is replicated per rank
+  already; under mirrored TP every worker holds an identical pool and the
+  existing span-identity assert covers it). `--no-prefix-cache` skips the pool
+  entirely — it is neither allocated nor charged against the context budget;
+  host offload stays rejected with DSpark (offloaded pages are untagged by
+  construction).
+
+Status: implementation complete; the GB300 EP4/EP8 gates (cold vs warm accept
+parity, losslessness, untagged fallback, exact 64-token boundary, prefill-only
+warm, budget/VRAM floor, mirrored identity) are the acceptance step.
 
 ## Determinism contract change (for the jz-38 gates)
 

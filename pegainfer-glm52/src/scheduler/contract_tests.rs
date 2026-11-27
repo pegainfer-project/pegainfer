@@ -36,6 +36,7 @@ use super::slot::Glm52StepOutcome;
 use super::testkit::EOS;
 use super::testkit::request;
 use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::scheduler::DraftMode;
 
 /// A tier-less store over `pool`, on a private runtime: admission consults
 /// only `pinned_blocks` (0 here), so any live handle serves.
@@ -74,6 +75,7 @@ fn load_snapshot_reports_the_ranks_own_state() {
     slots[0] = Some(ActiveRequest {
         req,
         state,
+        draft: DraftMode::Eligible,
         client_prompt_tokens: 2,
         kv,
         save_cursor: SaveCursor::new(),
@@ -164,6 +166,7 @@ fn admission_fills_free_slots_from_the_local_queue() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("admission");
 
@@ -204,6 +207,7 @@ fn prefill_only_admits_multiple_requests_within_pool_capacity() {
         false,
         true,
         &mut pending_resets,
+        None,
     )
     .expect("prefill-only admission");
 
@@ -238,6 +242,7 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
         false,
         true,
         &mut pending_resets,
+        None,
     )
     .expect("temporary pressure is not an admission error");
 
@@ -256,6 +261,7 @@ fn admission_defers_while_physical_pages_are_temporarily_held() {
         false,
         true,
         &mut pending_resets,
+        None,
     )
     .expect("admit after pressure clears");
 
@@ -305,6 +311,7 @@ fn admission_sheds_rear_prefix_holds_when_the_front_cannot_fit() {
         false,
         true,
         &mut pending_resets,
+        None,
     )
     .expect("shedding the rear hold is not an admission error");
 
@@ -381,6 +388,7 @@ fn admission_admits_a_page_aligned_full_hit_at_exact_pool_capacity() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("a fully-cached page-aligned prompt at exact capacity must admit");
 
@@ -463,6 +471,7 @@ fn native_admission_rebuilds_the_padded_chain() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("native admission");
 
@@ -522,6 +531,7 @@ fn aligned_native_front_admits_against_its_own_hold() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("admission at exact capacity");
 
@@ -567,6 +577,7 @@ fn unaligned_native_credits_full_pages_only() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("a boundary destination the pool cannot back defers, never fails");
     assert_eq!(pending.len(), 1, "the front waits for a free page");
@@ -594,6 +605,7 @@ fn unaligned_native_credits_full_pages_only() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("one spare page admits the boundary copy");
     assert!(pending.is_empty());
@@ -637,6 +649,7 @@ fn suppressed_eos_finishes_at_admission_without_a_slot() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("EOS handoff admission");
 
@@ -703,6 +716,7 @@ fn suppressed_eos_finishes_behind_a_budget_stalled_front() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("EOS sweep behind stalled front");
 
@@ -760,6 +774,7 @@ fn anchor_exhausting_max_tokens_finishes_as_length() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("anchored-length admission");
 
@@ -825,6 +840,7 @@ fn budget_stalled_front_lets_a_fitting_native_bypass() {
         false,
         false,
         &mut pending_resets,
+        None,
     )
     .expect("bypassing a budget-stalled front is not an admission error");
 

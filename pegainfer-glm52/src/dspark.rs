@@ -106,11 +106,11 @@ pub(crate) fn glm52_dspark_arena_bytes(max_model_len: usize) -> usize {
     crate::model::glm52_decode_slots() * (kv + pending + context) + tail + rope
 }
 
-const DSPARK_LAYERS: usize = 5;
+pub(crate) const DSPARK_LAYERS: usize = 5;
 const DSPARK_HEADS: usize = 64;
 const DSPARK_HEAD_DIM: usize = 64;
 /// 64 q-heads == 64 kv-heads (MHA): q and kv projections are both 4096 wide.
-const DSPARK_QKV_DIM: usize = DSPARK_HEADS * DSPARK_HEAD_DIM;
+pub(crate) const DSPARK_QKV_DIM: usize = DSPARK_HEADS * DSPARK_HEAD_DIM;
 const DSPARK_INTER: usize = 12_288;
 const DSPARK_MARKOV_RANK: usize = 256;
 const DSPARK_MASK_TOKEN: u32 = 154_856;

@@ -15,9 +15,9 @@ use super::GLM52_DSPARK_BLOCK;
 use super::GLM52_DSPARK_CONTEXT_DIM;
 use super::GLM52_HIDDEN;
 
-pub(super) struct DsparkLayerKv {
-    pub(super) k: HiddenStates,
-    pub(super) v: HiddenStates,
+pub(crate) struct DsparkLayerKv {
+    pub(crate) k: HiddenStates,
+    pub(crate) v: HiddenStates,
 }
 
 /// Per-slot draft state: the draft KV over committed tokens, the pending
@@ -28,11 +28,11 @@ pub(super) struct DsparkLayerKv {
 /// there would tear the whole engine down), and the launch-time VRAM probe
 /// already charged the full-cap footprint ([`glm52_dspark_arena_bytes`]).
 pub(crate) struct Glm52DsparkSlotState {
-    pub(super) layers: Vec<DsparkLayerKv>,
+    pub(crate) layers: Vec<DsparkLayerKv>,
     /// Captured target hidden `[pending_len, 30720]` awaiting projection.
     pub(super) pending: HiddenStates,
     pub(super) pending_len: usize,
-    pub(super) committed_len: usize,
+    pub(crate) committed_len: usize,
     pub(super) context_projected: HiddenStates,
     pub(super) context_hidden: HiddenStates,
     /// The drafter's KV capacity ([`Glm52DsparkModel::cache_len`]) — the
@@ -60,6 +60,18 @@ impl Glm52DsparkSlotState {
             context_hidden: HiddenStates::zeros(ctx, GLM52_HIDDEN, cache_len)?,
             cache_len,
         })
+    }
+
+    /// Resume from a restored paged prefix: every row below `tokens` is in
+    /// the slot's dense K/V (the gather just wrote it) and nothing is pending.
+    pub(crate) fn restore(&mut self, tokens: usize) {
+        self.committed_len = tokens;
+        self.pending_len = 0;
+        self.pending.seq_len = 0;
+    }
+
+    pub(crate) fn cache_len(&self) -> usize {
+        self.cache_len
     }
 
     /// Clear the slot for a new request. The KV/pending contents need no

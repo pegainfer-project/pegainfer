@@ -12,6 +12,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
 use crossbeam_channel::unbounded;
+use cudarc::driver::CudaSlice;
 use pegainfer_core::cuda_graph::CudaGraphDumpSummary;
 use pegainfer_kv_store::ArenaSpec;
 
@@ -202,6 +203,37 @@ pub(crate) struct Glm52MtpRound {
     pub(crate) proposal_slots: Vec<usize>,
 }
 
+/// One slot's draft input for a round: the verified anchor and whether the
+/// round should keep the proposed span. `draft == false` is a
+/// materialize-only round (prefill-only turn): it still drains the pending
+/// captures into the slot's K/V so the paged pool can persist them.
+#[derive(Clone, Debug)]
+pub(crate) struct DsparkProposal {
+    pub(crate) slot: usize,
+    pub(crate) anchor: u32,
+    pub(crate) anchor_pos: usize,
+    pub(crate) draft: bool,
+}
+
+/// One slot's paged-pool gather before the round.
+#[derive(Clone, Debug)]
+pub(crate) struct DsparkRestore {
+    pub(crate) slot: usize,
+    pub(crate) tokens: usize,
+    /// Pool slot of every restored row, in position order.
+    pub(crate) locs: Vec<i32>,
+}
+
+/// One slot's paged-pool scatter after the round.
+#[derive(Clone, Debug)]
+pub(crate) struct DsparkScatter {
+    pub(crate) slot: usize,
+    /// First dense row in the slot's K/V to copy (rows `start_row..start_row + locs.len()`).
+    pub(crate) start_row: usize,
+    /// Pool slot of every copied row, in position order.
+    pub(crate) locs: Vec<i32>,
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
@@ -270,6 +302,8 @@ enum Glm52RankCommand {
     /// embed/lm_head at forward time).
     LoadDspark {
         path: PathBuf,
+        /// Pages of the paged DSpark draft K/V pool (0 = persistence off).
+        pool_blocks: usize,
         resp: Sender<Result<()>>,
     },
     /// Non-collective: report this rank's current free device VRAM (the
@@ -288,7 +322,9 @@ enum Glm52RankCommand {
         bucket: usize,
         resets: Vec<usize>,
         appends: Vec<(usize, usize)>,
-        proposals: Vec<(usize, u32, usize)>,
+        proposals: Vec<DsparkProposal>,
+        restores: Vec<DsparkRestore>,
+        scatters: Vec<DsparkScatter>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
     },
     /// Collective native-MTP round. Every EP rank's engine issues one command
@@ -460,11 +496,16 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn load_dspark_async(
+        &self,
+        path: &Path,
+        pool_blocks: usize,
+    ) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadDspark {
                 path: path.to_path_buf(),
+                pool_blocks,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -484,7 +525,9 @@ impl Glm52RankWorker {
         bucket: usize,
         resets: Vec<usize>,
         appends: Vec<(usize, usize)>,
-        proposals: Vec<(usize, u32, usize)>,
+        proposals: Vec<DsparkProposal>,
+        restores: Vec<DsparkRestore>,
+        scatters: Vec<DsparkScatter>,
     ) -> Result<Receiver<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -493,6 +536,8 @@ impl Glm52RankWorker {
                 resets,
                 appends,
                 proposals,
+                restores,
+                scatters,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -595,6 +640,12 @@ struct Glm52RankRuntime {
 struct Glm52DsparkRank {
     model: Glm52DsparkModel,
     scratch: Glm52DsparkScratch,
+    /// Paged draft K/V addressed by the target's page ids (#590); `None`
+    /// when the launch budget leaves no room (persistence off).
+    pool: Option<crate::dspark_pool::Glm52DsparkKvPool>,
+    /// H2D staging for restore/scatter location lists (preallocated: the
+    /// round must never hit the allocator).
+    locs_scratch: Option<CudaSlice<i32>>,
     // Sized to the RUNTIME slot count (admission never fills past it) — the
     // cache-length-scaled states are exactly what the dspark arena ledger
     // charges, and a ceiling-sized array would allocate unledgered GiBs.
@@ -762,7 +813,7 @@ impl Glm52RankThreadState {
         Ok(arenas)
     }
 
-    fn load_dspark(&mut self, path: &Path) -> Result<()> {
+    fn load_dspark(&mut self, path: &Path, pool_blocks: usize) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
             .runtime
@@ -780,9 +831,21 @@ impl Glm52RankThreadState {
         for _ in 0..slot_count {
             slots.push(Glm52DsparkSlotState::new(&dev_ctx, model.cache_len())?);
         }
+        let (pool, locs_scratch) = if pool_blocks > 0 {
+            let pool = crate::dspark_pool::Glm52DsparkKvPool::new(&dev_ctx, pool_blocks)?;
+            let locs = dev_ctx
+                .stream
+                .alloc_zeros::<i32>(model.cache_len())
+                .context("GLM5.2 DSpark restore/scatter locs scratch")?;
+            (Some(pool), Some(locs))
+        } else {
+            (None, None)
+        };
         runtime.dspark = Some(Glm52DsparkRank {
             model,
             scratch,
+            pool,
+            locs_scratch,
             slots,
         });
         Ok(())
@@ -793,7 +856,9 @@ impl Glm52RankThreadState {
         bucket: usize,
         resets: &[usize],
         appends: &[(usize, usize)],
-        proposals: &[(usize, u32, usize)],
+        proposals: &[DsparkProposal],
+        restores: &[DsparkRestore],
+        scatters: &[DsparkScatter],
     ) -> Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -804,10 +869,62 @@ impl Glm52RankThreadState {
         let dspark = dspark
             .as_mut()
             .context("GLM5.2 draft command without a loaded DSpark drafter")?;
+        let Glm52DsparkRank {
+            model: dspark_model,
+            pool,
+            locs_scratch,
+            slots,
+            scratch,
+        } = dspark;
 
         for &slot in resets {
             ensure!(slot < GLM52_MAX_BATCH_PER_RANK, "dspark reset slot {slot}");
-            dspark.slots[slot].reset();
+            slots[slot].reset();
+        }
+        // Restores land before appends/propose so `committed_len` walks from
+        // the matched prefix boundary.
+        for restore in restores {
+            ensure!(
+                restore.slot < GLM52_MAX_BATCH_PER_RANK && restore.tokens > 0,
+                "dspark restore slot {} tokens {}",
+                restore.slot,
+                restore.tokens
+            );
+            ensure!(
+                restore.locs.len() >= restore.tokens,
+                "dspark restore has {} locs for {} rows",
+                restore.locs.len(),
+                restore.tokens
+            );
+            let pool = pool
+                .as_ref()
+                .context("dspark restore without a draft pool")?;
+            let locs = locs_scratch
+                .as_mut()
+                .context("dspark restore without locs scratch")?;
+            let mut locs_dst = locs.slice_mut(..restore.tokens);
+            dev_ctx
+                .stream
+                .memcpy_htod(&restore.locs[..restore.tokens], &mut locs_dst)?;
+            let state = &mut slots[restore.slot];
+            ensure!(
+                restore.tokens <= state.cache_len(),
+                "dspark restore {} tokens exceeds the draft cache {}",
+                restore.tokens,
+                state.cache_len()
+            );
+            let mut pairs = Vec::with_capacity(2 * state.layers.len());
+            for (layer_idx, layer) in state.layers.iter_mut().enumerate() {
+                pairs.push((&pool.k[layer_idx], &mut layer.k));
+                pairs.push((&pool.v[layer_idx], &mut layer.v));
+            }
+            pegainfer_kernels::ops::draft_kv_gather_into(
+                &dev_ctx,
+                &mut pairs,
+                locs,
+                restore.tokens,
+            )?;
+            state.restore(restore.tokens);
         }
         if !appends.is_empty() {
             let captured = model.captured(bucket)?;
@@ -816,44 +933,107 @@ impl Glm52RankThreadState {
                     row < bucket && slot < GLM52_MAX_BATCH_PER_RANK,
                     "dspark append row {row} (bucket {bucket}) slot {slot}"
                 );
-                dspark.slots[slot].append_captured_row(&dev_ctx, captured, row)?;
+                slots[slot].append_captured_row(&dev_ctx, captured, row)?;
             }
         }
-        if proposals.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Proposals must arrive slot-ascending so the reply order is the
-        // request order (and slots are trivially unique).
-        ensure!(
-            proposals.windows(2).all(|pair| pair[0].0 < pair[1].0),
-            "dspark proposals must be sorted by slot: {proposals:?}"
-        );
-        let mut states = Vec::with_capacity(proposals.len());
-        let mut anchors = Vec::with_capacity(proposals.len());
-        let mut wanted = proposals.iter().peekable();
-        for (slot, state) in dspark.slots.iter_mut().enumerate() {
-            let Some(&&(want_slot, anchor, anchor_pos)) = wanted.peek() else {
-                break;
-            };
-            if want_slot != slot {
-                continue;
+        // One propose over every slot that has pending rows: `draft` entries
+        // contribute a span, materialize-only entries drain their captures and
+        // drop it. Entries must arrive slot-ascending.
+        let mut spans = Vec::new();
+        if !proposals.is_empty() {
+            ensure!(
+                proposals.windows(2).all(|pair| pair[0].slot < pair[1].slot),
+                "dspark proposals must be sorted by slot"
+            );
+            let mut states = Vec::with_capacity(proposals.len());
+            let mut anchors = Vec::with_capacity(proposals.len());
+            let mut next = 0usize;
+            for (slot, state) in slots.iter_mut().enumerate() {
+                let Some(proposal) = proposals.get(next) else {
+                    break;
+                };
+                if proposal.slot != slot {
+                    continue;
+                }
+                next += 1;
+                states.push(state);
+                anchors.push((proposal.anchor, proposal.anchor_pos));
             }
-            wanted.next();
-            states.push(state);
-            anchors.push((anchor, anchor_pos));
+            ensure!(next == proposals.len(), "dspark propose slot out of range");
+            let proposed = dspark_model.propose(
+                &dev_ctx,
+                model.embed(),
+                model.lm_head(),
+                &mut states,
+                &anchors,
+                scratch,
+            )?;
+            ensure!(
+                proposed.len() == proposals.len(),
+                "dspark propose returned {} spans for {} entries",
+                proposed.len(),
+                proposals.len()
+            );
+            spans = proposed
+                .into_iter()
+                .zip(proposals)
+                .filter(|(_, proposal)| proposal.draft)
+                .map(|(span, _)| span)
+                .collect();
         }
-        ensure!(
-            wanted.peek().is_none(),
-            "dspark propose slot out of range in {proposals:?}"
-        );
-        dspark.model.propose(
-            &dev_ctx,
-            model.embed(),
-            model.lm_head(),
-            &mut states,
-            &anchors,
-            &mut dspark.scratch,
-        )
+        // Persist the rows this round wrote (or the backlog a prior round could
+        // not address) at the target's page ids.
+        for scatter in scatters {
+            ensure!(
+                scatter.slot < GLM52_MAX_BATCH_PER_RANK && !scatter.locs.is_empty(),
+                "dspark scatter slot {} rows {}",
+                scatter.slot,
+                scatter.locs.len()
+            );
+            let pool = pool
+                .as_mut()
+                .context("dspark scatter without a draft pool")?;
+            ensure!(
+                scatter
+                    .locs
+                    .iter()
+                    .all(|&loc| loc >= 0 && (loc as usize) < pool.slots()),
+                "dspark scatter location outside the draft pool ({} slots)",
+                pool.slots()
+            );
+            let locs = locs_scratch
+                .as_mut()
+                .context("dspark scatter without locs scratch")?;
+            let rows = scatter.locs.len();
+            let state = &mut slots[scatter.slot];
+            ensure!(
+                scatter.start_row + rows <= state.committed_len,
+                "dspark scatter rows [{}..{}) are not materialized (committed {})",
+                scatter.start_row,
+                scatter.start_row + rows,
+                state.committed_len
+            );
+            let mut locs_dst = locs.slice_mut(..rows);
+            dev_ctx.stream.memcpy_htod(&scatter.locs, &mut locs_dst)?;
+            let mut pairs = Vec::with_capacity(2 * state.layers.len());
+            for ((pool_k, pool_v), layer) in pool
+                .k
+                .iter_mut()
+                .zip(pool.v.iter_mut())
+                .zip(state.layers.iter_mut())
+            {
+                pairs.push((&layer.k, pool_k));
+                pairs.push((&layer.v, pool_v));
+            }
+            pegainfer_kernels::ops::draft_kv_scatter_into(
+                &dev_ctx,
+                &mut pairs,
+                scatter.start_row,
+                locs,
+                rows,
+            )?;
+        }
+        Ok(spans)
     }
 
     fn mtp_draft(
@@ -1100,8 +1280,12 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             } => {
                 let _ = resp.send(state.dump_decode_graph(bucket, &png_path, &title));
             }
-            Glm52RankCommand::LoadDspark { path, resp } => {
-                let _ = resp.send(state.load_dspark(&path));
+            Glm52RankCommand::LoadDspark {
+                path,
+                pool_blocks,
+                resp,
+            } => {
+                let _ = resp.send(state.load_dspark(&path, pool_blocks));
             }
             Glm52RankCommand::FreeVram { resp } => {
                 let _ = resp.send(state.ctx.free_vram_bytes());
@@ -1111,9 +1295,12 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resets,
                 appends,
                 proposals,
+                restores,
+                scatters,
                 resp,
             } => {
-                let _ = resp.send(state.draft(bucket, &resets, &appends, &proposals));
+                let _ = resp
+                    .send(state.draft(bucket, &resets, &appends, &proposals, &restores, &scatters));
             }
             Glm52RankCommand::MtpDraft { round, resp } => {
                 let _ = resp.send(state.mtp_draft(&round));

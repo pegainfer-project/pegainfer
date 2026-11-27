@@ -94,6 +94,8 @@ use crate::model::GLM52_MODEL_LEN_ALIGN;
 use crate::model::Glm52StepKv;
 use crate::model::Glm52StepShape;
 use crate::model::glm52_table_width;
+use crate::runner::DsparkProposal;
+use crate::runner::DsparkScatter;
 use crate::runner::Glm52MtpAppend;
 use crate::runner::Glm52PrefillBatch;
 use crate::runner::Glm52StepFlags;
@@ -108,11 +110,17 @@ const PAGE: usize = GLM52_MODEL_LEN_ALIGN;
 /// seed suffices; per-request `seed` params replay through `mix_seed`).
 const GLM52_SAMPLE_SEED: u64 = 42;
 
-fn prefix_cache_enabled(drafter: &crate::Glm52Drafter, no_prefix_cache: bool) -> bool {
+fn prefix_cache_enabled(
+    drafter: &crate::Glm52Drafter,
+    no_prefix_cache: bool,
+    draft_pool: bool,
+) -> bool {
     match drafter {
         // DSpark consumes aux-hidden captures produced by exactly the target
-        // forwards a prefix hit skips — missing state, not stale state (#590).
-        crate::Glm52Drafter::Dspark(_) => false,
+        // forwards a prefix hit skips. Persisting the projected draft K/V in
+        // the paged pool turns a hit into a gather (#590); without a pool the
+        // hit would have no drafter state, so matching stays off.
+        crate::Glm52Drafter::Dspark(_) => draft_pool && !no_prefix_cache,
         // Native MTP's layer-78 KV rides the same pool page ids as the main
         // cache, so a GPU radix hit reuses it for free: a hit means the pages
         // were never recycled, and their L78 rows are exactly the ones written
@@ -132,19 +140,235 @@ mod prefix_cache_policy_tests {
         // L78 KV lives at the matched pages themselves, so radix hits are
         // sound; DSpark stays excluded — its aux-hidden captures cannot be
         // recovered from a hit at all.
-        assert!(prefix_cache_enabled(&crate::Glm52Drafter::NativeMtp, false));
-        assert!(!prefix_cache_enabled(&crate::Glm52Drafter::NativeMtp, true));
-        assert!(!prefix_cache_enabled(
-            &crate::Glm52Drafter::Dspark(std::path::PathBuf::from("draft")),
+        assert!(prefix_cache_enabled(
+            &crate::Glm52Drafter::NativeMtp,
+            false,
             false
         ));
-        assert!(prefix_cache_enabled(&crate::Glm52Drafter::None, false));
+        assert!(!prefix_cache_enabled(
+            &crate::Glm52Drafter::NativeMtp,
+            true,
+            false
+        ));
+        assert!(!prefix_cache_enabled(
+            &crate::Glm52Drafter::Dspark(std::path::PathBuf::from("draft")),
+            false,
+            false
+        ));
+        assert!(prefix_cache_enabled(
+            &crate::Glm52Drafter::Dspark(std::path::PathBuf::from("draft")),
+            false,
+            true
+        ));
+        assert!(!prefix_cache_enabled(
+            &crate::Glm52Drafter::Dspark(std::path::PathBuf::from("draft")),
+            true,
+            true
+        ));
+        assert!(prefix_cache_enabled(
+            &crate::Glm52Drafter::None,
+            false,
+            false
+        ));
     }
+}
+
+/// Whether the drafter may propose for this request. A prefix hit whose draft
+/// rows are missing from the paged pool keeps its target KV but degrades to
+/// plain decode (#590); every other DSpark request is eligible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DraftMode {
+    Eligible,
+    Plain,
+}
+
+/// What one span asks the DSpark lane to do next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DsparkSpanWork {
+    /// No draft work: plain mode, or a dying slot with nothing to persist.
+    None,
+    /// Feed the captures into the slot; a later round drains them.
+    Captures,
+    /// Run the draft forward to materialize the captures (the proposal is
+    /// discarded).
+    Materialize {
+        /// The request finishes this span: hold the slot (and its target
+        /// pages) until the draft round persists the captures.
+        defer_release: bool,
+    },
+    /// Propose a span for the next verify step.
+    Propose,
+}
+
+/// Decide the DSpark work for one span.
+///
+/// Two rules are load-bearing:
+/// - a finishing slot still materializes its captures when the pool is on,
+///   because a prefill-only turn is exactly the seed a later prefix hit
+///   restores from (and its target pages must outlive the scatter);
+/// - materialization is pointless without a pool, so a disabled pool never
+///   runs a discarded proposal.
+fn dspark_span_plan(
+    draft: DraftMode,
+    finished: bool,
+    pool_on: bool,
+    wants_drafts: bool,
+    anchor: Option<(u32, usize)>,
+    context_rows: usize,
+) -> DsparkSpanWork {
+    if draft != DraftMode::Eligible {
+        return DsparkSpanWork::None;
+    }
+    if !finished && wants_drafts && anchor.is_some() {
+        return DsparkSpanWork::Propose;
+    }
+    if anchor.is_some() && context_rows > 0 && pool_on {
+        return DsparkSpanWork::Materialize {
+            defer_release: finished,
+        };
+    }
+    if finished {
+        // A dying slot with no pool (or nothing to materialize) has no
+        // reason to keep its captures.
+        return DsparkSpanWork::None;
+    }
+    DsparkSpanWork::Captures
+}
+
+#[cfg(test)]
+mod dspark_span_plan_tests {
+    use super::DraftMode;
+    use super::DsparkSpanWork;
+    use super::dspark_span_plan;
+
+    const ANCHOR: Option<(u32, usize)> = Some((7, 0));
+
+    fn plan(
+        finished: bool,
+        pool_on: bool,
+        wants_drafts: bool,
+        anchor: Option<(u32, usize)>,
+        context_rows: usize,
+    ) -> DsparkSpanWork {
+        dspark_span_plan(
+            DraftMode::Eligible,
+            finished,
+            pool_on,
+            wants_drafts,
+            anchor,
+            context_rows,
+        )
+    }
+
+    #[test]
+    fn single_token_finish_materializes_before_release() {
+        // max_tokens=1 at the prefill boundary: the request finishes on the
+        // span that also produced the captures, so the slot must survive one
+        // materialize round and then release.
+        assert_eq!(
+            plan(true, true, false, ANCHOR, 64),
+            DsparkSpanWork::Materialize {
+                defer_release: true
+            }
+        );
+    }
+
+    #[test]
+    fn pool_off_finish_retires_without_a_discarded_proposal() {
+        assert_eq!(
+            plan(true, false, false, ANCHOR, 64),
+            DsparkSpanWork::None,
+            "a dying slot with no pool needs no captures"
+        );
+    }
+
+    #[test]
+    fn client_disconnect_materializes_without_proposing() {
+        // A disconnect can happen mid-decode with draft budget left: never
+        // propose into a slot that is about to disappear, but do persist the
+        // captures for a future prefix hit.
+        assert_eq!(
+            plan(true, true, true, ANCHOR, 3),
+            DsparkSpanWork::Materialize {
+                defer_release: true
+            }
+        );
+    }
+
+    #[test]
+    fn live_decode_proposes() {
+        assert_eq!(plan(false, true, true, ANCHOR, 1), DsparkSpanWork::Propose);
+    }
+
+    #[test]
+    fn live_tail_span_materializes() {
+        // A span that cannot draft (budget tail) still persists its captures
+        // so the page becomes taggable; the request stays live.
+        assert_eq!(
+            plan(false, true, false, ANCHOR, 1),
+            DsparkSpanWork::Materialize {
+                defer_release: false
+            }
+        );
+    }
+
+    #[test]
+    fn live_mid_prefill_keeps_captures_without_materializing() {
+        // Mid-prefill has no anchor yet; the captures accumulate until the
+        // boundary round.
+        assert_eq!(plan(false, true, false, None, 64), DsparkSpanWork::Captures);
+    }
+
+    #[test]
+    fn pool_off_live_tail_does_not_materialize() {
+        assert_eq!(
+            plan(false, false, false, ANCHOR, 1),
+            DsparkSpanWork::Captures,
+            "live captures still feed future proposals; no pool, no proposal"
+        );
+    }
+
+    #[test]
+    fn pool_off_live_decode_still_proposes() {
+        // Fix 2 must not disable speculative decoding: only the
+        // materialize-only work depends on the pool.
+        assert_eq!(plan(false, false, true, ANCHOR, 1), DsparkSpanWork::Propose);
+    }
+
+    #[test]
+    fn a_dying_slot_without_an_anchor_keeps_nothing() {
+        assert_eq!(plan(true, true, false, None, 64), DsparkSpanWork::None);
+    }
+
+    #[test]
+    fn plain_mode_does_no_draft_work() {
+        assert_eq!(
+            dspark_span_plan(DraftMode::Plain, true, true, true, ANCHOR, 64),
+            DsparkSpanWork::None
+        );
+        assert_eq!(
+            dspark_span_plan(DraftMode::Plain, false, true, true, ANCHOR, 64),
+            DsparkSpanWork::None
+        );
+    }
+}
+
+/// Admission's view of the paged draft state: the tag table it checks and the
+/// per-slot bookkeeping it resets for a new request.
+pub(super) struct DraftAdmission<'a> {
+    pub(super) tags: &'a [Option<[u8; 16]>],
+    pub(super) restores: &'a mut [Option<crate::runner::DsparkRestore>; GLM52_MAX_BATCH_PER_RANK],
+    pub(super) committed: &'a mut [usize; GLM52_MAX_BATCH_PER_RANK],
+    pub(super) materialized: &'a mut [usize; GLM52_MAX_BATCH_PER_RANK],
+    pub(super) pending: &'a mut [usize; GLM52_MAX_BATCH_PER_RANK],
+    pub(super) tagged: &'a mut [usize; GLM52_MAX_BATCH_PER_RANK],
 }
 
 struct ActiveRequest {
     req: GenerateRequest,
     state: Glm52SlotState,
+    /// DSpark only (Native MTP ignores it): see [`DraftMode`].
+    draft: DraftMode,
     /// Prompt length from the client request. Native P/D appends P's anchor
     /// internally, but OpenAI usage must still report the original.
     client_prompt_tokens: usize,
@@ -214,6 +438,8 @@ pub(crate) struct Glm52EngineSpec {
     pub(crate) prefill_chunk_size: Option<usize>,
     pub(crate) max_model_len: usize,
     pub(crate) no_prefix_cache: bool,
+    /// Pages of the paged DSpark draft K/V pool (0 = persistence off).
+    pub(crate) draft_pool_blocks: usize,
     pub(crate) moe_topo: crate::Glm52MoeTopo,
     pub(crate) load_tx: watch::Sender<SchedulerMetrics>,
     pub(crate) graph_dump_request: Option<GraphDumpRequest>,
@@ -235,6 +461,21 @@ pub(crate) struct Glm52Engine {
     prefill_chunk_size: Option<usize>,
     max_model_len: usize,
     prefix_cache: bool,
+    draft_pool_blocks: usize,
+    /// Per target page: the content hash whose draft rows live in the pool.
+    draft_kv_tags: Vec<Option<[u8; 16]>>,
+    /// Per slot: draft rows already written to the pool (scatter cursor).
+    draft_committed: [usize; GLM52_MAX_BATCH_PER_RANK],
+    /// Per slot: draft rows materialized in the dense K/V but not yet
+    /// scattered (the dangling-bonus backlog).
+    draft_materialized: [usize; GLM52_MAX_BATCH_PER_RANK],
+    /// Per slot: captured rows appended but not yet drained by a `propose`
+    /// (mid-prefill chunks accumulate here until the decode boundary).
+    draft_pending: [usize; GLM52_MAX_BATCH_PER_RANK],
+    /// Per slot: assigned blocks already tagged (cursor into the assigned list).
+    draft_tagged: [usize; GLM52_MAX_BATCH_PER_RANK],
+    /// Per slot: a restore to run before the next draft round.
+    draft_restores: [Option<crate::runner::DsparkRestore>; GLM52_MAX_BATCH_PER_RANK],
     /// Whether this rank's store registration carries a host tier (drives
     /// the step-flag hint the planner uses).
     kv_offload: bool,
@@ -279,6 +520,10 @@ pub(crate) struct Glm52Engine {
     /// let admission hand them to another request while the replay still
     /// writes them.
     deferred_releases: Vec<usize>,
+    /// Slots whose finish waited for this step's draft round to persist
+    /// their DSpark captures. They stay active (target pages pinned) through
+    /// `run_draft_round`, then release.
+    materialize_releases: Vec<usize>,
     /// Rank-local step counter driving the non-greedy rows' philox seeds (a
     /// fresh well-mixed seed per (step, rank); ranks never compare seeds).
     sample_step: u64,
@@ -315,7 +560,9 @@ impl Glm52Engine {
         // Prefix matching policy lives in `prefix_cache_enabled`: DSpark is
         // the only drafter that forces it off (aux-hidden captures cannot be
         // recovered from a hit).
-        let prefix_cache = prefix_cache_enabled(&spec.drafter, spec.no_prefix_cache);
+        let draft_pool_blocks = spec.draft_pool_blocks;
+        let prefix_cache =
+            prefix_cache_enabled(&spec.drafter, spec.no_prefix_cache, draft_pool_blocks > 0);
         if spec.drafter.enabled() && !prefix_cache && !spec.no_prefix_cache {
             log::info!("GLM5.2 prefix cache disabled: DSpark drafting is on");
         }
@@ -334,6 +581,13 @@ impl Glm52Engine {
             prefill_chunk_size: spec.prefill_chunk_size,
             max_model_len: spec.max_model_len,
             prefix_cache,
+            draft_pool_blocks,
+            draft_kv_tags: vec![None; draft_pool_blocks],
+            draft_committed: [0; GLM52_MAX_BATCH_PER_RANK],
+            draft_materialized: [0; GLM52_MAX_BATCH_PER_RANK],
+            draft_pending: [0; GLM52_MAX_BATCH_PER_RANK],
+            draft_tagged: [0; GLM52_MAX_BATCH_PER_RANK],
+            draft_restores: std::array::from_fn(|_| None),
             kv_offload: spec.kv_offload,
             store: spec.store,
             runtime: spec.runtime,
@@ -358,6 +612,7 @@ impl Glm52Engine {
             pending_resets: Vec::new(),
             leased_shape: None,
             deferred_releases: Vec::new(),
+            materialize_releases: Vec::new(),
             sample_step: 0,
             channel_open: true,
         }
@@ -514,7 +769,7 @@ impl Glm52Engine {
             };
             let step_ms = t_step.elapsed().as_millis();
             let t_apply = std::time::Instant::now();
-            let (rank_appends, mtp_appends, mut rank_proposals) =
+            let (rank_appends, mtp_appends, mut rank_proposals, rank_materialize_only) =
                 match self.apply_step_outputs(&outputs, &shape, span_kinds, &step_inputs) {
                     Ok(walked) => walked,
                     Err(err) => self.fatal(&err),
@@ -555,7 +810,12 @@ impl Glm52Engine {
             }
 
             let draft_result = if self.drafter.is_dspark() {
-                self.run_draft_round(shape.bucket, rank_appends, rank_proposals)
+                self.run_draft_round(
+                    shape.bucket,
+                    rank_appends,
+                    &rank_proposals,
+                    &rank_materialize_only,
+                )
             } else if self.drafter.is_mtp() {
                 run_mtp_round(
                     self.rank,
@@ -569,8 +829,9 @@ impl Glm52Engine {
             } else {
                 Ok(())
             };
-            if let Err(err) = draft_result {
-                self.fatal(&err);
+            match draft_result {
+                Ok(()) => self.release_materialized(),
+                Err(err) => self.fatal(&err),
             }
         }
     }
@@ -720,6 +981,14 @@ impl Glm52Engine {
     }
 
     fn admit(&mut self) -> anyhow::Result<()> {
+        let mut draft = (self.draft_pool_blocks > 0).then(|| DraftAdmission {
+            tags: &self.draft_kv_tags,
+            restores: &mut self.draft_restores,
+            committed: &mut self.draft_committed,
+            materialized: &mut self.draft_materialized,
+            pending: &mut self.draft_pending,
+            tagged: &mut self.draft_tagged,
+        });
         admit_from_queue(
             self.rank,
             &mut self.pending,
@@ -731,6 +1000,7 @@ impl Glm52Engine {
             self.drafter.enabled(),
             self.prefill_chunk_size.is_some() && self.drafter.is_mtp(),
             &mut self.pending_resets,
+            draft.as_mut(),
         )
     }
 
@@ -961,10 +1231,12 @@ impl Glm52Engine {
         Vec<(usize, usize)>,
         Vec<Glm52MtpAppend>,
         Vec<(usize, u32, usize)>,
+        Vec<(usize, u32, usize)>,
     )> {
         let mut rank_appends = Vec::new();
         let mut mtp_appends = Vec::new();
         let mut rank_proposals = Vec::new();
+        let mut rank_materialize_only = Vec::new();
         // Walk the shape's contiguous per-slot runs; each active slot folds
         // its whole span of row outputs in at once. Padding rows (past
         // `active_rows`) carry no outputs anyone reads (#812).
@@ -1063,6 +1335,72 @@ impl Glm52Engine {
                     (freed, context_rows)
                 }
             };
+            let pool_on = self.prefix_cache && self.draft_pool_blocks > 0;
+            let mut work = DsparkSpanWork::None;
+            let mut release_now = false;
+            if self.drafter.is_dspark() {
+                let anchor = active.state.decode_anchor();
+                work = dspark_span_plan(
+                    active.draft,
+                    freed,
+                    pool_on,
+                    active.state.wants_drafts(),
+                    anchor,
+                    context_rows,
+                );
+                if matches!(
+                    work,
+                    DsparkSpanWork::Captures
+                        | DsparkSpanWork::Materialize { .. }
+                        | DsparkSpanWork::Propose
+                ) {
+                    rank_appends.extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
+                    if pool_on {
+                        // These rows join the slot's pending context; the
+                        // next round that runs a propose drains them and the
+                        // scatter step persists them.
+                        self.draft_pending[slot_id] += context_rows;
+                    }
+                }
+                if let Some((anchor, anchor_pos)) = anchor {
+                    match work {
+                        DsparkSpanWork::Propose => {
+                            rank_proposals.push((slot_id, anchor, anchor_pos));
+                        }
+                        DsparkSpanWork::Materialize { .. } => {
+                            // A span that cannot draft (or a finishing
+                            // request) still drains its captures so the page
+                            // becomes taggable. A finishing slot's release
+                            // waits for the round below (the scatter reads
+                            // its target pages).
+                            rank_materialize_only.push((slot_id, anchor, anchor_pos));
+                        }
+                        DsparkSpanWork::None | DsparkSpanWork::Captures => {}
+                    }
+                }
+            } else if self.drafter.enabled() && !freed {
+                for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
+                    let input_token = if offset + 1 < context_rows {
+                        step_inputs[target_row + 1].0
+                    } else {
+                        active.state.next_input_at(0).token
+                    };
+                    mtp_appends.push(Glm52MtpAppend {
+                        target_row,
+                        slot: slot_id,
+                        input_token,
+                        position: step_inputs[target_row].1,
+                        pages: active.kv.current_page_indices(),
+                    });
+                }
+                let wants_drafts = active
+                    .state
+                    .wants_full_draft(crate::mtp::glm52_mtp_draft_len());
+                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
+                    rank_proposals.push((slot_id, anchor, anchor_pos));
+                }
+            }
+
             if freed {
                 #[cfg(test)]
                 active
@@ -1087,51 +1425,29 @@ impl Glm52Engine {
                     // admission hand them to another request while the
                     // replay still writes them.
                     self.deferred_releases.push(slot_id);
-                } else {
-                    let finished = slot.take().expect("freed slot was active");
-                    self.store.retire(
-                        self.rank,
-                        finished.kv,
-                        finished.save_cursor,
-                        SaveClass::Cacheable,
-                    );
-                    if self.drafter.enabled() {
-                        self.pending_resets.push(slot_id);
+                } else if matches!(
+                    work,
+                    DsparkSpanWork::Materialize {
+                        defer_release: true
                     }
-                    *slot = None;
-                }
-            } else if self.drafter.enabled() {
-                if self.drafter.is_dspark() {
-                    rank_appends.extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
+                ) {
+                    // The draft round below persists this finish's captures;
+                    // the target pages stay assigned (and pinned) until then.
+                    self.materialize_releases.push(slot_id);
                 } else {
-                    for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
-                        let input_token = if offset + 1 < context_rows {
-                            step_inputs[target_row + 1].0
-                        } else {
-                            active.state.next_input_at(0).token
-                        };
-                        mtp_appends.push(Glm52MtpAppend {
-                            target_row,
-                            slot: slot_id,
-                            input_token,
-                            position: step_inputs[target_row].1,
-                            pages: active.kv.current_page_indices(),
-                        });
-                    }
-                }
-                let wants_drafts = if self.drafter.is_mtp() {
-                    active
-                        .state
-                        .wants_full_draft(crate::mtp::glm52_mtp_draft_len())
-                } else {
-                    active.state.wants_drafts()
-                };
-                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
-                    rank_proposals.push((slot_id, anchor, anchor_pos));
+                    release_now = true;
                 }
             }
+            if release_now {
+                self.release_slot(slot_id);
+            }
         }
-        Ok((rank_appends, mtp_appends, rank_proposals))
+        Ok((
+            rank_appends,
+            mtp_appends,
+            rank_proposals,
+            rank_materialize_only,
+        ))
     }
 
     /// Physically release the slots whose finishes were deferred by the
@@ -1153,6 +1469,32 @@ impl Glm52Engine {
         }
     }
 
+    /// Physically release one slot whose client events already fired and
+    /// whose blocks were sealed at the finish.
+    fn release_slot(&mut self, slot_id: usize) {
+        let Some(finished) = self.slots[slot_id].take() else {
+            return;
+        };
+        self.store.retire(
+            self.rank,
+            finished.kv,
+            finished.save_cursor,
+            SaveClass::Cacheable,
+        );
+        if self.drafter.enabled() {
+            self.pending_resets.push(slot_id);
+        }
+    }
+
+    /// Release the slots whose finish waited for this step's draft round to
+    /// persist their DSpark captures. Runs AFTER `run_draft_round`: the
+    /// scatter and tag pass still need the slot's target pages.
+    fn release_materialized(&mut self) {
+        for slot_id in std::mem::take(&mut self.materialize_releases) {
+            self.release_slot(slot_id);
+        }
+    }
+
     /// DSpark draft round (rank-local, no collectives): resets, context
     /// appends from THIS step's capture buffer, and new proposals for the
     /// next verify span. FIFO per-worker channels order it before the next
@@ -1162,12 +1504,118 @@ impl Glm52Engine {
         &mut self,
         bucket: usize,
         appends: Vec<(usize, usize)>,
-        proposals: Vec<(usize, u32, usize)>,
+        proposals: &[(usize, u32, usize)],
+        materialize_only: &[(usize, u32, usize)],
     ) -> anyhow::Result<()> {
         let resets = std::mem::take(&mut self.pending_resets);
-        if resets.is_empty() && appends.is_empty() && proposals.is_empty() {
+        // A restore only belongs to a live, eligible slot; anything else (the
+        // request finished before its first round) is dropped with the slot.
+        let mut restores = Vec::new();
+        for slot_id in 0..GLM52_MAX_BATCH_PER_RANK {
+            let live = self.slots[slot_id]
+                .as_ref()
+                .is_some_and(|active| active.draft == DraftMode::Eligible);
+            if !live {
+                self.draft_restores[slot_id] = None;
+                continue;
+            }
+            if let Some(restore) = self.draft_restores[slot_id].take() {
+                restores.push(restore);
+            }
+        }
+        // A proposing slot drains its pending captures into the dense K/V this
+        // round; then every slot with materialized rows past the scatter
+        // cursor persists them (the verify bonus can trail one round).
+        let mut proposing = [false; GLM52_MAX_BATCH_PER_RANK];
+        for &(slot, ..) in proposals.iter().chain(materialize_only.iter()) {
+            proposing[slot] = true;
+        }
+        let mut scatters = Vec::new();
+        for (slot_id, proposing_slot) in proposing.iter().copied().enumerate() {
+            let Some(active) = self.slots[slot_id].as_ref() else {
+                continue;
+            };
+            if active.draft != DraftMode::Eligible {
+                continue;
+            }
+            if proposing_slot {
+                self.draft_materialized[slot_id] += self.draft_pending[slot_id];
+                self.draft_pending[slot_id] = 0;
+            }
+            let start = self.draft_committed[slot_id];
+            let materialized = self.draft_materialized[slot_id];
+            if materialized <= start {
+                continue;
+            }
+            let pages = active.kv.current_page_indices();
+            // The draft pool can be smaller than the target pool: stop before
+            // the first page it does not own (never write outside the pool).
+            let cover = crate::dspark_pool::scatter_cover(
+                &pages,
+                start,
+                materialized,
+                self.draft_pool_blocks,
+            );
+            if cover <= start {
+                continue;
+            }
+            let mut locs = Vec::with_capacity(cover - start);
+            for position in start..cover {
+                locs.push(crate::dspark_pool::pool_slot(
+                    pages[position / PAGE],
+                    position,
+                ));
+            }
+            // The frontier page keeps rows past `cover` from an older epoch
+            // (another sequence, other content): the pool no longer holds one
+            // content for the whole page, so its tag must not survive and let
+            // a later hit gather that mix. The tag pass re-establishes it once
+            // the cursor crosses the page.
+            if !cover.is_multiple_of(PAGE)
+                && let Some(&page) = pages.get(cover / PAGE)
+                && page >= 0
+                && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
+            {
+                *tag = None;
+            }
+            scatters.push(DsparkScatter {
+                slot: slot_id,
+                start_row: start,
+                locs,
+            });
+            self.draft_committed[slot_id] = cover;
+        }
+        if resets.is_empty()
+            && appends.is_empty()
+            && proposals.is_empty()
+            && materialize_only.is_empty()
+            && scatters.is_empty()
+            && restores.is_empty()
+        {
             return Ok(());
         }
+        // One slot-ascending proposal list for the worker: `draft` entries
+        // contribute a span, materialize-only entries just drain captures.
+        let mut round: Vec<DsparkProposal> = proposals
+            .iter()
+            .map(|&(slot, anchor, anchor_pos)| DsparkProposal {
+                slot,
+                anchor,
+                anchor_pos,
+                draft: true,
+            })
+            .chain(
+                materialize_only
+                    .iter()
+                    .map(|&(slot, anchor, anchor_pos)| DsparkProposal {
+                        slot,
+                        anchor,
+                        anchor_pos,
+                        draft: false,
+                    }),
+            )
+            .collect();
+        round.sort_by_key(|proposal| proposal.slot);
         let proposal_slots: Vec<usize> = proposals.iter().map(|&(slot, _, _)| slot).collect();
         // Same logical-to-executor mapping as the step submit: under the
         // mirrored topology every worker drafts from its own (identical)
@@ -1179,12 +1627,14 @@ impl Glm52Engine {
                 bucket,
                 resets.clone(),
                 appends.clone(),
-                proposals.clone(),
+                round.clone(),
+                restores.clone(),
+                scatters.clone(),
             )?);
         }
         // The payloads are fanned out to every executor but the last; the
         // last takes ownership instead of another clone.
-        rxs.push(last_worker.draft_async(bucket, resets, appends, proposals)?);
+        rxs.push(last_worker.draft_async(bucket, resets, appends, round, restores, scatters)?);
         let mut all_spans = Vec::with_capacity(rxs.len());
         for (executor, rx) in rxs.into_iter().enumerate() {
             let result = rx
@@ -1229,7 +1679,47 @@ impl Glm52Engine {
                 active.state.set_drafts(span.to_vec(), self.span_drafts);
             }
         }
+        // The pool now holds every row below each slot's scatter cursor.
+        self.tag_draft_blocks();
         Ok(())
+    }
+
+    /// Tag the target pages whose draft rows are all in the pool. A page is
+    /// tagged only after every one of its 64 rows was scattered, with the
+    /// same sequence hash the target's prefix matcher will report; a later
+    /// hit restores exactly those pages and plain-decodes otherwise.
+    fn tag_draft_blocks(&mut self) {
+        if self.draft_pool_blocks == 0 {
+            return;
+        }
+        for slot_id in 0..GLM52_MAX_BATCH_PER_RANK {
+            let Some(active) = self.slots[slot_id].as_ref() else {
+                continue;
+            };
+            if active.draft != DraftMode::Eligible {
+                continue;
+            }
+            let cursor = self.draft_tagged[slot_id];
+            let materialized = self.draft_committed[slot_id];
+            if (cursor + 1) * PAGE > materialized {
+                continue;
+            }
+            let (tail, _count) = active.kv.assigned_block_hashes_from(cursor);
+            let mut tagged = 0;
+            for (page, hash) in tail {
+                let block = cursor + tagged;
+                if (block + 1) * PAGE > materialized {
+                    break;
+                }
+                if page >= 0
+                    && let Some(tag) = self.draft_kv_tags.get_mut(page as usize)
+                {
+                    *tag = Some(hash);
+                }
+                tagged += 1;
+            }
+            self.draft_tagged[slot_id] = cursor + tagged;
+        }
     }
 
     #[allow(clippy::too_many_lines)]

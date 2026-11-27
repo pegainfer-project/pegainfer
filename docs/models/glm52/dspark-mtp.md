@@ -214,7 +214,8 @@ The win holds through c8 (≤ 1 request/rank — verify spans don't yet contend 
 throughput +21–25%, TPOT p50 1.4–1.6×. Two honest costs visible in the tails: **TPOT p99
 improves less than p50** (round-granular commits jitter the ITL — a rejected round pays a
 bucket-4 step for one token), and **the spec arm's TTFT p50 is ~150–280 ms worse under
-load** (the drafter forces prefix caching off, and verify spans lift the global bucket
+load** (measured while the drafter forced prefix caching off — the paged draft-K/V
+pool of #590 now lifts that exclusion — and verify spans lift the global bucket
 while co-resident prompts prefill). c > 8 (multi-slot contention) remains unmeasured.
 Note the Python `vllm bench serve` c8 client hang (#548) did NOT reproduce with the Rust
 `vllm-bench` client — 8/8 runs completed 100%.
