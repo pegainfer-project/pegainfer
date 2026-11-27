@@ -63,7 +63,7 @@ comparison test are gone with the policy; no other flag changes meaning.
 
 ## Tests
 
-`cargo test -p pegainfer-qwen35 --features qwen35 --lib scheduler::plan` covers
+`cargo test --release -p pegainfer-qwen35 --features qwen35 --lib scheduler::plan` covers
 the one-chunk default, FIFO packing at an explicit wider budget, slicing at
 the budget, resuming a sliced tail, prefill-only and decode-only plans, an
 unbounded budget, empty plans, and the zero-budget rejection.
