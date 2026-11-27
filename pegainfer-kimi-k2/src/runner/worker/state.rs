@@ -186,7 +186,6 @@ impl KimiRankThreadState {
         &mut self,
         token_ids: &[u32],
         append_positions: &[usize],
-        slots: &[usize],
         decode_batch_size: usize,
         kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
@@ -194,11 +193,10 @@ impl KimiRankThreadState {
     ) -> Result<Vec<KimiOneTokenForwardReport>> {
         ensure!(!token_ids.is_empty(), "Kimi batch decode requires tokens");
         ensure!(
-            token_ids.len() == append_positions.len() && token_ids.len() == slots.len(),
-            "Kimi batch decode input length mismatch: tokens={}, positions={}, slots={}",
+            token_ids.len() == append_positions.len(),
+            "Kimi batch decode input length mismatch: tokens={}, positions={}",
             token_ids.len(),
-            append_positions.len(),
-            slots.len()
+            append_positions.len()
         );
         ensure!(
             rows.len() == token_ids.len(),
@@ -236,7 +234,7 @@ impl KimiRankThreadState {
         );
         let decode_arena = decode_arenas.get_mut(&device_ctx, decode_batch_size)?;
         decode_arena
-            .configure_batch_decode(&device_ctx, slots, append_positions, kv_pages)
+            .configure_batch_decode(&device_ctx, append_positions, kv_pages)
             .with_context(|| format!("Kimi rank {rank} configure batch decode KV page table"))?;
         decode_arena
             .upload_batch_tokens(&device_ctx, token_ids)
@@ -405,7 +403,7 @@ impl KimiRankThreadState {
             };
             reports.push(KimiOneTokenForwardReport {
                 rank,
-                batch_slot: slots[row],
+                batch_row: row,
                 input_token_id: token_ids[row],
                 local_next_token_id: local_next,
                 local_next_token_global_id: cache.vocab_start as u32 + local_next,
@@ -650,7 +648,7 @@ impl KimiRankThreadState {
 
         let report = KimiOneTokenForwardReport {
             rank,
-            batch_slot: slot,
+            batch_row: slot,
             input_token_id,
             local_next_token_id: local_next,
             local_next_token_global_id: cache.vocab_start as u32 + local_next,

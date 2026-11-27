@@ -94,9 +94,12 @@ struct DecodeAdmission {
 }
 
 struct DecodeInput {
+    /// Rank-local request slot: the arena row that holds this request's KV.
+    /// It identifies the request state a report belongs to; the forward pass
+    /// itself is row-indexed and never sees it.
+    slot: usize,
     token_id: u32,
     append_position: usize,
-    slot: usize,
     options: KimiRowOptions,
     pages: Vec<i32>,
 }
@@ -121,13 +124,6 @@ impl DecodeBatchRow {
         }
     }
 
-    fn slot(&self) -> usize {
-        match self {
-            Self::Active(input) => input.slot,
-            Self::Admission(admission) => admission.slot,
-        }
-    }
-
     fn options(&self) -> KimiRowOptions {
         match self {
             Self::Active(input) => input.options,
@@ -147,7 +143,6 @@ enum StepCommand {
     Decode {
         token_ids: Vec<u32>,
         positions: Vec<usize>,
-        slots: Vec<usize>,
         decode_batch_size: usize,
         kv_pages: KimiKvStepPages,
         rows: Vec<KimiRowOptions>,
@@ -850,9 +845,9 @@ impl DpRankState {
                 continue;
             }
             inputs.push(DecodeInput {
+                slot,
                 token_id: state.last_token,
                 append_position: state.prompt_len + state.completion_tokens - 1,
-                slot,
                 options: state.options,
                 pages: state.kv.step_page_indices(1),
             });
@@ -965,7 +960,6 @@ fn build_padding_decode_command(seed: u64, padding_page: i32) -> StepCommand {
     StepCommand::Decode {
         token_ids: vec![0],
         positions: vec![0],
-        slots: vec![0],
         decode_batch_size: MAX_BATCH_PER_DP,
         kv_pages: KimiKvStepPages::single(vec![padding_page], padding_page),
         rows: vec![KimiRowOptions::default()],
@@ -981,7 +975,6 @@ fn build_decode_command_from_rows(
     StepCommand::Decode {
         token_ids: rows.iter().map(DecodeBatchRow::token_id).collect(),
         positions: rows.iter().map(DecodeBatchRow::append_position).collect(),
-        slots: rows.iter().map(DecodeBatchRow::slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
         kv_pages: KimiKvStepPages::new(
             rows.iter().map(DecodeBatchRow::pages).collect(),
@@ -1000,7 +993,6 @@ fn build_decode_command_from_inputs(
     StepCommand::Decode {
         token_ids: inputs.iter().map(|input| input.token_id).collect(),
         positions: inputs.iter().map(|input| input.append_position).collect(),
-        slots: inputs.iter().map(|input| input.slot).collect(),
         decode_batch_size: MAX_BATCH_PER_DP,
         rows: inputs.iter().map(|input| input.options).collect(),
         kv_pages: KimiKvStepPages::new(
@@ -1046,7 +1038,6 @@ fn rank_forward_loop(
             StepCommand::Decode {
                 token_ids,
                 positions,
-                slots,
                 decode_batch_size,
                 kv_pages,
                 rows,
@@ -1055,7 +1046,6 @@ fn rank_forward_loop(
                 let result = executor.forward_decode_batch(
                     &token_ids,
                     &positions,
-                    &slots,
                     decode_batch_size,
                     &kv_pages,
                     &rows,
@@ -1167,7 +1157,7 @@ mod tests {
     fn dummy_report(token_id: u32) -> KimiOneTokenForwardReport {
         KimiOneTokenForwardReport {
             rank: 0,
-            batch_slot: 0,
+            batch_row: 0,
             input_token_id: 0,
             local_next_token_id: token_id,
             local_next_token_global_id: token_id,
@@ -1208,7 +1198,6 @@ mod tests {
         let StepCommand::Decode {
             token_ids,
             positions,
-            slots,
             decode_batch_size,
             kv_pages,
             rows,
@@ -1221,7 +1210,6 @@ mod tests {
         assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
         assert_eq!(token_ids, vec![123]);
         assert_eq!(positions, vec![6]);
-        assert_eq!(slots, vec![MAX_BATCH_PER_DP - 1]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].logprobs, None);
         // 6 KV tokens + this step's append fit one 16-token page.
@@ -1261,7 +1249,6 @@ mod tests {
         let StepCommand::Decode {
             token_ids,
             positions,
-            slots,
             decode_batch_size,
             kv_pages,
             rows,
@@ -1274,7 +1261,6 @@ mod tests {
         assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
         assert_eq!(token_ids, vec![11, 99]);
         assert_eq!(positions, vec![5, 0]);
-        assert_eq!(slots, vec![3, 7]);
         assert_eq!(rows[0].logprobs, Some(4));
         assert!(rows[0].sampling.is_greedy());
         assert_eq!(rows[1].logprobs, None);
@@ -1291,7 +1277,6 @@ mod tests {
         let StepCommand::Decode {
             token_ids,
             positions,
-            slots,
             decode_batch_size,
             kv_pages,
             rows,
@@ -1304,7 +1289,6 @@ mod tests {
         assert_eq!(decode_batch_size, MAX_BATCH_PER_DP);
         assert_eq!(token_ids, vec![0]);
         assert_eq!(positions, vec![0]);
-        assert_eq!(slots, vec![0]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].sampling.is_greedy());
         // The dummy row's single KV write lands on the padding page.

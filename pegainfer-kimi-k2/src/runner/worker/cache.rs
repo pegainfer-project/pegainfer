@@ -105,8 +105,8 @@ impl KimiWorkerDecodeArena {
         );
         ensure!(pool_pages > 0, "Kimi decode arena needs a KV pool");
         let page_size = KIMI_KV_PAGE_SIZE;
-        // Worst case per step: every active slot's pages (disjoint pool
-        // pages, so ≤ pool_pages total) plus one padding entry per idle slot.
+        // Worst case per step: every active row's pages (disjoint pool pages,
+        // so ≤ pool_pages total) plus one padding entry per idle row.
         let page_table_capacity = pool_pages
             .checked_add(batch_size)
             .ok_or_else(|| anyhow::anyhow!("Kimi decode arena page table capacity overflow"))?;
@@ -119,12 +119,11 @@ impl KimiWorkerDecodeArena {
         // Placeholder table (page 0 everywhere): configure_* always rebuilds
         // it before any forward touches the pool.
         let placeholder = KimiKvStepPages::new(vec![vec![0i32]; batch_size], 0);
-        let all_slots = (0..batch_size).collect::<Vec<_>>();
-        let (page_indices, page_indptr, last_page_len) = build_slot_page_table(
+        let (page_indices, page_indptr, last_page_len) = build_page_table(
             batch_size,
             page_size,
             &placeholder,
-            &all_slots,
+            |row| row,
             &vec![1usize; batch_size],
         )?;
         let mut page_indices_padded = vec![0i32; page_table_capacity];
@@ -138,7 +137,7 @@ impl KimiWorkerDecodeArena {
         };
         let positions_padded = vec![0i32; append_capacity];
         // Idle plan: no row carries KV until the first configure_* call.
-        let idle_plan = plan_decode_kv_tiles(batch_size, kv_tiles, &[], &[])?;
+        let idle_plan = plan_decode_kv_tiles(batch_size, kv_tiles, &[])?;
         let token_ids = vec![0u32; batch_size];
         let (cos_host, sin_host) = build_yarn_rope_cache(KIMI_MAX_REQUEST_TOKENS);
 
@@ -156,10 +155,10 @@ impl KimiWorkerDecodeArena {
             last_page_len_d: ctx.stream.clone_htod(&last_page_len)?,
             batch_indices_d: ctx.stream.clone_htod(&batch_indices_padded)?,
             positions_d: ctx.stream.clone_htod(&positions_padded)?,
-            row_slots_d: ctx.stream.clone_htod(&idle_plan.row_slots)?,
+            row_batch_d: ctx.stream.clone_htod(&idle_plan.row_batch)?,
             row_tiles_d: ctx.stream.clone_htod(&idle_plan.row_tiles)?,
             tile_tokens_d: ctx.stream.clone_htod(&[idle_plan.tile_tokens])?,
-            slot_indptr_d: ctx.stream.clone_htod(&idle_plan.slot_indptr)?,
+            row_indptr_d: ctx.stream.clone_htod(&idle_plan.row_indptr)?,
             row_valid_d: ctx.stream.clone_htod(&idle_plan.row_valid)?,
             partial_ckv_d: ctx
                 .stream
@@ -189,7 +188,7 @@ impl KimiWorkerDecodeArena {
         );
         ensure!(
             page_indptr.len() == self.batch_size + 1 && last_page_len.len() == self.batch_size,
-            "Kimi page table metadata must cover all {} slots: indptr={}, last_page_len={}",
+            "Kimi page table metadata must cover all {} rows: indptr={}, last_page_len={}",
             self.batch_size,
             page_indptr.len(),
             last_page_len.len()
@@ -236,11 +235,11 @@ impl KimiWorkerDecodeArena {
             kv_pages.rows()
         );
         self.ensure_pool_page(kv_pages.padding_page)?;
-        let (page_indices, page_indptr, last_page_len) = build_slot_page_table(
+        let (page_indices, page_indptr, last_page_len) = build_page_table(
             self.batch_size,
             self.page_size,
             kv_pages,
-            &[slot],
+            |_| slot,
             &[kv_tokens],
         )?;
         let slot_pages_start = usize::try_from(page_indptr[slot])
@@ -261,72 +260,56 @@ impl KimiWorkerDecodeArena {
         Ok(slot_pages_start)
     }
 
+    /// Configure one decode step over batch rows `0..append_positions.len()`.
+    ///
+    /// Decode is row-indexed: row `r` holds request `r`'s query, page-table
+    /// row and appended KV, and its tiles are the merge window
+    /// `row_indptr[r]..row_indptr[r + 1]`. Rows past the live ones are masked
+    /// and ride the padding page.
     pub(super) fn configure_batch_decode(
         &mut self,
         ctx: &DeviceContext,
-        slots: &[usize],
         append_positions: &[usize],
         kv_pages: &KimiKvStepPages,
     ) -> Result<()> {
-        ensure!(!slots.is_empty(), "Kimi batch decode requires active slots");
         ensure!(
-            slots.len() == append_positions.len(),
-            "Kimi batch decode slots/positions mismatch: slots={}, positions={}",
-            slots.len(),
-            append_positions.len()
+            !append_positions.is_empty(),
+            "Kimi batch decode requires active rows"
         );
         ensure!(
-            slots.len() <= self.batch_size,
-            "Kimi batch decode active slots {} exceeds batch_size {}",
-            slots.len(),
+            append_positions.len() <= self.batch_size,
+            "Kimi batch decode active rows {} exceeds batch_size {}",
+            append_positions.len(),
             self.batch_size
         );
         ensure!(
-            kv_pages.rows() == slots.len(),
-            "Kimi batch decode KV page rows {} must match active slots {}",
+            kv_pages.rows() == append_positions.len(),
+            "Kimi batch decode KV page rows {} must match active rows {}",
             kv_pages.rows(),
-            slots.len()
+            append_positions.len()
         );
         self.ensure_pool_page(kv_pages.padding_page)?;
-        let mut batch_indices = vec![0i32; self.batch_size];
-        let mut row_positions = vec![0i32; self.batch_size];
-        let mut occupied_slots = vec![false; self.batch_size];
+        let mut positions = vec![0i32; self.batch_size];
         // KV tokens each active row holds after this step's append.
-        let mut kv_tokens = Vec::with_capacity(slots.len());
+        let mut kv_tokens = Vec::with_capacity(append_positions.len());
 
-        for (row, (&slot, &position)) in slots.iter().zip(append_positions.iter()).enumerate() {
-            ensure!(
-                slot < self.batch_size,
-                "Kimi batch decode slot {slot} exceeds batch_size {}",
-                self.batch_size
-            );
-            ensure!(
-                !occupied_slots[slot],
-                "Kimi batch decode slot {slot} appears more than once"
-            );
+        for (row, &position) in append_positions.iter().enumerate() {
             ensure!(
                 position < KIMI_MAX_REQUEST_TOKENS,
                 "Kimi decode append_position {position} exceeds per-request KV capacity {KIMI_MAX_REQUEST_TOKENS}"
             );
-            occupied_slots[slot] = true;
-            batch_indices[row] = slot as i32;
-            row_positions[row] = position as i32;
+            positions[row] = position as i32;
             kv_tokens.push(position + 1);
         }
-        // CUDA-graph padding rows reference idle slots, whose page lists are
-        // the pool padding page: their dummy append/read lands on a page no
-        // live request owns.
-        let free_slots = occupied_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, occupied)| (!occupied).then_some(slot))
-            .collect::<Vec<_>>();
-        for row in slots.len()..self.batch_size {
-            batch_indices[row] = free_slots[row - slots.len()] as i32;
-        }
+        let batch_indices = (0..self.batch_size as i32).collect::<Vec<_>>();
 
-        let (page_indices, page_indptr, last_page_len) =
-            build_slot_page_table(self.batch_size, self.page_size, kv_pages, slots, &kv_tokens)?;
+        let (page_indices, page_indptr, last_page_len) = build_page_table(
+            self.batch_size,
+            self.page_size,
+            kv_pages,
+            |row| row,
+            &kv_tokens,
+        )?;
         self.ensure_pool_pages(&page_indices)?;
         self.upload_page_table(ctx, &page_indices, &page_indptr, &last_page_len)?;
         {
@@ -336,15 +319,15 @@ impl KimiWorkerDecodeArena {
         }
         {
             let mut positions_d = self.positions_d.slice_mut(0..self.batch_size);
-            ctx.stream.memcpy_htod(&row_positions, &mut positions_d)?;
+            ctx.stream.memcpy_htod(&positions, &mut positions_d)?;
         }
-        let plan = plan_decode_kv_tiles(self.batch_size, self.kv_tiles, slots, &kv_tokens)?;
+        let plan = plan_decode_kv_tiles(self.batch_size, self.kv_tiles, &kv_tokens)?;
         ctx.stream
-            .memcpy_htod(&plan.row_slots, &mut self.row_slots_d)?;
+            .memcpy_htod(&plan.row_batch, &mut self.row_batch_d)?;
         ctx.stream
             .memcpy_htod(&plan.row_tiles, &mut self.row_tiles_d)?;
         ctx.stream
-            .memcpy_htod(&plan.slot_indptr, &mut self.slot_indptr_d)?;
+            .memcpy_htod(&plan.row_indptr, &mut self.row_indptr_d)?;
         ctx.stream
             .memcpy_htod(&plan.row_valid, &mut self.row_valid_d)?;
         ctx.stream
@@ -416,55 +399,67 @@ impl KimiWorkerDecodeArena {
     }
 }
 
-/// Build the slot-indexed page table (FlashInfer CSR over all `batch_size`
-/// slots) from a step's row-major page CSR. `slots[i]` is the slot that
-/// `kv_pages` row `i` belongs to; that slot holds `kv_tokens[i]` KV tokens
-/// after this step's append. Slots without a row ride the padding page.
-pub(super) fn build_slot_page_table(
+/// Build the page table (FlashInfer CSR over all `batch_size` arena rows) from
+/// a step's row-major page CSR.
+///
+/// `table_row(i)` names the arena row that KV row `i` of `kv_pages` occupies;
+/// that row holds `kv_tokens[i]` KV tokens after this step's append. A prefill
+/// step puts its single row at the request's slot; a decode step puts row `i`
+/// at row `i`. Rows no KV row claims ride the padding page with one token, so
+/// a masked CTA that still reads its page entry stays inside the pool.
+pub(super) fn build_page_table(
     batch_size: usize,
     page_size: usize,
     kv_pages: &KimiKvStepPages,
-    slots: &[usize],
+    table_row: impl Fn(usize) -> usize,
     kv_tokens: &[usize],
 ) -> Result<(Vec<i32>, Vec<i32>, Vec<i32>)> {
     ensure!(page_size > 0, "Kimi KV page_size must be positive");
     ensure!(
-        slots.len() == kv_tokens.len() && slots.len() == kv_pages.rows(),
-        "Kimi page table row mismatch: slots={}, kv_tokens={}, page rows={}",
-        slots.len(),
+        kv_tokens.len() == kv_pages.rows(),
+        "Kimi page table token rows {} must match page rows {}",
         kv_tokens.len(),
         kv_pages.rows()
     );
+    ensure!(
+        kv_tokens.len() <= batch_size,
+        "Kimi page table rows {} exceed batch_size {batch_size}",
+        kv_tokens.len()
+    );
     let padding_row = [kv_pages.padding_page];
-    let mut slot_rows: Vec<&[i32]> = vec![&padding_row; batch_size];
-    let mut slot_tokens = vec![1usize; batch_size];
-    for (row, (&slot, &tokens)) in slots.iter().zip(kv_tokens.iter()).enumerate() {
+    let mut row_pages: Vec<&[i32]> = vec![&padding_row; batch_size];
+    let mut row_tokens = vec![1usize; batch_size];
+    let mut claimed = vec![false; batch_size];
+    for (i, &tokens) in kv_tokens.iter().enumerate() {
+        let row = table_row(i);
         ensure!(
-            slot < batch_size,
-            "Kimi page table slot {slot} exceeds batch_size {batch_size}"
+            row < batch_size,
+            "Kimi page table row {row} exceeds batch_size {batch_size}"
         );
-        slot_rows[slot] = kv_pages.row(row)?;
-        slot_tokens[slot] = tokens;
+        ensure!(!claimed[row], "Kimi page table row {row} claimed twice");
+        claimed[row] = true;
+        row_pages[row] = kv_pages.row(i)?;
+        row_tokens[row] = tokens;
     }
 
     let mut page_indices = Vec::with_capacity(kv_pages.pages.len() + batch_size);
     let mut page_indptr = Vec::with_capacity(batch_size + 1);
     let mut last_page_len = Vec::with_capacity(batch_size);
     page_indptr.push(0i32);
-    for slot in 0..batch_size {
-        let tokens = slot_tokens[slot];
-        ensure!(tokens > 0, "Kimi page table slot {slot} has zero KV tokens");
+    for row in 0..batch_size {
+        let tokens = row_tokens[row];
+        ensure!(tokens > 0, "Kimi page table row {row} has zero KV tokens");
         let needed = tokens.div_ceil(page_size);
         // Exact match required: the scheduler's block accounting and the
         // kernel's view of the sequence must agree, or KV silently lands on
         // (or reads from) pages the request does not own.
         ensure!(
-            slot_rows[slot].len() == needed,
-            "Kimi page table slot {slot} has {} pages for {} KV tokens, needs {needed}",
-            slot_rows[slot].len(),
+            row_pages[row].len() == needed,
+            "Kimi page table row {row} has {} pages for {} KV tokens, needs {needed}",
+            row_pages[row].len(),
             tokens
         );
-        page_indices.extend_from_slice(slot_rows[slot]);
+        page_indices.extend_from_slice(row_pages[row]);
         page_indptr.push(page_indices.len() as i32);
         last_page_len.push((((tokens - 1) % page_size) + 1) as i32);
     }
@@ -478,84 +473,71 @@ pub(crate) fn decode_kv_tiles(batch_size: usize) -> usize {
     (KIMI_DECODE_KV_TILE_ROWS / batch_size).max(1)
 }
 
-/// One step's split-KV layout: each live request's tiles occupy a contiguous
-/// run of rows, packed in slot order with masked rows only after the last live
-/// tile. `slot_indptr` (indexed by slot) therefore windows exactly one
-/// request's tiles for the merge, and the grid stays bucket-sized.
+/// One step's split-KV layout: batch row `r`'s tiles occupy the contiguous row
+/// run `row_indptr[r]..row_indptr[r + 1]`, so `VariableLengthMergeStates`
+/// merges exactly that row's partials. Tiles are packed in batch-row order
+/// with the masked rows only after the last live tile, so the grid stays
+/// bucket-sized.
 pub(crate) struct KimiDecodeTilePlan {
     pub(crate) tile_tokens: i32,
-    pub(crate) slot_indptr: Vec<i32>,
-    pub(crate) row_slots: Vec<i32>,
+    pub(crate) row_indptr: Vec<i32>,
+    pub(crate) row_batch: Vec<i32>,
     pub(crate) row_tiles: Vec<i32>,
     pub(crate) row_valid: Vec<u8>,
 }
 
+/// Plan one decode step's tiles for batch rows `0..kv_tokens.len()`.
+///
+/// `row_batch` is FlashInfer's `request_indices`: the batch row whose query and
+/// paged KV a tile CTA reads. `row_indptr` is its `o_indptr`: row `r`'s merge
+/// window is `row_indptr[r]..row_indptr[r + 1]`, empty when row `r` is idle.
 pub(crate) fn plan_decode_kv_tiles(
     batch_size: usize,
     tiles: usize,
-    slots: &[usize],
     kv_tokens: &[usize],
 ) -> Result<KimiDecodeTilePlan> {
-    ensure!(batch_size > 0, "Kimi decode tile plan needs a decode slot");
+    ensure!(batch_size > 0, "Kimi decode tile plan needs a decode row");
     ensure!(tiles > 0, "Kimi decode tile plan needs at least one tile");
     ensure!(
-        slots.len() == kv_tokens.len(),
-        "Kimi decode tile plan slots/KV mismatch: slots={}, KV={}",
-        slots.len(),
+        kv_tokens.len() <= batch_size,
+        "Kimi decode tile plan live rows {} exceed batch size {batch_size}",
         kv_tokens.len()
     );
-    ensure!(
-        slots.len() <= batch_size,
-        "Kimi decode tile plan active slots {} exceed batch size {batch_size}",
-        slots.len()
-    );
-    let mut live = vec![false; batch_size];
-    let mut kv_by_slot = vec![0usize; batch_size];
-    for (&slot, &kv) in slots.iter().zip(kv_tokens.iter()) {
-        ensure!(
-            slot < batch_size,
-            "Kimi decode tile plan slot {slot} exceeds batch size {batch_size}"
-        );
-        ensure!(
-            !live[slot],
-            "Kimi decode tile plan slot {slot} appears more than once"
-        );
+    for (row, &kv) in kv_tokens.iter().enumerate() {
         ensure!(
             kv > 0,
-            "Kimi decode tile plan slot {slot} carries no KV tokens"
+            "Kimi decode tile plan row {row} carries no KV tokens"
         );
-        live[slot] = true;
-        kv_by_slot[slot] = kv;
     }
     let longest = kv_tokens.iter().copied().max().unwrap_or(0);
     let tile_tokens = longest.div_ceil(tiles).max(KIMI_DECODE_MIN_KV_TILE_TOKENS);
     let rows = batch_size * tiles;
-    let mut row_slots = vec![0i32; rows];
+    let mut row_batch = vec![0i32; rows];
     let mut row_tiles = vec![0i32; rows];
     let mut row_valid = vec![0u8; rows];
-    let mut slot_indptr = Vec::with_capacity(batch_size + 1);
-    slot_indptr.push(0i32);
+    let mut row_indptr = Vec::with_capacity(batch_size + 1);
+    row_indptr.push(0i32);
     let mut used_rows = 0usize;
-    // `VariableLengthMergeStates` walks `slot_indptr[slot]..slot_indptr[slot + 1]`
-    // and merges every row in that window as one of the slot's partials, so a
-    // live request's tiles are packed with no idle row or other request's tile
-    // between them. A slot that is not live gets an empty window.
-    for slot in 0..batch_size {
-        if live[slot] {
-            let used = kv_by_slot[slot].div_ceil(tile_tokens).min(tiles);
-            for tile in 0..used {
-                row_slots[used_rows + tile] = slot as i32;
-                row_tiles[used_rows + tile] = tile as i32;
-                row_valid[used_rows + tile] = 1;
-            }
-            used_rows += used;
+    // A tile reads batch row `r`'s query and its KV slice, so the tile's row
+    // in the flat grid names `r`, and `row_indptr[r]` opens the merge window
+    // that collects exactly row `r`'s partials.
+    for (row, &kv) in kv_tokens.iter().enumerate() {
+        let used = kv.div_ceil(tile_tokens).min(tiles);
+        for tile in 0..used {
+            row_batch[used_rows + tile] = row as i32;
+            row_tiles[used_rows + tile] = tile as i32;
+            row_valid[used_rows + tile] = 1;
         }
-        slot_indptr.push(used_rows as i32);
+        used_rows += used;
+        row_indptr.push(used_rows as i32);
+    }
+    while row_indptr.len() <= batch_size {
+        row_indptr.push(used_rows as i32);
     }
     Ok(KimiDecodeTilePlan {
         tile_tokens: tile_tokens as i32,
-        slot_indptr,
-        row_slots,
+        row_indptr,
+        row_batch,
         row_tiles,
         row_valid,
     })

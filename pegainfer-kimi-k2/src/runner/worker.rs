@@ -106,10 +106,10 @@ pub(crate) const KIMI_MAX_REQUEST_TOKENS: usize = 8192;
 /// Physical KV page assignments for one forward step.
 ///
 /// `pages`/`indptr` form a row-major CSR over the step's rows (prefill: one
-/// row for the target slot; decode: one row per active request, same order
-/// as `slots`). Page IDs index the rank's shared KV pool. `padding_page`
-/// backs idle slots and CUDA-graph padding rows — those rows write/read
-/// garbage on a page no live request owns, which is benign by construction.
+/// row for the target slot; decode: one row per batch row, in batch order).
+/// Page IDs index the rank's shared KV pool. `padding_page` backs idle rows
+/// and CUDA-graph padding rows — those rows write/read garbage on a page no
+/// live request owns, which is benign by construction.
 #[derive(Clone, Debug)]
 pub(crate) struct KimiKvStepPages {
     pages: Vec<i32>,
@@ -198,7 +198,9 @@ pub(crate) struct KimiRowOptions {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct KimiOneTokenForwardReport {
     pub rank: usize,
-    pub batch_slot: usize,
+    /// The batch row this report covers: the decode row, or the prefill
+    /// request's page-table row.
+    pub batch_row: usize,
     pub input_token_id: u32,
     pub local_next_token_id: u32,
     pub local_next_token_global_id: u32,
@@ -242,7 +244,6 @@ enum KimiRankCommand {
     ForwardDecodeBatchNextTokens {
         token_ids: Vec<u32>,
         append_positions: Vec<usize>,
-        slots: Vec<usize>,
         decode_batch_size: usize,
         kv_pages: KimiKvStepPages,
         rows: Vec<KimiRowOptions>,
@@ -411,7 +412,6 @@ impl KimiRankWorker {
         &self,
         token_ids: Vec<u32>,
         append_positions: Vec<usize>,
-        slots: Vec<usize>,
         decode_batch_size: usize,
         kv_pages: KimiKvStepPages,
         rows: Vec<KimiRowOptions>,
@@ -422,7 +422,6 @@ impl KimiRankWorker {
             .send(KimiRankCommand::ForwardDecodeBatchNextTokens {
                 token_ids,
                 append_positions,
-                slots,
                 decode_batch_size,
                 kv_pages,
                 rows,
@@ -628,9 +627,9 @@ struct KimiWorkerDecodeArena {
     page_table_capacity: usize,
     append_capacity: usize,
     layout: KimiMlaPagedKvLayout,
-    /// Split-KV geometry of this bucket: the live requests' tiles are packed
-    /// into rows `0..slot_indptr[batch_size]` in slot order, and the remaining
-    /// rows stay masked, so `kv_rows == batch_size * kv_tiles`.
+    /// Split-KV geometry of this bucket: live batch row `r`'s tiles are packed
+    /// into rows `row_indptr[r]..row_indptr[r + 1]`, and the remaining rows
+    /// stay masked, so `kv_rows == batch_size * kv_tiles`.
     kv_tiles: usize,
     kv_rows: usize,
     page_indices_d: CudaSlice<i32>,
@@ -638,14 +637,14 @@ struct KimiWorkerDecodeArena {
     last_page_len_d: CudaSlice<i32>,
     batch_indices_d: CudaSlice<i32>,
     positions_d: CudaSlice<i32>,
-    /// FlashInfer's `request_indices`: row → decode slot.
-    row_slots_d: CudaSlice<i32>,
-    /// FlashInfer's `kv_tile_indices`: row → KV tile.
+    /// FlashInfer's `request_indices`: tile row → batch row.
+    row_batch_d: CudaSlice<i32>,
+    /// FlashInfer's `kv_tile_indices`: tile row → KV tile.
     row_tiles_d: CudaSlice<i32>,
     /// FlashInfer's `kv_chunk_size`: tile span, one value per step.
     tile_tokens_d: CudaSlice<i32>,
-    /// FlashInfer's `o_indptr`: first tile row of each decode slot.
-    slot_indptr_d: CudaSlice<i32>,
+    /// FlashInfer's `o_indptr`: batch row → first tile row (merge window).
+    row_indptr_d: CudaSlice<i32>,
     /// FlashInfer's `block_valid_mask`: row carries KV this step.
     row_valid_d: CudaSlice<u8>,
     partial_ckv_d: CudaSlice<half::bf16>,
@@ -789,7 +788,6 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
             KimiRankCommand::ForwardDecodeBatchNextTokens {
                 token_ids,
                 append_positions,
-                slots,
                 decode_batch_size,
                 kv_pages,
                 rows,
@@ -799,7 +797,6 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 let result = state.forward_decode_batch_next_tokens(
                     &token_ids,
                     &append_positions,
-                    &slots,
                     decode_batch_size,
                     &kv_pages,
                     &rows,
@@ -830,9 +827,11 @@ pub(super) use runtime::maybe_all_reduce_hidden_via_f32_in_place;
 pub(super) use runtime::reduce_scatter_f32_hidden_into;
 mod forward;
 mod state;
-// The split-KV plan is the single owner of decode tile geometry: the arena and
-// the kernel report both build their launch layout through it.
+// The split-KV plan is the single owner of decode tile geometry: the kernel
+// report builds its launch layout through it.
+#[cfg(feature = "kernel-report")]
 pub(crate) use cache::decode_kv_tiles;
+#[cfg(feature = "kernel-report")]
 pub(crate) use cache::plan_decode_kv_tiles;
 
 impl KimiRankWeightLoadReport {
@@ -870,7 +869,7 @@ pub(super) fn build_placements(device_ordinals: &[usize]) -> Result<Vec<KimiK2Ra
 #[cfg(test)]
 mod tests {
     use super::KimiKvStepPages;
-    use super::cache::build_slot_page_table;
+    use super::cache::build_page_table;
     use super::cache::decode_kv_tiles;
     use super::cache::plan_decode_kv_tiles;
     use super::decode_batch_bucket;
@@ -899,44 +898,57 @@ mod tests {
     }
 
     #[test]
-    fn slot_page_table_scatters_rows_and_pads_idle_slots() {
-        // Row 0 → slot 2 with 26 KV tokens (2 pool pages); row 1 → slot 0
-        // with 1 token. Slots 1 and 3 are idle → padding page 7.
+    fn page_table_scatters_rows_and_pads_idle_rows() {
+        // Row 0 holds 26 KV tokens (2 pool pages), row 1 holds 1 token.
+        // Rows 2 and 3 are idle → padding page 7.
         let kv_pages = KimiKvStepPages::new(vec![vec![40, 41], vec![9]], 7);
         let (page_indices, page_indptr, last_page_len) =
-            build_slot_page_table(4, 16, &kv_pages, &[2, 0], &[26, 1]).unwrap();
-        assert_eq!(page_indices, vec![9, 7, 40, 41, 7]);
-        assert_eq!(page_indptr, vec![0, 1, 2, 4, 5]);
-        assert_eq!(last_page_len, vec![1, 1, 10, 1]);
+            build_page_table(4, 16, &kv_pages, |row| row, &[26, 1]).unwrap();
+        assert_eq!(page_indices, vec![40, 41, 9, 7, 7]);
+        assert_eq!(page_indptr, vec![0, 2, 3, 4, 5]);
+        assert_eq!(last_page_len, vec![10, 1, 1, 1]);
     }
 
     #[test]
-    fn slot_page_table_last_page_len_tracks_page_boundary() {
+    fn page_table_routes_rows_through_the_table_row_closure() {
+        // Prefill still places its one request at an arena row of its own
+        // choosing; the CSR row order stays the caller's.
+        let kv_pages = KimiKvStepPages::single(vec![5], 7);
+        let (page_indices, page_indptr, last_page_len) =
+            build_page_table(3, 16, &kv_pages, |_| 2, &[3]).unwrap();
+        assert_eq!(page_indices, vec![7, 7, 5]);
+        assert_eq!(page_indptr, vec![0, 1, 2, 3]);
+        assert_eq!(last_page_len, vec![1, 1, 3]);
+    }
+
+    #[test]
+    fn page_table_last_page_len_tracks_page_boundary() {
         // 16 tokens fill one page exactly; 17 spill one token into a second.
         let full = KimiKvStepPages::single(vec![3], 0);
-        let (_, _, last_page_len) = build_slot_page_table(1, 16, &full, &[0], &[16]).unwrap();
+        let (_, _, last_page_len) = build_page_table(1, 16, &full, |row| row, &[16]).unwrap();
         assert_eq!(last_page_len, vec![16]);
 
         let spill = KimiKvStepPages::single(vec![3, 4], 0);
-        let (_, _, last_page_len) = build_slot_page_table(1, 16, &spill, &[0], &[17]).unwrap();
+        let (_, _, last_page_len) = build_page_table(1, 16, &spill, |row| row, &[17]).unwrap();
         assert_eq!(last_page_len, vec![1]);
     }
 
     #[test]
-    fn slot_page_table_rejects_page_count_mismatch() {
+    fn page_table_rejects_page_count_mismatch() {
         // 26 tokens need 2 pages; offering 1 or 3 must fail loudly — the
         // scheduler's block accounting and the kernel view must agree.
         let short = KimiKvStepPages::single(vec![40], 0);
-        assert!(build_slot_page_table(2, 16, &short, &[0], &[26]).is_err());
+        assert!(build_page_table(2, 16, &short, |row| row, &[26]).is_err());
         let long = KimiKvStepPages::single(vec![40, 41, 42], 0);
-        assert!(build_slot_page_table(2, 16, &long, &[0], &[26]).is_err());
+        assert!(build_page_table(2, 16, &long, |row| row, &[26]).is_err());
     }
 
     #[test]
-    fn slot_page_table_rejects_out_of_range_slot_and_row_mismatch() {
-        let kv_pages = KimiKvStepPages::single(vec![1], 0);
-        assert!(build_slot_page_table(2, 16, &kv_pages, &[2], &[1]).is_err());
-        assert!(build_slot_page_table(2, 16, &kv_pages, &[0, 1], &[1, 1]).is_err());
+    fn page_table_rejects_out_of_range_and_repeated_rows() {
+        let kv_pages = KimiKvStepPages::new(vec![vec![1], vec![2]], 0);
+        assert!(build_page_table(2, 16, &kv_pages, |_| 2, &[1]).is_err());
+        assert!(build_page_table(2, 16, &kv_pages, |row| row, &[1, 1, 1]).is_err());
+        assert!(build_page_table(2, 16, &kv_pages, |_| 0, &[1, 1]).is_err());
     }
 
     #[test]
@@ -949,62 +961,59 @@ mod tests {
     }
 
     #[test]
-    fn decode_tile_plan_packs_the_short_request_after_the_long_one() {
-        // The longest request sets the chunk (3000 / 4 = 750). Slot 0's four
-        // tiles take rows 0..4 and slot 1's single 10-token tile follows at row
-        // 4, so each slot's merge window holds exactly its own tiles with no
+    fn decode_tile_plan_packs_the_short_row_after_the_long_one() {
+        // The longest row sets the chunk (3000 / 4 = 750). Row 0's single
+        // 10-token tile takes row 0 and row 1's four tiles follow at 1..5, so
+        // each batch row's merge window holds exactly its own tiles with no
         // masked row in between.
-        let plan = plan_decode_kv_tiles(2, 4, &[1, 0], &[10, 3000]).unwrap();
+        let plan = plan_decode_kv_tiles(2, 4, &[10, 3000]).unwrap();
         assert_eq!(plan.tile_tokens, 750);
-        assert_eq!(plan.slot_indptr, vec![0, 4, 5]);
-        assert_eq!(plan.row_tiles, vec![0, 1, 2, 3, 0, 0, 0, 0]);
-        assert_eq!(plan.row_slots, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(plan.row_indptr, vec![0, 1, 5]);
+        assert_eq!(plan.row_tiles, vec![0, 0, 1, 2, 3, 0, 0, 0]);
+        assert_eq!(plan.row_batch, vec![0, 1, 1, 1, 1, 0, 0, 0]);
         assert_eq!(plan.row_valid, vec![1, 1, 1, 1, 1, 0, 0, 0]);
     }
 
     #[test]
-    fn decode_tile_plan_packs_live_tiles_in_slot_order() {
-        // Slot 1 is shorter than slot 0, so its tiles must not be placed at a
-        // slot-derived row offset with a hole in between.
-        let plan = plan_decode_kv_tiles(2, 2, &[1, 0], &[300, 900]).unwrap();
+    fn decode_tile_plan_packs_live_tiles_in_row_order() {
+        // Row 0 is shorter than row 1, so row 1's tiles must not be placed at a
+        // row-derived offset with a hole in between.
+        let plan = plan_decode_kv_tiles(2, 2, &[300, 900]).unwrap();
         assert_eq!(plan.tile_tokens, 450);
-        assert_eq!(plan.slot_indptr, vec![0, 2, 3]);
-        assert_eq!(plan.row_tiles, vec![0, 1, 0, 0]);
-        assert_eq!(plan.row_slots, vec![0, 0, 1, 0]);
+        assert_eq!(plan.row_indptr, vec![0, 1, 3]);
+        assert_eq!(plan.row_tiles, vec![0, 0, 1, 0]);
+        assert_eq!(plan.row_batch, vec![0, 1, 1, 0]);
         assert_eq!(plan.row_valid, vec![1, 1, 1, 0]);
     }
 
     #[test]
     fn decode_tile_plan_keeps_a_short_kv_on_one_tile() {
         // 256 tokens is the floor chunk, so a 200-token request cannot fan out.
-        let plan = plan_decode_kv_tiles(1, 8, &[0], &[200]).unwrap();
+        let plan = plan_decode_kv_tiles(1, 8, &[200]).unwrap();
         assert_eq!(plan.tile_tokens, 256);
-        assert_eq!(plan.slot_indptr, vec![0, 1]);
+        assert_eq!(plan.row_indptr, vec![0, 1]);
         assert_eq!(plan.row_valid, vec![1, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
     fn decode_tile_plan_pads_idle_rows_without_kv() {
-        // One active request in a four-slot bucket: the rest of the rows launch
-        // with no KV, and the idle slots get empty merge windows.
-        let plan = plan_decode_kv_tiles(4, 2, &[3], &[900]).unwrap();
+        // One live batch row in a four-row bucket: the rest of the rows launch
+        // with no KV and their merge windows stay empty.
+        let plan = plan_decode_kv_tiles(4, 2, &[900]).unwrap();
         assert_eq!(plan.tile_tokens, 450);
-        assert_eq!(plan.slot_indptr, vec![0, 0, 0, 0, 2]);
+        assert_eq!(plan.row_indptr, vec![0, 2, 2, 2, 2]);
         assert_eq!(plan.row_valid, vec![1, 1, 0, 0, 0, 0, 0, 0]);
         assert_eq!(plan.row_tiles[0..2], [0, 1]);
-        assert_eq!(plan.row_slots[0], 3);
-        assert_eq!(plan.row_slots[1], 3);
-        assert!(plan.row_slots[2..].iter().all(|slot| *slot == 0));
+        assert_eq!(plan.row_batch[0], 0);
+        assert_eq!(plan.row_batch[1], 0);
+        assert!(plan.row_batch[2..].iter().all(|row| *row == 0));
     }
 
     #[test]
-    fn decode_tile_plan_rejects_row_and_slot_mismatches() {
-        assert!(plan_decode_kv_tiles(0, 4, &[], &[]).is_err());
-        assert!(plan_decode_kv_tiles(2, 4, &[0, 1], &[1]).is_err());
-        assert!(plan_decode_kv_tiles(2, 4, &[0, 1, 2], &[1, 1, 1]).is_err());
-        assert!(plan_decode_kv_tiles(2, 4, &[2], &[1]).is_err());
-        assert!(plan_decode_kv_tiles(2, 0, &[0], &[1]).is_err());
-        assert!(plan_decode_kv_tiles(2, 4, &[0, 0], &[1, 1]).is_err());
-        assert!(plan_decode_kv_tiles(2, 4, &[0], &[0]).is_err());
+    fn decode_tile_plan_rejects_input_mismatches() {
+        assert!(plan_decode_kv_tiles(0, 4, &[]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[1, 1, 1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 0, &[1]).is_err());
+        assert!(plan_decode_kv_tiles(2, 4, &[0]).is_err());
     }
 }

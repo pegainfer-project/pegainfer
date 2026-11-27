@@ -57,7 +57,6 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         &self,
         token_ids: &[u32],
         append_positions: &[usize],
-        slots: &[usize],
         decode_batch_size: usize,
         kv_pages: &KimiKvStepPages,
         rows: &[KimiRowOptions],
@@ -66,18 +65,16 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         if token_ids.is_empty() {
             bail!("Kimi TP1 batch decode requires at least one token");
         }
-        if token_ids.len() != append_positions.len() || token_ids.len() != slots.len() {
+        if token_ids.len() != append_positions.len() {
             bail!(
-                "Kimi TP1 batch decode input mismatch: tokens={}, positions={}, slots={}",
+                "Kimi TP1 batch decode input mismatch: tokens={}, positions={}",
                 token_ids.len(),
-                append_positions.len(),
-                slots.len()
+                append_positions.len()
             );
         }
         let response = self.worker.forward_decode_batch_next_tokens_async(
             token_ids.to_vec(),
             append_positions.to_vec(),
-            slots.to_vec(),
             decode_batch_size,
             kv_pages.clone(),
             rows.to_vec(),
@@ -93,7 +90,7 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
             token_ids.len()
         );
         for (row, report) in reports.iter().enumerate() {
-            validate_tp1_report(report, "decode", slots[row])?;
+            validate_tp1_report(report, "decode", row)?;
         }
         Ok(reports)
     }
@@ -116,14 +113,14 @@ impl Drop for Tp1Dp8ForwardExecutor {
 fn validate_tp1_report(
     report: &KimiOneTokenForwardReport,
     phase: &str,
-    expected_slot: usize,
+    expected_row: usize,
 ) -> Result<()> {
     ensure!(
-        report.batch_slot == expected_slot,
-        "Kimi TP1 {phase} rank {} report slot mismatch: got {}, expected {}",
+        report.batch_row == expected_row,
+        "Kimi TP1 {phase} rank {} report row mismatch: got {}, expected {}",
         report.rank,
-        report.batch_slot,
-        expected_slot
+        report.batch_row,
+        expected_row
     );
     ensure!(
         report.vocab_start == 0 && report.vocab_rows == KIMI_K2_VOCAB,

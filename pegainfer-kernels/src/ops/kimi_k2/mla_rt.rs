@@ -108,23 +108,26 @@ pub fn kimi_mla_v_up_rt(
     Ok(())
 }
 
-/// Split-KV plan for one MLA decode step: `row_slots` names the request each row
-/// serves and `row_tiles` its KV tile, `row_valid` masks the rows this step leaves
-/// empty, `slot_indptr` gives each request the contiguous row run its partials
-/// occupy for the merge, and `partial_ckv`/`partial_lse` hold one partial
-/// attention result per row.
+/// Split-KV plan for one MLA decode step: `row_batch` names the batch row each
+/// row serves and `row_tiles` its KV tile, `row_valid` masks the rows this step
+/// leaves empty, `row_indptr` gives each batch row the contiguous row run its
+/// partials occupy for the merge, and `partial_ckv`/`partial_lse` hold one
+/// partial attention result per row.
 pub struct KimiMlaSplitKv<'a> {
-    pub row_slots: &'a CudaSlice<i32>,
+    pub row_batch: &'a CudaSlice<i32>,
     pub row_tiles: &'a CudaSlice<i32>,
     pub row_valid: &'a CudaSlice<u8>,
-    pub slot_indptr: &'a CudaSlice<i32>,
+    pub row_indptr: &'a CudaSlice<i32>,
     pub tile_tokens: &'a CudaSlice<i32>,
     pub partial_ckv: &'a mut CudaSlice<half::bf16>,
     pub partial_lse: &'a mut CudaSlice<f32>,
     pub rows: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
+// The plan carries `&mut` workspace borrows: taking it by value lets the
+// launcher borrow `partial_ckv`/`partial_lse` mutably for the device-pointer
+// handles, which a `&KimiMlaSplitKv` argument would reborrow as shared.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn kimi_flashinfer_batch_decode_mla_rt(
     ctx: &DeviceContext,
     q_abs_nope: &HiddenStates,
@@ -148,17 +151,17 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
         layout.batch_size
     );
     ensure!(
-        split.row_slots.len() >= split.rows
+        split.row_batch.len() >= split.rows
             && split.row_tiles.len() >= split.rows
             && split.row_valid.len() >= split.rows,
         "Kimi MLA split-KV row metadata shorter than {} rows",
         split.rows
     );
     ensure!(
-        split.slot_indptr.len() >= layout.batch_size + 1,
-        "Kimi MLA split-KV indptr {} shorter than {} rows",
-        split.slot_indptr.len(),
-        layout.batch_size + 1
+        split.row_indptr.len() > layout.batch_size,
+        "Kimi MLA split-KV indptr {} needs one entry per batch row plus the closing entry ({} rows)",
+        split.row_indptr.len(),
+        layout.batch_size
     );
     ensure!(
         !split.tile_tokens.is_empty(),
@@ -178,10 +181,10 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
     let (pi_ptr, _g5) = page_indices_d.device_ptr(&ctx.stream);
     let (pip_ptr, _g6) = page_indptr_d.device_ptr(&ctx.stream);
     let (lpl_ptr, _g7) = last_page_len_d.device_ptr(&ctx.stream);
-    let (ri_ptr, _g8) = split.row_slots.device_ptr(&ctx.stream);
+    let (rb_ptr, _g8) = split.row_batch.device_ptr(&ctx.stream);
     let (kti_ptr, _g9) = split.row_tiles.device_ptr(&ctx.stream);
     let (kcs_ptr, _g10) = split.tile_tokens.device_ptr(&ctx.stream);
-    let (sip_ptr, _g11) = split.slot_indptr.device_ptr(&ctx.stream);
+    let (rip_ptr, _g11) = split.row_indptr.device_ptr(&ctx.stream);
     let (rv_ptr, _g12) = split.row_valid.device_ptr(&ctx.stream);
     let (pc_ptr, _g13) = split.partial_ckv.device_ptr_mut(&ctx.stream);
     let (pl_ptr, _g14) = split.partial_lse.device_ptr_mut(&ctx.stream);
@@ -195,10 +198,10 @@ pub fn kimi_flashinfer_batch_decode_mla_rt(
             pi_ptr as *const i32,
             pip_ptr as *const i32,
             lpl_ptr as *const i32,
-            ri_ptr as *const i32,
+            rb_ptr as *const i32,
             kti_ptr as *const i32,
             kcs_ptr as *const i32,
-            sip_ptr as *const i32,
+            rip_ptr as *const i32,
             rv_ptr as *const u8,
             pc_ptr as *mut ffi::Half,
             pl_ptr as *mut f32,

@@ -62,15 +62,17 @@ A layout subtlety that makes one shared pool possible:
 arenas (1/2/4/…/64) share the rank's single pool buffers, each arena keeping
 its own layout with the bucket's batch dimension.
 
-### Page table plumbing: row-major CSR → slot-indexed scatter
+### Page table plumbing: one row space for CSR and the kernel
 
 The scheduler speaks **row-major CSR** (`KimiKvStepPages`: one page row per
-batch row). The worker's FlashInfer metadata is indexed by **slot**
-(`batch_size` rows, idle slots included). `build_slot_page_table`
-(`worker/cache.rs`) scatters the row CSR to the slot table; idle slots and
-CUDA-graph padding rows ride the pool's **padding page** (block 0,
-leak-registered in `BlockPool` so it can never be handed to a request).
-Concurrent garbage writes to the padding page are benign by construction.
+batch row). Decode keeps that row space end to end: `build_page_table`
+(`worker/cache.rs`) scatters the CSR rows through a caller-supplied row map —
+decode passes identity, so row `r`'s query, page-table row and KV append all
+sit at `r`; prefill passes `|_| slot`, because a prefill request stores its KV
+at its own arena row. Idle and CUDA-graph padding rows ride the pool's
+**padding page** (block 0, leak-registered in `BlockPool` so it can never be
+handed to a request). Concurrent garbage writes to the padding page are benign
+by construction.
 Page counts are matched **exactly** (`pages == ceil(kv_tokens/16)`) — any
 drift between scheduler accounting and the kernel's view crashes the step
 instead of silently truncating attention.
