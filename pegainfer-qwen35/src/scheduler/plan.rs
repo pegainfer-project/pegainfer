@@ -18,7 +18,9 @@ pub(super) struct PrefillQueueState {
     pub(super) remaining_tokens: usize,
 }
 
-/// Linear per-step cost fit used to bound the prefill rows of one step.
+/// Empirical per-step cost model: a fixed launch cost, a per-prompt launch
+/// cost, per-row prefill and decode costs, and a quadratic attention term over
+/// the prompt rows read against resident KV.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StepCostModel {
     pub base_us: u64,
@@ -60,7 +62,7 @@ impl StepCostModel {
         }
         let r = rows as u128;
         let c = cursor as u128;
-        let attn_pairs = r * (2 * c + r + 1) / 2;
+        let attn_pairs = r.saturating_mul(2 * c + r + 1) / 2;
         let attn_us = attn_pairs.saturating_mul(self.us_per_million_attn_pairs as u128) / 1_000_000;
         let total = (self.us_per_prefill_prompt as u128)
             .saturating_add((self.us_per_prefill_row as u128).saturating_mul(r))
@@ -194,109 +196,122 @@ pub(super) fn plan_prefill_rows(
         StepPolicy::StallBounded {
             max_stall_us,
             cost_model,
-        } => {
-            let first = prefilling[0];
-            if first.remaining_tokens == 0 {
-                return Vec::new();
-            }
-            let fixed_us = cost_model.fixed_step_us(active_decodes);
-            if active_decodes == 0 {
-                // No active decoder shares this step, so the head prompt may use
-                // the whole budget. Followers still pay their own per-prompt and
-                // cursor cost, so a short head does not hide a long continuation.
-                let first_rows = first.remaining_tokens.min(remaining_budget);
-                if first_rows < first.remaining_tokens {
-                    return vec![first_rows];
-                }
-                let used_us =
-                    fixed_us.saturating_add(cost_model.prompt_cost_us(first.cursor, first_rows));
-                pack_whole_followers(
-                    first_rows,
-                    used_us,
-                    &prefilling[1..],
-                    remaining_budget,
-                    max_stall_us,
-                    cost_model,
-                )
-            } else {
-                // Mixed step: bound the head slice by the decode stall target.
-                let headroom_us = max_stall_us.saturating_sub(fixed_us);
-                let first_cap =
-                    cost_model.max_rows_for_prompt(headroom_us, first.cursor, remaining_budget);
-                if first.remaining_tokens > first_cap {
-                    let tail = first.remaining_tokens % first_cap;
-                    let tail_cursor = first.cursor.saturating_add(first.remaining_tokens - tail);
-                    let next_fits_with_tail = tail > 0
-                        && prefilling.get(1).is_some_and(|next| {
-                            next.remaining_tokens > 0
-                                && tail.saturating_add(next.remaining_tokens) <= remaining_budget
-                                && fixed_us
-                                    .saturating_add(cost_model.prompt_cost_us(tail_cursor, tail))
-                                    .saturating_add(
-                                        cost_model
-                                            .prompt_cost_us(next.cursor, next.remaining_tokens),
-                                    )
-                                    <= max_stall_us
-                        });
-                    if next_fits_with_tail {
-                        // Finish the tail in the next step beside the whole
-                        // follower, so this step takes a full slice.
-                        return vec![first_cap];
-                    }
-                    // Same number of steps as repeated capped slices, lower peak ITL.
-                    let chunks = first.remaining_tokens.div_ceil(first_cap);
-                    vec![first.remaining_tokens.div_ceil(chunks)]
-                } else {
-                    let used_us = fixed_us.saturating_add(
-                        cost_model.prompt_cost_us(first.cursor, first.remaining_tokens),
-                    );
-                    pack_whole_followers(
-                        first.remaining_tokens,
-                        used_us,
-                        &prefilling[1..],
-                        remaining_budget,
-                        max_stall_us,
-                        cost_model,
-                    )
-                }
-            }
-        }
+        } => StallBudget::new(active_decodes, max_stall_us, cost_model)
+            .plan(prefilling, remaining_budget),
     }
 }
 
-/// Pack the head plus only those FIFO followers that fit whole in the row budget
-/// and the stall target.
-///
-/// A follower that cannot fit is left for the next step; slicing it here would
-/// add a prefill request launch for a tiny fragment. Each follower pays its own
-/// per-prompt fixed cost and the attention cost of its own cursor, so packing
-/// short prompts cannot hide a deep continuation.
-fn pack_whole_followers(
-    first_rows: usize,
-    mut used_us: u64,
-    followers: &[PrefillQueueState],
-    row_cap: usize,
+/// One step's stall budget with its fixed cost already charged.
+struct StallBudget {
+    has_active_decodes: bool,
     max_stall_us: u64,
+    fixed_us: u64,
     cost_model: StepCostModel,
-) -> Vec<usize> {
-    let mut prefill = vec![first_rows];
-    let mut total_rows = first_rows;
-    for state in followers {
-        if state.remaining_tokens == 0 {
-            break;
-        }
-        let next_rows = total_rows.saturating_add(state.remaining_tokens);
-        let next_us =
-            used_us.saturating_add(cost_model.prompt_cost_us(state.cursor, state.remaining_tokens));
-        if next_rows <= row_cap && next_us <= max_stall_us {
-            total_rows = next_rows;
-            used_us = next_us;
-            prefill.push(state.remaining_tokens);
-        } else {
-            break;
+}
+
+impl StallBudget {
+    fn new(active_decodes: usize, max_stall_us: u64, cost_model: StepCostModel) -> Self {
+        Self {
+            has_active_decodes: active_decodes > 0,
+            max_stall_us,
+            fixed_us: cost_model.fixed_step_us(active_decodes),
+            cost_model,
         }
     }
-    prefill
+
+    fn headroom_us(&self) -> u64 {
+        self.max_stall_us.saturating_sub(self.fixed_us)
+    }
+
+    fn plan(&self, prefilling: &[PrefillQueueState], row_cap: usize) -> Vec<usize> {
+        let head = prefilling[0];
+        if head.remaining_tokens == 0 {
+            return Vec::new();
+        }
+        if !self.has_active_decodes {
+            // No active decoder shares this step, so the head may use the whole
+            // row budget. Followers still pay their own per-prompt and cursor
+            // cost, so a short head does not hide a long continuation.
+            if head.remaining_tokens > row_cap {
+                return vec![row_cap];
+            }
+            return self.pack_whole_followers(head, &prefilling[1..], row_cap);
+        }
+        let first_cap =
+            self.cost_model
+                .max_rows_for_prompt(self.headroom_us(), head.cursor, row_cap);
+        if head.remaining_tokens > first_cap {
+            return vec![self.slice_head(head, first_cap, prefilling.get(1).copied(), row_cap)];
+        }
+        self.pack_whole_followers(head, &prefilling[1..], row_cap)
+    }
+
+    fn slice_head(
+        &self,
+        head: PrefillQueueState,
+        first_cap: usize,
+        next: Option<PrefillQueueState>,
+        row_cap: usize,
+    ) -> usize {
+        let tail = head.remaining_tokens - first_cap;
+        let tail_cursor = head.cursor.saturating_add(first_cap);
+        let can_merge_next = next.is_some_and(|next| {
+            next.remaining_tokens > 0
+                && tail.saturating_add(next.remaining_tokens) <= row_cap
+                && self
+                    .fixed_us
+                    .saturating_add(self.cost_model.prompt_cost_us(tail_cursor, tail))
+                    .saturating_add(
+                        self.cost_model
+                            .prompt_cost_us(next.cursor, next.remaining_tokens),
+                    )
+                    <= self.max_stall_us
+        });
+        if can_merge_next {
+            return first_cap;
+        }
+        let chunks = head.remaining_tokens.div_ceil(first_cap);
+        head.remaining_tokens.div_ceil(chunks)
+    }
+
+    /// Pack the head plus only those FIFO followers that fit whole in the row
+    /// budget and the stall target.
+    ///
+    /// A follower that cannot fit is left for the next step; slicing it here
+    /// would add a prefill request launch for a tiny fragment. Each follower
+    /// pays its own per-prompt fixed cost and the attention cost of its own
+    /// cursor, so packing short prompts cannot hide a deep continuation.
+    fn pack_whole_followers(
+        &self,
+        head: PrefillQueueState,
+        followers: &[PrefillQueueState],
+        row_cap: usize,
+    ) -> Vec<usize> {
+        let mut prefill = vec![head.remaining_tokens];
+        let mut total_rows = head.remaining_tokens;
+        let mut used_us = self.fixed_us.saturating_add(
+            self.cost_model
+                .prompt_cost_us(head.cursor, head.remaining_tokens),
+        );
+        for state in followers {
+            if state.remaining_tokens == 0 {
+                break;
+            }
+            let next_rows = total_rows.saturating_add(state.remaining_tokens);
+            let next_us = used_us.saturating_add(
+                self.cost_model
+                    .prompt_cost_us(state.cursor, state.remaining_tokens),
+            );
+            if next_rows <= row_cap && next_us <= self.max_stall_us {
+                total_rows = next_rows;
+                used_us = next_us;
+                prefill.push(state.remaining_tokens);
+            } else {
+                break;
+            }
+        }
+        prefill
+    }
 }
 
 /// FIFO prompt slices under a hard row budget.
@@ -711,6 +726,7 @@ mod tests {
             "a long prompt saturates the u64 result instead of wrapping"
         );
         assert_eq!(model.prompt_cost_us(usize::MAX, 1), 35_602_216_062_264_302);
+        assert_eq!(model.prompt_cost_us(usize::MAX, usize::MAX), u64::MAX);
     }
 
     #[test]
@@ -780,42 +796,31 @@ mod tests {
     }
 
     #[test]
-    fn stall_bounded_returns_no_rows_for_an_empty_queue() {
+    fn stall_bounded_plans_no_rows_for_an_empty_queue_or_zero_budget() {
         let policy = StepPolicy::stall_bounded_ms(60);
         for active_decodes in [0, 1, 8] {
             assert!(plan_prefill_rows(active_decodes, &[], 1_024, policy).is_empty());
         }
-    }
-
-    #[test]
-    fn stall_bounded_zero_budget_yields_no_rows() {
-        let policy = StepPolicy::stall_bounded_ms(60);
         assert!(plan_prefill_rows(0, &prompts(&[1_024]), 0, policy).is_empty());
         assert!(plan_prefill_rows(3, &prompts(&[1_024]), 0, policy).is_empty());
         assert!(plan_prefill_rows(0, &prompts(&[1_024]), 0, StepPolicy::Fixed).is_empty());
+        assert!(plan_step(0, 1_024, &[], policy).is_empty());
     }
 
     #[test]
-    fn stall_bounded_empty_plan_without_prompt_or_decode_work() {
-        let plan = plan_step(0, 1_024, &[], StepPolicy::stall_bounded_ms(60));
-        assert!(plan.is_empty());
-    }
-
-    #[test]
-    fn stall_bounded_plan_step_keeps_prefill_only_and_mixed_marks() {
-        let pure = plan_step(
-            0,
-            2_048,
-            &prompts(&[3_000]),
-            StepPolicy::stall_bounded_ms(60),
-        );
+    fn stall_bounded_plan_step_sets_decode_and_prefill_flags() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        let pure = plan_step(0, 2_048, &prompts(&[3_000]), policy);
         assert!(!pure.decode);
         assert_eq!(pure.prefill, vec![2_048]);
 
-        let queue = prompts(&[1_024]);
-        let mixed = plan_step(2, 4_096, &queue, StepPolicy::stall_bounded_ms(60));
+        let mixed = plan_step(2, 4_096, &prompts(&[1_024]), policy);
         assert!(mixed.decode);
         assert_eq!(mixed.prefill, vec![512]);
+
+        let decode_only = plan_step(4, 1_024, &[], policy);
+        assert!(decode_only.decode);
+        assert!(decode_only.prefill.is_empty());
     }
 
     #[test]
@@ -825,46 +830,25 @@ mod tests {
     }
 
     #[test]
-    fn stall_bounded_decode_only_step_keeps_decoding() {
-        let plan = plan_step(4, 1_024, &[], StepPolicy::stall_bounded_ms(60));
-        assert!(plan.decode);
-        assert!(plan.prefill.is_empty());
-    }
-
-    #[test]
-    fn stall_bounded_pure_prefill_uses_the_whole_budget_for_one_long_prompt() {
-        let rows = plan_prefill_rows(
-            0,
-            &prompts(&[3_000]),
-            2_048,
-            StepPolicy::stall_bounded_ms(60),
-        );
-        assert_eq!(rows, vec![2_048]);
-    }
-
-    #[test]
-    fn stall_bounded_pure_prefill_does_not_pack_a_1024_prompt_burst() {
-        let rows = plan_prefill_rows(
-            0,
-            &prompts(&[1_024, 1_024, 1_024]),
-            4_096,
-            StepPolicy::stall_bounded_ms(60),
+    fn stall_bounded_pure_prefill_packs_whole_prompts_within_the_caps() {
+        let policy = StepPolicy::stall_bounded_ms(60);
+        assert_eq!(
+            plan_prefill_rows(0, &prompts(&[3_000]), 2_048, policy),
+            vec![2_048],
+            "the head may use the whole row budget when no decoder shares the step"
         );
         assert_eq!(
-            rows,
+            plan_prefill_rows(0, &prompts(&[3_000, 100]), 500, policy),
+            vec![500],
+            "the hard budget caps the head and the unfinished prompt blocks the follower"
+        );
+        assert_eq!(
+            plan_prefill_rows(0, &prompts(&[1_024, 1_024, 1_024]), 4_096, policy),
             vec![1_024],
             "a second 1024-row prompt must not delay the first prompt's TTFT"
         );
-    }
 
-    #[test]
-    fn stall_bounded_pure_prefill_packs_short_prompts_within_the_stall_cap() {
-        let rows = plan_prefill_rows(
-            0,
-            &prompts(&[300, 200, 100, 100]),
-            4_096,
-            StepPolicy::stall_bounded_ms(60),
-        );
+        let rows = plan_prefill_rows(0, &prompts(&[300, 200, 100, 100]), 4_096, policy);
         assert_eq!(
             rows,
             vec![300, 200],
@@ -876,40 +860,15 @@ mod tests {
                 > 60_000,
             "a third short prompt would cross the stall target"
         );
-    }
-
-    #[test]
-    fn stall_bounded_pure_prefill_does_not_slice_a_whole_follower() {
-        let rows = plan_prefill_rows(
-            0,
-            &prompts(&[300, 500]),
-            4_096,
-            StepPolicy::stall_bounded_ms(60),
-        );
         assert_eq!(
-            rows,
+            plan_prefill_rows(0, &prompts(&[300, 500]), 4_096, policy),
             vec![300],
             "a follower that does not fit whole waits for the next step"
         );
     }
 
     #[test]
-    fn stall_bounded_pure_prefill_slicing_takes_the_hard_budget() {
-        let rows = plan_prefill_rows(
-            0,
-            &prompts(&[3_000, 100]),
-            500,
-            StepPolicy::stall_bounded_ms(60),
-        );
-        assert_eq!(
-            rows,
-            vec![500],
-            "the hard budget caps the slice and the unfinished prompt blocks the follower"
-        );
-    }
-
-    #[test]
-    fn stall_bounded_mixed_step_slices_balanced_without_backlog() {
+    fn stall_bounded_mixed_step_slices_the_head_without_slicing_the_follower() {
         let policy = StepPolicy::stall_bounded_ms(60);
         let rows = plan_prefill_rows(1, &prompts(&[1_024]), 4_096, policy);
         assert_eq!(rows, vec![512]);
@@ -917,32 +876,55 @@ mod tests {
             StepCostModel::H20_QWEN35_4B.predict_step_us(1, &[(0, rows[0])]) <= 60_000,
             "the balanced slice must respect the stall target"
         );
-    }
-
-    #[test]
-    fn stall_bounded_mixed_step_respects_a_budget_below_the_stall_cap() {
-        let rows = plan_prefill_rows(1, &prompts(&[3_000]), 300, StepPolicy::stall_bounded_ms(60));
-        assert_eq!(rows, vec![300]);
-    }
-
-    #[test]
-    fn stall_bounded_mixed_step_does_not_slice_a_whole_follower() {
-        let policy = stall_policy_for_cap(1_062, 1);
-        let queue = prompts(&[1_024, 1_024]);
-        let rows = plan_prefill_rows(1, &queue, 4_096, policy);
         assert_eq!(
-            rows,
-            vec![1_024],
-            "must not emit a follower fragment to fill leftover rows"
+            plan_prefill_rows(1, &prompts(&[3_000]), 300, policy),
+            vec![300],
+            "a row budget below the stall cap bounds the balanced slice"
+        );
+
+        let policy = stall_policy_for_cap(550, 1);
+        assert_eq!(
+            plan_prefill_rows(1, &prompts(&[1_024, 1_024]), 4_096, policy),
+            vec![512]
+        );
+        let remaining = [
+            PrefillQueueState {
+                cursor: 512,
+                remaining_tokens: 512,
+            },
+            PrefillQueueState {
+                cursor: 0,
+                remaining_tokens: 1_024,
+            },
+        ];
+        assert_eq!(
+            plan_prefill_rows(1, &remaining, 4_096, policy),
+            vec![512],
+            "the tail step stays whole and never emits a follower fragment"
         );
     }
 
     #[test]
-    fn stall_bounded_mixed_step_packs_a_whole_follower_when_it_fits() {
-        let policy = stall_policy_for_cap(2_100, 1);
+    fn stall_bounded_mixed_step_packs_whole_followers_only() {
+        let policy = stall_policy_for_cap(1_062, 1);
         let queue = prompts(&[1_024, 1_024]);
-        let rows = plan_prefill_rows(1, &queue, 4_096, policy);
-        assert_eq!(rows, vec![1_024, 1_024]);
+        assert_eq!(
+            plan_prefill_rows(1, &queue, 4_096, policy),
+            vec![1_024],
+            "must not emit a follower fragment to fill leftover rows"
+        );
+
+        let policy = stall_policy_for_cap(2_100, 1);
+        assert_eq!(
+            plan_prefill_rows(1, &queue, 4_096, policy),
+            vec![1_024, 1_024]
+        );
+
+        let policy = stall_policy_for_cap(700, 1);
+        assert_eq!(
+            plan_prefill_rows(1, &prompts(&[256, 256, 512]), 4_096, policy),
+            vec![256, 256]
+        );
     }
 
     #[test]
@@ -975,40 +957,24 @@ mod tests {
     }
 
     #[test]
-    fn stall_bounded_mixed_step_balances_without_slicing_the_follower() {
-        let policy = stall_policy_for_cap(550, 1);
-        let queue = prompts(&[1_024, 1_024]);
-        let first = plan_prefill_rows(1, &queue, 4_096, policy);
-        assert_eq!(first, vec![512]);
+    fn stall_bounded_three_step_prompt_does_not_merge_a_small_tail_early() {
+        let policy = stall_policy_for_cap(512, 1);
+        let head_tokens = 1_050;
+        let queue = prompts(&[head_tokens, 200]);
 
-        let remaining = [
-            PrefillQueueState {
-                cursor: 512,
-                remaining_tokens: 512,
-            },
-            PrefillQueueState {
-                cursor: 0,
-                remaining_tokens: 1_024,
-            },
-        ];
-        let second = plan_prefill_rows(1, &remaining, 4_096, policy);
+        // 1050 % 512 == 26: a remainder probe treats 26 as the next-step tail,
+        // but the real second slice is 538 tokens and cannot merge beside the
+        // follower at cursor 512.
+        assert_eq!(head_tokens % 512, 26);
         assert_eq!(
-            second,
-            vec![512],
-            "the tail step stays whole and never emits a follower fragment"
+            plan_prefill_rows(1, &queue, 4_096, policy),
+            vec![350],
+            "a three-step head must use balanced slices, not the modulo tail"
         );
     }
 
     #[test]
-    fn stall_bounded_mixed_step_packs_whole_short_prompts() {
-        let policy = stall_policy_for_cap(700, 1);
-        let queue = prompts(&[256, 256, 512]);
-        let rows = plan_prefill_rows(1, &queue, 4_096, policy);
-        assert_eq!(rows, vec![256, 256]);
-    }
-
-    #[test]
-    fn feathbow_31_short_prompts_pack_only_what_the_stall_target_allows() {
+    fn short_prompt_burst_packs_within_per_prompt_stall_budget() {
         let model = StepCostModel::H20_QWEN35_4B;
         let queue = prompts(&[16; 31]);
         let plan = plan_step(1, 4_096, &queue, StepPolicy::stall_bounded_ms(50));
@@ -1029,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_long_context_continuation_slicing_prices_the_cursor() {
+    fn long_context_continuation_slicing_prices_the_cursor() {
         let model = StepCostModel::H20_QWEN35_4B;
         let cold = plan_prefill_rows(
             1,
@@ -1074,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn deep_cursor_follower_does_not_ride_a_short_prompt_step() {
+    fn high_cursor_follower_does_not_ride_a_short_prompt_step() {
         let model = StepCostModel::H20_QWEN35_4B;
         let queue = [
             PrefillQueueState {

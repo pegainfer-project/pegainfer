@@ -1,16 +1,17 @@
 //! Env-gated per-step ITL logging (`PEGAINFER_ITL_DEBUG`): one `ITL_STEP`
 //! line per executed scheduler step with the plan kind, chunk/decode widths,
-//! and CPU wall-time. Off by default; the check is cached so the serving path
-//! pays one static lookup.
+//! prefill queue depth, and CPU wall-time. Off by default; the check is cached
+//! so the serving path pays one static lookup.
 
 use super::*;
 
 /// Env-gated per-step ITL diagnostics (issue #470). When `PEGAINFER_ITL_DEBUG`
 /// is set, the scheduler emits one `ITL_STEP` line per executed step, tagging
 /// the plan kind, the *actual* prefill-chunk token count associated with the
-/// action, the active decode width, and the CPU wall-time. This lets the
-/// mixed-load bench separate serial Unified stalls from overlap launch,
-/// decode, completion, and wait actions instead of relying on the coarse
+/// action, the active decode width, the prefill queue depth (request and
+/// remaining-token counts), and the CPU wall-time. This lets the mixed-load
+/// bench separate serial Unified stalls from overlap launch, decode,
+/// completion, and wait actions instead of relying on the coarse
 /// `[submit, last-token]` injection window. Off by default: no cost on the
 /// normal bench path.
 pub(super) fn itl_debug_enabled() -> bool {

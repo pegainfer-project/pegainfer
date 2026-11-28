@@ -115,11 +115,15 @@ All scheduling policy logic lives in pure, stateless types and functions in
         (`pack_whole_followers`) while total rows stay within `remaining_budget`
         and cumulative step cost stays within `max_stall_us`, never slicing a
         follower into a partial sliver.
-      - If `first.remaining_tokens > first_cap`: slice at `first_cap` only when
-        `tail + next_whole` fits inside both `remaining_budget` and
-        `max_stall_us` on the next step (at `tail_cursor`); otherwise use
-        balanced slicing `first_rem.div_ceil(first_rem.div_ceil(first_cap))` so
-        the same step count yields a lower peak stall.
+      - If `first.remaining_tokens > first_cap`: the head needs more than one
+        slice. The next step can merge the remaining head
+        (`tail = first.remaining_tokens - first_cap`, starting at
+        `first.cursor + first_cap`) with the whole follower only when that pair
+        fits both `remaining_budget` and `max_stall_us`; then this step takes
+        `first_cap`. A head that needs three or more slices leaves `tail` too
+        large to pass, so the planner uses balanced slicing
+        `first_rem.div_ceil(first_rem.div_ceil(first_cap))` for the same step
+        count and a lower peak stall.
 
 ### Counterexample Verification on H20 (`PEGAINFER_ITL_DEBUG=1`)
 
@@ -205,11 +209,11 @@ and `--qwen35-prefill-stall-ms <MS>` is an explicit opt-in flag.
   Qwen3.5-4B BF16. Other GPU architectures, larger model sizes (9B/27B), or TP
   launches have different slopes and should supply a calibrated `StepCostModel`
   if millisecond accuracy is needed.
-- Verification covers `clippy -D warnings`, unit tests (`scheduler::plan` 58,
-  `model_line` 15, `lib` 26, `pegainfer-frontend` 109), single-GPU and TP2
-  `scheduler::e2e_tests`, `scheduler::chunked_prefill_tests`, the live H20
-  short-prompt and 32k/64k continuation checks, and the 5-arm H20 serving
-  matrix above.
+- Verification covers `clippy -D warnings`, unit tests (`scheduler::plan` 48,
+  `model_line` 15, `pegainfer-qwen35::tests` 9, `pegainfer-frontend` 109),
+  single-GPU and TP2 `scheduler::e2e_tests`, `scheduler::chunked_prefill_tests`,
+  the live H20 short-prompt and 32k/64k continuation checks, and the 5-arm H20
+  serving matrix above.
 
 ## Verification Commands
 

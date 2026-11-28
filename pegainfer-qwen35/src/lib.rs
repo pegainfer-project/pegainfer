@@ -244,7 +244,7 @@ pub(crate) fn check_launch(
         let min_stall_us = cost_model.min_reachable_stall_us();
         anyhow::ensure!(
             max_stall_us >= min_stall_us,
-            "Qwen3.5 --qwen35-prefill-stall-ms must be at least {} ms to cover one prefill row plus its per-prompt and cursor attention cost alongside one active decoder; a mixed prefill+decode step cannot stall less than {min_stall_us} us, got {max_stall_us} us",
+            "Qwen3.5 --qwen35-prefill-stall-ms must be at least {} ms to cover one prefill row alongside one active decoder; a mixed prefill+decode step cannot stall less than {min_stall_us} us, got {max_stall_us} us",
             min_stall_us.div_ceil(1_000)
         );
         anyhow::ensure!(
@@ -387,6 +387,29 @@ mod tests {
     use super::start_engine_with_backend;
     use super::start_engine_with_capacity_and_overlap;
 
+    fn start_with_step_policy(
+        max_batch: usize,
+        decode_overlap: Qwen35DecodeOverlap,
+        step_policy: StepPolicy,
+    ) -> anyhow::Result<crate::Engine> {
+        start_engine_with_backend(
+            Path::new("unused-model-path"),
+            EngineLoadOptions {
+                enable_cuda_graph: false,
+                device_ordinals: vec![0],
+                parallel_config: None,
+                ep_backend: EpBackend::Nccl,
+                seed: 42,
+            },
+            max_batch,
+            1_024,
+            decode_overlap,
+            Qwen35GdnBackend::Triton,
+            0,
+            step_policy,
+        )
+    }
+
     #[test]
     fn launch_options_reject_zero_tp_size() {
         let options = Qwen35LaunchOptions {
@@ -464,20 +487,9 @@ mod tests {
 
     #[test]
     fn rejects_zero_stall_bound_before_loading_model() {
-        let err = start_engine_with_backend(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: false,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
+        let err = start_with_step_policy(
             1,
-            1_024,
             Qwen35DecodeOverlap::Off,
-            Qwen35GdnBackend::Triton,
-            0,
             StepPolicy::StallBounded {
                 max_stall_us: 0,
                 cost_model: StepCostModel::H20_QWEN35_4B,
@@ -496,20 +508,9 @@ mod tests {
     #[test]
     fn rejects_unreachable_stall_bound_before_loading_model() {
         for stall_ms in [1, 11] {
-            let err = start_engine_with_backend(
-                Path::new("unused-model-path"),
-                EngineLoadOptions {
-                    enable_cuda_graph: false,
-                    device_ordinals: vec![0],
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: 42,
-                },
+            let err = start_with_step_policy(
                 1,
-                1_024,
                 Qwen35DecodeOverlap::Off,
-                Qwen35GdnBackend::Triton,
-                0,
                 StepPolicy::stall_bounded_ms(stall_ms),
             )
             .err()
@@ -536,20 +537,9 @@ mod tests {
 
     #[test]
     fn rejects_zero_cost_model_slope_before_loading_model() {
-        let err = start_engine_with_backend(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: false,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
+        let err = start_with_step_policy(
             1,
-            1_024,
             Qwen35DecodeOverlap::Off,
-            Qwen35GdnBackend::Triton,
-            0,
             StepPolicy::StallBounded {
                 max_stall_us: 60_000,
                 cost_model: StepCostModel {
@@ -570,20 +560,9 @@ mod tests {
 
     #[test]
     fn rejects_stall_bound_with_stream_overlap_before_loading_model() {
-        let err = start_engine_with_backend(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: false,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
+        let err = start_with_step_policy(
             32,
-            1_024,
             Qwen35DecodeOverlap::SharedSm,
-            Qwen35GdnBackend::Triton,
-            0,
             StepPolicy::stall_bounded_ms(60),
         )
         .err()

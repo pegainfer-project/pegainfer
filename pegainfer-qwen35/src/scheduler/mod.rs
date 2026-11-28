@@ -457,17 +457,19 @@ impl Qwen35Scheduler {
                     .expect("ready async prefill must still be present"),
                 ledger,
             );
+            let (prefill_queue_reqs, prefill_queue_tok) = if step_start.is_some() {
+                prefill_queue_depth(prefilling)
+            } else {
+                (0, 0)
+            };
             log_itl_step(
                 step_start,
                 "overlap_complete",
                 prefill_tokens,
                 prefill_reqs,
                 decode_n,
-                prefilling.len(),
-                prefilling
-                    .iter()
-                    .map(|p| p.req.request.prompt_tokens.len().saturating_sub(p.cursor))
-                    .sum(),
+                prefill_queue_reqs,
+                prefill_queue_tok,
             );
             finish_result?;
         }
@@ -524,17 +526,19 @@ impl Qwen35Scheduler {
                 .map(|_| ());
                 ("overlap_decode", result)
             };
+            let (itl_queue_reqs, itl_queue_tok) = if itl_step_start.is_some() {
+                prefill_queue_depth(prefilling)
+            } else {
+                (0, 0)
+            };
             log_itl_step(
                 itl_step_start,
                 itl_plan_kind,
                 itl_prefill_tokens,
                 itl_prefill_reqs,
                 itl_decode_n,
-                prefilling.len(),
-                prefilling
-                    .iter()
-                    .map(|p| p.req.request.prompt_tokens.len().saturating_sub(p.cursor))
-                    .sum(),
+                itl_queue_reqs,
+                itl_queue_tok,
             );
             return step_result;
         }
@@ -648,8 +652,11 @@ impl Qwen35Scheduler {
             let itl_debug = itl_debug_enabled();
             let itl_prefill_reqs = plan.prefill.len();
             let itl_decode_n = active.len();
-            let itl_queue_reqs = prefill_queue.len();
-            let itl_queue_tok: usize = prefill_queue.iter().map(|p| p.remaining_tokens).sum();
+            let (itl_queue_reqs, itl_queue_tok) = if itl_debug {
+                prefill_queue_depth(prefilling)
+            } else {
+                (0, 0)
+            };
             let itl_step_start = itl_debug.then(Instant::now);
             let snapshot_stride = backend.snapshot_stride();
             let step_result = run_step(
@@ -729,6 +736,16 @@ fn active_request_kv(request: &mut ActiveRequest35) -> Option<&mut RequestKv> {
         ActiveBackendState::Tp { .. } => None,
     }
 }
+fn prefill_queue_depth(prefilling: &[PrefillingRequest35]) -> (usize, usize) {
+    (
+        prefilling.len(),
+        prefilling
+            .iter()
+            .map(|p| p.req.request.prompt_tokens.len().saturating_sub(p.cursor))
+            .sum(),
+    )
+}
+
 /// Tokens one prefill step forwards: with the cache on, an unfinished step ends on a
 /// stride boundary and the history stop is always a step end.
 fn prefill_step_chunk(

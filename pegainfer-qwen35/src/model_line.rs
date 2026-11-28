@@ -44,8 +44,8 @@ struct Qwen35Cli {
     /// the attention cost of the context already resident in KV, so a packed
     /// burst of short prompts and a deep continuation are both priced. Pure
     /// prefill steps still let the head prompt use the full
-    /// --max-prefill-tokens budget. Unset keeps the fixed 1024-row budget;
-    /// requires --decode-overlap=off.
+    /// --max-prefill-tokens budget. Unset keeps the fixed --max-prefill-tokens
+    /// budget (1024 rows by default); requires --decode-overlap=off.
     #[arg(long)]
     qwen35_prefill_stall_ms: Option<u64>,
 }
