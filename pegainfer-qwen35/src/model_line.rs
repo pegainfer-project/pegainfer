@@ -40,9 +40,12 @@ struct Qwen35Cli {
 
     /// Bound mixed prefill+decode steps that have active decoders by a fitted
     /// stall target in milliseconds. The built-in coefficients are fitted on a
-    /// single-card H20 with Qwen3.5-4B. Pure prefill steps still let the head
-    /// prompt use the full --max-prefill-tokens budget. Unset keeps the fixed
-    /// 1024-row budget; requires --decode-overlap=off.
+    /// single-card H20 with Qwen3.5-4B and charge a per-prompt launch cost plus
+    /// the attention cost of the context already resident in KV, so a packed
+    /// burst of short prompts and a deep continuation are both priced. Pure
+    /// prefill steps still let the head prompt use the full
+    /// --max-prefill-tokens budget. Unset keeps the fixed 1024-row budget;
+    /// requires --decode-overlap=off.
     #[arg(long)]
     qwen35_prefill_stall_ms: Option<u64>,
 }
@@ -258,10 +261,12 @@ mod tests {
 
     #[test]
     fn rejects_unreachable_prefill_stall_ms() {
-        let error = validate_argv(&["pegainfer", "--qwen35-prefill-stall-ms", "1"])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("at least 9 ms"), "{error}");
+        for stall_ms in ["1", "11"] {
+            let error = validate_argv(&["pegainfer", "--qwen35-prefill-stall-ms", stall_ms])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("at least 12 ms"), "{error}");
+        }
     }
 
     #[test]

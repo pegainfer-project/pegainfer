@@ -63,7 +63,6 @@ use self::plan::ActiveKvBudget;
 use self::plan::PrefillKvBudget;
 use self::plan::PrefillQueueState;
 use self::plan::RejectReason;
-use self::plan::StepLoadSignals;
 use self::plan::StepPlan;
 use self::plan::StepPolicy;
 use self::plan::admit_pending_requests;
@@ -626,6 +625,7 @@ impl Qwen35Scheduler {
         let prefill_queue: Vec<PrefillQueueState> = prefilling
             .iter()
             .map(|req| PrefillQueueState {
+                cursor: req.cursor,
                 remaining_tokens: req
                     .req
                     .request
@@ -634,14 +634,7 @@ impl Qwen35Scheduler {
                     .saturating_sub(req.cursor),
             })
             .collect();
-        let load = StepLoadSignals::from_queue(pending.len(), &prefill_queue);
-        let plan = plan_step(
-            active.len(),
-            *prefill_budget,
-            &prefill_queue,
-            load,
-            *step_policy,
-        );
+        let plan = plan_step(active.len(), *prefill_budget, &prefill_queue, *step_policy);
         if !plan.is_empty() {
             let overlap = backend.overlap_enabled();
             let itl_plan_kind = match (plan.decode, plan.prefill.is_empty()) {

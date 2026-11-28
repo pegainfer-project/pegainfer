@@ -244,7 +244,7 @@ pub(crate) fn check_launch(
         let min_stall_us = cost_model.min_reachable_stall_us();
         anyhow::ensure!(
             max_stall_us >= min_stall_us,
-            "Qwen3.5 --qwen35-prefill-stall-ms must be at least {} ms to cover one prefill row alongside one active decoder; a mixed prefill+decode step cannot stall less than {min_stall_us} us, got {max_stall_us} us",
+            "Qwen3.5 --qwen35-prefill-stall-ms must be at least {} ms to cover one prefill row plus its per-prompt and cursor attention cost alongside one active decoder; a mixed prefill+decode step cannot stall less than {min_stall_us} us, got {max_stall_us} us",
             min_stall_us.div_ceil(1_000)
         );
         anyhow::ensure!(
@@ -383,6 +383,7 @@ mod tests {
     use super::Qwen35LaunchOptions;
     use super::StepCostModel;
     use super::StepPolicy;
+    use super::check_launch;
     use super::start_engine_with_backend;
     use super::start_engine_with_capacity_and_overlap;
 
@@ -494,27 +495,43 @@ mod tests {
 
     #[test]
     fn rejects_unreachable_stall_bound_before_loading_model() {
-        let err = start_engine_with_backend(
-            Path::new("unused-model-path"),
-            EngineLoadOptions {
-                enable_cuda_graph: false,
-                device_ordinals: vec![0],
-                parallel_config: None,
-                ep_backend: EpBackend::Nccl,
-                seed: 42,
-            },
-            1,
-            1_024,
-            Qwen35DecodeOverlap::Off,
-            Qwen35GdnBackend::Triton,
-            0,
-            StepPolicy::stall_bounded_ms(1),
-        )
-        .err()
-        .expect("an unreachable stall bound should reject the launch")
-        .to_string();
+        for stall_ms in [1, 11] {
+            let err = start_engine_with_backend(
+                Path::new("unused-model-path"),
+                EngineLoadOptions {
+                    enable_cuda_graph: false,
+                    device_ordinals: vec![0],
+                    parallel_config: None,
+                    ep_backend: EpBackend::Nccl,
+                    seed: 42,
+                },
+                1,
+                1_024,
+                Qwen35DecodeOverlap::Off,
+                Qwen35GdnBackend::Triton,
+                0,
+                StepPolicy::stall_bounded_ms(stall_ms),
+            )
+            .err()
+            .expect("an unreachable stall bound should reject the launch")
+            .to_string();
 
-        assert!(err.contains("at least 9 ms"), "{err}");
+            assert!(err.contains("at least 12 ms"), "{err}");
+        }
+    }
+
+    #[test]
+    fn accepts_reachable_stall_bound_before_loading_model() {
+        for stall_ms in [12, 60] {
+            check_launch(
+                1,
+                1_024,
+                false,
+                Qwen35DecodeOverlap::Off,
+                StepPolicy::stall_bounded_ms(stall_ms),
+            )
+            .expect("a stall bound at or above the keepalive floor should launch");
+        }
     }
 
     #[test]
@@ -536,9 +553,11 @@ mod tests {
             StepPolicy::StallBounded {
                 max_stall_us: 60_000,
                 cost_model: StepCostModel {
-                    base_us: 8_200,
+                    base_us: 7_000,
+                    us_per_prefill_prompt: 4_800,
                     us_per_prefill_row: 0,
-                    us_per_decode_row: 106,
+                    us_per_decode_row: 100,
+                    us_per_million_attn_pairs: 1_930,
                 },
             },
         )

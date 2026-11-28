@@ -612,16 +612,11 @@ fn take_prefill_chunks_cuts_each_request_on_its_own_prompt() {
         let queue: Vec<PrefillQueueState> = prefilling
             .iter()
             .map(|p| PrefillQueueState {
+                cursor: p.cursor,
                 remaining_tokens: p.req.request.prompt_tokens.len().saturating_sub(p.cursor),
             })
             .collect();
-        let plan = plan_step(
-            1,
-            1024,
-            &queue,
-            StepLoadSignals::default(),
-            StepPolicy::Fixed,
-        );
+        let plan = plan_step(1, 1024, &queue, StepPolicy::Fixed);
         take_prefill_chunks(&mut prefilling, &plan, stride)
             .iter()
             .map(|p| p.step_chunk)

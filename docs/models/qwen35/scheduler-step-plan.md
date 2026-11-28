@@ -16,7 +16,7 @@ The scheduler hands the executor facts, not a mode:
 - `prefill: Vec<usize>` — prompt rows for the first `prefill.len()` queued
   prompts, in FIFO order.
 
-`plan_step(active_decodes, budget, prefilling, load, policy)` is the only place
+`plan_step(active_decodes, budget, prefilling, policy)` is the only place
 the budget is divided, delegating prompt-row allocation to the pure function
 `plan_prefill_rows`. The budget counts prompt rows; live decode requests
 contribute one row each and do not consume it. `--max-prefill-tokens` overrides
