@@ -341,6 +341,58 @@ fn attention_grouped_matches_ifa() -> Result<()> {
     Ok(())
 }
 
+/// AddRmsNorm must agree with the unfused add + norm path.
+#[test]
+#[ignore = "requires an explicitly selected Ascend device"]
+fn add_norm_matches_add_then_norm() -> Result<()> {
+    let device = Device::new(0)?;
+    let (rows, h) = (4usize, 1024usize);
+    let eps = 1e-6f32;
+    let a = fill(rows * h, 501);
+    let b = fill(rows * h, 502);
+    let gamma = fill(h, 503);
+    let da = device.from_slice(&a)?;
+    let db = device.from_slice(&b)?;
+    let dg = device.from_slice(&gamma)?;
+    let mut fused_x = device.zeros::<bf16>(rows * h)?;
+    let mut fused_y = device.zeros::<bf16>(rows * h)?;
+    ops::add_norm(
+        &device,
+        &da,
+        &db,
+        &dg,
+        &mut fused_x,
+        &mut fused_y,
+        rows,
+        h,
+        eps,
+    )?;
+    let mut plain_x = device.zeros::<bf16>(rows * h)?;
+    let mut plain_y = device.zeros::<bf16>(rows * h)?;
+    ops::add(&device, &da, &db, &mut plain_x, rows * h)?;
+    ops::norm(&device, &plain_x, &dg, &mut plain_y, rows, h, eps)?;
+    let fx = fused_x.read(rows * h)?;
+    let fy = fused_y.read(rows * h)?;
+    let px = plain_x.read(rows * h)?;
+    let py = plain_y.read(rows * h)?;
+    let x_err = fx
+        .iter()
+        .zip(&px)
+        .map(|(l, r)| (l.to_f32() - r.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    let y_err = fy
+        .iter()
+        .zip(&py)
+        .map(|(l, r)| (l.to_f32() - r.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(
+        x_err < 0.05 && y_err < 0.05,
+        "add_norm x_err={x_err} y_err={y_err}"
+    );
+    println!("add_norm vs add+norm x_err={x_err} y_err={y_err}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an explicitly selected Ascend device"]
 fn rope_matches_reference_for_positions() -> Result<()> {

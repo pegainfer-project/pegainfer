@@ -407,6 +407,76 @@ pub fn norm(
     })
 }
 
+/// `x = a + b` and `y = rms_norm(x) * gamma` in one ACLNN op.
+/// The AddRmsNorm executor is not destroyed (CANN 9.2.1 double-frees on that
+/// path); its descriptors are deferred like the other one-shot ops.
+#[allow(clippy::too_many_arguments)]
+pub fn add_norm(
+    d: &Device,
+    a: &Buffer<bf16>,
+    b: &Buffer<bf16>,
+    gamma: &Buffer<bf16>,
+    x_out: &mut Buffer<bf16>,
+    y_out: &mut Buffer<bf16>,
+    rows: usize,
+    h: usize,
+    eps: f32,
+) -> Result<()> {
+    let n = dims(&[rows, h])?;
+    check(d, a, n)?;
+    check(d, b, n)?;
+    check(d, gamma, h)?;
+    check(d, x_out, n)?;
+    check(d, y_out, n)?;
+    ensure!(eps.is_finite() && eps > 0., "invalid norm epsilon");
+    d.run(|stream| {
+        let mut t = Tensors::new();
+        let rstd = d.scratch_locked(rows * 4)?;
+        let ta = t.mk(
+            &[rows as i64, h as i64],
+            sys::ACL_BF16,
+            a.as_ptr().cast_mut().cast(),
+            "add_norm a",
+        )?;
+        let tb = t.mk(
+            &[rows as i64, h as i64],
+            sys::ACL_BF16,
+            b.as_ptr().cast_mut().cast(),
+            "add_norm b",
+        )?;
+        let tg = t.mk(
+            &[h as i64],
+            sys::ACL_BF16,
+            gamma.as_ptr().cast_mut().cast(),
+            "add_norm gamma",
+        )?;
+        let tx = t.mk(
+            &[rows as i64, h as i64],
+            sys::ACL_BF16,
+            x_out.as_mut_ptr().cast(),
+            "add_norm x out",
+        )?;
+        let ty = t.mk(
+            &[rows as i64, h as i64],
+            sys::ACL_BF16,
+            y_out.as_mut_ptr().cast(),
+            "add_norm y out",
+        )?;
+        let tr = t.mk(&[rows as i64, 1], sys::ACL_FLOAT, rstd, "add_norm rstd")?;
+        let result = run_oneshot(
+            d,
+            stream,
+            |ws, ex| {
+                sys::aclnnAddRmsNormGetWorkspaceSize(ta, tb, tg, f64::from(eps), ty, tr, tx, ws, ex)
+            },
+            |p, n, ex, st| sys::aclnnAddRmsNorm(p, n, ex, st),
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
+    })
+}
+
 pub fn add(
     d: &Device,
     a: &Buffer<bf16>,

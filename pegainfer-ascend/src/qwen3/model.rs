@@ -602,11 +602,12 @@ impl Model {
                     mask,
                 )?;
                 ops::gemm(d, &layer.o, &s.attn, &mut s.projected, rows, h, q)?;
-                ops::add(d, &s.hidden, &s.projected, &mut s.residual, rows * h)?;
-                ops::norm(
+                ops::add_norm(
                     d,
-                    &s.residual,
+                    &s.hidden,
+                    &s.projected,
                     &layer.post_norm,
+                    &mut s.residual,
                     &mut s.norm,
                     rows,
                     h,

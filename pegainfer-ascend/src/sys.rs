@@ -282,6 +282,24 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> aclnnStatus;
 
+    pub(crate) safe fn aclnnAddRmsNormGetWorkspaceSize(
+        x1: *const aclTensor,
+        x2: *const aclTensor,
+        gamma: *const aclTensor,
+        epsilon: f64,
+        y_out: *const aclTensor,
+        rstd_out: *const aclTensor,
+        x_out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub(crate) safe fn aclnnAddRmsNorm(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: *mut c_void,
+    ) -> aclnnStatus;
+
     pub(crate) safe fn aclnnArgMaxGetWorkspaceSize(
         self_: *const aclTensor,
         dim: i64,
