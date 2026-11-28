@@ -9,6 +9,7 @@ use pegainfer_frontend::model_line::ModelLine;
 use pegainfer_frontend::model_line::parse_for_line;
 
 use crate::Qwen35DecodeOverlap;
+use crate::StepPolicy;
 pub(crate) use crate::test_fixture_common::EngineHarness;
 pub(crate) use crate::test_fixture_common::RequestGuard;
 pub(crate) use crate::test_fixture_common::load_tokenizer;
@@ -157,6 +158,7 @@ impl GdnAcceptance {
             max_batch,
             max_prefill_tokens,
             overlap,
+            StepPolicy::Fixed,
         )
     }
 }
