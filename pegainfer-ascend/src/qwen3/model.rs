@@ -537,15 +537,32 @@ impl Model {
         )?;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let step = || -> Result<()> {
-                ops::norm(
-                    d,
-                    &s.hidden,
-                    &layer.input_norm,
-                    &mut s.norm,
-                    rows,
-                    h,
-                    c.rms_norm_eps,
-                )?;
+                // The MLP residual of the previous layer is still in
+                // s.residual / s.projected. Fuse its add with this layer's
+                // input norm; layer 0 takes the embedding hidden state.
+                if idx == 0 {
+                    ops::norm(
+                        d,
+                        &s.hidden,
+                        &layer.input_norm,
+                        &mut s.norm,
+                        rows,
+                        h,
+                        c.rms_norm_eps,
+                    )?;
+                } else {
+                    ops::add_norm(
+                        d,
+                        &s.residual,
+                        &s.projected,
+                        &layer.input_norm,
+                        &mut s.hidden,
+                        &mut s.norm,
+                        rows,
+                        h,
+                        c.rms_norm_eps,
+                    )?;
+                }
                 ops::gemm(d, &layer.q, &s.norm, &mut s.q, rows, q, h)?;
                 ops::gemm(d, &layer.k, &s.norm, &mut s.k, rows, k, h)?;
                 ops::gemm(d, &layer.v, &s.norm, &mut s.v, rows, k, h)?;
@@ -617,16 +634,19 @@ impl Model {
                 ops::gemm(d, &layer.up, &s.norm, &mut s.up, rows, i, h)?;
                 ops::silu(d, &s.gate, &s.up, &mut s.activation, rows * i)?;
                 ops::gemm(d, &layer.down, &s.activation, &mut s.projected, rows, h, i)?;
-                ops::add(d, &s.residual, &s.projected, &mut s.hidden, rows * h)?;
+                // Leave residual+projected for the next layer's AddRmsNorm,
+                // or for the final AddRmsNorm after the loop.
                 Ok(())
             };
             let mut step = step;
             step().with_context(|| format!("Ascend Qwen3 layer {idx}"))?;
         }
-        ops::norm(
+        ops::add_norm(
             d,
-            &s.hidden,
+            &s.residual,
+            &s.projected,
             &self.final_norm,
+            &mut s.hidden,
             &mut s.norm,
             rows,
             h,
