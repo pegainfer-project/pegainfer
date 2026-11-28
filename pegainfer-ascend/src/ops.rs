@@ -144,6 +144,16 @@ impl Drop for Tensors {
     }
 }
 
+impl Tensors {
+    /// Move the descriptors out so they can be dropped after the stream is
+    /// synchronized, instead of destroying them immediately after enqueue.
+    fn release(mut self) -> (Vec<usize>, Vec<Vec<i64>>) {
+        let handles = self.handles.drain(..).map(|t| t as usize).collect();
+        let arrays = self.arrays.drain(..).collect();
+        (handles, arrays)
+    }
+}
+
 /// Descriptors for cached executors are destroyed with the device; their
 /// shape/stride arrays are leaked deliberately (bounded, one per shape).
 fn mk_tensor_owned(shape: &[i64], dtype: u32, ptr: *mut c_void) -> *mut sys::aclTensor {
@@ -184,13 +194,7 @@ fn run_cached(
     let (executor, ws) = d.cached_gemm(cache_key, create)?;
     let workspace = d.workspace_locked(ws)?;
     let status = launch(workspace, ws, executor as *mut sys::aclOpExecutor, stream);
-    let synced = if status == 0 {
-        sys::aclrtSynchronizeStream(stream)
-    } else {
-        0
-    };
-    crate::device::check(status)?;
-    crate::device::check(synced)
+    crate::device::check(status)
 }
 
 /// Run a one-shot ACLNN op. CANN owns the non-repeatable executor returned by
@@ -210,13 +214,7 @@ fn run_oneshot(
     crate::device::check(prepare(&mut ws, &mut executor))?;
     let workspace = d.workspace_locked(ws)?;
     let status = launch(workspace, ws, executor, stream);
-    let synced = if status == 0 {
-        sys::aclrtSynchronizeStream(stream)
-    } else {
-        0
-    };
-    crate::device::check(status)?;
-    crate::device::check(synced)
+    crate::device::check(status)
 }
 
 /// Gather rows. Every index must be below `vocab`.
@@ -252,12 +250,15 @@ pub fn embedding(
             out.as_mut_ptr().cast(),
             "embedding out",
         )?;
-        run_oneshot(
+        let result = run_oneshot(
             d,
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tw, ti, to, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
-        )
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
     })
 }
 
@@ -318,13 +319,7 @@ pub fn gemm(
         let workspace = d.workspace_locked(ws)?;
         let ex = executor as *mut sys::aclOpExecutor;
         let status = { sys::aclnnMatmul(workspace, ws, ex, stream) };
-        let synced = if status == 0 {
-            sys::aclrtSynchronizeStream(stream)
-        } else {
-            0
-        };
-        crate::device::check(status)?;
-        crate::device::check(synced)
+        crate::device::check(status)
     })
 }
 
@@ -364,12 +359,15 @@ pub fn norm(
             "norm out",
         )?;
         let tr = t.mk(&[rows as i64, 1], sys::ACL_FLOAT, rstd, "norm rstd")?;
-        run_oneshot(
+        let result = run_oneshot(
             d,
             stream,
             |ws, ex| sys::aclnnRmsNormGetWorkspaceSize(tx, tw, f64::from(eps), ty, tr, ws, ex),
             |p, n, ex, s| sys::aclnnRmsNorm(p, n, ex, s),
-        )
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
     })
 }
 
@@ -452,13 +450,7 @@ fn mul_locked(
     let workspace = d.workspace_locked(ws)?;
     let ex = executor as *mut sys::aclOpExecutor;
     let status = sys::aclnnMul(workspace, ws, ex, stream);
-    let synced = if status == 0 {
-        sys::aclrtSynchronizeStream(stream)
-    } else {
-        0
-    };
-    crate::device::check(status)?;
-    crate::device::check(synced)
+    crate::device::check(status)
 }
 
 /// `out = silu(a) * b`, used for the SwiGLU MLP.
@@ -603,7 +595,7 @@ pub fn rope(
             "rope sin view",
         )?;
         let mode = c"half";
-        run_oneshot(
+        let result = run_oneshot(
             d,
             stream,
             |ws, ex| {
@@ -619,7 +611,10 @@ pub fn rope(
                 )
             },
             |p, n, ex, s| sys::aclnnApplyRotaryPosEmbV2(p, n, ex, s),
-        )
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
     })
 }
 
@@ -725,12 +720,15 @@ pub fn cache(
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(kc, 1, index, src_k, kc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
             )?;
-            run_oneshot(
+            let result = run_oneshot(
                 d,
                 stream,
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(vc, 1, index, src_v, vc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
-            )
+            );
+            let (handles, arrays) = t.release();
+            d.defer_tensors(handles, arrays);
+            result
         })?;
     }
     Ok(())
@@ -1008,7 +1006,7 @@ fn prefill_rows(
         let actual_q = d.int_array(rows as i64)? as *const sys::aclIntArray;
         let actual_kv = d.int_array(kv_len as i64)? as *const sys::aclIntArray;
         let layout = c"BNSD";
-        run_oneshot(
+        let result = run_oneshot(
             d,
             stream,
             |ws, ex| {
@@ -1039,7 +1037,10 @@ fn prefill_rows(
                 )
             },
             |p, n, ex, st| sys::aclnnPromptFlashAttentionV3(p, n, ex, st),
-        )
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
     })
 }
 
@@ -1066,12 +1067,15 @@ pub fn top1(
             ids.as_mut_ptr().cast(),
             "argmax out",
         )?;
-        run_oneshot(
+        let result = run_oneshot(
             d,
             stream,
             |ws, ex| sys::aclnnArgMaxGetWorkspaceSize(tx, 1, false, to, ws, ex),
             |p, n, ex, s| sys::aclnnArgMax(p, n, ex, s),
-        )
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
     })
 }
 

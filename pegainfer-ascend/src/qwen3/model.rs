@@ -656,6 +656,8 @@ impl Model {
             outputs.len(),
             c.decodable_vocab,
         )?;
+        // One synchronization per forward; individual ops no longer sync.
+        d.flush_deferred()?;
         let ids = s.predictions.read(outputs.len())?;
         self.lengths = next;
         self.last_output_rows = outputs.len();

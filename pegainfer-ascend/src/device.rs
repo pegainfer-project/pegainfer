@@ -71,6 +71,9 @@ struct Inner {
     scratch: Mutex<HashMap<usize, usize>>,
     /// Reused ACLNN workspaces, keyed by byte size. Freed in `Drop`.
     workspaces: Mutex<HashMap<usize, usize>>,
+    /// Descriptors for ops submitted asynchronously and not synchronized
+    /// yet. They stay alive until the forward boundary flushes them.
+    deferred: Mutex<Vec<(Vec<usize>, Vec<Vec<i64>>)>>,
     /// Attention descriptors. Destroying them between IFA calls aborts on
     /// CANN 9.2.1, so they are cached and reused by address. Freed in `Drop`.
     descs: Mutex<HashMap<u64, Descs>>,
@@ -138,6 +141,13 @@ impl Drop for Inner {
             }
             workspaces.clear();
         }
+        if let Ok(deferred) = self.deferred.get_mut() {
+            for (handles, _arrays) in deferred.drain(..) {
+                for handle in handles {
+                    let _ = sys::aclDestroyTensor(handle as *const sys::aclTensor);
+                }
+            }
+        }
 
         let _ = sys::aclrtDestroyStream(self.stream);
         let _ = sys::aclrtDestroyContext(self.context);
@@ -184,6 +194,7 @@ impl Device {
                 keepalive: Mutex::new(Vec::new()),
                 scratch: Mutex::new(HashMap::new()),
                 workspaces: Mutex::new(HashMap::new()),
+                deferred: Mutex::new(Vec::new()),
                 descs: Mutex::new(HashMap::new()),
                 int_arrays: Mutex::new(HashMap::new()),
             }),
@@ -345,6 +356,38 @@ impl Device {
         Ok(raw)
     }
 
+    /// Keep descriptors alive until the next `flush_deferred` (which first
+    /// synchronizes the stream). Used by ops that no longer synchronize after
+    /// every launch.
+    pub(crate) fn defer_tensors(&self, handles: Vec<usize>, arrays: Vec<Vec<i64>>) {
+        if handles.is_empty() {
+            return;
+        }
+        let mut deferred = self
+            .inner
+            .deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        deferred.push((handles, arrays));
+    }
+
+    /// Synchronize the stream, then release descriptors deferred since the
+    /// last call. This is the per-forward boundary.
+    pub(crate) fn flush_deferred(&self) -> Result<()> {
+        self.synchronize()?;
+        let mut deferred = self
+            .inner
+            .deferred
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (handles, _arrays) in deferred.drain(..) {
+            for handle in handles {
+                let _ = sys::aclDestroyTensor(handle as *const sys::aclTensor);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn cached_descs(
         &self,
         key: u64,
@@ -436,6 +479,9 @@ impl<T: DeviceRepr> Buffer<T> {
     }
     pub fn read(&self, len: usize) -> Result<Vec<T>> {
         ensure!(len <= self.len, "host read exceeds device buffer");
+        // Reads are the sampling / test boundary: make every enqueued op
+        // visible before the D2H copy.
+        self.device.synchronize()?;
         let mut data = vec![T::default(); len];
         let raw = self.raw;
         let bytes = std::mem::size_of_val(data.as_slice());
