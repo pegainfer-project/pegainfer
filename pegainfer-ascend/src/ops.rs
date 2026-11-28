@@ -230,35 +230,51 @@ pub fn embedding(
     check(d, w, dims(&[vocab, h])?)?;
     check(d, ids, rows)?;
     check(d, out, dims(&[rows, h])?)?;
+    let cache_key = key(
+        "embedding",
+        &[rows as i64, h as i64, vocab as i64],
+        &[
+            w.as_ptr() as usize,
+            ids.as_ptr() as usize,
+            out.as_mut_ptr() as usize,
+        ],
+    );
     d.run(|stream| {
-        let mut t = Tensors::new();
-        let tw = t.mk(
-            &[vocab as i64, h as i64],
-            sys::ACL_BF16,
-            w.as_ptr().cast_mut().cast(),
-            "embedding weight",
-        )?;
-        let ti = t.mk(
-            &[rows as i64],
-            sys::ACL_INT32,
-            ids.as_ptr().cast_mut().cast(),
-            "embedding indices",
-        )?;
-        let to = t.mk(
-            &[rows as i64, h as i64],
-            sys::ACL_BF16,
-            out.as_mut_ptr().cast(),
-            "embedding out",
-        )?;
-        let result = run_oneshot(
+        run_cached(
             d,
             stream,
-            |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tw, ti, to, ws, ex),
-            |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
-        );
-        let (handles, arrays) = t.release();
-        d.defer_tensors(handles, arrays);
-        result
+            cache_key,
+            || {
+                let tw = mk_tensor_owned(
+                    &[vocab as i64, h as i64],
+                    sys::ACL_BF16,
+                    w.as_ptr().cast_mut().cast(),
+                );
+                let ti = mk_tensor_owned(
+                    &[rows as i64],
+                    sys::ACL_INT32,
+                    ids.as_ptr().cast_mut().cast(),
+                );
+                let to = mk_tensor_owned(
+                    &[rows as i64, h as i64],
+                    sys::ACL_BF16,
+                    out.as_mut_ptr().cast(),
+                );
+                ensure!(
+                    !tw.is_null() && !ti.is_null() && !to.is_null(),
+                    "embedding tensor"
+                );
+                let mut ws = 0u64;
+                let mut ex = std::ptr::null_mut();
+                crate::device::check(sys::aclnnEmbeddingGetWorkspaceSize(
+                    tw, ti, to, &mut ws, &mut ex,
+                ))?;
+                crate::device::check(sys::aclSetAclOpExecutorRepeatable(ex))?;
+                d.keep_tensors(vec![tw, ti, to]);
+                Ok((ex as usize, ws))
+            },
+            |p, n, ex, st| sys::aclnnEmbedding(p, n, ex, st),
+        )
     })
 }
 
@@ -338,36 +354,56 @@ pub fn norm(
     check(d, out, n)?;
     ensure!(eps.is_finite() && eps > 0., "invalid norm epsilon");
     d.run(|stream| {
-        let mut t = Tensors::new();
         let rstd = d.scratch_locked(rows * 4)?;
-        let tx = t.mk(
+        let cache_key = key(
+            "norm",
             &[rows as i64, h as i64],
-            sys::ACL_BF16,
-            x.as_ptr().cast_mut().cast(),
-            "norm x",
-        )?;
-        let tw = t.mk(
-            &[h as i64],
-            sys::ACL_BF16,
-            w.as_ptr().cast_mut().cast(),
-            "norm weight",
-        )?;
-        let ty = t.mk(
-            &[rows as i64, h as i64],
-            sys::ACL_BF16,
-            out.as_mut_ptr().cast(),
-            "norm out",
-        )?;
-        let tr = t.mk(&[rows as i64, 1], sys::ACL_FLOAT, rstd, "norm rstd")?;
-        let result = run_oneshot(
+            &[
+                x.as_ptr() as usize,
+                w.as_ptr() as usize,
+                out.as_mut_ptr() as usize,
+                rstd as usize,
+                eps.to_bits() as usize,
+            ],
+        );
+        run_cached(
             d,
             stream,
-            |ws, ex| sys::aclnnRmsNormGetWorkspaceSize(tx, tw, f64::from(eps), ty, tr, ws, ex),
-            |p, n, ex, s| sys::aclnnRmsNorm(p, n, ex, s),
-        );
-        let (handles, arrays) = t.release();
-        d.defer_tensors(handles, arrays);
-        result
+            cache_key,
+            || {
+                let tx = mk_tensor_owned(
+                    &[rows as i64, h as i64],
+                    sys::ACL_BF16,
+                    x.as_ptr().cast_mut().cast(),
+                );
+                let tw = mk_tensor_owned(&[h as i64], sys::ACL_BF16, w.as_ptr().cast_mut().cast());
+                let ty = mk_tensor_owned(
+                    &[rows as i64, h as i64],
+                    sys::ACL_BF16,
+                    out.as_mut_ptr().cast(),
+                );
+                let tr = mk_tensor_owned(&[rows as i64, 1], sys::ACL_FLOAT, rstd);
+                ensure!(
+                    !tx.is_null() && !tw.is_null() && !ty.is_null() && !tr.is_null(),
+                    "norm tensor"
+                );
+                let mut ws = 0u64;
+                let mut ex = std::ptr::null_mut();
+                crate::device::check(sys::aclnnRmsNormGetWorkspaceSize(
+                    tx,
+                    tw,
+                    f64::from(eps),
+                    ty,
+                    tr,
+                    &mut ws,
+                    &mut ex,
+                ))?;
+                crate::device::check(sys::aclSetAclOpExecutorRepeatable(ex))?;
+                d.keep_tensors(vec![tx, tw, ty, tr]);
+                Ok((ex as usize, ws))
+            },
+            |p, n, ex, st| sys::aclnnRmsNorm(p, n, ex, st),
+        )
     })
 }
 
@@ -1053,29 +1089,35 @@ pub fn top1(
 ) -> Result<()> {
     check(d, x, dims(&[rows, vocab])?)?;
     check(d, ids, rows)?;
+    let cache_key = key(
+        "argmax",
+        &[rows as i64, vocab as i64],
+        &[x.as_ptr() as usize, ids.as_mut_ptr() as usize],
+    );
     d.run(|stream| {
-        let mut t = Tensors::new();
-        let tx = t.mk(
-            &[rows as i64, vocab as i64],
-            sys::ACL_BF16,
-            x.as_ptr().cast_mut().cast(),
-            "argmax in",
-        )?;
-        let to = t.mk(
-            &[rows as i64],
-            sys::ACL_INT32,
-            ids.as_mut_ptr().cast(),
-            "argmax out",
-        )?;
-        let result = run_oneshot(
+        run_cached(
             d,
             stream,
-            |ws, ex| sys::aclnnArgMaxGetWorkspaceSize(tx, 1, false, to, ws, ex),
-            |p, n, ex, s| sys::aclnnArgMax(p, n, ex, s),
-        );
-        let (handles, arrays) = t.release();
-        d.defer_tensors(handles, arrays);
-        result
+            cache_key,
+            || {
+                let tx = mk_tensor_owned(
+                    &[rows as i64, vocab as i64],
+                    sys::ACL_BF16,
+                    x.as_ptr().cast_mut().cast(),
+                );
+                let to = mk_tensor_owned(&[rows as i64], sys::ACL_INT32, ids.as_mut_ptr().cast());
+                ensure!(!tx.is_null() && !to.is_null(), "argmax tensor");
+                let mut ws = 0u64;
+                let mut ex = std::ptr::null_mut();
+                crate::device::check(sys::aclnnArgMaxGetWorkspaceSize(
+                    tx, 1, false, to, &mut ws, &mut ex,
+                ))?;
+                crate::device::check(sys::aclSetAclOpExecutorRepeatable(ex))?;
+                d.keep_tensors(vec![tx, to]);
+                Ok((ex as usize, ws))
+            },
+            |p, n, ex, st| sys::aclnnArgMax(p, n, ex, st),
+        )
     })
 }
 
