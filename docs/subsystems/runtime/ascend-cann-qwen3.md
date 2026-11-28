@@ -1,6 +1,6 @@
 # Initial Ascend (CANN) support for Qwen3
 
-**TL;DR**: Qwen3-0.6B/4B BF16 runs on an Ascend 910B3 through `pegainfer-ascend` (native Rust + AscendCL/ACLNN), using single-device eager execution, greedy decoding, fixed KV slots, chunked prefill, and mixed batches. Both models pass the shared HF golden and HTTP lifecycle gates; the device gates are manual and nothing Ascend runs in the repository's CI. The first release is TP1. Non-repeatable executors are owned and released by CANN; the repeatable executors cached by the GEMM-family ops, their descriptors, int arrays and device scratch are released when the device drops, and a 600-step decode soak keeps host RSS growth under 30 MB. Prefill performance is the main follow-up.
+**TL;DR**: Qwen3-0.6B/4B BF16 runs on an Ascend 910B3 through `pegainfer-ascend` (native Rust + AscendCL/ACLNN), using single-device eager execution, greedy decoding, fixed KV slots, chunked prefill, and mixed batches. Both models pass the shared HF golden and HTTP lifecycle gates; the device gates are manual and nothing Ascend runs in the repository's CI. The first release is TP1. The M1 runtime pass adds cached workspaces, one synchronization per forward, grouped prefill through PromptFlashAttentionV3, repeatable executors for norm/embedding/argmax, AddRmsNorm and cross-layer fusion, a fused gate/up GEMM with ClippedSwiglu, and FRACTAL_NZ weights: 0.6B golden drops from 143s to 54s and the serving benchmark reaches about 141 tokens/s with 5.5ms TPOT on the dev pod. Host RSS stays flat over a 1000-step soak.
 
 Last touched: 2026-11
 
@@ -60,7 +60,16 @@ The `device` module of `pegainfer-ascend` owns the AscendCL context, stream, and
 
 Executor ownership follows CANN. The non-repeatable executor returned by an ACLNN `*GetWorkspaceSize` call is released by the framework after the op runs, so the backend never destroys it (destroying it double-frees on CANN 9.2.1). GEMM/Add/Silu/Mul cache a repeatable executor instead; `Device::drop` releases those executors first, then their tensor descriptors, cached IFA descriptors/lists, int arrays, scratch, the stream, and the context. `aclrtResetDevice`/`aclFinalize` stay out of the drop path: tests create several short-lived devices in one process and CANN 9.2.1 can hang in finalize at exit. A regression test runs every operator repeatedly, drops the device, and opens a fresh one.
 
-The `ops` module wraps ACLNN. GEMM uses `aclnnMatmul`; the KV cache is laid out as `[slot, kv_head, context, dim]` so a slot view is directly usable as the BNSD IFA cache; the language head packs only the first `decodable_vocab` rows when the tied embedding is transposed, because `decodable_vocab` (151669) is smaller than `vocab_size` (151936). RoPE is `aclnnApplyRotaryPosEmbV2` in BSND `half` mode, with cos/sin rows gathered from a `[context, dim]` table.
+The `ops` module wraps ACLNN. Linear weights are packed on the host into FRACTAL_NZ `[1, ceil(out/16), ceil(in/16)*16, 16]` storage and run through `aclnnMatmulWeightNz`; the embedding gather weight stays ND. The KV cache is laid out as `[slot, kv_head, context, dim]` so a slot view is directly usable as the PFA/IFA BNSD cache; the language head packs only the first `decodable_vocab` rows when the tied embedding is transposed, because `decodable_vocab` (151669) is smaller than `vocab_size` (151936). RoPE is `aclnnApplyRotaryPosEmbV2` in BSND `half` mode, with cos/sin rows gathered from a `[context, dim]` table.
+
+## M1 runtime optimizations
+
+- **Workspace reuse.** `Device` caches ACLNN workspaces by byte size and frees them at device teardown; ops no longer call `aclrtMalloc`/`aclrtFree` per submission.
+- **One sync per forward.** Operators no longer synchronize individually. Descriptors are deferred and released after a single `Device::flush_deferred()` at the end of each `Model::forward`; `Buffer::read` also synchronizes at the sampling/test boundary.
+- **Grouped prefill attention.** Consecutive rows of one slot run through one `aclnnPromptFlashAttentionV3` call with `actualSeqLengths`/`actualSeqLengthsKv` and a 2048-or-larger int8 causal mask built at load. Q/out stay row-major and are presented as BNSD through explicit strides; single-row decode groups still use IFA.
+- **Executor cache (partial).** norm, embedding and argmax cache one repeatable executor per `(op, shape, addresses)`; GEMM-family ops already did. RoPE, IndexCopy and IFA still create one-shot executors per call.
+- **Fused normalization and MLP.** residual add + RMSNorm uses `aclnnAddRmsNorm` (also across layer boundaries and before the final norm); gate/up weights are concatenated into `[h, 2i]` and activated with `aclnnClippedSwiglu`.
+- **Benchmark.** `scripts/ascend/bench_serving.py` measures TTFT, TPOT and tokens/s against the release server.
 
 The Qwen3 scheduler reuses the production `RequestLedger` and step contract. Each request owns a contiguous KV slot; reclaimed slots restart at position 0. Fixed-slot KV storage is `slots × layers × kv_heads × context × head_dim × 2(K,V) × 2(BF16)` bytes, with the kv-head-major layout above. Cancellation reclaims slots while retaining the allocation for reuse.
 
@@ -83,9 +92,14 @@ PEGAINFER_TEST_MODEL_PATH=/opt/atomgit/models/Qwen3-0.6B \
 
 # Decode soak: host RSS must stay flat (CANN owns the one-shot executors)
 PEGAINFER_TEST_MODEL_PATH=/opt/atomgit/models/Qwen3-0.6B \
-  PEGAINFER_SOAK_STEPS=600 \
+  PEGAINFER_SOAK_STEPS=1000 \
   cargo test --release -p pegainfer-ascend --features ascend \
   --test soak -- --ignored --test-threads=1
+
+# Serving benchmark: TTFT / TPOT / tokens/s
+python3 scripts/ascend/bench_serving.py \
+  --model-path /opt/atomgit/models/Qwen3-0.6B \
+  --output target/ascend-bench-06b --requests 4 --max-tokens 32
 
 # Release HTTP lifecycle (0.6B and 4B)
 python3 scripts/ascend/check_http.py \
@@ -97,12 +111,12 @@ HF golden results, using the CUDA gate's bounds (`MEAN_TOL=0.06`, `P99_TOL=0.20`
 
 | model | case | mean | p99 |
 |---|---|---|---|
-| 0.6B | sequential | 0.0398 | 0.153 |
-| 0.6B | ragged batch4 | 0.0400 | 0.152 |
-| 0.6B | mixed prefill/decode | 0.0396 | 0.140 |
-| 4B | sequential | 0.0307 | 0.106 |
-| 4B | ragged batch4 | 0.0317 | 0.108 |
-| 4B | mixed prefill/decode | 0.0311 | 0.110 |
+| 0.6B | sequential | 0.0403 | 0.150 |
+| 0.6B | ragged batch4 | 0.0398 | 0.150 |
+| 0.6B | mixed prefill/decode | 0.0401 | 0.145 |
+| 4B | sequential | 0.0308 | 0.107 |
+| 4B | ragged batch4 | 0.0313 | 0.108 |
+| 4B | mixed prefill/decode | 0.0322 | 0.113 |
 
 The HTTP gate covers health/models, completions, streaming concurrency, stop strings, chat, unsupported-parameter 400s, context boundaries, queued and active cancellation, slot re-admission, idle metrics, and shutdown. On SIGINT the server drains the scheduler, logs `scheduler drained after frontend shutdown, exiting`, exits 0, and leaves no NPU process; the script requires that path. CANN installs its own SIGINT handler after the process has been up for a few minutes, so the frontend re-installs its handler every 100 ms; otherwise CTRL+C would become a signal exit after a few minutes of uptime. A request that outlives the shared frontend shutdown deadline is aborted with a 500, which is frontend policy rather than an Ascend difference.
 
@@ -114,11 +128,15 @@ These were reproduced in minimal C++ programs and the Rust teardown test, indepe
 - **Repeatable executors are not reclaimed.** GEMM/Add/Silu/Mul set `aclSetAclOpExecutorRepeatable` and cache the executor; CANN keeps it until the caller destroys it, which the backend does when the device drops.
 - Destroying the IFA `aclTensor` descriptors between calls crashes the next call, so they are cached by address. A tensor list and a tensor it contains share a free path: destroying both double-frees, so only the standalone query/output tensors are listed for teardown while the K/V lists own their members.
 - `aclrtDestroyContext` is safe after the stream and retained resources are released. `aclrtResetDevice` / `aclFinalize` are not called from `Device::drop`: unit tests create several short-lived devices in one process, and CANN 9.2.1 can hang in finalize at exit.
-- `aclnnMul` with `out == self` traps; SwiGLU writes the product to a distinct output.
-- `aclnnAddRmsNorm` is not used in v1: it agrees numerically but aborts on executor destruction. The model uses `aclnnAdd` + `aclnnRmsNorm`.
+- `aclnnMul` with `out == self` traps; the fused gate/up path uses `aclnnClippedSwiglu` with a high clip limit, which matches SiLU*up.
+- `aclnnAddRmsNorm` and `aclnnClippedSwiglu` are used as non-repeatable one-shot executors and are not destroyed (destroying the AddRmsNorm executor aborts on CANN 9.2.1).
+- PFA V3 executor destruction also double-frees; the backend leaves PFA executors to CANN.
+- FRACTAL_NZ weights are packed on the host at load; `aclnnMatmulWeightNz` requires the NZ storage layout, not an ND tensor.
 
 ## Outstanding
 
-- Prefill performance (`PromptFlashAttentionV3` per slot), a shape-bucketed repeatable-executor cache, and a serving benchmark baseline.
+- QKV projection fusion and `qkv_rms_norm_rope_cache`: the fused QKV output needs strided downstream norm/RoPE/cache support; the copy-based experiment was slower and was reverted.
+- Decode attention batching across slots, LM-head + ArgMax fusion, and the remaining executor caches (RoPE/IndexCopy/IFA).
+- Batched KV append needs a transpose or a contiguous cache layout because IndexCopy rejects the strided multi-row form.
 - Paged KV, prefix cache, sampling/logprobs, CANN graph, TP/HCCL, and other model lines.
 - No repository CI; keep the device gates manual.
