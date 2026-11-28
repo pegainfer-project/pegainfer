@@ -160,33 +160,6 @@ impl Drop for Scalar {
     }
 }
 
-struct Workspace(*mut c_void);
-impl Workspace {
-    fn new(bytes: u64) -> Result<Self> {
-        if bytes == 0 {
-            return Ok(Self(std::ptr::null_mut()));
-        }
-        let mut raw = std::ptr::null_mut();
-        crate::device::check({
-            sys::aclrtMalloc(
-                &raw mut raw,
-                usize::try_from(bytes)?,
-                sys::ACL_MEM_MALLOC_HUGE_FIRST,
-            )
-        })?;
-        Ok(Self(raw))
-    }
-}
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            {
-                sys::aclrtFree(self.0);
-            }
-        }
-    }
-}
-
 /// Run a cached executor on an already-bound stream.
 fn run_cached(
     d: &Device,
@@ -196,8 +169,8 @@ fn run_cached(
     launch: impl FnOnce(*mut c_void, u64, *mut sys::aclOpExecutor, *mut c_void) -> i32,
 ) -> Result<()> {
     let (executor, ws) = d.cached_gemm(cache_key, create)?;
-    let workspace = Workspace::new(ws)?;
-    let status = launch(workspace.0, ws, executor as *mut sys::aclOpExecutor, stream);
+    let workspace = d.workspace_locked(ws)?;
+    let status = launch(workspace, ws, executor as *mut sys::aclOpExecutor, stream);
     let synced = if status == 0 {
         sys::aclrtSynchronizeStream(stream)
     } else {
@@ -214,6 +187,7 @@ fn run_cached(
 /// flat, so not destroying it leaks nothing. The caller owns and frees the
 /// workspace.
 fn run_oneshot(
+    d: &Device,
     stream: *mut c_void,
     prepare: impl FnOnce(&mut u64, &mut *mut sys::aclOpExecutor) -> i32,
     launch: impl FnOnce(*mut c_void, u64, *mut sys::aclOpExecutor, *mut c_void) -> i32,
@@ -221,8 +195,8 @@ fn run_oneshot(
     let mut ws = 0u64;
     let mut executor = std::ptr::null_mut();
     crate::device::check(prepare(&mut ws, &mut executor))?;
-    let workspace = Workspace::new(ws)?;
-    let status = launch(workspace.0, ws, executor, stream);
+    let workspace = d.workspace_locked(ws)?;
+    let status = launch(workspace, ws, executor, stream);
     let synced = if status == 0 {
         sys::aclrtSynchronizeStream(stream)
     } else {
@@ -266,6 +240,7 @@ pub fn embedding(
             "embedding out",
         )?;
         run_oneshot(
+            d,
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tw, ti, to, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
@@ -327,9 +302,9 @@ pub fn gemm(
             d.keep_tensors(vec![tx, tw, to]);
             Ok((ex as usize, ws))
         })?;
-        let workspace = Workspace::new(ws)?;
+        let workspace = d.workspace_locked(ws)?;
         let ex = executor as *mut sys::aclOpExecutor;
-        let status = { sys::aclnnMatmul(workspace.0, ws, ex, stream) };
+        let status = { sys::aclnnMatmul(workspace, ws, ex, stream) };
         let synced = if status == 0 {
             sys::aclrtSynchronizeStream(stream)
         } else {
@@ -377,6 +352,7 @@ pub fn norm(
         )?;
         let tr = t.mk(&[rows as i64, 1], sys::ACL_FLOAT, rstd, "norm rstd")?;
         run_oneshot(
+            d,
             stream,
             |ws, ex| sys::aclnnRmsNormGetWorkspaceSize(tx, tw, f64::from(eps), ty, tr, ws, ex),
             |p, n, ex, s| sys::aclnnRmsNorm(p, n, ex, s),
@@ -460,9 +436,9 @@ fn mul_locked(
         d.keep_tensors(vec![ta, tb, to]);
         Ok((ex as usize, ws))
     })?;
-    let workspace = Workspace::new(ws)?;
+    let workspace = d.workspace_locked(ws)?;
     let ex = executor as *mut sys::aclOpExecutor;
-    let status = sys::aclnnMul(workspace.0, ws, ex, stream);
+    let status = sys::aclnnMul(workspace, ws, ex, stream);
     let synced = if status == 0 {
         sys::aclrtSynchronizeStream(stream)
     } else {
@@ -578,11 +554,13 @@ pub fn rope(
             "rope sin rows",
         )?;
         run_oneshot(
+            d,
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tcos, tp, crows, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
         )?;
         run_oneshot(
+            d,
             stream,
             |ws, ex| sys::aclnnEmbeddingGetWorkspaceSize(tsin, tp, srows, ws, ex),
             |p, n, ex, s| sys::aclnnEmbedding(p, n, ex, s),
@@ -613,6 +591,7 @@ pub fn rope(
         )?;
         let mode = c"half";
         run_oneshot(
+            d,
             stream,
             |ws, ex| {
                 sys::aclnnApplyRotaryPosEmbV2GetWorkspaceSize(
@@ -728,11 +707,13 @@ pub fn cache(
                 "cache v out",
             )?;
             run_oneshot(
+                d,
                 stream,
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(kc, 1, index, src_k, kc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
             )?;
             run_oneshot(
+                d,
                 stream,
                 |ws, ex| sys::aclnnIndexCopyGetWorkspaceSize(vc, 1, index, src_v, vc_out, ws, ex),
                 |p, n, ex, s| sys::aclnnIndexCopy(p, n, ex, s),
@@ -835,6 +816,7 @@ pub fn attention(
         d.run(|stream| {
             let layout = c"BNSD";
             run_oneshot(
+                d,
                 stream,
                 |ws, ex| {
                     sys::aclnnIncreFlashAttentionV4GetWorkspaceSize(
@@ -895,6 +877,7 @@ pub fn top1(
             "argmax out",
         )?;
         run_oneshot(
+            d,
             stream,
             |ws, ex| sys::aclnnArgMaxGetWorkspaceSize(tx, 1, false, to, ws, ex),
             |p, n, ex, s| sys::aclnnArgMax(p, n, ex, s),

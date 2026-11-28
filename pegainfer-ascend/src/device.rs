@@ -69,6 +69,8 @@ struct Inner {
     /// addresses, so their inputs must stay at a stable address. Freed in
     /// `Drop`.
     scratch: Mutex<HashMap<usize, usize>>,
+    /// Reused ACLNN workspaces, keyed by byte size. Freed in `Drop`.
+    workspaces: Mutex<HashMap<usize, usize>>,
     /// Attention descriptors. Destroying them between IFA calls aborts on
     /// CANN 9.2.1, so they are cached and reused by address. Freed in `Drop`.
     descs: Mutex<HashMap<u64, Descs>>,
@@ -130,6 +132,12 @@ impl Drop for Inner {
             }
             scratch.clear();
         }
+        if let Ok(workspaces) = self.workspaces.get_mut() {
+            for &ptr in workspaces.values() {
+                let _ = sys::aclrtFree(ptr as *mut c_void);
+            }
+            workspaces.clear();
+        }
 
         let _ = sys::aclrtDestroyStream(self.stream);
         let _ = sys::aclrtDestroyContext(self.context);
@@ -175,6 +183,7 @@ impl Device {
                 gemm_cache: Mutex::new(HashMap::new()),
                 keepalive: Mutex::new(Vec::new()),
                 scratch: Mutex::new(HashMap::new()),
+                workspaces: Mutex::new(HashMap::new()),
                 descs: Mutex::new(HashMap::new()),
                 int_arrays: Mutex::new(HashMap::new()),
             }),
@@ -297,6 +306,32 @@ impl Device {
             .scratch
             .lock()
             .map_err(|_| anyhow::anyhow!("Ascend scratch cache poisoned"))?;
+        if let Some(&ptr) = map.get(&bytes) {
+            return Ok(ptr as *mut std::ffi::c_void);
+        }
+        let mut raw = std::ptr::null_mut();
+        check(sys::aclrtMalloc(
+            &raw mut raw,
+            bytes,
+            sys::ACL_MEM_MALLOC_HUGE_FIRST,
+        ))?;
+        map.insert(bytes, raw as usize);
+        Ok(raw)
+    }
+
+    /// Reuse a device workspace for an ACLNN op, keyed by byte size. The
+    /// caller must hold the device lock; every op synchronizes before the
+    /// workspace can be handed to the next one.
+    pub(crate) fn workspace_locked(&self, bytes: u64) -> Result<*mut std::ffi::c_void> {
+        if bytes == 0 {
+            return Ok(std::ptr::null_mut());
+        }
+        let bytes = usize::try_from(bytes)?;
+        let mut map = self
+            .inner
+            .workspaces
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Ascend workspace cache poisoned"))?;
         if let Some(&ptr) = map.get(&bytes) {
             return Ok(ptr as *mut std::ffi::c_void);
         }
