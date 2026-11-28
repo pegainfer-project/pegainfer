@@ -18,6 +18,7 @@ pub(crate) const ACL_INT32: u32 = 3;
 pub(crate) const ACL_BF16: u32 = 27;
 
 pub(crate) const ACL_FORMAT_ND: u32 = 2;
+pub(crate) const ACL_FORMAT_FRACTAL_NZ: u32 = 29;
 
 pub(crate) const ACL_MEMCPY_HOST_TO_DEVICE: u32 = 1;
 pub(crate) const ACL_MEMCPY_DEVICE_TO_HOST: u32 = 2;
@@ -106,6 +107,21 @@ unsafe extern "C" {
         executor: *mut *mut aclOpExecutor,
     ) -> aclnnStatus;
     pub(crate) safe fn aclnnMatmul(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: *mut c_void,
+    ) -> aclnnStatus;
+
+    pub(crate) safe fn aclnnMatmulWeightNzGetWorkspaceSize(
+        self_: *const aclTensor,
+        mat2: *const aclTensor,
+        out: *mut aclTensor,
+        cube_math_type: i8,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub(crate) safe fn aclnnMatmulWeightNz(
         workspace: *mut c_void,
         workspace_size: u64,
         executor: *mut aclOpExecutor,

@@ -174,6 +174,29 @@ fn mk_tensor_owned(shape: &[i64], dtype: u32, ptr: *mut c_void) -> *mut sys::acl
     }
 }
 
+fn mk_tensor_owned_nz(
+    view: &[i64],
+    storage: &[i64],
+    dtype: u32,
+    ptr: *mut c_void,
+) -> *mut sys::aclTensor {
+    let view_dims: &'static [i64] = Box::leak(view.to_vec().into_boxed_slice());
+    let storage_dims: &'static [i64] = Box::leak(storage.to_vec().into_boxed_slice());
+    {
+        sys::aclCreateTensor(
+            view_dims.as_ptr(),
+            view.len(),
+            dtype,
+            std::ptr::null(),
+            0,
+            sys::ACL_FORMAT_FRACTAL_NZ,
+            storage_dims.as_ptr(),
+            storage.len(),
+            ptr,
+        )
+    }
+}
+
 struct Scalar(*mut sys::aclScalar);
 impl Drop for Scalar {
     fn drop(&mut self) {
@@ -335,6 +358,69 @@ pub fn gemm(
         let workspace = d.workspace_locked(ws)?;
         let ex = executor as *mut sys::aclOpExecutor;
         let status = { sys::aclnnMatmul(workspace, ws, ex, stream) };
+        crate::device::check(status)
+    })
+}
+
+pub fn gemm_nz(
+    d: &Device,
+    w: &Buffer<bf16>,
+    x: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    rows: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let nblocks = n.div_ceil(16);
+    let kpad = k.div_ceil(16) * 16;
+    check(d, w, nblocks * kpad * 16)?;
+    check(d, x, dims(&[rows, k])?)?;
+    check(d, out, dims(&[rows, n])?)?;
+    let cache_key = key(
+        "mm",
+        &[rows as i64, n as i64, k as i64],
+        &[
+            w.as_ptr() as usize,
+            x.as_ptr() as usize,
+            out.as_ptr() as usize,
+        ],
+    );
+    d.run(|stream| {
+        let (executor, ws) = d.cached_gemm(cache_key, || {
+            let tx = mk_tensor_owned(
+                &[rows as i64, k as i64],
+                sys::ACL_BF16,
+                x.as_ptr().cast_mut().cast(),
+            );
+            let tw = mk_tensor_owned_nz(
+                &[k as i64, n as i64],
+                &[1, nblocks as i64, kpad as i64, 16],
+                sys::ACL_BF16,
+                w.as_ptr().cast_mut().cast(),
+            );
+            let to = mk_tensor_owned(
+                &[rows as i64, n as i64],
+                sys::ACL_BF16,
+                out.as_mut_ptr().cast(),
+            );
+            ensure!(
+                !tx.is_null() && !tw.is_null() && !to.is_null(),
+                "gemm tensor"
+            );
+            let mut ws = 0u64;
+            let mut ex = std::ptr::null_mut();
+            crate::device::check(sys::aclnnMatmulWeightNzGetWorkspaceSize(
+                tx, tw, to, 0, &mut ws, &mut ex,
+            ))?;
+            crate::device::check(sys::aclSetAclOpExecutorRepeatable(ex))?;
+            // The repeatable executor keeps references to these descriptors;
+            // `Device::drop` destroys the executor first, then the tensors.
+            d.keep_tensors(vec![tx, tw, to]);
+            Ok((ex as usize, ws))
+        })?;
+        let workspace = d.workspace_locked(ws)?;
+        let ex = executor as *mut sys::aclOpExecutor;
+        let status = { sys::aclnnMatmulWeightNz(workspace, ws, ex, stream) };
         crate::device::check(status)
     })
 }

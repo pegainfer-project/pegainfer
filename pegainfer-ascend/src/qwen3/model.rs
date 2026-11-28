@@ -132,6 +132,27 @@ fn transpose_2d(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     }
     out
 }
+/// Pack a row-major BF16 `[k, n]` matrix into FRACTAL_NZ storage
+/// `[1, ceil(n/16), ceil(k/16)*16, 16]`, matching aclnnMatmulWeightNz.
+fn pack_nz(bytes: &[u8], k: usize, n: usize) -> Vec<u8> {
+    let nblocks = n.div_ceil(16);
+    let kpad = k.div_ceil(16) * 16;
+    let mut out = vec![0u8; nblocks * kpad * 16 * 2];
+    for nb in 0..nblocks {
+        for kk in 0..kpad {
+            for j in 0..16 {
+                let col = nb * 16 + j;
+                let dst = ((nb * kpad + kk) * 16 + j) * 2;
+                if kk < k && col < n {
+                    let src = (kk * n + col) * 2;
+                    out[dst..dst + 2].copy_from_slice(&bytes[src..src + 2]);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn rotary_tables(
     device: &Device,
     context: usize,
@@ -324,19 +345,26 @@ impl Model {
                         t.dtype(),
                         t.shape()
                     );
-                    let data = if name == "lm_head.weight" {
-                        transpose_prefix(t.data(), c.decodable_vocab, h)
-                    } else if is_linear(name) {
+                    let gate_or_up = name.ends_with(".mlp.gate_proj.weight")
+                        || name.ends_with(".mlp.up_proj.weight");
+                    let data = if gate_or_up {
+                        // Keep raw [h, i] so gate/up can be concatenated
+                        // before packing.
                         transpose_2d(t.data(), shape[0], shape[1])
+                    } else if name == "lm_head.weight" {
+                        let raw = transpose_prefix(t.data(), c.decodable_vocab, h);
+                        pack_nz(&raw, h, c.decodable_vocab)
+                    } else if is_linear(name) {
+                        let raw = transpose_2d(t.data(), shape[0], shape[1]);
+                        pack_nz(&raw, shape[1], shape[0])
                     } else {
                         t.data().to_vec()
                     };
                     if name == "model.embed_tokens.weight" && c.tie_word_embeddings {
-                        tied_head = Some(transpose_prefix(t.data(), c.decodable_vocab, h));
+                        let raw = transpose_prefix(t.data(), c.decodable_vocab, h);
+                        tied_head = Some(pack_nz(&raw, h, c.decodable_vocab));
                     }
-                    if name.ends_with(".mlp.gate_proj.weight")
-                        || name.ends_with(".mlp.up_proj.weight")
-                    {
+                    if gate_or_up {
                         let layer = name
                             .split('.')
                             .nth(2)
@@ -387,7 +415,7 @@ impl Model {
             }
             weights.insert(
                 format!("model.layers.{l}.mlp.gate_up.weight"),
-                Arc::new(device.from_bytes(&combined)?),
+                Arc::new(device.from_bytes(&pack_nz(&combined, h, 2 * i))?),
             );
         }
         let embedding = weights.remove("model.embed_tokens.weight").unwrap();
@@ -602,9 +630,9 @@ impl Model {
                         c.rms_norm_eps,
                     )?;
                 }
-                ops::gemm(d, &layer.q, &s.norm, &mut s.q, rows, q, h)?;
-                ops::gemm(d, &layer.k, &s.norm, &mut s.k, rows, k, h)?;
-                ops::gemm(d, &layer.v, &s.norm, &mut s.v, rows, k, h)?;
+                ops::gemm_nz(d, &layer.q, &s.norm, &mut s.q, rows, q, h)?;
+                ops::gemm_nz(d, &layer.k, &s.norm, &mut s.k, rows, k, h)?;
+                ops::gemm_nz(d, &layer.v, &s.norm, &mut s.v, rows, k, h)?;
                 ops::norm(
                     d,
                     &s.q,
@@ -657,7 +685,7 @@ impl Model {
                     shape,
                     mask,
                 )?;
-                ops::gemm(d, &layer.o, &s.attn, &mut s.projected, rows, h, q)?;
+                ops::gemm_nz(d, &layer.o, &s.attn, &mut s.projected, rows, h, q)?;
                 ops::add_norm(
                     d,
                     &s.hidden,
@@ -669,9 +697,9 @@ impl Model {
                     h,
                     c.rms_norm_eps,
                 )?;
-                ops::gemm(d, &layer.gate_up, &s.norm, &mut s.gate_up, rows, 2 * i, h)?;
+                ops::gemm_nz(d, &layer.gate_up, &s.norm, &mut s.gate_up, rows, 2 * i, h)?;
                 ops::swiglu(d, &s.gate_up, &mut s.activation, rows, i)?;
-                ops::gemm(d, &layer.down, &s.activation, &mut s.projected, rows, h, i)?;
+                ops::gemm_nz(d, &layer.down, &s.activation, &mut s.projected, rows, h, i)?;
                 // Leave residual+projected for the next layer's AddRmsNorm,
                 // or for the final AddRmsNorm after the loop.
                 Ok(())
@@ -699,7 +727,7 @@ impl Model {
             h,
             rows,
         )?;
-        ops::gemm(
+        ops::gemm_nz(
             d,
             &self.head,
             &s.selected,
