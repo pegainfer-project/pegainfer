@@ -300,6 +300,25 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> aclnnStatus;
 
+    pub(crate) safe fn aclnnClippedSwigluGetWorkspaceSize(
+        x: *const aclTensor,
+        group_index: *const aclTensor,
+        dim: i64,
+        alpha: f64,
+        limit: f64,
+        bias: f64,
+        interleaved: bool,
+        out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub(crate) safe fn aclnnClippedSwiglu(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: *mut c_void,
+    ) -> aclnnStatus;
+
     pub(crate) safe fn aclnnArgMaxGetWorkspaceSize(
         self_: *const aclTensor,
         dim: i64,

@@ -393,6 +393,39 @@ fn add_norm_matches_add_then_norm() -> Result<()> {
     Ok(())
 }
 
+/// Clipped SwiGLU on the concatenated gate/up matrix must agree with the
+/// separate SiLU + Mul path.
+#[test]
+#[ignore = "requires an explicitly selected Ascend device"]
+fn swiglu_matches_silu_mul() -> Result<()> {
+    let device = Device::new(0)?;
+    let (rows, i) = (4usize, 128usize);
+    let gate = fill(rows * i, 601);
+    let up = fill(rows * i, 602);
+    let mut x = vec![bf16::ZERO; rows * 2 * i];
+    for row in 0..rows {
+        x[row * 2 * i..row * 2 * i + i].copy_from_slice(&gate[row * i..(row + 1) * i]);
+        x[row * 2 * i + i..(row + 1) * 2 * i].copy_from_slice(&up[row * i..(row + 1) * i]);
+    }
+    let dx = device.from_slice(&x)?;
+    let dg = device.from_slice(&gate)?;
+    let du = device.from_slice(&up)?;
+    let mut out = device.zeros::<bf16>(rows * i)?;
+    let mut want = device.zeros::<bf16>(rows * i)?;
+    ops::swiglu(&device, &dx, &mut out, rows, i)?;
+    ops::silu(&device, &dg, &du, &mut want, rows * i)?;
+    let got = out.read(rows * i)?;
+    let reference = want.read(rows * i)?;
+    let worst = got
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(worst < 0.05, "swiglu vs silu*mul max abs error {worst}");
+    println!("swiglu vs silu*mul max_abs={worst}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an explicitly selected Ascend device"]
 fn rope_matches_reference_for_positions() -> Result<()> {

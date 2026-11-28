@@ -23,8 +23,7 @@ struct Layer {
     o: Weight,
     q_norm: Weight,
     k_norm: Weight,
-    gate: Weight,
-    up: Weight,
+    gate_up: Weight,
     down: Weight,
     keys: Buffer<bf16>,
     values: Buffer<bf16>,
@@ -57,8 +56,7 @@ struct Scratch {
     kn: Buffer<bf16>,
     v: Buffer<bf16>,
     attn: Buffer<bf16>,
-    gate: Buffer<bf16>,
-    up: Buffer<bf16>,
+    gate_up: Buffer<bf16>,
     activation: Buffer<bf16>,
     selected: Buffer<bf16>,
     logits: Buffer<bf16>,
@@ -309,6 +307,7 @@ impl Model {
             path.display()
         );
         let mut weights = HashMap::<String, Weight>::new();
+        let mut gate_up_parts = HashMap::<usize, (Option<Vec<u8>>, Option<Vec<u8>>)>::new();
         let mut tied_head: Option<Vec<u8>> = None;
         for file in files {
             let handle = std::fs::File::open(&file)?;
@@ -335,6 +334,24 @@ impl Model {
                     if name == "model.embed_tokens.weight" && c.tie_word_embeddings {
                         tied_head = Some(transpose_prefix(t.data(), c.decodable_vocab, h));
                     }
+                    if name.ends_with(".mlp.gate_proj.weight")
+                        || name.ends_with(".mlp.up_proj.weight")
+                    {
+                        let layer = name
+                            .split('.')
+                            .nth(2)
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .context("gate/up layer index")?;
+                        let entry = gate_up_parts.entry(layer).or_default();
+                        if name.ends_with("gate_proj.weight") {
+                            ensure!(entry.0.is_none(), "duplicate gate {name}");
+                            entry.0 = Some(data);
+                        } else {
+                            ensure!(entry.1.is_none(), "duplicate up {name}");
+                            entry.1 = Some(data);
+                        }
+                        continue;
+                    }
                     weights.insert(
                         name.to_string(),
                         Arc::new(
@@ -347,7 +364,31 @@ impl Model {
             }
         }
         for name in specs.keys() {
+            if name.ends_with(".mlp.gate_proj.weight") || name.ends_with(".mlp.up_proj.weight") {
+                continue;
+            }
             ensure!(weights.contains_key(name), "missing tensor {name}");
+        }
+        for l in 0..c.num_hidden_layers {
+            let (gate, up) = gate_up_parts
+                .remove(&l)
+                .with_context(|| format!("missing gate/up for layer {l}"))?;
+            let gate = gate.with_context(|| format!("missing gate for layer {l}"))?;
+            let up = up.with_context(|| format!("missing up for layer {l}"))?;
+            ensure!(
+                gate.len() == h * i * 2 && up.len() == h * i * 2,
+                "gate/up size for layer {l}"
+            );
+            let mut combined = Vec::with_capacity(2 * h * i * 2);
+            for row in 0..h {
+                let range = row * i * 2..(row + 1) * i * 2;
+                combined.extend_from_slice(&gate[range.clone()]);
+                combined.extend_from_slice(&up[range]);
+            }
+            weights.insert(
+                format!("model.layers.{l}.mlp.gate_up.weight"),
+                Arc::new(device.from_bytes(&combined)?),
+            );
         }
         let embedding = weights.remove("model.embed_tokens.weight").unwrap();
         let head = if c.tie_word_embeddings {
@@ -380,8 +421,7 @@ impl Model {
                 o: take("self_attn.o_proj"),
                 q_norm: take("self_attn.q_norm"),
                 k_norm: take("self_attn.k_norm"),
-                gate: take("mlp.gate_proj"),
-                up: take("mlp.up_proj"),
+                gate_up: take("mlp.gate_up"),
                 down: take("mlp.down_proj"),
                 keys: device.zeros(kv_elements)?,
                 values: device.zeros(kv_elements)?,
@@ -402,8 +442,7 @@ impl Model {
             kn: device.zeros(max_rows * k)?,
             v: device.zeros(max_rows * k)?,
             attn: device.zeros(max_rows * q)?,
-            gate: device.zeros(max_rows * i)?,
-            up: device.zeros(max_rows * i)?,
+            gate_up: device.zeros(max_rows * 2 * i)?,
             activation: device.zeros(max_rows * i)?,
             selected: device.zeros(max_rows * h)?,
             logits: device.zeros(max_rows * c.decodable_vocab)?,
@@ -630,9 +669,8 @@ impl Model {
                     h,
                     c.rms_norm_eps,
                 )?;
-                ops::gemm(d, &layer.gate, &s.norm, &mut s.gate, rows, i, h)?;
-                ops::gemm(d, &layer.up, &s.norm, &mut s.up, rows, i, h)?;
-                ops::silu(d, &s.gate, &s.up, &mut s.activation, rows * i)?;
+                ops::gemm(d, &layer.gate_up, &s.norm, &mut s.gate_up, rows, 2 * i, h)?;
+                ops::swiglu(d, &s.gate_up, &mut s.activation, rows, i)?;
                 ops::gemm(d, &layer.down, &s.activation, &mut s.projected, rows, h, i)?;
                 // Leave residual+projected for the next layer's AddRmsNorm,
                 // or for the final AddRmsNorm after the loop.

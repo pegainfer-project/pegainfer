@@ -559,6 +559,55 @@ fn mul_locked(
     crate::device::check(status)
 }
 
+/// Clipped SwiGLU over a concatenated `[rows, 2i]` gate/up matrix.
+pub fn swiglu(
+    d: &Device,
+    x: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    rows: usize,
+    i: usize,
+) -> Result<()> {
+    check(d, x, dims(&[rows, 2 * i])?)?;
+    check(d, out, dims(&[rows, i])?)?;
+    d.run(|stream| {
+        let mut t = Tensors::new();
+        let tx = t.mk(
+            &[rows as i64, (2 * i) as i64],
+            sys::ACL_BF16,
+            x.as_ptr().cast_mut().cast(),
+            "swiglu in",
+        )?;
+        let to = t.mk(
+            &[rows as i64, i as i64],
+            sys::ACL_BF16,
+            out.as_mut_ptr().cast(),
+            "swiglu out",
+        )?;
+        let result = run_oneshot(
+            d,
+            stream,
+            |ws, ex| {
+                sys::aclnnClippedSwigluGetWorkspaceSize(
+                    tx,
+                    std::ptr::null(),
+                    1,
+                    1.0,
+                    1e10,
+                    0.0,
+                    false,
+                    to,
+                    ws,
+                    ex,
+                )
+            },
+            |p, n, ex, st| sys::aclnnClippedSwiglu(p, n, ex, st),
+        );
+        let (handles, arrays) = t.release();
+        d.defer_tensors(handles, arrays);
+        result
+    })
+}
+
 /// `out = silu(a) * b`, used for the SwiGLU MLP.
 pub fn silu(
     d: &Device,
