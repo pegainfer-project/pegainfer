@@ -273,6 +273,74 @@ fn attention_matches_reference() -> Result<()> {
     Ok(())
 }
 
+/// PromptFlashAttentionV3 grouping must agree with the per-row IFA path on
+/// the same cache, including a non-zero prefix and multi-row query.
+#[test]
+#[ignore = "requires an explicitly selected Ascend device"]
+fn attention_grouped_matches_ifa() -> Result<()> {
+    let device = Device::new(0)?;
+    let (heads, kv_heads, dim, context, capacity) = (4usize, 2usize, 128usize, 64usize, 1usize);
+    let rows = 4usize;
+    let start = 2usize;
+    let keys = fill(capacity * context * kv_heads * dim, 301);
+    let values = fill(capacity * context * kv_heads * dim, 302);
+    let q = fill(rows * heads * dim, 303);
+    let dk = device.from_slice(&keys)?;
+    let dv = device.from_slice(&values)?;
+    let dq = device.from_slice(&q)?;
+    let mut out_ifa = device.zeros::<bf16>(rows * heads * dim)?;
+    let mut out_pfa = device.zeros::<bf16>(rows * heads * dim)?;
+    let slots = vec![0i32; rows];
+    let positions = (start..start + rows).map(|p| p as i32).collect::<Vec<_>>();
+    let shape = ops::AttentionShape {
+        rows,
+        heads,
+        kv_heads,
+        dim,
+        context,
+        capacity,
+    };
+    ops::attention(
+        &device,
+        &dq,
+        &dk,
+        &dv,
+        &mut out_ifa,
+        &slots,
+        &positions,
+        shape,
+    )?;
+    let mask_dim = 2048usize;
+    let mut mask = vec![0i8; mask_dim * mask_dim];
+    for i in 0..mask_dim {
+        for j in (i + 1)..mask_dim {
+            mask[i * mask_dim + j] = 1;
+        }
+    }
+    let dmask = device.from_slice(&mask)?;
+    ops::attention_grouped(
+        &device,
+        &dq,
+        &dk,
+        &dv,
+        &mut out_pfa,
+        &slots,
+        &positions,
+        shape,
+        &dmask,
+    )?;
+    let a = out_ifa.read(rows * heads * dim)?;
+    let b = out_pfa.read(rows * heads * dim)?;
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x.to_f32() - y.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    ensure!(worst < 0.01, "PFA vs IFA max abs error {worst}");
+    println!("attention grouped vs IFA max_abs={worst}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires an explicitly selected Ascend device"]
 fn rope_matches_reference_for_positions() -> Result<()> {

@@ -85,8 +85,21 @@ impl Tensors {
         ptr: *mut c_void,
         what: &str,
     ) -> Result<*mut sys::aclTensor> {
+        let stride = strides(shape);
+        self.mk_strided(shape, &stride, dtype, ptr, what)
+    }
+
+    fn mk_strided(
+        &mut self,
+        shape: &[i64],
+        stride: &[i64],
+        dtype: u32,
+        ptr: *mut c_void,
+        what: &str,
+    ) -> Result<*mut sys::aclTensor> {
+        ensure!(shape.len() == stride.len(), "stride rank mismatch");
         self.arrays.push(shape.to_vec());
-        self.arrays.push(strides(shape));
+        self.arrays.push(stride.to_vec());
         let n = self.arrays.len();
         let dims = self.arrays[n - 2].as_ptr();
         let st = self.arrays[n - 1].as_ptr();
@@ -723,6 +736,121 @@ pub fn cache(
     Ok(())
 }
 
+/// One row of decode-style IFA against its slot's KV prefix.
+#[allow(clippy::too_many_arguments)]
+fn ifa_row(
+    d: &Device,
+    q: &Buffer<bf16>,
+    keys: &Buffer<bf16>,
+    values: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    slot: usize,
+    pos: usize,
+    s: AttentionShape,
+    row: usize,
+) -> Result<()> {
+    let row_elems = s.heads * s.dim;
+    let kv_row_elems = s.kv_heads * s.dim;
+    let slot_elems = s.context * kv_row_elems;
+    let scale = 1.0 / (s.dim as f64).sqrt();
+    let seq_len = i64::try_from(pos + 1)?;
+    let q_ptr = q.as_ptr() as usize + row * row_elems * 2;
+    let out_ptr = out.as_mut_ptr() as usize + row * row_elems * 2;
+    let keys_ptr = keys.as_ptr() as usize + slot * slot_elems * 2;
+    let values_ptr = values.as_ptr() as usize + slot * slot_elems * 2;
+    let cache_key = key(
+        "ifa",
+        &[
+            s.heads as i64,
+            s.kv_heads as i64,
+            s.dim as i64,
+            s.context as i64,
+            slot as i64,
+            row as i64,
+        ],
+        &[q_ptr, out_ptr, keys_ptr, values_ptr],
+    );
+    let descs = d.cached_descs(cache_key, || {
+        let tq = mk_tensor_owned(
+            &[1, s.heads as i64, 1, s.dim as i64],
+            sys::ACL_BF16,
+            q_ptr as *mut c_void,
+        );
+        let tc = mk_tensor_owned(
+            &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
+            sys::ACL_BF16,
+            keys_ptr as *mut c_void,
+        );
+        let tv = mk_tensor_owned(
+            &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
+            sys::ACL_BF16,
+            values_ptr as *mut c_void,
+        );
+        let to = mk_tensor_owned(
+            &[1, s.heads as i64, 1, s.dim as i64],
+            sys::ACL_BF16,
+            out_ptr as *mut c_void,
+        );
+        ensure!(
+            !tq.is_null() && !tc.is_null() && !tv.is_null() && !to.is_null(),
+            "attention tensor"
+        );
+        let karr = [tc as *const sys::aclTensor];
+        let varr = [tv as *const sys::aclTensor];
+        let klist = sys::aclCreateTensorList(karr.as_ptr(), 1);
+        let vlist = sys::aclCreateTensorList(varr.as_ptr(), 1);
+        ensure!(!klist.is_null() && !vlist.is_null(), "tensor list");
+        // CANN 9.2.1 double-frees when a tensor list and a tensor it
+        // contains are both destroyed, so `tensors` keeps only the
+        // standalone query/output descriptors; the lists own K/V.
+        Ok(crate::device::Descs {
+            tensors: vec![tq as usize, to as usize],
+            lists: vec![klist as usize, vlist as usize],
+        })
+    })?;
+    let tq = descs.tensors[0] as *mut sys::aclTensor;
+    let to = descs.tensors[1] as *mut sys::aclTensor;
+    let klist = descs.lists[0] as *mut sys::aclTensorList;
+    let vlist = descs.lists[1] as *mut sys::aclTensorList;
+    let actual = d.int_array(seq_len)? as *mut sys::aclIntArray;
+    d.run(|stream| {
+        let layout = c"BNSD";
+        run_oneshot(
+            d,
+            stream,
+            |ws, ex| {
+                sys::aclnnIncreFlashAttentionV4GetWorkspaceSize(
+                    tq,
+                    klist,
+                    vlist,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    actual,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    s.heads as i64,
+                    scale,
+                    layout.as_ptr().cast_mut(),
+                    s.kv_heads as i64,
+                    0,
+                    1,
+                    to,
+                    ws,
+                    ex,
+                )
+            },
+            |p, n, ex, st| sys::aclnnIncreFlashAttentionV4(p, n, ex, st),
+        )
+    })
+}
+
 /// Causal attention for each row against its slot's KV prefix.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
@@ -745,112 +873,174 @@ pub fn attention(
     check(d, out, n)?;
     check(d, keys, cache)?;
     check(d, values, cache)?;
-    let row_elems = s.heads * s.dim;
-    let kv_row_elems = s.kv_heads * s.dim;
-    let slot_elems = s.context * kv_row_elems;
-    let scale = 1.0 / (s.dim as f64).sqrt();
     for row in 0..s.rows {
         let slot = usize::try_from(slots[row])?;
         let pos = usize::try_from(positions[row])?;
         ensure!(slot < s.capacity && pos < s.context, "row out of range");
-        let seq_len = i64::try_from(pos + 1)?;
-        let q_ptr = q.as_ptr() as usize + row * row_elems * 2;
-        let out_ptr = out.as_mut_ptr() as usize + row * row_elems * 2;
-        let keys_ptr = keys.as_ptr() as usize + slot * slot_elems * 2;
-        let values_ptr = values.as_ptr() as usize + slot * slot_elems * 2;
-        let cache_key = key(
-            "ifa",
-            &[
-                s.heads as i64,
-                s.kv_heads as i64,
-                s.dim as i64,
-                s.context as i64,
-                slot as i64,
-                row as i64,
-            ],
-            &[q_ptr, out_ptr, keys_ptr, values_ptr],
-        );
-        let descs = d.cached_descs(cache_key, || {
-            let tq = mk_tensor_owned(
-                &[1, s.heads as i64, 1, s.dim as i64],
-                sys::ACL_BF16,
-                q_ptr as *mut c_void,
-            );
-            let tc = mk_tensor_owned(
-                &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
-                sys::ACL_BF16,
-                keys_ptr as *mut c_void,
-            );
-            let tv = mk_tensor_owned(
-                &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
-                sys::ACL_BF16,
-                values_ptr as *mut c_void,
-            );
-            let to = mk_tensor_owned(
-                &[1, s.heads as i64, 1, s.dim as i64],
-                sys::ACL_BF16,
-                out_ptr as *mut c_void,
-            );
-            ensure!(
-                !tq.is_null() && !tc.is_null() && !tv.is_null() && !to.is_null(),
-                "attention tensor"
-            );
-            let karr = [tc as *const sys::aclTensor];
-            let varr = [tv as *const sys::aclTensor];
-            let klist = sys::aclCreateTensorList(karr.as_ptr(), 1);
-            let vlist = sys::aclCreateTensorList(varr.as_ptr(), 1);
-            ensure!(!klist.is_null() && !vlist.is_null(), "tensor list");
-            // CANN 9.2.1 double-frees when a tensor list and a tensor it
-            // contains are both destroyed, so `tensors` keeps only the
-            // standalone query/output descriptors; the lists own K/V.
-            Ok(crate::device::Descs {
-                tensors: vec![tq as usize, to as usize],
-                lists: vec![klist as usize, vlist as usize],
-            })
-        })?;
-        let tq = descs.tensors[0] as *mut sys::aclTensor;
-        let to = descs.tensors[1] as *mut sys::aclTensor;
-        let klist = descs.lists[0] as *mut sys::aclTensorList;
-        let vlist = descs.lists[1] as *mut sys::aclTensorList;
-        let actual = d.int_array(seq_len)? as *mut sys::aclIntArray;
-        d.run(|stream| {
-            let layout = c"BNSD";
-            run_oneshot(
-                d,
-                stream,
-                |ws, ex| {
-                    sys::aclnnIncreFlashAttentionV4GetWorkspaceSize(
-                        tq,
-                        klist,
-                        vlist,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        actual,
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        s.heads as i64,
-                        scale,
-                        layout.as_ptr().cast_mut(),
-                        s.kv_heads as i64,
-                        0,
-                        1,
-                        to,
-                        ws,
-                        ex,
-                    )
-                },
-                |p, n, ex, st| sys::aclnnIncreFlashAttentionV4(p, n, ex, st),
-            )
-        })?;
+        ifa_row(d, q, keys, values, out, slot, pos, s, row)?;
     }
     Ok(())
+}
+
+/// Group consecutive rows that belong to one slot and run a multi-row prefill
+/// chunk through PromptFlashAttentionV3. Single-row groups stay on IFA.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_grouped(
+    d: &Device,
+    q: &Buffer<bf16>,
+    keys: &Buffer<bf16>,
+    values: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    slots: &[i32],
+    positions: &[i32],
+    s: AttentionShape,
+    mask: &Buffer<i8>,
+) -> Result<()> {
+    let n = dims(&[s.rows, s.heads, s.dim])?;
+    let cache = dims(&[s.capacity, s.context, s.kv_heads, s.dim])?;
+    ensure!(
+        s.heads.is_multiple_of(s.kv_heads) && slots.len() == s.rows && positions.len() == s.rows,
+        "unsupported attention geometry"
+    );
+    check(d, q, n)?;
+    check(d, out, n)?;
+    check(d, keys, cache)?;
+    check(d, values, cache)?;
+    let mut start = 0;
+    while start < s.rows {
+        let slot = usize::try_from(slots[start])?;
+        let mut end = start + 1;
+        while end < s.rows && slots[end] == slots[start] && positions[end] == positions[end - 1] + 1
+        {
+            end += 1;
+        }
+        let rows = end - start;
+        let pos = usize::try_from(positions[start])?;
+        ensure!(
+            slot < s.capacity && pos + rows <= s.context,
+            "row out of range"
+        );
+        if rows == 1 {
+            ifa_row(d, q, keys, values, out, slot, pos, s, start)?;
+        } else {
+            prefill_rows(d, q, keys, values, out, slot, start, rows, pos, s, mask)?;
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_rows(
+    d: &Device,
+    q: &Buffer<bf16>,
+    keys: &Buffer<bf16>,
+    values: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    slot: usize,
+    row_start: usize,
+    rows: usize,
+    pos0: usize,
+    s: AttentionShape,
+    mask: &Buffer<i8>,
+) -> Result<()> {
+    let mask_dim = (mask.len() as f64).sqrt() as usize;
+    ensure!(
+        mask_dim * mask_dim == mask.len() && mask_dim >= s.context,
+        "attention mask geometry"
+    );
+    let row_elems = s.heads * s.dim;
+    let slot_elems = s.context * s.kv_heads * s.dim;
+    let kv_len = pos0 + rows;
+    ensure!(
+        row_start + rows <= s.rows && kv_len <= s.context && slot < s.capacity,
+        "prefill row out of range"
+    );
+    let q_ptr = q.as_ptr() as usize + row_start * row_elems * 2;
+    let out_ptr = out.as_mut_ptr() as usize + row_start * row_elems * 2;
+    let keys_ptr = keys.as_ptr() as usize + slot * slot_elems * 2;
+    let values_ptr = values.as_ptr() as usize + slot * slot_elems * 2;
+    let scale = 1.0 / (s.dim as f64).sqrt();
+    d.run(|stream| {
+        let mut t = Tensors::new();
+        // Q/out are row-major [rows, heads, dim]; present them as BNSD
+        // [1, heads, rows, dim] through strides [heads*rows*dim, dim,
+        // heads*dim, 1]. PFA V3 honours these strides (validated in
+        // smoke_pfa_layout.cpp).
+        let q_stride = [
+            (s.heads * rows * s.dim) as i64,
+            s.dim as i64,
+            (s.heads * s.dim) as i64,
+            1,
+        ];
+        let tq = t.mk_strided(
+            &[1, s.heads as i64, rows as i64, s.dim as i64],
+            &q_stride,
+            sys::ACL_BF16,
+            q_ptr as *mut c_void,
+            "pfa q",
+        )?;
+        let tk = t.mk(
+            &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
+            sys::ACL_BF16,
+            keys_ptr as *mut c_void,
+            "pfa k",
+        )?;
+        let tv = t.mk(
+            &[1, s.kv_heads as i64, s.context as i64, s.dim as i64],
+            sys::ACL_BF16,
+            values_ptr as *mut c_void,
+            "pfa v",
+        )?;
+        let to = t.mk_strided(
+            &[1, s.heads as i64, rows as i64, s.dim as i64],
+            &q_stride,
+            sys::ACL_BF16,
+            out_ptr as *mut c_void,
+            "pfa out",
+        )?;
+        let tm = t.mk(
+            &[mask_dim as i64, mask_dim as i64],
+            sys::ACL_INT8,
+            mask.as_ptr().cast_mut().cast(),
+            "pfa mask",
+        )?;
+        let actual_q = d.int_array(rows as i64)? as *const sys::aclIntArray;
+        let actual_kv = d.int_array(kv_len as i64)? as *const sys::aclIntArray;
+        let layout = c"BNSD";
+        run_oneshot(
+            d,
+            stream,
+            |ws, ex| {
+                sys::aclnnPromptFlashAttentionV3GetWorkspaceSize(
+                    tq,
+                    tk,
+                    tv,
+                    std::ptr::null(),
+                    tm,
+                    actual_q,
+                    actual_kv,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    s.heads as i64,
+                    scale,
+                    i64::from(i32::MAX),
+                    0,
+                    layout.as_ptr().cast_mut(),
+                    s.kv_heads as i64,
+                    3,
+                    1,
+                    to,
+                    ws,
+                    ex,
+                )
+            },
+            |p, n, ex, st| sys::aclnnPromptFlashAttentionV3(p, n, ex, st),
+        )
+    })
 }
 
 pub fn top1(

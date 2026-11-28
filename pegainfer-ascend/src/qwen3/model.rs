@@ -74,6 +74,9 @@ pub struct Model {
     final_norm: Weight,
     cos: Arc<Buffer<bf16>>,
     sin: Arc<Buffer<bf16>>,
+    /// Causal mask for PromptFlashAttentionV3, `[mask_dim, mask_dim]` int8.
+    /// CANN requires at least 2048x2048; the side is max(context, 2048).
+    mask: Buffer<i8>,
     scratch: Scratch,
     lengths: Vec<usize>,
     last_output_rows: usize,
@@ -407,6 +410,15 @@ impl Model {
             predictions: device.zeros(max_rows)?,
         };
         let (cos, sin) = rotary_tables(&device, options.max_context, c.head_dim, c.rope_theta)?;
+        let mask_dim = options.max_context.max(2048);
+        let mut causal = vec![0i8; mask_dim * mask_dim];
+        for i in 0..mask_dim {
+            let row = i * mask_dim;
+            for j in (i + 1)..mask_dim {
+                causal[row + j] = 1;
+            }
+        }
+        let mask = device.from_slice(&causal)?;
         device.synchronize()?;
         Ok(Self {
             device,
@@ -418,6 +430,7 @@ impl Model {
             final_norm,
             cos: Arc::new(cos),
             sin: Arc::new(sin),
+            mask,
             scratch,
             lengths: vec![0; options.slots],
             last_output_rows: 0,
@@ -488,6 +501,7 @@ impl Model {
         let d = &self.device;
         let cos = Arc::clone(&self.cos);
         let sin = Arc::clone(&self.sin);
+        let mask = &self.mask;
         s.ids
             .write(&input.iter().map(|t| t.token).collect::<Vec<_>>())?;
         s.slots
@@ -576,7 +590,7 @@ impl Model {
                     &s.positions,
                     shape,
                 )?;
-                ops::attention(
+                ops::attention_grouped(
                     d,
                     &s.qn,
                     &layer.keys,
@@ -585,6 +599,7 @@ impl Model {
                     &host_slots,
                     &host_positions,
                     shape,
+                    mask,
                 )?;
                 ops::gemm(d, &layer.o, &s.attn, &mut s.projected, rows, h, q)?;
                 ops::add(d, &s.hidden, &s.projected, &mut s.residual, rows * h)?;

@@ -250,6 +250,38 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> aclnnStatus;
 
+    pub(crate) safe fn aclnnPromptFlashAttentionV3GetWorkspaceSize(
+        query: *const aclTensor,
+        key: *const aclTensor,
+        value: *const aclTensor,
+        pse_shift: *const aclTensor,
+        atten_mask: *const aclTensor,
+        actual_seq_lengths: *const aclIntArray,
+        actual_seq_lengths_kv: *const aclIntArray,
+        deq_scale1: *const aclTensor,
+        quant_scale1: *const aclTensor,
+        deq_scale2: *const aclTensor,
+        quant_scale2: *const aclTensor,
+        quant_offset2: *const aclTensor,
+        num_heads: i64,
+        scale_value: f64,
+        pre_tokens: i64,
+        next_tokens: i64,
+        input_layout: *mut c_char,
+        num_key_value_heads: i64,
+        sparse_mode: i64,
+        inner_precise: i64,
+        attention_out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+    pub(crate) safe fn aclnnPromptFlashAttentionV3(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: *mut c_void,
+    ) -> aclnnStatus;
+
     pub(crate) safe fn aclnnArgMaxGetWorkspaceSize(
         self_: *const aclTensor,
         dim: i64,
